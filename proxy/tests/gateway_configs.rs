@@ -113,3 +113,64 @@ fn every_a2a_route_denies_calls_to_a_halted_agent() {
         }
     }
 }
+
+#[test]
+fn mcp_capture_can_pair_each_response_with_its_request() {
+    for (path, _) in CONFIGS {
+        let config = load(path);
+        for route in config["routes"].as_vec().unwrap() {
+            let Some(processors) = route["policies"]["mcpGuardrails"]["processors"].as_vec() else {
+                continue;
+            };
+            for processor in processors {
+                let metadata = &processor["metadata"];
+                for key in ["agent", "wake_event_id", "session"] {
+                    assert!(
+                        metadata[key].as_str().is_some(),
+                        "{path}: mcpGuardrails metadata needs {key}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Every host a config calls wake-proxy's hooks on.
+fn hook_hosts(config: &Yaml) -> Vec<String> {
+    let mut hosts = vec![];
+    let mut add = |y: &Yaml| hosts.extend(y["host"].as_str().map(String::from));
+    for (_, gateway) in entries(&config["gateways"]) {
+        add(&gateway["extAuthz"]);
+        add(&gateway["extProc"]);
+    }
+    for route in config["routes"].as_vec().unwrap() {
+        let policies = &route["policies"];
+        add(&policies["extAuthz"]);
+        add(&policies["extProc"]);
+        for processor in policies["mcpGuardrails"]["processors"].as_vec().into_iter().flatten() {
+            add(processor);
+        }
+    }
+    hosts
+}
+
+#[test]
+fn only_agentgateway_reaches_the_hooks() {
+    for (path, _) in CONFIGS {
+        let hosts = hook_hosts(&load(path));
+        assert!(!hosts.is_empty(), "{path}");
+        for host in &hosts {
+            // wake-proxy refuses to listen anywhere else (listen.rs).
+            let private =
+                host.starts_with("unix:/") || host.starts_with("localhost:") || host.starts_with("127.0.0.1:");
+            assert!(private, "{path}: hooks on {host}, which other services could reach");
+        }
+        // The compose stack gives the socket a volume only agentgateway shares.
+        if !path.starts_with("proxy/") {
+            assert!(
+                hosts.iter().all(|h| h == "unix:/run/wake/proxy.sock"),
+                "{path}: {hosts:?}"
+            );
+        }
+    }
+}

@@ -66,7 +66,7 @@ services:
       identity: {condition: service_completed_successfully}
       proxy-state: {condition: service_completed_successfully}
       collector: {condition: service_started}
-    command: ["serve", "--listen", "0.0.0.0:9001",
+    command: ["serve", "--listen", "unix:/run/wake/proxy.sock",
               "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem",
               "--collector", "https://collector:4318", "--collector-ca", "/etc/wake/identity/bundle.pem",
               "--state-dir", "/var/lib/wake-proxy", "--agents", "/etc/wake/agents.json",
@@ -81,9 +81,11 @@ services:
       # Which agent each SPIFFE ID or JWT subject is: the names the brake halts by.
       # WAKE_AGENTS swaps in another map, as the reference fleet does.
       - ${WAKE_AGENTS:-./agents.json}:/etc/wake/agents.json:ro
-    # Not published. Only agentgateway may reach 9001, and only the brake, which alone has
-    # the SVID the control API checks, may use 9002. Memory adapters read their quarantine
-    # rules from 9003.
+      # The hooks agentgateway calls, as a Unix socket. Only agentgateway mounts this too:
+      # anything that can reach the hooks can get events signed in the proxy's name.
+      - proxy-socket:/run/wake
+    # Not published. Only the brake, which alone has the SVID the control API checks, may
+    # use 9002. Memory adapters read their quarantine rules from 9003.
     restart: unless-stopped
 
   agentgateway:
@@ -97,6 +99,7 @@ services:
     volumes:
       - "${WAKE_GATEWAY_CONFIG:-./agentgateway.yaml}:/etc/agentgateway/config.yaml:ro"
       - gateway-identity:/etc/wake/gateway:ro
+      - proxy-socket:/run/wake
     ports: ["3000:3000"]
     # Lets the example backends in agentgateway.yaml reach services on the host.
     extra_hosts: ["host.docker.internal:host-gateway"]
@@ -107,4 +110,5 @@ volumes:
   identity:
   gateway-identity:
   proxy-state:
+  proxy-socket:
   data:

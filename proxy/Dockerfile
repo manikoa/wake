@@ -9,19 +9,20 @@ WORKDIR /src
 COPY proxy/ .
 RUN cargo build --release --locked --bin wake-proxy
 # Directories volumes mount over, owned by the user the proxy runs as.
-RUN mkdir -p /out/etc/wake/identity /out/etc/wake/gateway /out/var/lib/wake-proxy
+RUN mkdir -p /out/etc/wake/identity /out/etc/wake/gateway /out/var/lib/wake-proxy /out/run/wake
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/wake-proxy /wake-proxy
 COPY --from=build --chown=65532:65532 /out/etc/wake /etc/wake
 COPY --from=build --chown=65532:65532 /out/var/lib/wake-proxy /var/lib/wake-proxy
+COPY --from=build --chown=65532:65532 /out/run/wake /run/wake
 USER nonroot
-# 9001 is reachable only by agentgateway: anything that can call it can get events signed.
-# 9002 is the brake's control API, mTLS with the brake's SVID. 9003 serves memory adapters
-# their quarantine rules, read only.
-EXPOSE 9001 9002 9003
+# The hooks are a Unix socket in /run/wake, for a volume only agentgateway shares: anything
+# that can call them can get events signed. 9002 is the brake's control API, mTLS with the
+# brake's SVID. 9003 serves memory adapters their quarantine rules, read only.
+EXPOSE 9002 9003
 ENTRYPOINT ["/wake-proxy"]
 # The halts state must be initialized once (wake-proxy init --state-dir /var/lib/wake-proxy);
 # until it is, every call is denied.
-CMD ["serve", "--listen", "0.0.0.0:9001", "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem", \
+CMD ["serve", "--listen", "unix:/run/wake/proxy.sock", "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem", \
      "--state-dir", "/var/lib/wake-proxy"]

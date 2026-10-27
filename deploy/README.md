@@ -3,7 +3,7 @@
 `compose.yaml` runs the open source recorder in one place, such as a staging environment:
 
 - **collector:** receives events over OTLP/HTTP with TLS on port 4318, signs the SDK's events, checks the proxy's, and keeps the signed log in the `data` volume.
-- **wake-proxy:** records MCP calls and A2A messages for agentgateway. It's reachable only on the compose network.
+- **wake-proxy:** records MCP calls and A2A messages for agentgateway, which reaches its hooks on a Unix socket in the `proxy-socket` volume. No other service mounts it, since anything that can call the hooks can get events signed.
 - **agentgateway:** your agents call MCP servers and A2A agents through it on port 3000, over mTLS, each presenting its own SVID. Point its backends at yours in `agentgateway.yaml`.
 - **First start:** one-shot containers create the collector's signing key, the log's checkpoint key, a development identity and the halts state, kept in volumes. The identity is a CA standing in for SPIRE, the proxy's SVID, the collector's and agentgateway's TLS certificates, the brake's SVID, and an SVID for each agent in `WAKE_DEV_AGENTS` (default `research,smoke-test`). agentgateway gets only its own certificate and the trust bundle, in the `gateway-identity` volume. A restart reuses them all.
 

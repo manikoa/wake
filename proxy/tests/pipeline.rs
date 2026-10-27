@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -16,8 +17,9 @@ use prost_types::{Struct, Value as PbValue, value::Kind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
+use wake_proxy::budget::MAX_CAPTURE;
 use wake_proxy::canonical::{Event, Value, canonical};
-use wake_proxy::export::Counters;
+use wake_proxy::export::{Counters, MAX_BATCH_BYTES};
 use wake_proxy::extmcp::pb::{
     McpRequest, McpResponse, ext_mcp_client::ExtMcpClient, mcp_request_result, mcp_response_result,
 };
@@ -26,15 +28,24 @@ use wake_proxy::signer::{Signer, dev_identity};
 
 /// A stand-in collector: accepts OTLP/HTTP posts and hands each span to the test.
 async fn collector() -> (String, mpsc::UnboundedReceiver<Span>) {
+    let (url, spans, _) = measuring_collector().await;
+    (url, spans)
+}
+
+/// A stand-in collector that also keeps the largest request body it was sent.
+async fn measuring_collector() -> (String, mpsc::UnboundedReceiver<Span>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::unbounded_channel();
+    let largest = Arc::new(AtomicUsize::new(0));
+    let seen = largest.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut conn, _)) = listener.accept().await else {
                 return;
             };
             let tx = tx.clone();
+            let seen = seen.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 65536];
@@ -58,6 +69,7 @@ async fn collector() -> (String, mpsc::UnboundedReceiver<Span>) {
                     }
                     let body = buf[end + 4..end + 4 + len].to_vec();
                     buf.drain(..end + 4 + len);
+                    seen.fetch_max(body.len(), Ordering::Relaxed);
                     let req = ExportTraceServiceRequest::decode(body.as_slice()).unwrap();
                     for rs in req.resource_spans {
                         for ss in rs.scope_spans {
@@ -71,7 +83,7 @@ async fn collector() -> (String, mpsc::UnboundedReceiver<Span>) {
             });
         }
     });
-    (url, rx)
+    (url, rx, largest)
 }
 
 struct Proxy {
@@ -83,13 +95,7 @@ struct Proxy {
 }
 
 async fn proxy(collector: &str, response_timeout: Duration) -> Proxy {
-    let id = dev_identity("spiffe://wake.local/proxy").unwrap();
-    let signer = Signer::from_pem(&id.key_pem, &id.cert_pem).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let counters = Arc::new(Counters::default());
-    let (stop, stopped) = oneshot::channel::<()>();
-    let options = Options {
+    proxy_with(Options {
         collector: collector.into(),
         // For against_a_real_collector over TLS: the CA the collector's certificate chains to.
         collector_ca: std::env::var("WAKE_TEST_COLLECTOR_CA")
@@ -97,7 +103,17 @@ async fn proxy(collector: &str, response_timeout: Duration) -> Proxy {
             .map(|p| std::fs::read(p).unwrap()),
         response_timeout,
         ..Default::default()
-    };
+    })
+    .await
+}
+
+async fn proxy_with(options: Options) -> Proxy {
+    let id = dev_identity("spiffe://wake.local/proxy").unwrap();
+    let signer = Signer::from_pem(&id.key_pem, &id.cert_pem).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counters = Arc::new(Counters::default());
+    let (stop, stopped) = oneshot::channel::<()>();
     let c = counters.clone();
     let done = tokio::spawn(async move {
         serve(listener, signer, options, c, async {
@@ -435,4 +451,176 @@ async fn records_an_a2a_message_and_reply_through_ext_proc() {
     verify(message);
     verify(reply);
     p.shutdown().await;
+}
+
+/// One MCP call through the hooks: a request, then its response with this result.
+async fn call(p: &mut Proxy, tool: &str, result: Vec<u8>) {
+    let req = p
+        .client
+        .check_request(McpRequest {
+            service_names: vec!["files".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("session", "s1")]),
+            mcp_request: Some(format!(r#"{{"name":"{tool}"}}"#).into_bytes()),
+            headers: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let event_id = match req.metadata.unwrap().fields["wake_event_id"].kind.clone() {
+        Some(Kind::StringValue(id)) => id,
+        other => panic!("{other:?}"),
+    };
+    let resp = p
+        .client
+        .check_response(McpResponse {
+            service_names: vec!["files".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("wake_event_id", &event_id), ("session", "s1")]),
+            mcp_response: result,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(resp.result, Some(mcp_response_result::Result::Pass(_))));
+}
+
+#[tokio::test]
+async fn large_results_are_capped_and_batches_stay_under_the_collectors_limit() {
+    let (url, mut spans, largest) = measuring_collector().await;
+    let mut p = proxy(&url, Duration::from_secs(60)).await;
+    // 30 results of 3 MiB: 30 MiB of events at 1 MiB each, over the collector's 20 MiB
+    // request limit if they went out in one batch.
+    let big = format!(r#"{{"content":[{{"type":"text","text":"{}"}}]}}"#, "x".repeat(3 << 20)).into_bytes();
+    for i in 0..30 {
+        call(&mut p, &format!("read_{i}"), big.clone()).await;
+    }
+    for _ in 0..30 {
+        let span = tokio::time::timeout(Duration::from_secs(10), spans.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let a = attrs(&span);
+        let payload: serde_json::Value = serde_json::from_str(&s(&a, "wake.payload")).unwrap();
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["output"].as_str().unwrap().len(), MAX_CAPTURE);
+        assert!(s(&a, "gen_ai.tool.name").starts_with("read_"));
+        verify(&span);
+    }
+    let largest = largest.load(Ordering::Relaxed);
+    assert!(largest <= MAX_BATCH_BYTES + (1 << 20), "a request of {largest} bytes");
+    let counters = p.counters.clone();
+    p.shutdown().await;
+    assert_eq!(Counters::get(&counters.sent), 30);
+    assert_eq!(
+        Counters::get(&counters.hooks_dropped) + Counters::get(&counters.export_dropped),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_flood_of_large_calls_is_dropped_and_counted_not_held() {
+    // Nothing listens here, so every event waits on retries.
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", dead.local_addr().unwrap());
+    drop(dead);
+    let mut p = proxy_with(Options {
+        collector: url,
+        response_timeout: Duration::from_secs(60),
+        queue_bytes: 4 << 20,
+        ..Default::default()
+    })
+    .await;
+    let big = vec![b'x'; 2 << 20];
+    let started = Instant::now();
+    for i in 0..20 {
+        call(&mut p, &format!("t{i}"), big.clone()).await;
+    }
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let counters = p.counters.clone();
+    p.shutdown().await;
+    // At most 4 MiB of events waited at once; the rest were counted, not kept.
+    assert!(
+        Counters::get(&counters.export_dropped) >= 10,
+        "{}",
+        Counters::get(&counters.export_dropped)
+    );
+    assert_eq!(Counters::get(&counters.sent), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serves_the_hooks_on_a_unix_socket() {
+    use hyper_util::rt::TokioIo;
+    use tokio::net::UnixStream;
+    use wake_proxy::pipeline::serve_unix;
+
+    let (url, mut spans) = collector().await;
+    // Short: a socket's path has to fit in about 100 bytes.
+    let dir = std::path::PathBuf::from("/tmp").join(format!("wake-hooks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("proxy.sock");
+    let listener = wake_proxy::listen::bind_unix(&path).unwrap();
+    let id = dev_identity("spiffe://wake.local/proxy").unwrap();
+    let signer = Signer::from_pem(&id.key_pem, &id.cert_pem).unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let options = Options {
+        collector: url,
+        ..Default::default()
+    };
+    let done = tokio::spawn(serve_unix(
+        listener,
+        signer,
+        options,
+        Arc::new(Counters::default()),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+
+    let socket = path.clone();
+    let channel = tonic::transport::Endpoint::try_from("http://wake-proxy")
+        .unwrap()
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move { Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(socket).await?)) }
+        }))
+        .await
+        .unwrap();
+    let mut client = ExtMcpClient::new(channel);
+    let req = client
+        .check_request(McpRequest {
+            service_names: vec!["inbox".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("session", "s1")]),
+            mcp_request: Some(br#"{"name":"read_email"}"#.to_vec()),
+            headers: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let event_id = match req.metadata.unwrap().fields["wake_event_id"].kind.clone() {
+        Some(Kind::StringValue(id)) => id,
+        other => panic!("{other:?}"),
+    };
+    client
+        .check_response(McpResponse {
+            service_names: vec!["inbox".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("wake_event_id", &event_id), ("session", "s1")]),
+            mcp_response: b"{}".to_vec(),
+        })
+        .await
+        .unwrap();
+    let span = tokio::time::timeout(Duration::from_secs(5), spans.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s(&attrs(&span), "wake.event.id"), event_id);
+    verify(&span);
+
+    drop(client);
+    let _ = stop.send(());
+    let _ = done.await;
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -20,7 +20,9 @@
 //! It listens on its own port, apart from the hooks agentgateway calls, over TLS with the
 //! proxy's SVID, and serves only clients that present an X.509-SVID chained to the trust
 //! bundle with the brake's SPIFFE ID. An agent can neither reach it nor present that
-//! identity, so no agent can lift a halt.
+//! identity, so no agent can lift a halt. It takes a few connections at once, each with a
+//! handshake timeout and a lifetime (listen::CONTROL), so a client that connects and stalls
+//! can't keep the brake out.
 
 use std::sync::Arc;
 
@@ -29,17 +31,16 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
-use hyper_util::service::TowerToHyperService;
 use serde::Deserialize;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{self, RootCertStore, ServerConfig};
 
 use crate::halts::{self, Halts, Scope, Selection};
+use crate::listen::{self, Limits};
 use crate::signer::spiffe_id;
 
 /// What the control API needs to serve mTLS.
@@ -185,9 +186,21 @@ pub async fn serve(
     tls: Tls,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), String> {
+    serve_with(listener, halts, tls, listen::CONTROL, shutdown).await
+}
+
+/// Serves the control API with these limits.
+pub async fn serve_with(
+    listener: TcpListener,
+    halts: Arc<Halts>,
+    tls: Tls,
+    limits: Limits,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), String> {
     let acceptor = tls_acceptor(&tls)?;
     let brake_id = Arc::new(tls.brake_id);
     let app = router(halts);
+    let open = Arc::new(Semaphore::new(limits.connections));
     tokio::pin!(shutdown);
     loop {
         let (stream, peer) = tokio::select! {
@@ -200,12 +213,17 @@ pub async fn serve(
             },
             _ = &mut shutdown => return Ok(()),
         };
+        let Ok(slot) = open.clone().try_acquire_owned() else {
+            tracing::warn!(%peer, "control API: too many connections; closed one");
+            continue;
+        };
         let acceptor = acceptor.clone();
         let brake_id = brake_id.clone();
         let app = app.clone();
         tokio::spawn(async move {
-            let Ok(stream) = acceptor.accept(stream).await else {
-                tracing::warn!(%peer, "control API: TLS handshake failed");
+            let _slot = slot;
+            let Ok(Ok(stream)) = tokio::time::timeout(limits.handshake, acceptor.accept(stream)).await else {
+                tracing::warn!(%peer, "control API: TLS handshake failed or took too long");
                 return;
             };
             let caller = stream
@@ -218,13 +236,7 @@ pub async fn serve(
                 tracing::warn!(%peer, ?caller, "control API: refused a caller that isn't the brake");
                 return;
             }
-            let service = TowerToHyperService::new(app);
-            if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
-                tracing::debug!(%peer, error = %e, "control API: connection ended");
-            }
+            listen::serve_for(stream, app, limits).await;
         });
     }
 }

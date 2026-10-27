@@ -19,7 +19,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost_types::value::Kind;
@@ -30,8 +29,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::a2a;
 use crate::agents::Agents;
+use crate::budget::{Budget, Events, Permit};
 use crate::canonical::{Event, Value};
-use crate::export::Counters;
 use crate::mcp::{self, TraceParent};
 
 // Generated from Envoy's protos, doc comments and all.
@@ -72,7 +71,7 @@ pub const ATTR_SENDER: &str = "sender";
 pub const ATTR_RECEIVER: &str = "receiver";
 
 /// How much of each body is kept for the event's payload.
-pub const MAX_CAPTURE: usize = 1 << 20;
+pub use crate::budget::MAX_CAPTURE;
 
 /// One HTTP exchange between two agents.
 #[derive(Default)]
@@ -85,6 +84,9 @@ pub struct Exchange {
     receiver: String,
     header_trace: Option<TraceParent>,
     header_parents: Vec<String>,
+    // The receiver's link headers wait for the body: the sender's trace is only in the
+    // message's metadata.
+    link_pending: bool,
     trace_id: [u8; 16],
     parent_span: Option<[u8; 8]>,
     message_id: String,
@@ -103,6 +105,9 @@ pub struct Exchange {
     reply_emitted: bool,
     tasks: Option<Arc<a2a::Tasks>>,
     agents: Arc<Agents>,
+    // What every exchange's captured bodies may hold together, and this one's share.
+    bodies: Option<Arc<Budget>>,
+    held: Vec<Permit>,
 }
 
 impl Exchange {
@@ -118,6 +123,35 @@ impl Exchange {
     pub fn with_agents(mut self, agents: Arc<Agents>) -> Self {
         self.agents = agents;
         self
+    }
+
+    /// Captures bodies only while budget has room for them, shared with other exchanges.
+    /// Past it, a body is recorded from the prefix it has, marked truncated.
+    pub fn with_budget(mut self, budget: Arc<Budget>) -> Self {
+        self.bodies = Some(budget);
+        self
+    }
+
+    /// Keeps what of chunk fits, under MAX_CAPTURE and the shared budget.
+    fn capture(&mut self, response: bool, chunk: &[u8]) {
+        let (into, truncated) = if response {
+            (&mut self.response_body, &mut self.response_truncated)
+        } else {
+            (&mut self.request_body, &mut self.request_truncated)
+        };
+        let mut room = MAX_CAPTURE.saturating_sub(into.len()).min(chunk.len());
+        if room > 0
+            && let Some(budget) = &self.bodies
+        {
+            match budget.take(room) {
+                Some(permit) => self.held.push(permit),
+                None => room = 0,
+            }
+        }
+        if chunk.len() > room {
+            *truncated = true;
+        }
+        into.extend_from_slice(&chunk[..room]);
     }
 
     /// Answers one message from the gateway and returns any events it completes. The
@@ -146,12 +180,26 @@ impl Exchange {
             Some(Phase::RequestBody(b)) => {
                 let full_duplex = self.request_mode == BodySendMode::FullDuplexStreamed as i32;
                 if self.recorded {
-                    capture(&mut self.request_body, &mut self.request_truncated, &b.body);
+                    self.capture(false, &b.body);
                     if b.end_of_stream {
                         events.extend(self.finish_request(now));
                     }
                 }
-                Answer::RequestBody(body_answer(full_duplex, b.body, b.end_of_stream))
+                let mut answer = body_answer(full_duplex, b.body, b.end_of_stream);
+                if std::mem::take(&mut self.link_pending) {
+                    // A buffered body is held until this answer, so the forwarded request
+                    // still takes headers: link the receiver in the trace just read.
+                    if self.request.is_none()
+                        && let Some(t) = a2a::parse_request(&self.request_body).trace
+                    {
+                        self.join(t);
+                    }
+                    answer
+                        .response
+                        .get_or_insert_with(CommonResponse::default)
+                        .header_mutation = Some(link_mutation(self.trace_id, self.message_span, &self.message_id));
+                }
+                Answer::RequestBody(answer)
             }
             Some(Phase::ResponseHeaders(h)) => {
                 // A buffered-partial request body over the gateway's limit sends only its
@@ -170,7 +218,7 @@ impl Exchange {
             Some(Phase::ResponseBody(b)) => {
                 let full_duplex = self.response_mode == BodySendMode::FullDuplexStreamed as i32;
                 if self.recorded {
-                    capture(&mut self.response_body, &mut self.response_truncated, &b.body);
+                    self.capture(true, &b.body);
                     if b.end_of_stream {
                         events.extend(self.finish(now));
                     }
@@ -225,8 +273,22 @@ impl Exchange {
         self.parent_span = self.header_trace.map(|t| t.span_id);
         self.message_span = span;
         self.message_id = uuid::Uuid::new_v4().to_string();
+        // A sender with no traceparent header may carry its trace in the message's metadata,
+        // which only the body shows. A buffered body is answered before the request goes
+        // on, so the receiver's link waits for it, and the message, its reply and the
+        // receiver's next step share one trace.
+        if self.header_trace.is_none() && self.request_mode != BodySendMode::FullDuplexStreamed as i32 {
+            self.link_pending = true;
+            return HeadersResponse::default();
+        }
         // The receiver's next step can link to this message.
         link_headers(self.trace_id, self.message_span, &self.message_id)
+    }
+
+    /// Joins the sender's trace, read from the message's metadata.
+    fn join(&mut self, trace: TraceParent) {
+        self.trace_id = trace.trace_id;
+        self.parent_span = Some(trace.span_id);
     }
 
     fn response_headers(&mut self, h: &HttpHeaders) -> (HeadersResponse, Option<ProcessingMode>) {
@@ -271,6 +333,9 @@ impl Exchange {
             return vec![];
         }
         let request = a2a::parse_request(&self.request_body);
+        if let (None, Some(t)) = (self.header_trace, request.trace) {
+            self.join(t);
+        }
         let is_message = request
             .method
             .as_deref()
@@ -321,7 +386,6 @@ impl Exchange {
         } else {
             self.header_parents.clone()
         };
-        let trace_from_metadata = self.header_trace.is_none().then_some(request.trace).flatten();
         let mut e = self.base(
             &self.message_id,
             self.message_span,
@@ -329,10 +393,6 @@ impl Exchange {
             self.started_at,
             nanos(now),
         );
-        if let Some(t) = trace_from_metadata {
-            e.trace_id = t.trace_id;
-            e.parent_span_id = Some(t.span_id);
-        }
         e.name = format!("agent_message {} -> {}", self.sender, self.receiver);
         e.set("wake.agent.id", Value::Str(self.receiver.clone()));
         e.set("gen_ai.agent.name", Value::Str(self.receiver.clone()));
@@ -364,7 +424,7 @@ impl Exchange {
             .and_then(|r| r.method.as_deref())
             .is_some_and(|m| a2a::MESSAGE_METHODS.contains(&m));
         if let (true, Some(task), Some(tasks)) = (answers_message, &reply.task_id, &self.tasks) {
-            tasks.remember(task, &self.message_id);
+            tasks.remember(&self.receiver, task, &self.message_id);
         }
         let mut parents = reply.parents;
         if parents.is_empty() {
@@ -373,7 +433,7 @@ impl Exchange {
                 parents.push(self.message_id.clone());
             } else if let Some(started_by) = request
                 .and_then(|r| r.task_id.as_deref())
-                .and_then(|t| self.tasks.as_ref()?.started(t))
+                .and_then(|t| self.tasks.as_ref()?.started(&self.receiver, t))
             {
                 // A task's later status follows from the message that started it.
                 parents.push(started_by);
@@ -402,6 +462,15 @@ impl Exchange {
 /// Headers that link the next hop to an event: its span as traceparent, its id as
 /// wake-parents.
 fn link_headers(trace_id: [u8; 16], span: [u8; 8], event_id: &str) -> HeadersResponse {
+    HeadersResponse {
+        response: Some(CommonResponse {
+            header_mutation: Some(link_mutation(trace_id, span, event_id)),
+            ..Default::default()
+        }),
+    }
+}
+
+fn link_mutation(trace_id: [u8; 16], span: [u8; 8], event_id: &str) -> HeaderMutation {
     let set = |key: &str, value: String| HeaderValueOption {
         header: Some(HeaderValue {
             key: key.into(),
@@ -411,20 +480,15 @@ fn link_headers(trace_id: [u8; 16], span: [u8; 8], event_id: &str) -> HeadersRes
         append_action: HeaderAppendAction::OverwriteIfExistsOrAdd as i32,
         ..Default::default()
     };
-    HeadersResponse {
-        response: Some(CommonResponse {
-            header_mutation: Some(HeaderMutation {
-                set_headers: vec![
-                    set(
-                        mcp::HEADER_TRACEPARENT,
-                        format!("00-{}-{}-01", hex::encode(trace_id), hex::encode(span)),
-                    ),
-                    set(mcp::HEADER_PARENTS, event_id.to_string()),
-                ],
-                remove_headers: vec![],
-            }),
-            ..Default::default()
-        }),
+    HeaderMutation {
+        set_headers: vec![
+            set(
+                mcp::HEADER_TRACEPARENT,
+                format!("00-{}-{}-01", hex::encode(trace_id), hex::encode(span)),
+            ),
+            set(mcp::HEADER_PARENTS, event_id.to_string()),
+        ],
+        remove_headers: vec![],
     }
 }
 
@@ -445,14 +509,6 @@ fn body_answer(full_duplex: bool, body: Vec<u8>, end_of_stream: bool) -> BodyRes
             ..Default::default()
         }),
     }
-}
-
-fn capture(into: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
-    let room = MAX_CAPTURE.saturating_sub(into.len());
-    if chunk.len() > room {
-        *truncated = true;
-    }
-    into.extend_from_slice(&chunk[..chunk.len().min(room)]);
 }
 
 /// The payload of a message: who sent it to whom, and the body exactly as it went over
@@ -521,22 +577,23 @@ fn random_ids() -> ([u8; 16], [u8; 8]) {
 
 /// The gRPC service. Each stream runs its exchange in its own task.
 pub struct Processor {
-    events: mpsc::Sender<Event>,
-    counters: Arc<Counters>,
+    events: Events,
     tasks: Arc<a2a::Tasks>,
     agents: Arc<Agents>,
+    bodies: Arc<Budget>,
 }
 
 /// How many tasks the processor remembers the starting message of.
 pub const TASKS_REMEMBERED: usize = 10_000;
 
 impl Processor {
-    pub fn new(events: mpsc::Sender<Event>, counters: Arc<Counters>, agents: Arc<Agents>) -> Self {
+    /// bodies bounds what every exchange's captured bodies hold together.
+    pub fn new(events: Events, agents: Arc<Agents>, bodies: Arc<Budget>) -> Self {
         Processor {
             events,
-            counters,
             tasks: Arc::new(a2a::Tasks::new(TASKS_REMEMBERED)),
             agents,
+            bodies,
         }
     }
 
@@ -557,16 +614,14 @@ impl ExternalProcessor for Processor {
         let mut incoming = request.into_inner();
         let (tx, rx) = mpsc::channel(16);
         let events = self.events.clone();
-        let counters = self.counters.clone();
         let tasks = self.tasks.clone();
         let agents = self.agents.clone();
+        let bodies = self.bodies.clone();
         tokio::spawn(async move {
-            let mut exchange = Exchange::with_tasks(tasks).with_agents(agents);
+            let mut exchange = Exchange::with_tasks(tasks).with_agents(agents).with_budget(bodies);
             let emit = |list: Vec<Event>| {
                 for e in list {
-                    if events.try_send(e).is_err() {
-                        counters.export_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
+                    events.send(e);
                 }
             };
             while let Some(message) = incoming.next().await {
@@ -902,6 +957,66 @@ mod tests {
             br#"{"result":{"id":"t-unknown"}}"#,
         );
         assert_eq!(events[0].attributes["wake.parents"], Value::Strs(vec![]));
+    }
+
+    #[test]
+    fn a_trace_only_in_the_messages_metadata_is_the_one_trace() {
+        let send =
+            br#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","parts":[],
+            "metadata":{"traceparent":"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01"}}}}"#;
+        let mut x = Exchange::default();
+        let (answer, _) = x.handle(first(&[(":method", "POST")]), t(0));
+        // No traceparent header: the receiver's link waits for the body.
+        assert!(set_headers(&answer).is_empty());
+        let (answer, events) = x.handle(phase(Phase::RequestBody(body(send, true))), t(1));
+        let [message] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        let Some(Answer::RequestBody(BodyResponse { response: Some(c) })) = &answer.response else {
+            panic!("{answer:?}")
+        };
+        assert!(c.body_mutation.is_none(), "the body goes on as it was");
+        let linked: HashMap<String, String> = c
+            .header_mutation
+            .as_ref()
+            .unwrap()
+            .set_headers
+            .iter()
+            .filter_map(|o| o.header.as_ref())
+            .map(|h| (h.key.clone(), String::from_utf8(h.raw_value.clone()).unwrap()))
+            .collect();
+        let trace = "0102030405060708090a0b0c0d0e0f10";
+        assert_eq!(hex::encode(message.trace_id), trace);
+        assert_eq!(
+            message.parent_span_id.map(hex::encode).as_deref(),
+            Some("1112131415161718")
+        );
+        assert_eq!(
+            linked["traceparent"],
+            format!("00-{trace}-{}-01", hex::encode(message.span_id))
+        );
+        assert_eq!(linked["wake-parents"], s(message, "wake.event.id"));
+
+        let (answer, _) = x.handle(
+            phase(Phase::ResponseHeaders(headers(&[("content-type", "application/json")]))),
+            t(2),
+        );
+        assert!(set_headers(&answer)["traceparent"].contains(trace));
+        let (_, events) = x.handle(phase(Phase::ResponseBody(body(REPLY, true))), t(3));
+        assert_eq!(hex::encode(events[0].trace_id), trace, "the reply too");
+    }
+
+    #[test]
+    fn without_any_trace_the_receiver_is_still_linked() {
+        let mut x = Exchange::default();
+        x.handle(first(&[(":method", "POST")]), t(0));
+        let (answer, events) = x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        let Some(Answer::RequestBody(BodyResponse { response: Some(c) })) = &answer.response else {
+            panic!("{answer:?}")
+        };
+        let traceparent = &c.header_mutation.as_ref().unwrap().set_headers[0];
+        let value = String::from_utf8(traceparent.header.as_ref().unwrap().raw_value.clone()).unwrap();
+        assert!(value.contains(&hex::encode(events[0].trace_id)));
     }
 
     #[test]

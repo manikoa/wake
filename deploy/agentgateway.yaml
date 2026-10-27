@@ -3,7 +3,9 @@
 # agentgateway for deploy/compose.yaml. Point the backends at your own MCP servers and A2A
 # agents; the examples reach services on the host. Agents call agentgateway on port 3000,
 # over mTLS with their SVIDs. Every route records through wake-proxy, and every call is
-# denied while the brake has halted it.
+# denied while the brake has halted it. agentgateway reaches wake-proxy's hooks on a Unix
+# socket in a volume no other service mounts, since anything that can reach them can get
+# events signed.
 gateways:
   default:
     port: 3000
@@ -19,7 +21,7 @@ gateways:
     # a halted agent is denied wherever it goes. It fails closed: if wake-proxy can't
     # answer, the call is denied. Never give it a cache, or a halt waits for it to expire.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "unix:/run/wake/proxy.sock"
       failureMode: deny
       protocol:
         grpc:
@@ -38,7 +40,7 @@ routes:
     # The deny lever again, naming the agent this route reaches, so a call sent to a halted
     # agent is denied too. Every A2A route needs one (proxy/tests/gateway_configs.rs).
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "unix:/run/wake/proxy.sock"
       failureMode: deny
       protocol:
         grpc:
@@ -47,7 +49,7 @@ routes:
           metadata:
             wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")}'
     extProc:
-      host: "wake-proxy:9001"
+      host: "unix:/run/wake/proxy.sock"
       # Calls that start while wake-proxy is down go through unrecorded; one in progress
       # when it dies fails (docs/proxy.md).
       failureMode: failOpen
@@ -69,7 +71,7 @@ routes:
     mcpGuardrails:
       processors:
       - kind: remote
-        host: "wake-proxy:9001"
+        host: "unix:/run/wake/proxy.sock"
         # Recording never blocks: if wake-proxy is down, calls go through unrecorded.
         failureMode: failOpen
         methods:
@@ -81,6 +83,9 @@ routes:
         metadata:
           agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")'
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
+          # The caller's MCP session, in both phases, so a response whose event id didn't come
+          # back is paired in order only within its own session.
+          session: '"mcp-session-id" in request.headers ? request.headers["mcp-session-id"] : ""'
   backends:
   - mcp:
       targets:

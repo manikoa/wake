@@ -5,6 +5,7 @@
 pub mod a2a;
 pub mod agents;
 pub mod authz;
+pub mod budget;
 pub mod canonical;
 pub mod capture;
 pub mod control;
@@ -12,6 +13,7 @@ pub mod export;
 pub mod extmcp;
 pub mod extproc;
 pub mod halts;
+pub mod listen;
 pub mod mcp;
 pub mod memory;
 pub mod pipeline;

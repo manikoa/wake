@@ -9,10 +9,14 @@
 //!
 //! JSON-RPC errors skip the response hook, so a request with no response within the
 //! timeout becomes an event with no output.
+//!
+//! Params and results are parsed whole, then kept only up to budget::MAX_CAPTURE, and the
+//! requests waiting for a response are bounded by bytes as well as by count.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::budget::MAX_CAPTURE;
 use crate::canonical::{Event, Value};
 use crate::mcp;
 
@@ -38,6 +42,29 @@ pub enum Hook {
     },
 }
 
+impl Hook {
+    /// About how many bytes the hook holds.
+    pub fn size(&self) -> usize {
+        let strings = |m: &HashMap<String, String>| m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        match self {
+            Hook::Request {
+                metadata,
+                params,
+                headers,
+                ..
+            } => {
+                256 + strings(metadata)
+                    + params.as_ref().map_or(0, Vec::len)
+                    + headers.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+            }
+            Hook::Response { metadata, result, .. } => 256 + strings(metadata) + result.len(),
+        }
+    }
+}
+
+/// Bytes of params the requests waiting for a response may hold, by default.
+pub const PENDING_BYTES: usize = 64 << 20;
+
 /// Metadata keys the gateway config fills from CEL.
 pub const META_EVENT_ID: &str = "wake_event_id";
 pub const META_AGENT: &str = "agent";
@@ -49,6 +76,7 @@ struct Pending {
     agent: String,
     session: String,
     params: Option<Vec<u8>>,
+    params_cut: bool,
     request: mcp::Request,
     at: SystemTime,
 }
@@ -62,27 +90,43 @@ pub struct Capture {
     pub paired_in_order: u64,
     timeout: Duration,
     limit: usize,
+    max_bytes: usize,
+    bytes: usize, // params held by pending requests
     pending: HashMap<String, Pending>,
     order: VecDeque<String>, // event ids, oldest first
     queues: HashMap<Key, VecDeque<String>>,
 }
 
 impl Capture {
-    /// timeout is how long a request waits for its response; limit bounds how many wait.
+    /// timeout is how long a request waits for its response; limit bounds how many wait,
+    /// and PENDING_BYTES how many bytes of params they hold.
     pub fn new(timeout: Duration, limit: usize) -> Self {
         Capture {
             paired_by_id: 0,
             paired_in_order: 0,
             timeout,
             limit,
+            max_bytes: PENDING_BYTES,
+            bytes: 0,
             pending: HashMap::new(),
             order: VecDeque::new(),
             queues: HashMap::new(),
         }
     }
 
+    /// Bounds the bytes of params the waiting requests hold.
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
     pub fn waiting(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Bytes of params the waiting requests hold.
+    pub fn held(&self) -> usize {
+        self.bytes
     }
 
     /// Takes one hook and returns any events it completes.
@@ -98,6 +142,10 @@ impl Capture {
                 at,
             } => {
                 let request = mcp::parse_request(&method, params.as_deref(), &headers);
+                let (params, params_cut) = match params.map(|p| mcp::cap(p, MAX_CAPTURE)) {
+                    Some((p, cut)) => (Some(p), cut),
+                    None => (None, false),
+                };
                 // Pairing uses the session from metadata, the only place the response hook
                 // can carry it too.
                 let session = metadata.get(META_SESSION).cloned().unwrap_or_default();
@@ -111,7 +159,8 @@ impl Capture {
                     .or_default()
                     .push_back(event_id.clone());
                 self.order.push_back(event_id.clone());
-                self.pending.insert(
+                self.bytes += params.as_ref().map_or(0, Vec::len);
+                if let Some(old) = self.pending.insert(
                     event_id,
                     Pending {
                         method,
@@ -119,13 +168,18 @@ impl Capture {
                         agent,
                         session,
                         params,
+                        params_cut,
                         request,
                         at,
                     },
-                );
-                // Never hold more than limit: the oldest goes out without its response.
+                ) {
+                    // The same id twice: only the newer one waits.
+                    self.bytes = self.bytes.saturating_sub(old.params.as_ref().map_or(0, Vec::len));
+                }
+                // Never hold more than limit, or more than max_bytes of params: the oldest
+                // goes out without its response.
                 let mut out = Vec::new();
-                while self.pending.len() > self.limit {
+                while self.pending.len() > self.limit || self.bytes > self.max_bytes {
                     match self.order.pop_front() {
                         Some(id) => out.extend(self.finish(
                             &id,
@@ -145,15 +199,16 @@ impl Capture {
                 result,
                 at,
             } => {
-                let by_id = metadata
-                    .get(META_EVENT_ID)
-                    .filter(|id| self.pending.contains_key(*id))
-                    .cloned();
-                let id = match by_id {
-                    Some(id) => {
+                let (result, result_cut) = mcp::cap(result, MAX_CAPTURE);
+                let id = match metadata.get(META_EVENT_ID).filter(|id| !id.is_empty()) {
+                    Some(id) if self.pending.contains_key(id) => {
                         self.paired_by_id += 1;
-                        Some(id)
+                        Some(id.clone())
                     }
+                    // An id this processor doesn't hold: its request was already recorded
+                    // without it, or went through another replica. Pairing it in order
+                    // would give some other call this response.
+                    Some(_) => None,
                     None => {
                         let session = metadata.get(META_SESSION).cloned().unwrap_or_default();
                         let next = self
@@ -167,10 +222,13 @@ impl Capture {
                     }
                 };
                 match id {
-                    Some(id) => self.finish(&id, Some(&result), at, None).into_iter().collect(),
+                    Some(id) => self
+                        .finish(&id, Some((&result, result_cut)), at, None)
+                        .into_iter()
+                        .collect(),
                     // A response with no request seen, such as when only the response
                     // phase is configured. Still recorded.
-                    None => vec![orphan(&method, &server, &metadata, &result, at)],
+                    None => vec![orphan(&method, &server, &metadata, (&result, result_cut), at)],
                 }
             }
         }
@@ -199,8 +257,15 @@ impl Capture {
         out
     }
 
-    fn finish(&mut self, id: &str, result: Option<&[u8]>, at: SystemTime, error: Option<&str>) -> Option<Event> {
+    fn finish(
+        &mut self,
+        id: &str,
+        result: Option<(&[u8], bool)>,
+        at: SystemTime,
+        error: Option<&str>,
+    ) -> Option<Event> {
         let p = self.pending.remove(id)?;
+        self.bytes = self.bytes.saturating_sub(p.params.as_ref().map_or(0, Vec::len));
         if let Some(q) = self
             .queues
             .get_mut(&(p.session.clone(), p.method.clone(), p.server.clone()))
@@ -227,7 +292,7 @@ fn random_trace() -> ([u8; 16], [u8; 8]) {
     (*a.as_bytes(), span)
 }
 
-fn build(id: &str, p: &Pending, result: Option<&[u8]>, end: SystemTime, error: Option<&str>) -> Event {
+fn build(id: &str, p: &Pending, result: Option<(&[u8], bool)>, end: SystemTime, error: Option<&str>) -> Event {
     let (trace_id, span_id) = random_trace();
     let mut event = Event {
         trace_id: p.request.trace.map(|t| t.trace_id).unwrap_or(trace_id),
@@ -271,12 +336,22 @@ fn build(id: &str, p: &Pending, result: Option<&[u8]>, end: SystemTime, error: O
     }
     event.set(
         "wake.payload",
-        Value::Str(mcp::payload(p.params.as_deref(), result, error)),
+        Value::Str(mcp::capped_payload(
+            (p.params.as_deref(), p.params_cut),
+            (result.map(|(r, _)| r), result.is_some_and(|(_, cut)| cut)),
+            error,
+        )),
     );
     event
 }
 
-fn orphan(method: &str, server: &str, metadata: &HashMap<String, String>, result: &[u8], at: SystemTime) -> Event {
+fn orphan(
+    method: &str,
+    server: &str,
+    metadata: &HashMap<String, String>,
+    result: (&[u8], bool),
+    at: SystemTime,
+) -> Event {
     let p = Pending {
         method: method.into(),
         server: server.into(),
@@ -287,6 +362,7 @@ fn orphan(method: &str, server: &str, metadata: &HashMap<String, String>, result
             .unwrap_or_else(|| "unknown".into()),
         session: metadata.get(META_SESSION).cloned().unwrap_or_default(),
         params: None,
+        params_cut: false,
         request: mcp::Request::default(),
         at,
     };
@@ -413,6 +489,75 @@ mod tests {
             c.handle(response("s1", None, "{}", t(3)))[0].str("wake.event.id"),
             Some("b")
         );
+    }
+
+    #[test]
+    fn a_response_naming_an_id_it_doesnt_hold_isnt_paired_in_order() {
+        let mut c = Capture::new(Duration::from_secs(60), 100);
+        c.handle(request("a", "s1", "read_email", t(0)));
+        // An id from another replica, or from a request already recorded without it.
+        let out = c.handle(response("s1", Some("elsewhere"), "{}", t(1)));
+        assert_eq!(out.len(), 1);
+        assert_ne!(out[0].str("wake.event.id"), Some("a"));
+        assert!(
+            out[0]
+                .str("wake.payload")
+                .unwrap()
+                .contains("response with no request seen")
+        );
+        assert_eq!(c.waiting(), 1, "a still waits for its own response");
+        assert_eq!((c.paired_by_id, c.paired_in_order), (0, 0));
+        // An empty id is no id: paired in order.
+        let out = c.handle(response("s1", Some(""), "{}", t(2)));
+        assert_eq!(out[0].str("wake.event.id"), Some("a"));
+        assert_eq!(c.paired_in_order, 1);
+    }
+
+    #[test]
+    fn params_and_results_are_kept_up_to_the_cap() {
+        let mut c = Capture::new(Duration::from_secs(60), 100);
+        let big = format!(
+            r#"{{"name":"upload","arguments":{{"blob":"{}"}}}}"#,
+            "x".repeat(MAX_CAPTURE)
+        );
+        c.handle(Hook::Request {
+            event_id: "a".into(),
+            method: "tools/call".into(),
+            server: "files".into(),
+            metadata: HashMap::new(),
+            params: Some(big.into_bytes()),
+            headers: vec![],
+            at: t(0),
+        });
+        assert_eq!(c.held(), MAX_CAPTURE);
+        let out = c.handle(response("", Some("a"), &"y".repeat(MAX_CAPTURE + 1), t(1)));
+        let e = &out[0];
+        // Parsed whole, so the tool's name survives the cut.
+        assert_eq!(e.str("gen_ai.tool.name"), Some("upload"));
+        let payload: serde_json::Value = serde_json::from_str(e.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["input"].as_str().unwrap().len(), MAX_CAPTURE);
+        assert_eq!(payload["output"].as_str().unwrap().len(), MAX_CAPTURE);
+        assert_eq!(c.held(), 0);
+    }
+
+    #[test]
+    fn waiting_requests_are_bounded_by_bytes() {
+        let mut c = Capture::new(Duration::from_secs(60), 100).with_max_bytes(100);
+        let hook = |id: &str, size: usize| Hook::Request {
+            event_id: id.into(),
+            method: "tools/call".into(),
+            server: "s".into(),
+            metadata: HashMap::new(),
+            params: Some(vec![b'1'; size]),
+            headers: vec![],
+            at: t(0),
+        };
+        assert!(c.handle(hook("a", 60)).is_empty());
+        let out = c.handle(hook("b", 60));
+        assert_eq!(out.len(), 1, "a goes out without its response");
+        assert_eq!(out[0].str("wake.event.id"), Some("a"));
+        assert_eq!((c.waiting(), c.held()), (1, 60));
     }
 
     #[test]
