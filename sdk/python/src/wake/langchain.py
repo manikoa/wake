@@ -116,6 +116,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         self._event_by_message = _Recent()  # AI message id -> model call event id
         self._event_by_tool_call = _Recent()  # tool call id -> model call that requested it
         self._result_by_tool_call = _Recent()  # tool call id -> tool call event id
+        self._returned_by_event = _Recent()  # tool call event id -> events its result came from
         self._seen_user_messages = _Recent()
         self._linked = _Recent()  # top level run id -> the link it started under, for its first event
         self._installed: _Installed | None = None
@@ -216,7 +217,9 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                 if isinstance(m, AIMessage) and m.id in self._event_by_message:
                     parents.append(self._event_by_message[m.id])
                 elif isinstance(m, ToolMessage) and m.tool_call_id in self._result_by_tool_call:
-                    parents.append(self._result_by_tool_call[m.tool_call_id])
+                    tool_event = self._result_by_tool_call[m.tool_call_id]
+                    parents.append(tool_event)
+                    parents += self._returned_by_event.get(tool_event, [])
                 elif (isinstance(m, HumanMessage) and _current_run.get() is None and not linked
                       and m.id not in self._seen_user_messages):
                     # A user's message is new content the first time a model sees it.
@@ -384,6 +387,8 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             attributes=attributes,
         )
         span.end()
+        ctx = span.get_span_context()
+        links._note(links.Link(event_id, ctx.trace_id, ctx.span_id))
         self._remember_output(trace_id, event_id, text)
         return event_id
 
@@ -439,11 +444,12 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         if metadata.get("langgraph_node"):
             attributes["wake.langgraph.node"] = metadata["langgraph_node"]
         span = self._recorder.tracer.start_span(name, context=context, attributes=attributes)
+        ctx = span.get_span_context()
+        links._note(links.Link(event_id, ctx.trace_id, ctx.span_id))
         link = None
         if kind == events.TOOL_CALL:
             # Calls the tool makes, such as to an MCP server through the proxy, link back
             # to this event. LangChain runs the tool in the context this callback runs in.
-            ctx = span.get_span_context()
             link = links._enter(links.Link(event_id, ctx.trace_id, ctx.span_id))
         with self._lock:
             self._spans[run_id] = span
@@ -460,7 +466,13 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             pending = self._pending.pop(run_id, None)
         if span is None or pending is None:
             return
+        returned = links._returned(pending.get("link"))
         links._exit(pending.get("link"))
+        if returned:
+            # What the tool got back came from these events, such as an A2A reply: they
+            # feed the step that reads its result.
+            with self._lock:
+                self._returned_by_event[pending["event_id"]] = returned
         payload = {"input": pending["inputs"], "output": outputs}
         if error is not None:
             payload["error"] = repr(error)

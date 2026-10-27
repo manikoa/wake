@@ -99,6 +99,7 @@ class WakeTracingProcessor(EventGraph):
         self._pending = _Recent()  # sdk span id -> what on_span_start set up
         self._call = _Recent()  # (trace, tool name, arguments) -> (call id, response event id)
         self._event_by_call = _Recent()  # call id -> tool call event id
+        self._returned_by_event = _Recent()  # tool call event id -> events its output came from
         self._event_by_item = _Recent()  # response or output item id -> response event id
         self._last_response = _Recent()  # (trace, agent) -> response event id
         self._handed_off = _Recent()  # (trace, agent) -> handoff event id, feeding its next step
@@ -220,7 +221,9 @@ class WakeTracingProcessor(EventGraph):
                 item_type = _field(item, "type")
                 call_id = _field(item, "call_id")
                 if item_type == "function_call_output" and call_id in self._event_by_call:
-                    parents.append(self._event_by_call[call_id])
+                    tool_event = self._event_by_call[call_id]
+                    parents.append(tool_event)
+                    parents += self._returned_by_event.get(tool_event, [])
                 elif _field(item, "id") in self._event_by_item:
                     parents.append(self._event_by_item[_field(item, "id")])
                 elif _field(item, "role") == "user":
@@ -258,8 +261,14 @@ class WakeTracingProcessor(EventGraph):
     def _function_ended(self, span, data) -> None:
         with self._lock:
             pending = self._pending.pop(span.span_id, None) or {}
+        returned = links._returned(pending.get("link"))
         links._exit(pending.get("link"))
         event_id = pending.get("event_id") or str(uuid.uuid4())
+        if returned:
+            # What the tool got back came from these events, such as an A2A reply: they
+            # feed the response that reads its output.
+            with self._lock:
+                self._returned_by_event[event_id] = returned
         agent = self._agent_for(span)
         otel = self._take(span)
         if otel is None:
@@ -347,3 +356,5 @@ class WakeTracingProcessor(EventGraph):
             payload = {**payload, "error": _plain(span.error)}
             otel.set_status(Status(StatusCode.ERROR, str(_field(span.error, "message") or "error")))
         otel.set_attributes(events.payload_attributes(json.loads(json.dumps(payload, default=str))))
+        ctx = otel.get_span_context()
+        links._note(links.Link(event_id, ctx.trace_id, ctx.span_id))

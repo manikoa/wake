@@ -13,6 +13,12 @@ the link the message carried is current, and a run the agent starts descends fro
 
     with wake.links.received(headers=request.headers, metadata=message.metadata):
         answer = await agent.run(...)
+        reply = {"text": answer, "metadata": wake.links.meta()}  # names the run's last step
+
+Outside any recorded tool call, an outgoing call links to the latest event recorded under
+the current link, so a reply names the step that produced it. And when what a call gets
+back came from recorded events, such as an A2A reply the proxy recorded, returned() says
+so, and the step that reads the result descends from them.
 """
 
 import logging
@@ -65,14 +71,17 @@ class Link:
 
 
 class _Frame:
-    """One recorded call's link, on top of whatever link was current when it began."""
+    """One recorded call's link, on top of whatever link was current when it began, with
+    the latest event recorded while it was on top and the events its result came from."""
 
-    __slots__ = ("ended", "link", "previous")
+    __slots__ = ("ended", "latest", "link", "previous", "returned")
 
     def __init__(self, link: Link, previous: "_Frame | None") -> None:
         self.link = link
         self.previous = previous
         self.ended = False
+        self.latest: Link | None = None
+        self.returned: list[str] = []
 
 
 _current: ContextVar[_Frame | None] = ContextVar("wake_link", default=None)
@@ -93,16 +102,49 @@ def current() -> Link | None:
     return frame.link if frame else None
 
 
+def _outgoing() -> Link | None:
+    """What a call made now comes from: the latest event recorded under the current link,
+    such as a run's last step, else the link's own event, such as the tool call."""
+    frame = _top()
+    if frame is None:
+        return None
+    return frame.latest or frame.link
+
+
 def headers() -> dict[str, str]:
     """HTTP headers linking an outgoing call to the current event, or {} if there's none."""
-    link = current()
+    link = _outgoing()
     return link.headers() if link else {}
 
 
 def meta() -> dict[str, object]:
     """The same link as MCP params._meta fields, or {} if there's no current event."""
-    link = current()
+    link = _outgoing()
     return link.meta() if link else {}
+
+
+def returned(parents: Any) -> None:
+    """Record that what the current call got back came from these events, such as the
+    proxy's record of an A2A reply. The step that reads the call's result descends from
+    them. Ids that don't look like event ids are dropped."""
+    frame = _top()
+    if frame is None or not isinstance(parents, (list, tuple)):
+        return
+    for p in parents:
+        p = p.strip() if isinstance(p, str) else ""
+        if _EVENT_ID.match(p) and p not in frame.returned and len(frame.returned) < _MAX_PARENTS:
+            frame.returned.append(p)
+
+
+def _note(link: Link) -> None:
+    """Called by the integrations for each event they record."""
+    frame = _top()
+    if frame is not None:
+        frame.latest = link
+
+
+def _returned(frame: _Frame | None) -> list[str]:
+    return list(frame.returned) if frame is not None else []
 
 
 def _enter(link: Link) -> _Frame:

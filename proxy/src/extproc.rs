@@ -12,8 +12,10 @@
 //! becomes another, in the sender's name, with the receiver as its origin. The request
 //! headers forwarded to the receiver gain traceparent and wake-parents, so a receiver with a
 //! Wake SDK links its next step to the message, the same way the proxy reads a sender's
-//! links (see docs/proxy.md). A reply to tasks/get or GetTask links to the message that
-//! started the task, which an earlier exchange recorded.
+//! links (see docs/proxy.md). The response headers going back to the sender gain them too,
+//! naming the reply's event, so the sender's next step descends from the reply. A reply to
+//! tasks/get or GetTask links to the message that started the task, which an earlier
+//! exchange recorded.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,6 +88,8 @@ pub struct Exchange {
     parent_span: Option<[u8; 8]>,
     message_id: String,
     message_span: [u8; 8],
+    reply_id: String,
+    reply_span: [u8; 8],
     request_body: Vec<u8>,
     request_truncated: bool,
     request: Option<a2a::Request>,
@@ -222,34 +226,7 @@ impl Exchange {
         self.message_span = span;
         self.message_id = uuid::Uuid::new_v4().to_string();
         // The receiver's next step can link to this message.
-        let set = |key: &str, value: String| HeaderValueOption {
-            header: Some(HeaderValue {
-                key: key.into(),
-                raw_value: value.into_bytes(),
-                ..Default::default()
-            }),
-            append_action: HeaderAppendAction::OverwriteIfExistsOrAdd as i32,
-            ..Default::default()
-        };
-        HeadersResponse {
-            response: Some(CommonResponse {
-                header_mutation: Some(HeaderMutation {
-                    set_headers: vec![
-                        set(
-                            mcp::HEADER_TRACEPARENT,
-                            format!(
-                                "00-{}-{}-01",
-                                hex::encode(self.trace_id),
-                                hex::encode(self.message_span)
-                            ),
-                        ),
-                        set(mcp::HEADER_PARENTS, self.message_id.clone()),
-                    ],
-                    remove_headers: vec![],
-                }),
-                ..Default::default()
-            }),
-        }
+        link_headers(self.trace_id, self.message_span, &self.message_id)
     }
 
     fn response_headers(&mut self, h: &HttpHeaders) -> (HeadersResponse, Option<ProcessingMode>) {
@@ -258,8 +235,18 @@ impl Exchange {
         let streamed = headers
             .get("content-type")
             .is_some_and(|c| c.starts_with("text/event-stream"));
+        let answer = if self.recorded && self.replies() {
+            // The reply's event is named now, before its body: the sender's next step can
+            // link to it.
+            let (_, span) = random_ids();
+            self.reply_span = span;
+            self.reply_id = uuid::Uuid::new_v4().to_string();
+            link_headers(self.trace_id, self.reply_span, &self.reply_id)
+        } else {
+            HeadersResponse::default()
+        };
         if !self.recorded || !streamed {
-            return (HeadersResponse::default(), None);
+            return (answer, None);
         }
         // Buffering a stream would hold it until it ends, so receive it in full duplex and
         // pass each chunk straight back.
@@ -269,7 +256,7 @@ impl Exchange {
             response_body_mode: BodySendMode::FullDuplexStreamed as i32,
             ..Default::default()
         };
-        (HeadersResponse::default(), Some(mode))
+        (answer, Some(mode))
     }
 
     fn replies(&self) -> bool {
@@ -366,7 +353,11 @@ impl Exchange {
 
     /// The receiver's reply, recorded where the sender gets it.
     fn reply_event(&self, now: SystemTime) -> Event {
-        let (_, span) = random_ids();
+        let (id, span) = if self.reply_id.is_empty() {
+            (uuid::Uuid::new_v4().to_string(), random_ids().1)
+        } else {
+            (self.reply_id.clone(), self.reply_span)
+        };
         let reply = a2a::parse_reply(&self.response_body, self.response_streamed);
         let request = self.request.as_ref();
         let answers_message = request
@@ -388,13 +379,7 @@ impl Exchange {
                 parents.push(started_by);
             }
         }
-        let mut e = self.base(
-            &uuid::Uuid::new_v4().to_string(),
-            span,
-            Some(self.message_span),
-            self.started_at,
-            nanos(now),
-        );
+        let mut e = self.base(&id, span, Some(self.message_span), self.started_at, nanos(now));
         e.name = format!("agent_message {} -> {}", self.receiver, self.sender);
         e.set("wake.agent.id", Value::Str(self.sender.clone()));
         e.set("gen_ai.agent.name", Value::Str(self.sender.clone()));
@@ -411,6 +396,35 @@ impl Exchange {
             )),
         );
         e
+    }
+}
+
+/// Headers that link the next hop to an event: its span as traceparent, its id as
+/// wake-parents.
+fn link_headers(trace_id: [u8; 16], span: [u8; 8], event_id: &str) -> HeadersResponse {
+    let set = |key: &str, value: String| HeaderValueOption {
+        header: Some(HeaderValue {
+            key: key.into(),
+            raw_value: value.into_bytes(),
+            ..Default::default()
+        }),
+        append_action: HeaderAppendAction::OverwriteIfExistsOrAdd as i32,
+        ..Default::default()
+    };
+    HeadersResponse {
+        response: Some(CommonResponse {
+            header_mutation: Some(HeaderMutation {
+                set_headers: vec![
+                    set(
+                        mcp::HEADER_TRACEPARENT,
+                        format!("00-{}-{}-01", hex::encode(trace_id), hex::encode(span)),
+                    ),
+                    set(mcp::HEADER_PARENTS, event_id.to_string()),
+                ],
+                remove_headers: vec![],
+            }),
+            ..Default::default()
+        }),
     }
 }
 
@@ -644,7 +658,7 @@ mod tests {
     }
 
     fn set_headers(r: &ProcessingResponse) -> HashMap<String, String> {
-        let Some(Answer::RequestHeaders(h)) = &r.response else {
+        let (Some(Answer::RequestHeaders(h)) | Some(Answer::ResponseHeaders(h))) = &r.response else {
             panic!("{r:?}")
         };
         h.response
@@ -725,10 +739,17 @@ mod tests {
             t(2),
         );
         assert!(answer.mode_override.is_none());
+        let returned = set_headers(&answer);
         let (_, events) = x.handle(phase(Phase::ResponseBody(body(REPLY, true))), t(3));
         let [reply] = events.as_slice() else {
             panic!("{events:?}")
         };
+        // The sender is told which event its next step follows from: the reply.
+        assert_eq!(returned["wake-parents"], s(reply, "wake.event.id"));
+        assert_eq!(
+            returned["traceparent"],
+            format!("00-0102030405060708090a0b0c0d0e0f10-{}-01", hex::encode(reply.span_id))
+        );
         assert_eq!(s(reply, "wake.agent.id"), "spiffe://wake.local/agent/planner");
         assert_eq!(
             reply.attributes["wake.origins"],

@@ -127,14 +127,18 @@ async for reply in client.send_message(SendMessageRequest(message=message)):
     ...
 ```
 
-On the receiving side, handle the message inside `received`:
+On the receiving side, handle the message inside `received`, and link the reply there:
 
 ```python
 class Researcher(AgentExecutor):
     async def execute(self, context, event_queue):
         with wake_a2a.received(context):
             answer = await agent.run(context.get_user_input())
+            reply = wake_a2a.link(new_text_message(answer, context_id=context.context_id))
+        await event_queue.enqueue_event(reply)
 ```
+
+The reply names the receiver's last step, and the proxy names its record of the reply in the response's `wake-parents` header, which Wake's HTTP client reads. So the sender's next model call, the one that reads the tool's result, descends from the reply and from whatever the receiver read to produce it. Without the proxy, call `wake_a2a.replied(reply)` on each reply the client yields.
 
 A run started inside the block is linked whatever records it: LangChain or LangGraph, the OpenAI Agents SDK or the Claude Agent SDK. Its first step's parent is the proxy's record of the message when the message went through agentgateway, or else the sender's tool call. For other servers, pass the request's headers and the message's metadata to `wake.links.received(headers=..., metadata=...)`. The same holds for a run started inside a recorded tool call: it descends from the tool call. Install with the `a2a` extra.
 
