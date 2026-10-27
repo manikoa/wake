@@ -11,11 +11,11 @@ The roadmap in `docs/product-roadmap.md` is staged on purpose: each phase is a c
 
 Read the "Current phase" section of `CLAUDE.md` at the repo root. If it's missing or unclear, ask the user which phase they're in instead of guessing, because the answer changes what's allowed.
 
-## Step 2: No product code before the Validate gate
+## Step 2: No product code before the IP release
 
 The first gate includes a written release of IP ownership from Microsoft, or an exit. Until then the company may not own what it builds: Washington's RCW 49.44.140 doesn't protect inventions that relate directly to the employer's business, and Microsoft sells agent governance (Agent 365, Entra Agent ID, the Agent Governance Toolkit). The roadmap ranks this as the first risk.
 
-If `CLAUDE.md` doesn't record the Validate gate as cleared and the task is product code (SDKs, proxy, collector, signed log, brake, dashboard), say so plainly and ask whether the gate has been cleared before writing it. Work that isn't product code is fine during Validate: docs, research notes, interview scripts, the Clavr game day plan, design partner material and the trademark check.
+If `CLAUDE.md` doesn't record the IP release as in hand and the task is product code (SDKs, proxy, collector, signed log, brake, dashboard), say so plainly and ask whether the release is in hand before writing it. The release makes product code legally safe to write; it doesn't start the Record phase. Record work still waits for the whole Validate gate (step 3). Work that isn't product code is fine during Validate: docs, research notes, interview scripts, the Clavr game day plan, design partner material and the trademark check.
 
 The roadmap also says to use no Microsoft devices, accounts or tools for Wake work. Raise it if a task would.
 
@@ -62,4 +62,4 @@ When a task depends on one of these, don't settle it in code. Build the smallest
 
 ## Output
 
-Answer in a few lines: the current phase, the verdict (in phase, needed for the gate, later phase, not on the roadmap, or blocked by the Validate gate), the reason with the roadmap section it comes from, and the smallest in-phase version if there is one.
+Answer in a few lines: the current phase, the verdict (in phase, needed for the gate, later phase, not on the roadmap, or blocked by the IP release), the reason with the roadmap section it comes from, and the smallest in-phase version if there is one.

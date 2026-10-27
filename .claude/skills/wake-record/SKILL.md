@@ -5,7 +5,7 @@ description: Guide for building Wake's Record phase exactly as the roadmap descr
 
 # Building the Record phase
 
-Read the `wake-architecture` skill first for the boundaries and principles. Check the `wake-scope` skill to confirm the Validate gate is cleared before writing product code.
+Read the `wake-architecture` skill first for the boundaries and principles. Check the `wake-scope` skill to confirm the IP release is in hand and the project has passed the Validate gate into Record.
 
 ## What ships, and what counts as done
 
