@@ -68,7 +68,7 @@ class EventGraph:
         """The trace context for an event recorded outside the framework's own hooks, such
         as a memory read or write: under the tool call making it."""
         link = links.current()
-        if link is not None:
+        if link is not None and link.trace_id and link.span_id:
             return trace.set_span_in_context(
                 trace.NonRecordingSpan(
                     trace.SpanContext(link.trace_id, link.span_id, is_remote=False, trace_flags=trace.TraceFlags(1))

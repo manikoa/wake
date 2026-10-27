@@ -14,6 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+a2a = [
+    "a2a-sdk>=1.2.3",
+]
 claude-agent-sdk = [
     "claude-agent-sdk>=0.2.174",
 ]
@@ -40,6 +43,7 @@ packages = ["src/wake"]
 
 [dependency-groups]
 dev = [
+    "a2a-sdk[http-server]>=1.2.3",
     "claude-agent-sdk>=0.2.174",
     "langchain-mcp-adapters>=0.3.2",
     "langgraph>=1.2.18",

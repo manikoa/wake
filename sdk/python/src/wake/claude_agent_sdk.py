@@ -267,8 +267,9 @@ class WakeClaudeAgent(EventGraph):
         parents: list[str] = []
         origins: list[str] = []
         if link is not None:
-            # Started from inside a recorded tool call, which gave it the prompt.
-            parents.append(link.event_id)
+            # Started inside a recorded tool call, or for a message from another agent,
+            # which gave it the prompt.
+            parents += link.parents
         elif prompt is not None:
             origins.append(events.ORIGIN_USER)
         if prompt:
