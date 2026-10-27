@@ -153,7 +153,12 @@ class WakeCallbackHandler(BaseCallbackHandler):
             error = e
             raise
         finally:
-            _current_run.reset(token)
+            try:
+                _current_run.reset(token)
+            except ValueError:
+                # The block ended in another context, such as an async generator
+                # finished by a different task. That context never saw the run.
+                pass
             self._end_span(run._span, error)
 
     # Structure: one invoke_agent span per top level run groups its events into a trace.
