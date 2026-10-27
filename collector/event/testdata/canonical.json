@@ -1,0 +1,168 @@
+[
+  {
+    "name": "proxy tool call",
+    "trace_id": "0102030405060708090a0b0c0d0e0f10",
+    "span_id": "1112131415161718",
+    "start_time_unix_nano": 1761552000000000000,
+    "end_time_unix_nano": 1761552000123456789,
+    "attributes": [
+      {
+        "key": "wake.event.id",
+        "string": "6f1c2a9e-1b7d-4f43-9a51-3c1f0a2b7d10"
+      },
+      {
+        "key": "wake.event.kind",
+        "string": "tool_call"
+      },
+      {
+        "key": "wake.agent.id",
+        "string": "spiffe://wake.local/agent/email"
+      },
+      {
+        "key": "wake.capture",
+        "string": "proxy"
+      },
+      {
+        "key": "wake.parents"
+      },
+      {
+        "key": "wake.origins",
+        "strings": [
+          "tool:read_email"
+        ]
+      },
+      {
+        "key": "wake.payload.sha256",
+        "string": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+      },
+      {
+        "key": "gen_ai.operation.name",
+        "string": "execute_tool"
+      },
+      {
+        "key": "gen_ai.tool.name",
+        "string": "read_email"
+      },
+      {
+        "key": "wake.mcp.method",
+        "string": "tools/call"
+      },
+      {
+        "key": "wake.mcp.server",
+        "string": "inbox"
+      },
+      {
+        "key": "wake.payload",
+        "string": "{\"input\":{\"subject\":\"invoice\"},\"output\":\"wire $10,000\"}"
+      },
+      {
+        "key": "wake.signer",
+        "string": "spiffe://wake.local/proxy"
+      },
+      {
+        "key": "wake.signature",
+        "string": "MEUCIQ=="
+      },
+      {
+        "key": "wake.signature.certificate",
+        "string": "MIIB"
+      },
+      {
+        "key": "http.url",
+        "string": "not signed"
+      }
+    ],
+    "canonical": "{\"attributes\":{\"gen_ai.operation.name\":\"execute_tool\",\"gen_ai.tool.name\":\"read_email\",\"wake.agent.id\":\"spiffe://wake.local/agent/email\",\"wake.capture\":\"proxy\",\"wake.event.id\":\"6f1c2a9e-1b7d-4f43-9a51-3c1f0a2b7d10\",\"wake.event.kind\":\"tool_call\",\"wake.mcp.method\":\"tools/call\",\"wake.mcp.server\":\"inbox\",\"wake.origins\":[\"tool:read_email\"],\"wake.parents\":[],\"wake.payload.sha256\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"},\"end_time_unix_nano\":1761552000123456789,\"span_id\":\"1112131415161718\",\"start_time_unix_nano\":1761552000000000000,\"trace_id\":\"0102030405060708090a0b0c0d0e0f10\"}"
+  },
+  {
+    "name": "escaping",
+    "trace_id": "0102030405060708090a0b0c0d0e0f10",
+    "span_id": "1112131415161718",
+    "start_time_unix_nano": 1761552000000000000,
+    "end_time_unix_nano": 1761552000123456789,
+    "attributes": [
+      {
+        "key": "wake.event.id",
+        "string": "e"
+      },
+      {
+        "key": "wake.text.quotes",
+        "string": "say \"hi\" \\ back\\slash"
+      },
+      {
+        "key": "wake.text.control",
+        "string": "line\nbreak\ttab\rreturn\u0000nul\u0001\u001f\b\f"
+      },
+      {
+        "key": "wake.text.html",
+        "string": "<b>a & b</b>"
+      },
+      {
+        "key": "wake.text.unicode",
+        "string": "é ü 漢字 🙂  "
+      },
+      {
+        "key": "wake.text.separators",
+        "string": "a\u2028b\u2029c"
+      },
+      {
+        "key": "wake.text.empty",
+        "string": ""
+      }
+    ],
+    "canonical": "{\"attributes\":{\"wake.event.id\":\"e\",\"wake.text.control\":\"line\\nbreak\\ttab\\rreturn\\u0000nul\\u0001\\u001f\\b\\f\",\"wake.text.empty\":\"\",\"wake.text.html\":\"<b>a & b</b>\",\"wake.text.quotes\":\"say \\\"hi\\\" \\\\ back\\\\slash\",\"wake.text.separators\":\"a\\u2028b\\u2029c\",\"wake.text.unicode\":\"é ü 漢字 🙂  \"},\"end_time_unix_nano\":1761552000123456789,\"span_id\":\"1112131415161718\",\"start_time_unix_nano\":1761552000000000000,\"trace_id\":\"0102030405060708090a0b0c0d0e0f10\"}"
+  },
+  {
+    "name": "types and ordering",
+    "trace_id": "0102030405060708090a0b0c0d0e0f10",
+    "span_id": "1112131415161718",
+    "start_time_unix_nano": 1761552000000000000,
+    "end_time_unix_nano": 1761552000123456789,
+    "attributes": [
+      {
+        "key": "wake.z",
+        "string": "last"
+      },
+      {
+        "key": "gen_ai.a",
+        "string": "gen_ai before wake"
+      },
+      {
+        "key": "wake.count",
+        "int": -42
+      },
+      {
+        "key": "wake.big",
+        "int": 9007199254740993
+      },
+      {
+        "key": "wake.zero",
+        "int": 0
+      },
+      {
+        "key": "wake.yes",
+        "bool": true
+      },
+      {
+        "key": "wake.no",
+        "bool": false
+      },
+      {
+        "key": "wake.list",
+        "strings": [
+          "b",
+          "a",
+          "a"
+        ]
+      },
+      {
+        "key": "wake.empty_list"
+      },
+      {
+        "key": "wake.A",
+        "string": "uppercase sorts first"
+      }
+    ],
+    "canonical": "{\"attributes\":{\"gen_ai.a\":\"gen_ai before wake\",\"wake.A\":\"uppercase sorts first\",\"wake.big\":9007199254740993,\"wake.count\":-42,\"wake.empty_list\":[],\"wake.list\":[\"b\",\"a\",\"a\"],\"wake.no\":false,\"wake.yes\":true,\"wake.z\":\"last\",\"wake.zero\":0},\"end_time_unix_nano\":1761552000123456789,\"span_id\":\"1112131415161718\",\"start_time_unix_nano\":1761552000000000000,\"trace_id\":\"0102030405060708090a0b0c0d0e0f10\"}"
+  }
+]

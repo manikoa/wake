@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# agentgateway v1.6.0 config that records MCP calls through wake-proxy. agentgateway
+# serves the agents on port 3000 and calls wake-proxy on localhost:9001 before each
+# recorded call reaches its MCP server and after the result comes back.
+gateways:
+  default:
+    port: 3000
+routes:
+- policies:
+    mcpGuardrails:
+      processors:
+      - kind: remote
+        host: "localhost:9001"
+        # Recording never blocks: if wake-proxy is down or slow, calls go through
+        # unrecorded. Deny, in the Brake phase, goes in its own processor and fails closed.
+        failureMode: failOpen
+        methods:
+          tools/call: full
+          resources/read: full
+          prompts/get: full
+        # Sent to wake-proxy with each hook. A failing expression is left out.
+        metadata:
+          # Who's calling: the agent's SPIFFE ID from mTLS, else its JWT subject.
+          agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")'
+          session: 'has(mcp.sessionId) ? mcp.sessionId : ""'
+          # The event id wake-proxy handed back from the request hook, so the response
+          # hook can say which call it belongs to.
+          wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
+  backends:
+  - mcp:
+      targets:
+      - name: everything
+        stdio:
+          cmd: npx
+          args: ["@modelcontextprotocol/server-everything"]
