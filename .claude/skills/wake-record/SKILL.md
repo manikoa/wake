@@ -22,9 +22,9 @@ Everything below serves that gate. If a task doesn't move a partner closer to ru
 The gate is about partners running the whole loop, so get one path working end to end before widening it:
 
 1. One SDK, for the framework and language the first design partner uses.
-2. The collector with the Go processor that checks signatures and extracts provenance.
+2. The collector with the Go processor that checks signatures and appends events to the log.
 3. The signed log in a bucket with object lock.
-4. Postgres edges and ClickHouse events.
+4. An ingester, in `wake-platform`, that reads the log into Postgres edges and ClickHouse events.
 5. The provenance view, showing what led to one action.
 
 Then add the proxy (it covers agents without an SDK and every MCP and A2A call), the memory adapter, and the remaining frameworks and languages, in the order partners need them.
@@ -63,7 +63,8 @@ Build the 95% metric early as a query: the share of action events with an unbrok
 ## Signing and the log
 
 - Sign each event where it's captured, then append it to a Trillian Tessera log that writes tiles to the customer's bucket with object lock. Tessera's Merkle tree and signed checkpoints provide the append only, hash chained property. Don't build a second chain next to it.
-- The collector's Go processor checks signatures before anything reaches Postgres or ClickHouse, and records events that fail the check instead of silently dropping them.
+- The collector's Go processor checks signatures before events reach the log, and records events that fail the check instead of silently dropping them.
+- The provenance graph is built from the log, never fed straight from the collector. An ingester in `wake-platform` reads the log into Postgres and ClickHouse, checks each signature again with public keys only, and can replay the log from the start. The design is in `wake-platform/docs/provenance-storage.md`.
 - Signing happens at the first hop outside the agent's process: the collector signs SDK and memory adapter events, and the proxy signs its own (`docs/signing.md`). The SDK never holds a key. The signed bytes are defined in `docs/events.md`.
 - The open source package includes a self hosted signed log, so a team can run the recorder with no Wake account.
 
