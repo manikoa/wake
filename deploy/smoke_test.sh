@@ -36,6 +36,9 @@ for _ in $(seq 1 20); do
   size=$(sed -n 2p "$work/checkpoint" 2>/dev/null || echo 0)
   if [ "${size:-0}" -ge 5 ]; then
     echo "signed log holds $size entries"
+    # Check it as anyone could: the checkpoint, the tree, and every event's signature.
+    compose run --rm --no-deps --entrypoint /wake-log collector verify -log /var/lib/wake/log \
+      -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem
     exit 0
   fi
   sleep 1
