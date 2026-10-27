@@ -49,6 +49,21 @@ A message from agent A to agent B is an `agent_message` event in B's run, record
 
 The message is a parent of B's next event. An answer going back from B to A is another `agent_message`, this time in A's run.
 
+## Memory
+
+The memory adapter records each write to a memory store or memory file as a `memory_write` event, and each read as a `memory_read`. Both have `wake.capture` `memory_adapter`, `wake.memory.store` and `wake.memory.entry`.
+
+- **A write's parents** are the tool call making it, plus the earlier events in the trace whose output it carries. Before the entry lands, the adapter hands back a label for the store to keep with it:
+
+  ```json
+  {"event":"<the write's event id>","origins":["tool:read_email","user"],"sha256":"<digest of the content>","agent":"<id>"}
+  ```
+
+  `origins` is the union of origins upstream of the write that the SDK recorded. `wake.memory.origins` on the write holds the same list. A store keeps the label in the entry under `__wake__`; a memory file keeps it next to the file as `<file>.wake.json`.
+- **A read's origin** is `memory:<store>/<entry>`. When the entry's label digest matches what was read, the read's parent is the write, and `wake.memory.origins` repeats the label's origins. An entry with no label (`wake.memory.labeled` false), or one changed since it was written (`wake.memory.changed` true), gets no parent. So anything that follows from it is flagged, rather than trusted, by the completeness metric.
+
+The label is a pointer, not evidence: anything that can write the store can forge one. The signed `memory_write` it names, and the digest, are what make it checkable.
+
 ## How the SDK finds parents
 
 Where the framework gives message ids, parents follow them: the AI and tool messages in a model call's context, and the model call that requested a tool call. Where an app builds prompts from strings, so nothing links one call to the next, the SDK compares content within the trace: an earlier event is a parent when its output appears in the new event's input, or, for a tool call, when the tool's arguments appear in its output. Short outputs aren't matched, so a parent found this way is unlikely to be chance. An event with no parent found is left unlinked rather than given a guess.

@@ -30,6 +30,24 @@ A handoff is recorded as an `agent_message` event in the receiving agent's run, 
 
 The recorder sends to `WAKE_ENDPOINT`, or `http://localhost:4318` by default. Install with the `langchain` or `langgraph` extra.
 
+## Memory
+
+The memory adapter records each write to agent memory, and each read from it. It labels each entry with where its content came from before it lands, so a later read, by any agent in any session, links back to the write. Entries with no label, such as ones planted or written outside Wake, or changed since they were written, aren't linked, so whatever follows from them is flagged.
+
+For LangGraph's long-term memory store, which langmem uses too, wrap the store:
+
+```python
+from wake.langgraph import WakeStore
+from wake.memory import Memory
+
+store = WakeStore(PostgresStore(...), Memory(handler))
+graph = builder.compile(store=store)
+```
+
+The label is kept in each value under `__wake__` and taken out before values reach the app.
+
+For memory files, such as an agent's notes file, use `Memory(handler).write_file(path, text)` and `read_file(path)`. The label goes next to the file as `<file>.wake.json`. For any other store, call `memory.write(store, entry, content)` before writing, save the label it returns with the entry, and call `memory.read(store, entry, content, label)` after reading.
+
 ## MCP calls through the proxy
 
 When an agent's MCP calls go through agentgateway, Wake's proxy records each one too. Link each call to the SDK's event for it, so the proxy's record joins the agent's trace and provenance. The link travels as two HTTP headers, `traceparent` and `wake-parents`. Install with the `mcp` extra.

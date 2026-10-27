@@ -1622,6 +1622,7 @@ langchain = [
 ]
 langgraph = [
     { name = "langchain-core" },
+    { name = "langgraph" },
 ]
 mcp = [
     { name = "mcp" },
@@ -1639,6 +1640,7 @@ dev = [
 requires-dist = [
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.0" },
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=1.0" },
+    { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=1.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.20" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.45.1" },
     { name = "opentelemetry-sdk", specifier = ">=1.45.1" },
