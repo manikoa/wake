@@ -94,19 +94,28 @@ pub fn dev_identity(spiffe_id: &str) -> Result<DevIdentity, String> {
 
 /// A development identity, plus a TLS server certificate for these hosts when there are any.
 pub fn dev_identity_with_tls(spiffe_id: &str, tls_hosts: &[String]) -> Result<DevIdentity, String> {
-    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, PKCS_ECDSA_P256_SHA256, SanType};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+        PKCS_ECDSA_P256_SHA256, SanType,
+    };
     let err = |e: rcgen::Error| e.to_string();
 
+    // Strict X.509 checks, which Python 3.13 makes the default, want a CA's key usage and
+    // each issued certificate's authority key identifier.
     let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
     let mut ca = CertificateParams::new(Vec::<String>::new()).map_err(err)?;
     ca.distinguished_name
         .push(DnType::CommonName, "Wake development trust bundle");
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca_cert = ca.self_signed(&ca_key).map_err(err)?;
 
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
     let mut leaf = CertificateParams::new(Vec::<String>::new()).map_err(err)?;
     leaf.subject_alt_names = vec![SanType::URI(spiffe_id.try_into().map_err(err)?)];
+    // An X.509-SVID signs; it never issues certificates (SPIFFE X509-SVID, section 4.3).
+    leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    leaf.use_authority_key_identifier_extension = true;
     let issuer = Issuer::new(ca, ca_key);
     let cert = leaf.signed_by(&key, &issuer).map_err(err)?;
 
@@ -114,7 +123,10 @@ pub fn dev_identity_with_tls(spiffe_id: &str, tls_hosts: &[String]) -> Result<De
         None
     } else {
         let tls_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
-        let server = CertificateParams::new(tls_hosts.to_vec()).map_err(err)?;
+        let mut server = CertificateParams::new(tls_hosts.to_vec()).map_err(err)?;
+        server.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        server.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        server.use_authority_key_identifier_extension = true;
         let tls_cert = server.signed_by(&tls_key, &issuer).map_err(err)?;
         Some((tls_cert.pem(), tls_key.serialize_pem()))
     };

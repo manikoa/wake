@@ -10,8 +10,9 @@ trap 'compose logs --no-color collector wake-proxy > "$work/logs.txt" 2>&1 || tr
 compose up -d --build --wait collector wake-proxy agentgateway
 compose cp collector:/etc/wake/identity/bundle.pem "$work/ca.pem"
 
+# Python 3.13 checks certificates strictly by default, so the development identity must pass.
 (cd ../sdk/python && WAKE_ENDPOINT=https://localhost:4318 OTEL_EXPORTER_OTLP_CERTIFICATE="$work/ca.pem" \
-  uv run --locked --all-extras python - <<'PY'
+  uv run --python 3.13 --locked --all-extras python - <<'PY'
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from wake import Recorder
