@@ -61,9 +61,13 @@ That's four languages, each where it's strongest: Rust for the proxy, Go for the
 
 For OpenTelemetry, use the GenAI semantic conventions where they exist (they're still marked Development) and keep Wake's provenance fields in their own attribute namespace, so they can move onto the standard when it settles.
 
+## Decisions already made
+
+- **Where signing happens:** at the first hop outside the agent's process. See `docs/signing.md`.
+- **The event format** shared by every component: see `docs/events.md`.
+
 ## Questions the roadmap leaves open
 
 The roadmap doesn't settle these. Don't resolve them silently in code; write a short decision note in `docs/` and confirm it with the user first.
 
-- **Where signing happens.** The roadmap says events are "signed at the source" and also that "agents never hold signing keys". The SDK runs inside the agent's process, so decide how both can hold, for example by signing in a capture component outside the agent's process or with a per component SPIFFE identity, and write down why.
 - **Whether the log defaults to Wake's hosting or the customer's bucket.** This is an open question for design partners. Support the customer's bucket from the start, because principle 2 depends on it.
