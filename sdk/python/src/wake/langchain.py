@@ -140,6 +140,7 @@ class WakeCallbackHandler(BaseCallbackHandler):
         self._result_by_tool_call = _Recent()  # tool call id -> tool call event id
         self._seen_user_messages = _Recent()
         self._outputs = _Recent(limit=256)  # trace id -> recent (event id, output text)
+        self._lineage = _Recent()  # event id -> (parents, origins), for memory labels
         self._installed: _Installed | None = None
 
     def install(self) -> "WakeCallbackHandler":
@@ -372,12 +373,14 @@ class WakeCallbackHandler(BaseCallbackHandler):
         text = _text(content)
         trace_id = receiver._span.get_span_context().trace_id
         event_id = str(uuid.uuid4())
+        parents = self._matching_outputs(trace_id, text)
+        self._remember_lineage(event_id, parents, [f"agent:{sender.agent}"])
         attributes = {
             events.EVENT_ID: event_id,
             events.EVENT_KIND: events.AGENT_MESSAGE,
             events.AGENT_ID: receiver.agent,
             events.CAPTURE: "sdk",
-            events.PARENTS: self._matching_outputs(trace_id, text),
+            events.PARENTS: parents,
             events.ORIGINS: [f"agent:{sender.agent}"],
             "gen_ai.agent.name": receiver.agent,
             **events.payload_attributes({"from": sender.agent, "to": receiver.agent, "content": content}),
@@ -425,12 +428,14 @@ class WakeCallbackHandler(BaseCallbackHandler):
             if arguments:
                 parents = parents + self._outputs_containing(trace_id, arguments)
         event_id = str(uuid.uuid4())
+        parents = list(dict.fromkeys(parents))
+        self._remember_lineage(event_id, parents, origins)
         attributes = {
             events.EVENT_ID: event_id,
             events.EVENT_KIND: kind,
             events.AGENT_ID: agent,
             events.CAPTURE: "sdk",
-            events.PARENTS: list(dict.fromkeys(parents)),
+            events.PARENTS: parents,
             events.ORIGINS: origins,
             **attributes,
         }
@@ -481,6 +486,48 @@ class WakeCallbackHandler(BaseCallbackHandler):
             span.end()
         except Exception:
             log.warning("wake: failed to end span", exc_info=True)
+
+    def _remember_lineage(self, event_id: str, parents: list[str], origins: list[str]) -> None:
+        with self._lock:
+            self._lineage[event_id] = (tuple(parents), tuple(origins))
+
+    def _origins_upstream(self, event_ids: list[str], limit: int = 2000) -> list[str]:
+        """The origins of these events and everything upstream of them that this handler
+        recorded. Coarse: an event's origins are the union over its ancestors."""
+        seen: set[str] = set()
+        out: list[str] = []
+        queue = list(event_ids)
+        with self._lock:
+            while queue and len(seen) < limit:
+                event_id = queue.pop()
+                if event_id in seen:
+                    continue
+                seen.add(event_id)
+                parents, origins = self._lineage.get(event_id, ((), ()))
+                for o in origins:
+                    if o not in out:
+                        out.append(o)
+                queue.extend(parents)
+        return out
+
+    def _event_context(self):
+        """The trace context for an event recorded outside a LangChain callback, such as a
+        memory read or write: under the tool call making it, else the agent run."""
+        link = links.current()
+        if link is not None:
+            return trace.set_span_in_context(
+                trace.NonRecordingSpan(
+                    trace.SpanContext(link.trace_id, link.span_id, is_remote=False, trace_flags=trace.TraceFlags(1))
+                )
+            )
+        run = _current_run.get()
+        if run is not None and run._span is not None:
+            return trace.set_span_in_context(run._span)
+        return None
+
+    def _current_agent(self) -> str:
+        run = _current_run.get()
+        return run.agent if run else self._recorder.agent
 
     def _remember_output(self, trace_id: int, event_id: str, text: str) -> None:
         text = text.strip()
