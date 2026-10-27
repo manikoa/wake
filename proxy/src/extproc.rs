@@ -211,14 +211,7 @@ impl Exchange {
             .and_then(|t| mcp::parse_traceparent(t));
         self.header_parents = headers
             .get(mcp::HEADER_PARENTS)
-            .map(|p| {
-                p.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && s.len() <= 128)
-                    .take(64)
-                    .map(str::to_string)
-                    .collect()
-            })
+            .map(|p| mcp::event_ids(p.split(',')))
             .unwrap_or_default();
         let (trace_id, span) = random_ids();
         self.trace_id = self.header_trace.map(|t| t.trace_id).unwrap_or(trace_id);

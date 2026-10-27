@@ -32,9 +32,27 @@ pub const HEADER_TRACEPARENT: &str = "traceparent";
 pub const HEADER_PARENTS: &str = "wake-parents";
 pub const HEADER_SESSION: &str = "mcp-session-id";
 
-fn parent_id(s: &str) -> Option<String> {
-    let s = s.trim();
-    (!s.is_empty() && s.len() <= 128).then(|| s.to_string())
+/// The most parents a link may name (docs/linking.md).
+pub const MAX_PARENTS: usize = 64;
+
+/// Reads the event ids a link names, as docs/linking.md says: each trimmed, 1 to 128
+/// characters from A-Z a-z 0-9 . _ : -, duplicates dropped, at most MAX_PARENTS.
+pub fn event_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let valid = |s: &str| {
+        (1..=128).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    };
+    let mut out: Vec<String> = Vec::new();
+    for id in ids.into_iter().map(str::trim) {
+        if out.len() == MAX_PARENTS {
+            break;
+        }
+        if valid(id) && !out.iter().any(|o| o == id) {
+            out.push(id.to_string());
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,7 +75,7 @@ pub fn parse_request(method: &str, params: Option<&[u8]>, headers: &[(String, Ve
         request.trace = Some(trace);
     }
     if let Some(parents) = header(HEADER_PARENTS) {
-        let parents: Vec<String> = parents.split(',').filter_map(parent_id).take(64).collect();
+        let parents = event_ids(parents.split(','));
         if !parents.is_empty() {
             request.parents = parents;
         }
@@ -86,13 +104,7 @@ fn parse_params(method: &str, params: Option<&[u8]>) -> Request {
     let parents = meta
         .and_then(|m| m.get("dev.wake/parents"))
         .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(Value::as_str)
-                .filter_map(parent_id)
-                .take(64)
-                .collect()
-        })
+        .map(|list| event_ids(list.iter().filter_map(Value::as_str)))
         .unwrap_or_default();
     Request {
         target,
@@ -106,11 +118,15 @@ fn parse_params(method: &str, params: Option<&[u8]>) -> Request {
 /// trace or span id is invalid.
 pub fn parse_traceparent(s: &str) -> Option<TraceParent> {
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() < 4 || parts[0].len() != 2 || parts[0] == "ff" || parts[3].len() != 2 {
+    // Version 00 has exactly four fields; a later version may add more after them.
+    if parts.len() < 4 || (parts[0] == "00" && parts.len() != 4) {
+        return None;
+    }
+    if parts[0].len() != 2 || parts[0] == "ff" || parts[3].len() != 2 {
         return None;
     }
     let lower_hex = |p: &str| p.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if !parts.iter().all(|p| lower_hex(p)) {
+    if !parts[..4].iter().all(|p| lower_hex(p)) {
         return None;
     }
     let mut trace_id = [0u8; 16];
@@ -152,6 +168,29 @@ fn push_json(out: &mut String, bytes: Option<&[u8]>) {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn reads_event_ids_as_docs_linking_says() {
+        assert_eq!(event_ids("a, b,a,  ,bad id!,c:1".split(',')), vec!["a", "b", "c:1"]);
+        let long = "x".repeat(129);
+        assert!(event_ids([long.as_str(), "", "é"]).is_empty());
+        let many: Vec<String> = (0..500).map(|i| format!("e{i}")).collect();
+        assert_eq!(event_ids(many.iter().map(String::as_str)).len(), MAX_PARENTS);
+    }
+
+    #[test]
+    fn reads_traceparents_as_w3c_says() {
+        let ok = "00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01";
+        assert!(parse_traceparent(ok).is_some());
+        assert!(
+            parse_traceparent(&format!("{ok}-extra")).is_none(),
+            "version 00 has four fields"
+        );
+        assert!(parse_traceparent("01-0102030405060708090a0b0c0d0e0f10-1112131415161718-01-future").is_some());
+        assert!(parse_traceparent("ff-0102030405060708090a0b0c0d0e0f10-1112131415161718-01").is_none());
+        assert!(parse_traceparent(&ok.to_uppercase()).is_none(), "lowercase hex only");
+        assert!(parse_traceparent("00-00000000000000000000000000000000-1112131415161718-01").is_none());
+    }
 
     #[test]
     fn reads_the_target_trace_and_parents() {

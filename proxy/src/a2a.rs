@@ -122,11 +122,11 @@ pub fn parse_reply(body: &[u8], streamed: bool) -> Reply {
                 }
             }
         }
-        if out.parents.len() >= 64 {
+        if out.parents.len() >= crate::mcp::MAX_PARENTS {
             break;
         }
     }
-    out.parents.truncate(64);
+    out.parents.truncate(crate::mcp::MAX_PARENTS);
     out
 }
 
@@ -147,15 +147,7 @@ fn parents_in(metadata: Option<&Value>) -> Vec<String> {
     metadata
         .and_then(|m| m.get(META_PARENTS))
         .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && s.len() <= 128)
-                .take(64)
-                .map(str::to_string)
-                .collect()
-        })
+        .map(|list| crate::mcp::event_ids(list.iter().filter_map(Value::as_str)))
         .unwrap_or_default()
 }
 

@@ -47,7 +47,7 @@ A message from agent A to agent B is an `agent_message` event in B's run, record
 - `wake.parents` are the events in A whose output the message carries.
 - `wake.payload` is `{"from": "<A>", "to": "<B>", "content": ...}`.
 
-The message is a parent of B's next event. An answer going back from B to A is another `agent_message`, this time in A's run.
+The message is a parent of B's next event. An answer going back from B to A is another `agent_message`, this time in A's run, and it's a parent of the step in A that reads it. How the link travels between processes is in [linking.md](linking.md).
 
 ## Memory
 
