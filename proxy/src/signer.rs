@@ -25,7 +25,11 @@ impl Signer {
         let leaf = chain.first().ok_or("no certificate")?;
         let id = spiffe_id(leaf.contents())?;
         let der: Vec<u8> = chain.iter().flat_map(|c| c.contents().to_vec()).collect();
-        Ok(Signer { key, id, certificate: STANDARD.encode(der) })
+        Ok(Signer {
+            key,
+            id,
+            certificate: STANDARD.encode(der),
+        })
     }
 
     /// The SPIFFE ID this signer signs as.
@@ -87,7 +91,8 @@ pub fn dev_identity(spiffe_id: &str) -> Result<DevIdentity, String> {
 
     let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
     let mut ca = CertificateParams::new(Vec::<String>::new()).map_err(err)?;
-    ca.distinguished_name.push(DnType::CommonName, "Wake development trust bundle");
+    ca.distinguished_name
+        .push(DnType::CommonName, "Wake development trust bundle");
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_cert = ca.self_signed(&ca_key).map_err(err)?;
 
@@ -97,7 +102,11 @@ pub fn dev_identity(spiffe_id: &str) -> Result<DevIdentity, String> {
     let issuer = Issuer::new(ca, ca_key);
     let cert = leaf.signed_by(&key, &issuer).map_err(err)?;
 
-    Ok(DevIdentity { ca_pem: ca_cert.pem(), cert_pem: cert.pem(), key_pem: key.serialize_pem() })
+    Ok(DevIdentity {
+        ca_pem: ca_cert.pem(),
+        cert_pem: cert.pem(),
+        key_pem: key.serialize_pem(),
+    })
 }
 
 #[cfg(test)]
@@ -126,7 +135,9 @@ mod tests {
         assert_eq!(event.str("wake.signer"), Some("spiffe://wake.local/proxy"));
 
         // Check the way a verifier would: the key from the certificate the event carries.
-        let der = STANDARD.decode(event.str("wake.signature.certificate").unwrap()).unwrap();
+        let der = STANDARD
+            .decode(event.str("wake.signature.certificate").unwrap())
+            .unwrap();
         let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
         let key = VerifyingKey::from_sec1_bytes(cert.public_key().subject_public_key.as_ref()).unwrap();
         let sig = Signature::from_der(&STANDARD.decode(event.str("wake.signature").unwrap()).unwrap()).unwrap();
@@ -146,6 +157,11 @@ mod tests {
         let id = dev_identity("spiffe://wake.local/proxy").unwrap();
         // The CA certificate has no SAN at all.
         assert!(Signer::from_pem(&id.key_pem, &id.ca_pem).is_err());
-        assert!(dev_identity("https://not-spiffe").map(|i| Signer::from_pem(&i.key_pem, &i.cert_pem)).unwrap().is_err());
+        assert!(
+            dev_identity("https://not-spiffe")
+                .map(|i| Signer::from_pem(&i.key_pem, &i.cert_pem))
+                .unwrap()
+                .is_err()
+        );
     }
 }

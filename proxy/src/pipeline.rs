@@ -28,7 +28,11 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { collector: "http://localhost:4318".into(), response_timeout: Duration::from_secs(60), queue: 10_000 }
+        Options {
+            collector: "http://localhost:4318".into(),
+            response_timeout: Duration::from_secs(60),
+            queue: 10_000,
+        }
     }
 }
 

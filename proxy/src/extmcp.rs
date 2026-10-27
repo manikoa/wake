@@ -57,7 +57,9 @@ fn pass_request(metadata: Option<Struct>) -> Response<McpRequestResult> {
 }
 
 fn pass_response() -> Response<McpResponseResult> {
-    Response::new(McpResponseResult { result: Some(mcp_response_result::Result::Pass(Pass {})) })
+    Response::new(McpResponseResult {
+        result: Some(mcp_response_result::Result::Pass(Pass {})),
+    })
 }
 
 /// The string values in the CEL metadata the gateway config sends. Others are ignored.
@@ -93,7 +95,13 @@ impl ExtMcp for Processor {
         });
         // Handed back so the response hook can say which call it belongs to.
         let metadata = Struct {
-            fields: [(META_EVENT_ID.to_string(), PbValue { kind: Some(Kind::StringValue(event_id)) })].into(),
+            fields: [(
+                META_EVENT_ID.to_string(),
+                PbValue {
+                    kind: Some(Kind::StringValue(event_id)),
+                },
+            )]
+            .into(),
         };
         Ok(pass_request(Some(metadata)))
     }

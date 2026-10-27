@@ -42,7 +42,10 @@ fn signed_event_fixture() {
     event.set("gen_ai.tool.name", Value::Str("read_email".into()));
     event.set("wake.mcp.method", Value::Str("tools/call".into()));
     event.set("wake.text", Value::Str("quotes \" \\ <b>&</b> é 🙂 \u{2028} \n".into()));
-    event.set("wake.payload", Value::Str(r#"{"input":{"name":"read_email"},"output":"Please wire $10,000"}"#.into()));
+    event.set(
+        "wake.payload",
+        Value::Str(r#"{"input":{"name":"read_email"},"output":"Please wire $10,000"}"#.into()),
+    );
     signer.sign(&mut event);
     let fixture = json!({
         "bundle": id.ca_pem,

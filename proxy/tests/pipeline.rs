@@ -18,7 +18,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use wake_proxy::canonical::{Event, Value, canonical};
 use wake_proxy::export::Counters;
-use wake_proxy::extmcp::pb::{McpRequest, McpResponse, ext_mcp_client::ExtMcpClient, mcp_request_result, mcp_response_result};
+use wake_proxy::extmcp::pb::{
+    McpRequest, McpResponse, ext_mcp_client::ExtMcpClient, mcp_request_result, mcp_response_result,
+};
 use wake_proxy::pipeline::{Options, serve};
 use wake_proxy::signer::{Signer, dev_identity};
 
@@ -29,7 +31,9 @@ async fn collector() -> (String, mpsc::UnboundedReceiver<Span>) {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
-            let Ok((mut conn, _)) = listener.accept().await else { return };
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
             let tx = tx.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
@@ -40,7 +44,9 @@ async fn collector() -> (String, mpsc::UnboundedReceiver<Span>) {
                         return;
                     }
                     buf.extend_from_slice(&chunk[..n]);
-                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
                     let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
                     let len: usize = head
                         .lines()
@@ -83,7 +89,11 @@ async fn proxy(collector: &str, response_timeout: Duration) -> Proxy {
     let addr = listener.local_addr().unwrap();
     let counters = Arc::new(Counters::default());
     let (stop, stopped) = oneshot::channel::<()>();
-    let options = Options { collector: collector.into(), response_timeout, ..Default::default() };
+    let options = Options {
+        collector: collector.into(),
+        response_timeout,
+        ..Default::default()
+    };
     let c = counters.clone();
     let done = tokio::spawn(async move {
         serve(listener, signer, options, c, async {
@@ -98,7 +108,13 @@ async fn proxy(collector: &str, response_timeout: Duration) -> Proxy {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    Proxy { addr: format!("http://{addr}"), client, counters, stop: Some(stop), done }
+    Proxy {
+        addr: format!("http://{addr}"),
+        client,
+        counters,
+        stop: Some(stop),
+        done,
+    }
 }
 
 impl Proxy {
@@ -111,7 +127,17 @@ impl Proxy {
 
 fn metadata(pairs: &[(&str, &str)]) -> Option<Struct> {
     Some(Struct {
-        fields: pairs.iter().map(|(k, v)| (k.to_string(), PbValue { kind: Some(Kind::StringValue(v.to_string())) })).collect(),
+        fields: pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    PbValue {
+                        kind: Some(Kind::StringValue(v.to_string())),
+                    },
+                )
+            })
+            .collect(),
     })
 }
 
@@ -124,7 +150,13 @@ fn attrs(span: &Span) -> BTreeMap<String, Value> {
                 Some(Any::IntValue(n)) => Value::Int(n),
                 Some(Any::BoolValue(b)) => Value::Bool(b),
                 Some(Any::ArrayValue(a)) => Value::Strs(
-                    a.values.into_iter().filter_map(|v| match v.value { Some(Any::StringValue(s)) => Some(s), _ => None }).collect(),
+                    a.values
+                        .into_iter()
+                        .filter_map(|v| match v.value {
+                            Some(Any::StringValue(s)) => Some(s),
+                            _ => None,
+                        })
+                        .collect(),
                 ),
                 _ => Value::Strs(vec![]),
             };
@@ -194,7 +226,10 @@ async fn records_a_tool_call_as_a_signed_event() {
         .into_inner();
     assert!(matches!(resp.result, Some(mcp_response_result::Result::Pass(_))));
 
-    let span = tokio::time::timeout(Duration::from_secs(5), spans.recv()).await.unwrap().unwrap();
+    let span = tokio::time::timeout(Duration::from_secs(5), spans.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let a = attrs(&span);
     assert_eq!(s(&a, "wake.event.id"), event_id);
     assert_eq!(s(&a, "wake.capture"), "proxy");
@@ -207,7 +242,10 @@ async fn records_a_tool_call_as_a_signed_event() {
     // tools/list isn't recorded, but always passes.
     let list = p
         .client
-        .check_request(McpRequest { method: "tools/list".into(), ..Default::default() })
+        .check_request(McpRequest {
+            method: "tools/list".into(),
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();
@@ -245,7 +283,11 @@ async fn calls_pass_at_once_while_the_collector_is_down() {
         assert!(matches!(r.result, Some(mcp_request_result::Result::Pass(_))));
     }
     // The hooks never wait on the collector.
-    assert!(started.elapsed() < Duration::from_secs(1), "20 calls took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "20 calls took {:?}",
+        started.elapsed()
+    );
 
     let counters = p.counters.clone();
     p.shutdown().await;
@@ -295,11 +337,12 @@ async fn against_a_real_collector() {
 
 #[tokio::test]
 async fn records_an_a2a_message_and_reply_through_ext_proc() {
-    use wake_proxy::extproc::pb::ext_proc::{
-        HeaderMap, HttpBody, HttpHeaders, ProcessingRequest, ProtocolConfiguration, external_processor_client::ExternalProcessorClient,
-        processing_mode::BodySendMode, processing_request::Request as Phase,
-    };
     use wake_proxy::extproc::pb::common::HeaderValue;
+    use wake_proxy::extproc::pb::ext_proc::{
+        HeaderMap, HttpBody, HttpHeaders, ProcessingRequest, ProtocolConfiguration,
+        external_processor_client::ExternalProcessorClient, processing_mode::BodySendMode,
+        processing_request::Request as Phase,
+    };
 
     let (url, mut spans) = collector().await;
     let p = proxy(&url, Duration::from_secs(60)).await;
@@ -307,15 +350,32 @@ async fn records_an_a2a_message_and_reply_through_ext_proc() {
 
     let headers = |pairs: &[(&str, &str)]| HttpHeaders {
         headers: Some(HeaderMap {
-            headers: pairs.iter().map(|(k, v)| HeaderValue { key: k.to_string(), raw_value: v.as_bytes().to_vec(), ..Default::default() }).collect(),
+            headers: pairs
+                .iter()
+                .map(|(k, v)| HeaderValue {
+                    key: k.to_string(),
+                    raw_value: v.as_bytes().to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
         }),
         ..Default::default()
     };
     let route: Struct = Struct {
-        fields: [("sender", "spiffe://wake.local/agent/planner"), ("receiver", "research")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), PbValue { kind: Some(Kind::StringValue(v.into())) }))
-            .collect(),
+        fields: [
+            ("sender", "spiffe://wake.local/agent/planner"),
+            ("receiver", "research"),
+        ]
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                PbValue {
+                    kind: Some(Kind::StringValue(v.into())),
+                },
+            )
+        })
+        .collect(),
     };
     let messages = vec![
         ProcessingRequest {
@@ -354,7 +414,12 @@ async fn records_an_a2a_message_and_reply_through_ext_proc() {
 
     let mut got = vec![];
     for _ in 0..2 {
-        got.push(tokio::time::timeout(Duration::from_secs(5), spans.recv()).await.unwrap().unwrap());
+        got.push(
+            tokio::time::timeout(Duration::from_secs(5), spans.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
     }
     got.sort_by_key(|s| s.start_time_unix_nano + if s.parent_span_id.is_empty() { 0 } else { 1 });
     let (message, reply) = (&got[0], &got[1]);
