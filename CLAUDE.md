@@ -9,6 +9,8 @@ Wake is an independent recorder and brake for multiagent AI systems. The source 
 - Record started early, by founder decision, before the rest of the Validate gate was met. Still open from Validate: 5 teams with a real incident or stalled deal, and 3 design partners committed. Keep running interviews alongside Record.
 - First slice: Python and LangChain, with Clavr as the first test bed. Clavr builds its agents as plain Python around LangChain models and tools, not LangGraph (checked October 26, 2026), so the SDK records it through LangChain callbacks with named agent runs.
 - LangGraph stays in the slice, with a design partner running LangGraph as its test bed. Still to find.
+- Building ahead, by founder decision (October 27, 2026): finish the rest of Record's code (SDK coverage, proxy loose ends, release safety), then build Brake, Prove and Contain, before the Record gate is met. The gates still stand as the business tests: partners live in staging, paid pilots and customers. Deferred for now: the log in the customer's bucket, keys in KMS and SVIDs from SPIRE, and Clavr's wiring.
+- Test bed: Clavr isn't in production, so don't rely on it alone. A reference fleet in `examples/` (agents on several frameworks, talking over A2A and MCP through agentgateway) is the end-to-end test and the game day target.
 
 Update these lines as each part of a gate is met and when the phase changes. The `wake-scope` skill reads them.
 
