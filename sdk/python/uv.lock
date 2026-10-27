@@ -1005,6 +1005,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+langchain = [
+    { name = "langchain-core" },
+]
 langgraph = [
     { name = "langchain-core" },
 ]
@@ -1017,11 +1020,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.0" },
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=1.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.45.1" },
     { name = "opentelemetry-sdk", specifier = ">=1.45.1" },
 ]
-provides-extras = ["langgraph"]
+provides-extras = ["langchain", "langgraph"]
 
 [package.metadata.requires-dev]
 dev = [
