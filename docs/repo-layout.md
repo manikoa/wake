@@ -6,9 +6,9 @@ Decided October 26, 2026.
 
 **This repository** is public and Apache 2.0. It holds only the open source recorder, which the roadmap's pricing table lists as free forever: the SDKs, the proxy, the memory adapter and a self hosted signed log.
 
-**A separate private repository** holds the paid parts: the hosted log, the provenance and downstream views (the dashboard), the brake and its Temporal workers, and the hosted control plane and its deployment.
+**The private repository, `manikoa/wake-platform`,** holds the paid parts: the hosted log, the provenance and downstream views (the dashboard), the brake and its Temporal workers, and the hosted control plane and its deployment.
 
-The test for where code goes: if it's part of the open source recorder, it goes here. Everything else goes in the private repository.
+The test for where code goes: if it's part of the open source recorder, it goes here. Everything else goes in `wake-platform`.
 
 ## This repository
 
@@ -27,6 +27,6 @@ docs/
 
 ## Rules
 
-- **Dependencies point one way.** The private repository uses released versions of the SDKs, proxy and log from here. Nothing here depends on the private repository, and the recorder must run on its own with no Wake account.
-- **Turborepo is for the dashboard**, which lives in the private repository, as the roadmap's stack table says.
+- **Dependencies point one way.** `wake-platform` uses released versions of the SDKs, proxy and log from here. Nothing here depends on `wake-platform`, and the recorder must run on its own with no Wake account.
+- **Turborepo is for the dashboard**, which lives in `wake-platform`, as the roadmap's stack table says.
 - **Proxy exception.** If agentgateway's extension points cover Wake's signing and deny, the proxy stays in `proxy/`. If Wake has to fork agentgateway, the fork gets its own public repository so it stays easy to sync with upstream. Check this at the start of Record.

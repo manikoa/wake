@@ -11,7 +11,7 @@ Update these two lines whenever a gate is passed. The `wake-scope` skill reads t
 
 ## Repository
 
-This public repository holds only the open source recorder. The paid parts live in a separate private repository. Folders and rules are in [docs/repo-layout.md](docs/repo-layout.md).
+This public repository holds only the open source recorder. The paid parts live in the private repository `manikoa/wake-platform`, checked out next to this one at `../wake-platform`. Folders and rules are in [docs/repo-layout.md](docs/repo-layout.md).
 
 ## Skills
 
