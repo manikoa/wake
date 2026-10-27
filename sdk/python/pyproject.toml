@@ -7,7 +7,7 @@ license = "Apache-2.0"
 authors = [
     { name = "Anthony Maniko", email = "117973652+manikoa@users.noreply.github.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.45.1",
     "opentelemetry-sdk>=1.45.1",
