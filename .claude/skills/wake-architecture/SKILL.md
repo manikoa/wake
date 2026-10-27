@@ -47,9 +47,9 @@ Follow the architecture from top to bottom. Each pick comes with the roadmap's r
 | SDK in each agent | Python and TypeScript, built on OpenTelemetry | Where agent frameworks live; standard spans plus Wake's provenance fields |
 | MCP and A2A proxy | Rust, built on agentgateway | Apache licensed Rust proxy in the Agentic AI Foundation that already speaks MCP and A2A; Wake adds signing and the brake |
 | Memory adapter | Thin wrappers in the SDKs for common memory stores and memory files | Every write gets an origin label before it lands |
-| Ingestion | OpenTelemetry Collector with a custom Go processor | Batching, retries and exporters for free; signatures checked and provenance extracted there |
+| Ingestion | OpenTelemetry Collector with a custom Go processor | Batching, retries and exporters for free; signatures checked there before events reach the signed log |
 | Signed log | Trillian Tessera, writing to the customer's bucket with object lock | The tile based log library under Sigstore's Rekor v2; cheap and checkable by third parties |
-| Provenance graph | Postgres for metadata and causal edges, ClickHouse for raw events | Recursive queries cover the graph until a graph database is clearly needed; ClickHouse handles trace volume |
+| Provenance graph | Postgres for metadata and causal edges, ClickHouse for raw events, filled by an ingester that reads the signed log | Built from the log, so the log stays the source of truth; recursive queries cover the graph until a graph database is clearly needed; ClickHouse handles trace volume |
 | Detect | Cedar policies in the proxy, rules over ClickHouse, out of band monitors from more than one lab | Cedar is analyzable and is what AWS AgentCore Policy uses |
 | Brake | Temporal workflows with Go workers calling each lever | Durable fan out with retries and verification, so a revocation never fails silently |
 | Identity and keys | SPIFFE/SPIRE plus cloud KMS, with customer held keys as an option | Short lived identities for capture components; agents never hold signing keys |
