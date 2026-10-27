@@ -17,7 +17,7 @@ The goal is to catch drift from the roadmap while it's still cheap to fix: build
 
 **Blockers.** Each of these breaks a promise the product makes:
 
-- Product code while `CLAUDE.md` doesn't record the Validate gate as cleared.
+- Product code while `CLAUDE.md` doesn't record the IP release as in hand.
 - An agent can reach the keys, config or credentials for its own record or brake. Look for signing keys in agent environment variables, brake credentials in the agent stack, or proxy config an agent can write.
 - Recording can block, slow or crash the agent: synchronous sends on the agent's call path, unbounded buffers, or exceptions that can escape into agent code.
 - The brake reports success without positive verification, or treats a timeout or error as stopped instead of live.

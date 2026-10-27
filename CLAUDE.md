@@ -5,9 +5,10 @@ Wake is an independent recorder and brake for multiagent AI systems. The source 
 ## Current phase
 
 - Phase: Validate (months 0 to 1)
-- Validate gate: not recorded as cleared. The gate is a written IP release from Microsoft (or an exit), 5 teams with a real incident or stalled deal, and 3 design partners committed.
+- IP release from Microsoft: in hand (recorded October 26, 2026)
+- Rest of the Validate gate: not yet met. It needs 5 teams with a real incident or stalled deal, and 3 design partners committed.
 
-Update these two lines whenever a gate is passed. The `wake-scope` skill reads them.
+Update these lines as each part of a gate is met and when the phase changes. The `wake-scope` skill reads them.
 
 ## Repository
 
