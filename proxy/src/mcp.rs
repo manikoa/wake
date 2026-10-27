@@ -141,11 +141,32 @@ pub fn payload(input: Option<&[u8]>, output: Option<&[u8]>, error: Option<&str>)
 fn push_json(out: &mut String, bytes: Option<&[u8]>) {
     match bytes {
         None => out.push_str("null"),
-        Some(b) => match std::str::from_utf8(b) {
-            Ok(s) if serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok() => out.push_str(s.trim()),
-            _ => out.push_str(&Value::String(String::from_utf8_lossy(b).into_owned()).to_string()),
+        Some(b) => match as_json(b) {
+            Some(json) => out.push_str(json),
+            None => out.push_str(&Value::String(String::from_utf8_lossy(b).into_owned()).to_string()),
         },
     }
+}
+
+/// How deep JSON may nest to go into a payload as it is. Parsers cap nesting (serde_json
+/// at 128), and a payload wraps what it carries at least one level deeper.
+const MAX_EMBEDDED_DEPTH: usize = 100;
+
+/// The bytes as they are, trimmed, if they can go into a payload byte for byte: JSON that
+/// parses as a value, numbers in range included, nested no deeper than MAX_EMBEDDED_DEPTH.
+/// Anything else, such as `1e999`, which is JSON by its grammar but no parser's value,
+/// goes in quoted instead, so a payload is always JSON every consumer can read.
+pub fn as_json(bytes: &[u8]) -> Option<&str> {
+    fn depth(v: &Value) -> usize {
+        match v {
+            Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+            Value::Object(fields) => 1 + fields.values().map(depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    let value: Value = serde_json::from_str(s).ok()?;
+    (depth(&value) <= MAX_EMBEDDED_DEPTH).then(|| s.trim())
 }
 
 #[cfg(test)]
@@ -233,6 +254,20 @@ mod tests {
         );
         let p = payload(Some(b"\xff"), Some(b"{"), None);
         assert!(serde_json::from_str::<Value>(&p).is_ok(), "{p}");
+    }
+
+    #[test]
+    fn payload_quotes_json_no_parser_can_hold() {
+        // Found by fuzzing: a number out of a float's range is JSON by the grammar, but
+        // serde_json and Go's encoding/json both refuse it.
+        let p = payload(Some(b"6441e626"), Some(b"[1e999]"), None);
+        assert_eq!(p, r#"{"input":"6441e626","output":"[1e999]"}"#);
+        // Valid JSON nested so deep that wrapping it would pass serde_json's limit.
+        let deep = format!("{}{}", "[".repeat(128), "]".repeat(128));
+        let p = payload(Some(deep.as_bytes()), None, None);
+        assert!(serde_json::from_str::<Value>(&p).is_ok(), "{p}");
+        let fine = format!("{}{}", "[".repeat(100), "]".repeat(100));
+        assert_eq!(as_json(fine.as_bytes()), Some(fine.as_str()));
     }
 
     proptest! {
