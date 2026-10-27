@@ -1,5 +1,6 @@
 # Builds the Wake collector: the standard OTLP receiver plus Wake's signing
-# processor and signed log exporter. Run: make -C collector build
+# processor and signed log exporter, with file storage for the exporter's
+# persistent queue. Run: make -C collector build
 dist:
   name: wake-collector
   description: Wake collector
@@ -16,6 +17,9 @@ exporters:
   - gomod: github.com/manikoa/wake/collector v0.0.0
     import: github.com/manikoa/wake/collector/exporter/wakelogexporter
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.164.0
+
+extensions:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.164.0
 
 providers:
   - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.70.0
