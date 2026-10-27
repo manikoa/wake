@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use wake_proxy::export::Counters;
 use wake_proxy::pipeline::{self, Options};
-use wake_proxy::signer::{Signer, dev_identity};
+use wake_proxy::signer::{Signer, dev_identity_with_tls};
 
 #[derive(Parser)]
 #[command(version, about = "Records MCP calls through agentgateway as signed Wake events")]
@@ -35,6 +35,9 @@ enum Command {
         /// Seconds a request waits for its response before it's recorded without one.
         #[arg(long, default_value_t = 60)]
         response_timeout: u64,
+        /// A CA certificate (PEM) to trust for the collector's TLS, besides the system's.
+        #[arg(long)]
+        collector_ca: Option<PathBuf>,
     },
     /// Write a development identity: a stand-in trust bundle and a key and certificate
     /// signed by it. For local development only; SPIRE issues them in production.
@@ -43,6 +46,13 @@ enum Command {
         spiffe_id: String,
         #[arg(long, default_value = "keys")]
         out: PathBuf,
+        /// Also issue a TLS server certificate for the collector, signed by the same CA,
+        /// for these host names (repeatable). Written as collector-tls.pem and .key.
+        #[arg(long = "tls-host")]
+        tls_hosts: Vec<String>,
+        /// Succeed without writing if the identity already exists, as on a restart.
+        #[arg(long)]
+        keep_existing: bool,
     },
 }
 
@@ -52,16 +62,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     match Cli::parse().command {
-        Command::DevIdentity { spiffe_id, out } => {
-            let id = dev_identity(&spiffe_id)?;
+        Command::DevIdentity {
+            spiffe_id,
+            out,
+            tls_hosts,
+            keep_existing,
+        } => {
+            let mut files = vec!["bundle.pem", "proxy.pem", "proxy.key"];
+            if !tls_hosts.is_empty() {
+                files.extend(["collector-tls.pem", "collector-tls.key"]);
+            }
+            if keep_existing && files.iter().all(|f| out.join(f).exists()) {
+                return Ok(());
+            }
+            let id = dev_identity_with_tls(&spiffe_id, &tls_hosts)?;
             std::fs::create_dir_all(&out)?;
             std::fs::write(out.join("bundle.pem"), id.ca_pem)?;
             std::fs::write(out.join("proxy.pem"), id.cert_pem)?;
             write_private(&out.join("proxy.key"), &id.key_pem)?;
-            println!(
-                "wrote {}/bundle.pem, proxy.pem and proxy.key for {spiffe_id}",
-                out.display()
-            );
+            if let Some((cert, key)) = id.tls {
+                std::fs::write(out.join("collector-tls.pem"), cert)?;
+                write_private(&out.join("collector-tls.key"), &key)?;
+            }
+            println!("wrote a development identity for {spiffe_id} to {}", out.display());
         }
         Command::Serve {
             listen,
@@ -69,13 +92,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             cert,
             response_timeout,
+            collector_ca,
         } => {
             let signer = Signer::from_pem(&std::fs::read_to_string(key)?, &std::fs::read_to_string(cert)?)?;
-            tracing::info!(listen, collector, signer = signer.id(), "serving the ExtMCP processor");
+            tracing::info!(
+                listen,
+                collector,
+                signer = signer.id(),
+                "serving the ExtMCP and ext_proc processor"
+            );
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             let counters = Arc::new(Counters::default());
+            let collector_ca = collector_ca.map(std::fs::read).transpose()?;
             let options = Options {
                 collector,
+                collector_ca,
                 response_timeout: Duration::from_secs(response_timeout),
                 ..Default::default()
             };

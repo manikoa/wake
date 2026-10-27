@@ -20,6 +20,8 @@ use crate::signer::Signer;
 pub struct Options {
     /// The collector's OTLP/HTTP base URL.
     pub collector: String,
+    /// A CA certificate (PEM) to trust for the collector's TLS, besides the system's.
+    pub collector_ca: Option<Vec<u8>>,
     /// How long a request waits for its response before it's recorded without one.
     pub response_timeout: Duration,
     /// How many hooks and events may wait in each queue.
@@ -30,6 +32,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             collector: "http://localhost:4318".into(),
+            collector_ca: None,
             response_timeout: Duration::from_secs(60),
             queue: 10_000,
         }
@@ -49,7 +52,7 @@ pub async fn serve(
     let (unsigned_tx, mut unsigned_rx) = mpsc::channel::<Event>(options.queue);
     let (signed_tx, signed_rx) = mpsc::channel(options.queue);
 
-    let exporter = Exporter::new(&options.collector, counters.clone());
+    let exporter = Exporter::new(&options.collector, options.collector_ca.as_deref(), counters.clone());
     let exported = tokio::spawn(exporter.run(signed_rx));
 
     let sign_counters = counters.clone();

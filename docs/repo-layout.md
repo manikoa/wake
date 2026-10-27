@@ -18,10 +18,11 @@ sdk/typescript/   TypeScript SDK: the same coverage
 proxy/            Rust MCP and A2A proxy on agentgateway
 collector/        Go processor for the OpenTelemetry Collector
 log/              Go self hosted signed log on Trillian Tessera
+deploy/           Compose file that runs the recorder: collector, proxy and agentgateway
 docs/
 ```
 
-- Each folder uses its own language's standard tooling: cargo for `proxy/`, a separate Go module each for `collector/` and `log/`, uv for `sdk/python/`, and pnpm for `sdk/typescript/`. Don't add a cross-language build system.
+- Each folder uses its own language's standard tooling: cargo for `proxy/`, a separate Go module each for `collector/` and `log/`, uv for `sdk/python/`, and pnpm for `sdk/typescript/`. Don't add a cross-language build system. Each component's Dockerfile lives in its folder; `deploy/` only puts the images together.
 - The memory adapter lives inside the SDKs, as the roadmap describes, not in a folder of its own.
 - Create a folder when its first code lands, not before.
 

@@ -83,9 +83,17 @@ pub struct DevIdentity {
     pub ca_pem: String,
     pub cert_pem: String,
     pub key_pem: String,
+    /// A TLS server certificate and key signed by the same CA, for the collector's
+    /// receiver, when TLS hosts were asked for.
+    pub tls: Option<(String, String)>,
 }
 
 pub fn dev_identity(spiffe_id: &str) -> Result<DevIdentity, String> {
+    dev_identity_with_tls(spiffe_id, &[])
+}
+
+/// A development identity, plus a TLS server certificate for these hosts when there are any.
+pub fn dev_identity_with_tls(spiffe_id: &str, tls_hosts: &[String]) -> Result<DevIdentity, String> {
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, PKCS_ECDSA_P256_SHA256, SanType};
     let err = |e: rcgen::Error| e.to_string();
 
@@ -102,10 +110,20 @@ pub fn dev_identity(spiffe_id: &str) -> Result<DevIdentity, String> {
     let issuer = Issuer::new(ca, ca_key);
     let cert = leaf.signed_by(&key, &issuer).map_err(err)?;
 
+    let tls = if tls_hosts.is_empty() {
+        None
+    } else {
+        let tls_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
+        let server = CertificateParams::new(tls_hosts.to_vec()).map_err(err)?;
+        let tls_cert = server.signed_by(&tls_key, &issuer).map_err(err)?;
+        Some((tls_cert.pem(), tls_key.serialize_pem()))
+    };
+
     Ok(DevIdentity {
         ca_pem: ca_cert.pem(),
         cert_pem: cert.pem(),
         key_pem: key.serialize_pem(),
+        tls,
     })
 }
 
