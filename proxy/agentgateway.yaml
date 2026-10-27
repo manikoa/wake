@@ -1,11 +1,33 @@
 # yaml-language-server: $schema=https://agentgateway.dev/schema/config
 #
-# agentgateway v1.6.0 config that records MCP calls and A2A messages through wake-proxy.
-# agentgateway serves the agents on port 3000 and calls wake-proxy on localhost:9001: its
-# ExtMCP hook for MCP calls, and its ext_proc hook for A2A messages.
+# agentgateway v1.6.0 config that records MCP calls and A2A messages through wake-proxy,
+# and denies the calls the brake has halted. agentgateway serves the agents on port 3000
+# and calls wake-proxy on localhost:9001: its ExtMCP hook for MCP calls, its ext_proc hook
+# for A2A messages, and its ext_authz hook for the deny lever.
 gateways:
   default:
     port: 3000
+    # Every caller authenticates, so the deny lever and the record know which agent each
+    # call is from. Here agents present their X.509-SVIDs (mTLS); the files are what
+    # `wake-proxy dev-identity --gateway-host localhost --agent <name>` writes. Or validate
+    # their JWTs with a gateway-level jwtAuth (mode: strict) instead. Either must be on the
+    # gateway, not a route: the gateway's extAuthz below runs before any route's policies.
+    tls:
+      cert: keys/gateway/gateway.pem
+      key: keys/gateway/gateway.key
+      root: keys/gateway/bundle.pem
+    # The brake's deny lever, for every call on every route. It fails closed: if wake-proxy
+    # can't answer, the call is denied. Deny, unlike capture, never fails open. Never give
+    # it a cache, or a halt waits for the cache to expire.
+    extAuthz:
+      host: "localhost:9001"
+      failureMode: deny
+      protocol:
+        grpc:
+          metadata:
+            # Who's calling: the agent's SPIFFE ID from mTLS, else its JWT subject.
+            # wake-proxy's --agents map turns it into the name the brake halts by.
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")}'
 routes:
 # An A2A agent. Add one route like this per agent.
 - matches:
@@ -13,6 +35,17 @@ routes:
       pathPrefix: /agents/research
   policies:
     a2a: {}
+    # The deny lever again, naming the agent behind this route, so calls sent to a halted
+    # agent are denied too. Every A2A route needs one.
+    extAuthz:
+      host: "localhost:9001"
+      failureMode: deny
+      protocol:
+        grpc:
+          context:
+            receiver: research
+          metadata:
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")}'
     extProc:
       host: "localhost:9001"
       # Calls that start while wake-proxy is down go through unrecorded. One that's in
@@ -43,7 +76,7 @@ routes:
       - kind: remote
         host: "localhost:9001"
         # Recording never blocks: if wake-proxy is down or slow, calls go through
-        # unrecorded. Deny, in the Brake phase, goes in its own processor and fails closed.
+        # unrecorded. Deny is the gateway's extAuthz above, which fails closed.
         failureMode: failOpen
         methods:
           tools/call: full

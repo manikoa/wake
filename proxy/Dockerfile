@@ -9,7 +9,7 @@ WORKDIR /src
 COPY proxy/ .
 RUN cargo build --release --locked --bin wake-proxy
 # Directories volumes mount over, owned by the user the proxy runs as.
-RUN mkdir -p /out/etc/wake/identity /out/var/lib/wake-proxy
+RUN mkdir -p /out/etc/wake/identity /out/etc/wake/gateway /out/var/lib/wake-proxy
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/wake-proxy /wake-proxy
@@ -21,5 +21,7 @@ USER nonroot
 # their quarantine rules, read only.
 EXPOSE 9001 9002 9003
 ENTRYPOINT ["/wake-proxy"]
+# The halts state must be initialized once (wake-proxy init --state-dir /var/lib/wake-proxy);
+# until it is, every call is denied.
 CMD ["serve", "--listen", "0.0.0.0:9001", "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem", \
      "--state-dir", "/var/lib/wake-proxy"]

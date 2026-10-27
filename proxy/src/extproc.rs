@@ -29,6 +29,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::a2a;
+use crate::agents::Agents;
 use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::mcp::{self, TraceParent};
@@ -101,6 +102,7 @@ pub struct Exchange {
     response_truncated: bool,
     reply_emitted: bool,
     tasks: Option<Arc<a2a::Tasks>>,
+    agents: Arc<Agents>,
 }
 
 impl Exchange {
@@ -110,6 +112,12 @@ impl Exchange {
             tasks: Some(tasks),
             ..Default::default()
         }
+    }
+
+    /// Names the sender and receiver through this identity map.
+    pub fn with_agents(mut self, agents: Arc<Agents>) -> Self {
+        self.agents = agents;
+        self
     }
 
     /// Answers one message from the gateway and returns any events it completes. The
@@ -122,16 +130,15 @@ impl Exchange {
                 self.response_mode = c.response_body_mode;
             }
             let attrs = attributes(&request);
-            self.sender = attrs
-                .get(ATTR_SENDER)
-                .filter(|s| !s.is_empty())
-                .cloned()
-                .unwrap_or_else(|| "unknown".into());
-            self.receiver = attrs
-                .get(ATTR_RECEIVER)
-                .filter(|s| !s.is_empty())
-                .cloned()
-                .unwrap_or_else(|| "unknown".into());
+            let named = |key: &str| {
+                attrs
+                    .get(key)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| self.agents.record(s).to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            };
+            self.sender = named(ATTR_SENDER);
+            self.receiver = named(ATTR_RECEIVER);
         }
         let mut events = Vec::new();
         let answer = match request.request {
@@ -517,17 +524,19 @@ pub struct Processor {
     events: mpsc::Sender<Event>,
     counters: Arc<Counters>,
     tasks: Arc<a2a::Tasks>,
+    agents: Arc<Agents>,
 }
 
 /// How many tasks the processor remembers the starting message of.
 pub const TASKS_REMEMBERED: usize = 10_000;
 
 impl Processor {
-    pub fn new(events: mpsc::Sender<Event>, counters: Arc<Counters>) -> Self {
+    pub fn new(events: mpsc::Sender<Event>, counters: Arc<Counters>, agents: Arc<Agents>) -> Self {
         Processor {
             events,
             counters,
             tasks: Arc::new(a2a::Tasks::new(TASKS_REMEMBERED)),
+            agents,
         }
     }
 
@@ -550,8 +559,9 @@ impl ExternalProcessor for Processor {
         let events = self.events.clone();
         let counters = self.counters.clone();
         let tasks = self.tasks.clone();
+        let agents = self.agents.clone();
         tokio::spawn(async move {
-            let mut exchange = Exchange::with_tasks(tasks);
+            let mut exchange = Exchange::with_tasks(tasks).with_agents(agents);
             let emit = |list: Vec<Event>| {
                 for e in list {
                     if events.try_send(e).is_err() {
@@ -892,6 +902,27 @@ mod tests {
             br#"{"result":{"id":"t-unknown"}}"#,
         );
         assert_eq!(events[0].attributes["wake.parents"], Value::Strs(vec![]));
+    }
+
+    #[test]
+    fn the_identity_map_names_the_sender() {
+        let map = br#"{"planner": ["spiffe://wake.local/agent/planner"]}"#;
+        let agents = Arc::new(Agents::from_json(map).unwrap());
+        let mut x = Exchange::default().with_agents(agents);
+        let events = exchange(&mut x, SEND, REPLY);
+        let [message, reply] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        assert_eq!(
+            message.attributes["wake.origins"],
+            Value::Strs(vec!["agent:planner".into()])
+        );
+        assert_eq!(s(reply, "wake.agent.id"), "planner");
+        assert_eq!(
+            s(message, "wake.agent.id"),
+            "research",
+            "a name the map doesn't list stays as it is"
+        );
     }
 
     #[test]

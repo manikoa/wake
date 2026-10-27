@@ -26,8 +26,12 @@ struct Control {
 }
 
 async fn control() -> Control {
+    control_with(Halts::in_memory()).await
+}
+
+async fn control_with(halts: Halts) -> Control {
     let id = dev_identity_with_tls("spiffe://wake.local/proxy", &[], Some(BRAKE)).unwrap();
-    let halts = Arc::new(Halts::in_memory());
+    let halts = Arc::new(halts);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("https://{}", listener.local_addr().unwrap());
     let tls = control::Tls {
@@ -82,7 +86,7 @@ async fn the_brake_puts_lists_and_lifts_halts() {
     assert_eq!(state["version"], 1);
     assert_eq!(state["halts"][0]["id"], "halt-1");
     assert_eq!(state["halts"][0]["issued_at"], 42);
-    assert!(c.halts.deciding(Some("billing"), None).is_some());
+    assert_eq!(c.halts.deciding(Some("billing"), None).len(), 1);
 
     let listed: serde_json::Value = brake
         .get(format!("{}/v1/halts", c.url))
@@ -101,7 +105,7 @@ async fn the_brake_puts_lists_and_lifts_halts() {
         (state["version"].as_u64(), state["halts"].as_array().unwrap().len()),
         (Some(2), 0)
     );
-    assert!(c.halts.deciding(Some("billing"), None).is_none());
+    assert!(c.halts.deciding(Some("billing"), None).is_empty());
 }
 
 #[tokio::test]
@@ -254,4 +258,67 @@ async fn a_quarantine_reaches_the_memory_adapters() {
         .unwrap();
     let state: serde_json::Value = released.json().await.unwrap();
     assert_eq!(state["quarantines"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_halt_that_cant_be_stored_is_in_force_but_not_acknowledged() {
+    let dir = std::env::temp_dir().join(format!("wake-control-{}", uuid::Uuid::new_v4()));
+    Halts::init(&dir).unwrap();
+    let c = control_with(Halts::load(&dir)).await;
+    // The disk goes away.
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"").unwrap();
+    let put = client(&c, &c.brake)
+        .put(format!("{}/v1/halts/halt-1", c.url))
+        .json(&serde_json::json!({"scope": {"agents": ["billing"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 500, "not the lever's acknowledgement");
+    let state: serde_json::Value = put.json().await.unwrap();
+    assert_eq!(state["halts"][0]["id"], "halt-1");
+    assert!(state["not_persisted"].is_string(), "{state}");
+    assert_eq!(c.halts.deciding(Some("billing"), None).len(), 1, "but in force");
+    let listed: serde_json::Value = client(&c, &c.brake)
+        .get(format!("{}/v1/halts", c.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed["not_persisted"].is_string());
+    std::fs::remove_file(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn the_brake_initializes_a_proxy_that_lost_its_state() {
+    let dir = std::env::temp_dir().join(format!("wake-control-{}", uuid::Uuid::new_v4()));
+    let c = control_with(Halts::load(&dir)).await;
+    let brake = client(&c, &c.brake);
+    let listed: serde_json::Value = brake
+        .get(format!("{}/v1/halts", c.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["uninitialized"], true);
+    assert!(listed.get("epoch").is_none());
+    assert_eq!(c.halts.deciding(Some("billing"), None)[0].id, "uninitialized-state");
+    let lifted: serde_json::Value = brake
+        .delete(format!("{}/v1/halts/uninitialized-state", c.url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(lifted.get("uninitialized").is_none());
+    assert!(lifted["epoch"].as_str().is_some_and(|e| !e.is_empty()));
+    assert!(c.halts.deciding(Some("billing"), None).is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

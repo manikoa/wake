@@ -10,8 +10,12 @@
 //! GET    /v1/memory/seen        each agent's memory adapter: the version it last fetched, and when
 //! ```
 //!
-//! Each answers with the state now in force and its version, and a change answers only
-//! once it's on disk, so the brake can count that answer as the lever's acknowledgement.
+//! Each answers with the state now in force and its version, and a change answers 200 only
+//! once it's on disk, so the brake can count that answer as the lever's acknowledgement. A
+//! change that couldn't be written is in force anyway: it answers 500 with the state, whose
+//! `not_persisted` says why, and a restart would lose it. Until the state is initialized,
+//! or while it can't be read, every call is denied; lifting `uninitialized-state` or
+//! `unreadable-state` starts it over with a new `epoch`.
 //!
 //! It listens on its own port, apart from the hooks agentgateway calls, over TLS with the
 //! proxy's SVID, and serves only clients that present an X.509-SVID chained to the trust
@@ -22,6 +26,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -98,41 +103,30 @@ fn valid_id(id: &str) -> Result<(), Failure> {
     ))
 }
 
-fn stored(result: std::io::Result<halts::State>) -> Result<Json<halts::State>, Failure> {
-    result.map(Json).map_err(|e| {
-        tracing::error!(error = %e, "couldn't store the halts");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("couldn't store the halts: {e}"),
-        )
-    })
+fn stored(result: Result<halts::Changed, tokio::task::JoinError>) -> Response {
+    match result {
+        Ok(Ok(state)) => Json(state).into_response(),
+        Ok(Err(not_persisted)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(*not_persisted.state)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
-async fn put_halt(
-    State(halts): State<Arc<Halts>>,
-    Path(id): Path<String>,
-    Json(body): Json<PutHalt>,
-) -> Result<Json<halts::State>, Failure> {
-    valid_id(&id)?;
+async fn put_halt(State(halts): State<Arc<Halts>>, Path(id): Path<String>, Json(body): Json<PutHalt>) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
     if body.scope.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "a halt needs a scope: the fleet, or agents".into(),
-        ));
+        return (StatusCode::BAD_REQUEST, "a halt needs a scope: the fleet, or agents").into_response();
     }
     let issued_at = body.issued_at.unwrap_or_else(halts::now);
-    let result = tokio::task::spawn_blocking(move || halts.put(&id, body.scope, issued_at))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    stored(result)
+    stored(tokio::task::spawn_blocking(move || halts.put(&id, body.scope, issued_at)).await)
 }
 
-async fn lift_halt(State(halts): State<Arc<Halts>>, Path(id): Path<String>) -> Result<Json<halts::State>, Failure> {
-    valid_id(&id)?;
-    let result = tokio::task::spawn_blocking(move || halts.lift(&id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    stored(result)
+async fn lift_halt(State(halts): State<Arc<Halts>>, Path(id): Path<String>) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
+    stored(tokio::task::spawn_blocking(move || halts.lift(&id)).await)
 }
 
 async fn list_halts(State(halts): State<Arc<Halts>>) -> Json<halts::State> {
@@ -150,30 +144,22 @@ async fn put_quarantine(
     State(halts): State<Arc<Halts>>,
     Path(id): Path<String>,
     Json(body): Json<PutQuarantine>,
-) -> Result<Json<halts::State>, Failure> {
-    valid_id(&id)?;
+) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
     if body.selection.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "a quarantine needs something to lock or hide".into(),
-        ));
+        return (StatusCode::BAD_REQUEST, "a quarantine needs something to lock or hide").into_response();
     }
     let issued_at = body.issued_at.unwrap_or_else(halts::now);
-    let result = tokio::task::spawn_blocking(move || halts.quarantine(&id, body.selection, issued_at))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    stored(result)
+    stored(tokio::task::spawn_blocking(move || halts.quarantine(&id, body.selection, issued_at)).await)
 }
 
-async fn release_quarantine(
-    State(halts): State<Arc<Halts>>,
-    Path(id): Path<String>,
-) -> Result<Json<halts::State>, Failure> {
-    valid_id(&id)?;
-    let result = tokio::task::spawn_blocking(move || halts.release(&id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    stored(result)
+async fn release_quarantine(State(halts): State<Arc<Halts>>, Path(id): Path<String>) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
+    stored(tokio::task::spawn_blocking(move || halts.release(&id)).await)
 }
 
 async fn memory_seen(State(halts): State<Arc<Halts>>) -> Json<std::collections::HashMap<String, halts::Seen>> {

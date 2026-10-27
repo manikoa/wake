@@ -53,10 +53,10 @@ The message is a parent of B's next event. An answer going back from B to A is a
 
 The proxy's deny lever records each call it denies as a `denied` event, captured by the proxy and signed like its other events (the memory adapter records the memory it refuses the same way; see Memory):
 
-- `wake.agent.id` is the caller, or `unknown`.
+- `wake.agent.id` is the caller, under its agent's name when the proxy's agents file lists its identity, or `unknown`.
 - `wake.parents` come from the call's link, so the event joins the caller's trace under the step that made the call.
-- `wake.brake.halt_id` names the halt that denied it, and `wake.brake.receiver` the agent the call was sent to, when there is one.
-- `wake.payload` is `{"caller", "receiver", "method", "host", "path", "halt"}`.
+- `wake.brake.halt_id` names the first halt that denied it, and `wake.brake.receiver` the agent the call was sent to, when there is one.
+- `wake.payload` is `{"caller", "identity", "receiver", "method", "host", "path", "halt", "halts"}`: `identity` is what the caller authenticated as, when its name differs, and `halts` every halt that covered the call.
 
 ## Memory
 

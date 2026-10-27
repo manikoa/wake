@@ -3,6 +3,7 @@
 //! halted. See docs/proxy.md.
 
 pub mod a2a;
+pub mod agents;
 pub mod authz;
 pub mod canonical;
 pub mod capture;

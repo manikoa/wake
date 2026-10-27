@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use wake_proxy::agents::Agents;
 use wake_proxy::control;
 use wake_proxy::export::Counters;
 use wake_proxy::halts::Halts;
 use wake_proxy::pipeline::{self, Options};
-use wake_proxy::signer::{Signer, dev_identity_with_tls};
+use wake_proxy::signer::{DevExtras, Signer, dev_identity_with};
 
 #[derive(Parser)]
 #[command(version, about = "Records MCP calls through agentgateway as signed Wake events")]
@@ -41,9 +42,17 @@ enum Command {
         /// A CA certificate (PEM) to trust for the collector's TLS, besides the system's.
         #[arg(long)]
         collector_ca: Option<PathBuf>,
-        /// Where the halts in force are kept, so a restart doesn't lift one.
-        #[arg(long, default_value = "state")]
+        /// Where the halts in force are kept, so a restart doesn't lift one: an absolute path,
+        /// initialized once with `wake-proxy init`. Until it is, every call is denied.
+        #[arg(long)]
         state_dir: PathBuf,
+        /// A JSON file naming each agent and the identities it authenticates with, its SPIFFE
+        /// IDs and JWT subjects: {"billing": ["spiffe://example.org/agent/billing"]}. With it,
+        /// the brake halts agents by name, proxy events name agents the same way, and a caller
+        /// it doesn't list is denied while any agent is halted. Without it, identities are
+        /// names.
+        #[arg(long)]
+        agents: Option<PathBuf>,
         /// Where the brake reaches the control API (mTLS). Only the brake may reach it.
         /// Without it, halts can't be put or lifted.
         #[arg(long)]
@@ -58,6 +67,17 @@ enum Command {
         /// Where the SDKs' memory adapters fetch the memory quarantines (read only).
         #[arg(long)]
         memory_listen: Option<String>,
+    },
+    /// Initialize the halts state: a new, empty state with a new epoch. The deny lever
+    /// denies every call until this has been done once, so a proxy that loses its state
+    /// fails closed instead of starting over with no halts.
+    Init {
+        /// The directory `serve --state-dir` names.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Succeed without writing if the state already exists, as on a restart.
+        #[arg(long)]
+        keep_existing: bool,
     },
     /// Write a development identity: a stand-in trust bundle and a key and certificate
     /// signed by it. For local development only; SPIRE issues them in production.
@@ -74,6 +94,18 @@ enum Command {
         /// brake.pem and brake.key.
         #[arg(long)]
         brake_id: Option<String>,
+        /// Also issue agentgateway a TLS server certificate for these host names (repeatable),
+        /// to serve agents mTLS with. Written to --gateway-out as gateway.pem and .key, with
+        /// the trust bundle, apart from the keys agentgateway mustn't hold.
+        #[arg(long = "gateway-host")]
+        gateway_hosts: Vec<String>,
+        #[arg(long)]
+        gateway_out: Option<PathBuf>,
+        /// Also issue each of these agents an SVID, spiffe://<trust domain>/agent/<name>
+        /// (repeatable, or comma separated), to call through agentgateway with. Written as
+        /// agents/<name>.pem and .key.
+        #[arg(long = "agent", value_delimiter = ',')]
+        agents: Vec<String>,
         /// Succeed without writing if the identity already exists, as on a restart.
         #[arg(long)]
         keep_existing: bool,
@@ -86,26 +118,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     match Cli::parse().command {
+        Command::Init {
+            state_dir,
+            keep_existing,
+        } => {
+            absolute(&state_dir)?;
+            match Halts::init(&state_dir) {
+                Ok(state) => println!(
+                    "initialized the halts state in {}, epoch {}",
+                    state_dir.display(),
+                    state.epoch
+                ),
+                Err(e) if keep_existing && e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    println!("the halts state in {} already exists", state_dir.display())
+                }
+                Err(e) => return Err(format!("{}: {e}", state_dir.display()).into()),
+            }
+        }
         Command::DevIdentity {
             spiffe_id,
             out,
             tls_hosts,
             brake_id,
+            gateway_hosts,
+            gateway_out,
+            agents,
             keep_existing,
         } => {
-            let mut files = vec!["bundle.pem", "proxy.pem", "proxy.key"];
+            let gateway_out = gateway_out.unwrap_or_else(|| out.join("gateway"));
+            let agents: Vec<String> = agents.into_iter().filter(|a| !a.is_empty()).collect();
+            let mut files: Vec<PathBuf> = ["bundle.pem", "proxy.pem", "proxy.key"].map(|f| out.join(f)).into();
             if !tls_hosts.is_empty() {
-                files.extend(["collector-tls.pem", "collector-tls.key"]);
+                files.extend(["collector-tls.pem", "collector-tls.key"].map(|f| out.join(f)));
             }
             if brake_id.is_some() {
-                files.extend(["brake.pem", "brake.key"]);
+                files.extend(["brake.pem", "brake.key"].map(|f| out.join(f)));
             }
-            if keep_existing && files.iter().all(|f| out.join(f).exists()) {
+            if !gateway_hosts.is_empty() {
+                files.extend(["bundle.pem", "gateway.pem", "gateway.key"].map(|f| gateway_out.join(f)));
+            }
+            for agent in &agents {
+                files.extend([".pem", ".key"].map(|ext| out.join("agents").join(format!("{agent}{ext}"))));
+            }
+            if keep_existing && files.iter().all(|f| f.exists()) {
                 return Ok(());
             }
-            let id = dev_identity_with_tls(&spiffe_id, &tls_hosts, brake_id.as_deref())?;
+            let id = dev_identity_with(
+                &spiffe_id,
+                &DevExtras {
+                    tls_hosts: &tls_hosts,
+                    brake_id: brake_id.as_deref(),
+                    gateway_hosts: &gateway_hosts,
+                    agents: &agents,
+                },
+            )?;
             std::fs::create_dir_all(&out)?;
-            std::fs::write(out.join("bundle.pem"), id.ca_pem)?;
+            std::fs::write(out.join("bundle.pem"), &id.ca_pem)?;
             std::fs::write(out.join("proxy.pem"), id.cert_pem)?;
             write_private(&out.join("proxy.key"), &id.key_pem)?;
             if let Some((cert, key)) = id.tls {
@@ -115,6 +183,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((cert, key)) = id.brake {
                 std::fs::write(out.join("brake.pem"), cert)?;
                 write_private(&out.join("brake.key"), &key)?;
+            }
+            if let Some((cert, key)) = id.gateway {
+                std::fs::create_dir_all(&gateway_out)?;
+                std::fs::write(gateway_out.join("bundle.pem"), &id.ca_pem)?;
+                std::fs::write(gateway_out.join("gateway.pem"), cert)?;
+                write_private(&gateway_out.join("gateway.key"), &key)?;
+            }
+            if !id.agents.is_empty() {
+                std::fs::create_dir_all(out.join("agents"))?;
+            }
+            for (name, cert, key) in id.agents {
+                std::fs::write(out.join("agents").join(format!("{name}.pem")), cert)?;
+                write_private(&out.join("agents").join(format!("{name}.key")), &key)?;
             }
             println!("wrote a development identity for {spiffe_id} to {}", out.display());
         }
@@ -126,6 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             response_timeout,
             collector_ca,
             state_dir,
+            agents,
             control_listen,
             trust_bundle,
             brake_id,
@@ -134,11 +216,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_pem = std::fs::read_to_string(key)?;
             let cert_pem = std::fs::read_to_string(cert)?;
             let signer = Signer::from_pem(&key_pem, &cert_pem)?;
-            let halts = Arc::new(Halts::load(&state_dir));
+            absolute(&state_dir)?;
+            let agents = match agents {
+                Some(path) => {
+                    Agents::from_json(&std::fs::read(&path)?).map_err(|e| format!("{}: {e}", path.display()))?
+                }
+                None => Agents::none(),
+            };
+            let halts = Arc::new(Halts::load(&state_dir).with_agents(Arc::new(agents)));
             let in_force = halts.state();
             tracing::info!(
                 version = in_force.version,
+                epoch = in_force.epoch,
                 halts = in_force.halts.len(),
+                uninitialized = in_force.uninitialized,
+                unreadable = in_force.unreadable.is_some(),
                 "halts in force"
             );
             tracing::info!(
@@ -231,6 +323,16 @@ async fn stopping() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// A relative state directory would depend on where the proxy happens to start, and a
+/// different one is a state that's lost.
+fn absolute(dir: &std::path::Path) -> Result<(), String> {
+    if dir.is_absolute() {
+        Ok(())
+    } else {
+        Err(format!("--state-dir must be an absolute path, not {}", dir.display()))
     }
 }
 

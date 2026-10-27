@@ -12,7 +12,8 @@ use prost_types::{Struct, Value as PbValue, value::Kind};
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
-use crate::capture::{Hook, META_EVENT_ID};
+use crate::agents::Agents;
+use crate::capture::{Hook, META_AGENT, META_EVENT_ID};
 use crate::export::Counters;
 use crate::mcp;
 
@@ -30,11 +31,26 @@ pub const MAX_MESSAGE: usize = 32 << 20;
 pub struct Processor {
     hooks: mpsc::Sender<Hook>,
     counters: Arc<Counters>,
+    agents: Arc<Agents>,
 }
 
 impl Processor {
-    pub fn new(hooks: mpsc::Sender<Hook>, counters: Arc<Counters>) -> Self {
-        Processor { hooks, counters }
+    pub fn new(hooks: mpsc::Sender<Hook>, counters: Arc<Counters>, agents: Arc<Agents>) -> Self {
+        Processor {
+            hooks,
+            counters,
+            agents,
+        }
+    }
+
+    /// The string values in the metadata, with the caller named through the identity map.
+    fn metadata(&self, s: Option<Struct>) -> HashMap<String, String> {
+        let mut metadata = strings(s);
+        if let Some(agent) = metadata.get(META_AGENT) {
+            let named = self.agents.record(agent).to_string();
+            metadata.insert(META_AGENT.into(), named);
+        }
+        metadata
     }
 
     pub fn server(self) -> pb::ext_mcp_server::ExtMcpServer<Self> {
@@ -88,7 +104,7 @@ impl ExtMcp for Processor {
             event_id: event_id.clone(),
             method: r.method,
             server: r.service_names.into_iter().next().unwrap_or_default(),
-            metadata: strings(r.metadata_context),
+            metadata: self.metadata(r.metadata_context),
             params: r.mcp_request,
             headers: r.headers.into_iter().map(|h| (h.key, h.value)).collect(),
             at: SystemTime::now(),
@@ -112,7 +128,7 @@ impl ExtMcp for Processor {
             self.queue(Hook::Response {
                 method: r.method,
                 server: r.service_names.into_iter().next().unwrap_or_default(),
-                metadata: strings(r.metadata_context),
+                metadata: self.metadata(r.metadata_context),
                 result: r.mcp_response,
                 at: SystemTime::now(),
             });

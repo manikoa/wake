@@ -1,7 +1,8 @@
 # The open source recorder, for a staging environment: the collector, which signs events
 # and keeps the signed log; wake-proxy, which also enforces the brake's halts; and
-# agentgateway in front of your MCP servers and A2A agents (agentgateway.yaml). Keys and a development identity are created on first
-# start and kept in volumes. See deploy/README.md.
+# agentgateway in front of your MCP servers and A2A agents (agentgateway.yaml), which
+# requires every agent to present its SVID. Keys, a development identity and the halts
+# state are created on first start and kept in volumes. See deploy/README.md.
 name: wake
 
 x-collector-image: &collector-image
@@ -29,13 +30,22 @@ services:
     command: ["-keep-existing", "-name", "wake-log", "-out", "/etc/wake/keys/log"]
     volumes: [keys:/etc/wake/keys]
   # One-shot: a development CA standing in for SPIRE, the proxy's SVID, the collector's TLS
-  # certificate, and the brake's SVID for the proxy's control API. Production gets these
-  # from SPIRE.
+  # certificate, the brake's SVID for the proxy's control API, agentgateway's TLS
+  # certificate, and an SVID for each agent in WAKE_DEV_AGENTS (comma separated), written
+  # to identity/agents/<name>.pem and .key. Production gets these from SPIRE.
   identity:
     <<: *proxy-image
     command: ["dev-identity", "--keep-existing", "--out", "/etc/wake/identity", "--spiffe-id", "spiffe://wake.local/proxy",
-              "--tls-host", "collector", "--tls-host", "localhost", "--brake-id", "spiffe://wake.local/brake"]
-    volumes: [identity:/etc/wake/identity]
+              "--tls-host", "collector", "--tls-host", "localhost", "--brake-id", "spiffe://wake.local/brake",
+              "--gateway-host", "agentgateway", "--gateway-host", "localhost", "--gateway-out", "/etc/wake/gateway",
+              "--agent", "${WAKE_DEV_AGENTS:-research,smoke-test}"]
+    volumes: [identity:/etc/wake/identity, gateway-identity:/etc/wake/gateway]
+  # One-shot: the halts state, initialized once when its volume is new. A wake-proxy that
+  # starts without it denies every call, so losing the volume can't quietly lift a halt.
+  proxy-state:
+    <<: *proxy-image
+    command: ["init", "--state-dir", "/var/lib/wake-proxy", "--keep-existing"]
+    volumes: [proxy-state:/var/lib/wake-proxy]
 
   collector:
     <<: *collector-image
@@ -54,11 +64,12 @@ services:
     <<: *proxy-image
     depends_on:
       identity: {condition: service_completed_successfully}
+      proxy-state: {condition: service_completed_successfully}
       collector: {condition: service_started}
     command: ["serve", "--listen", "0.0.0.0:9001",
               "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem",
               "--collector", "https://collector:4318", "--collector-ca", "/etc/wake/identity/bundle.pem",
-              "--state-dir", "/var/lib/wake-proxy",
+              "--state-dir", "/var/lib/wake-proxy", "--agents", "/etc/wake/agents.json",
               "--control-listen", "0.0.0.0:9002", "--trust-bundle", "/etc/wake/identity/bundle.pem",
               "--memory-listen", "0.0.0.0:9003"]
     environment:
@@ -67,6 +78,9 @@ services:
       - identity:/etc/wake/identity:ro
       # The halts in force, kept so a restart doesn't lift one.
       - proxy-state:/var/lib/wake-proxy
+      # Which agent each SPIFFE ID or JWT subject is: the names the brake halts by.
+      # WAKE_AGENTS swaps in another map, as the reference fleet does.
+      - ${WAKE_AGENTS:-./agents.json}:/etc/wake/agents.json:ro
     # Not published. Only agentgateway may reach 9001, and only the brake, which alone has
     # the SVID the control API checks, may use 9002. Memory adapters read their quarantine
     # rules from 9003.
@@ -74,10 +88,15 @@ services:
 
   agentgateway:
     image: cr.agentgateway.dev/agentgateway:v1.6.0
-    depends_on: [wake-proxy]
+    depends_on:
+      identity: {condition: service_completed_successfully}
+      wake-proxy: {condition: service_started}
     command: ["-f", "/etc/agentgateway/config.yaml"]
-    # WAKE_GATEWAY_CONFIG swaps in another config, as the reference fleet does.
-    volumes: ["${WAKE_GATEWAY_CONFIG:-./agentgateway.yaml}:/etc/agentgateway/config.yaml:ro"]
+    # WAKE_GATEWAY_CONFIG swaps in another config, as the reference fleet does. The gateway
+    # gets its own TLS certificate and the trust bundle, never the proxy's or the brake's keys.
+    volumes:
+      - "${WAKE_GATEWAY_CONFIG:-./agentgateway.yaml}:/etc/agentgateway/config.yaml:ro"
+      - gateway-identity:/etc/wake/gateway:ro
     ports: ["3000:3000"]
     # Lets the example backends in agentgateway.yaml reach services on the host.
     extra_hosts: ["host.docker.internal:host-gateway"]
@@ -86,5 +105,6 @@ services:
 volumes:
   keys:
   identity:
+  gateway-identity:
   proxy-state:
   data:

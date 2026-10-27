@@ -88,10 +88,28 @@ pub struct DevIdentity {
     pub tls: Option<(String, String)>,
     /// An SVID and key for the brake, which the control API checks, when asked for.
     pub brake: Option<(String, String)>,
+    /// A TLS server certificate and key for agentgateway, which it serves agents mTLS with,
+    /// when gateway hosts were asked for.
+    pub gateway: Option<(String, String)>,
+    /// Each agent asked for, with an SVID and key: spiffe://<trust domain>/agent/<name>.
+    pub agents: Vec<(String, String, String)>,
+}
+
+/// What else a development identity issues, besides the processor's SVID.
+#[derive(Default)]
+pub struct DevExtras<'a> {
+    /// Host names for the collector's TLS server certificate.
+    pub tls_hosts: &'a [String],
+    /// The brake's SPIFFE ID, for its SVID.
+    pub brake_id: Option<&'a str>,
+    /// Host names for agentgateway's TLS server certificate.
+    pub gateway_hosts: &'a [String],
+    /// Agents to issue SVIDs, by name.
+    pub agents: &'a [String],
 }
 
 pub fn dev_identity(spiffe_id: &str) -> Result<DevIdentity, String> {
-    dev_identity_with_tls(spiffe_id, &[], None)
+    dev_identity_with(spiffe_id, &DevExtras::default())
 }
 
 /// A development identity, plus a TLS server certificate for these hosts when there are
@@ -101,6 +119,40 @@ pub fn dev_identity_with_tls(
     tls_hosts: &[String],
     brake_id: Option<&str>,
 ) -> Result<DevIdentity, String> {
+    dev_identity_with(
+        spiffe_id,
+        &DevExtras {
+            tls_hosts,
+            brake_id,
+            ..Default::default()
+        },
+    )
+}
+
+/// The trust domain of a SPIFFE ID: spiffe://<trust domain>/<path>.
+pub fn trust_domain(spiffe_id: &str) -> Option<&str> {
+    let rest = spiffe_id.strip_prefix("spiffe://")?;
+    let td = rest.split('/').next()?;
+    (!td.is_empty()).then_some(td)
+}
+
+/// Whether a name can be an agent's: a SPIFFE ID path segment and a file name.
+pub fn valid_agent_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !name.starts_with('.')
+}
+
+/// A development identity, plus whatever extras asks for, all signed by one CA.
+pub fn dev_identity_with(spiffe_id: &str, extras: &DevExtras) -> Result<DevIdentity, String> {
+    let DevExtras {
+        tls_hosts,
+        brake_id,
+        gateway_hosts,
+        agents,
+    } = *extras;
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
         PKCS_ECDSA_P256_SHA256, SanType,
@@ -126,31 +178,40 @@ pub fn dev_identity_with_tls(
     let issuer = Issuer::new(ca, ca_key);
     let cert = leaf.signed_by(&key, &issuer).map_err(err)?;
 
-    let tls = if tls_hosts.is_empty() {
-        None
-    } else {
-        let tls_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
-        let mut server = CertificateParams::new(tls_hosts.to_vec()).map_err(err)?;
+    let server = |hosts: &[String]| -> Result<(String, String), String> {
+        let server_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
+        let mut server = CertificateParams::new(hosts.to_vec()).map_err(err)?;
         server.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         server.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         server.use_authority_key_identifier_extension = true;
-        let tls_cert = server.signed_by(&tls_key, &issuer).map_err(err)?;
-        Some((tls_cert.pem(), tls_key.serialize_pem()))
+        let server_cert = server.signed_by(&server_key, &issuer).map_err(err)?;
+        Ok((server_cert.pem(), server_key.serialize_pem()))
+    };
+    let client = |id: &str| -> Result<(String, String), String> {
+        let client_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
+        let mut client = CertificateParams::new(Vec::<String>::new()).map_err(err)?;
+        client.subject_alt_names = vec![SanType::URI(id.try_into().map_err(err)?)];
+        client.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        client.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        client.use_authority_key_identifier_extension = true;
+        let client_cert = client.signed_by(&client_key, &issuer).map_err(err)?;
+        Ok((client_cert.pem(), client_key.serialize_pem()))
     };
 
-    let brake = match brake_id {
-        None => None,
-        Some(brake_id) => {
-            let brake_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
-            let mut client = CertificateParams::new(Vec::<String>::new()).map_err(err)?;
-            client.subject_alt_names = vec![SanType::URI(brake_id.try_into().map_err(err)?)];
-            client.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-            client.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-            client.use_authority_key_identifier_extension = true;
-            let brake_cert = client.signed_by(&brake_key, &issuer).map_err(err)?;
-            Some((brake_cert.pem(), brake_key.serialize_pem()))
-        }
-    };
+    let tls = (!tls_hosts.is_empty()).then(|| server(tls_hosts)).transpose()?;
+    let brake = brake_id.map(client).transpose()?;
+    let gateway = (!gateway_hosts.is_empty()).then(|| server(gateway_hosts)).transpose()?;
+    let agents = agents
+        .iter()
+        .map(|name| {
+            let td = trust_domain(spiffe_id).ok_or_else(|| format!("{spiffe_id} isn't a SPIFFE ID"))?;
+            if !valid_agent_name(name) {
+                return Err(format!("{name:?} isn't an agent name: 1 to 64 of A-Z a-z 0-9 . _ -"));
+            }
+            let (cert, key) = client(&format!("spiffe://{td}/agent/{name}"))?;
+            Ok((name.clone(), cert, key))
+        })
+        .collect::<Result<_, String>>()?;
 
     Ok(DevIdentity {
         ca_pem: ca_cert.pem(),
@@ -158,6 +219,8 @@ pub fn dev_identity_with_tls(
         key_pem: key.serialize_pem(),
         tls,
         brake,
+        gateway,
+        agents,
     })
 }
 
@@ -202,6 +265,44 @@ mod tests {
         let mut other_payload = event.clone();
         other_payload.set("wake.payload", Value::Str("{}".into()));
         key.verify(&canonical(&other_payload), &sig).unwrap();
+    }
+
+    #[test]
+    fn issues_the_gateway_and_each_agent_from_the_same_ca() {
+        let id = dev_identity_with(
+            "spiffe://wake.local/proxy",
+            &DevExtras {
+                gateway_hosts: &["agentgateway".into(), "localhost".into()],
+                agents: &["billing".into(), "research".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(id.gateway.is_some());
+        let ids: Vec<String> = id
+            .agents
+            .iter()
+            .map(|(_, cert, _)| spiffe_id(pem::parse(cert).unwrap().contents()).unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "spiffe://wake.local/agent/billing",
+                "spiffe://wake.local/agent/research"
+            ]
+        );
+        for bad in ["", "../x", "a b", ".hidden"] {
+            let extras = DevExtras {
+                agents: &[bad.to_string()],
+                ..Default::default()
+            };
+            assert!(
+                dev_identity_with("spiffe://wake.local/proxy", &extras).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(trust_domain("spiffe://example.org/agent/x"), Some("example.org"));
+        assert_eq!(trust_domain("https://example.org"), None);
     }
 
     #[test]

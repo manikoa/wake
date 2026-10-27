@@ -3,6 +3,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use prost::Message;
+use wake_proxy::agents::Agents;
 use wake_proxy::authz::{self, pb::auth::CheckRequest};
 use wake_proxy::halts::{Halts, Scope};
 
@@ -19,9 +20,10 @@ fuzz_target!(|data: &[u8]| {
     if !scope.is_empty() {
         halts.put("fuzz", scope, 0).unwrap();
     }
-    if let Some(halt) = halts.deciding(call.caller.as_deref(), call.receiver.as_deref()) {
-        let event = authz::denied_event(&call, &halt, 1);
+    let deciding = halts.deciding(call.caller.as_deref(), call.receiver.as_deref());
+    if !deciding.is_empty() {
+        let event = authz::denied_event(&call, &deciding, &Agents::none(), 1);
         assert!(serde_json::from_str::<serde_json::Value>(event.str("wake.payload").unwrap()).is_ok());
-        let _ = authz::deny(&halt);
+        let _ = authz::deny(&deciding);
     }
 });

@@ -6,10 +6,21 @@
 # Who's calling comes from the caller's SPIFFE ID or JWT subject, as in production, and
 # failing those from the x-fleet-agent header the fleet's agents send. That header is a
 # stand-in so the example needs no identity provider; any caller can set it, so never
-# trust it outside the example.
+# trust it outside the example. deploy/agentgateway.yaml requires mTLS instead.
 gateways:
   default:
     port: 3000
+    # The brake's deny lever, for every call on every route, before routing: a call made by
+    # a halted agent is denied wherever it goes. It fails closed: if wake-proxy can't
+    # answer, the call is denied. A caller wake-proxy can't name (agents.json) is denied
+    # while any agent is halted.
+    extAuthz:
+      host: "wake-proxy:9001"
+      failureMode: deny
+      protocol:
+        grpc:
+          metadata:
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
 routes:
 - name: research
   matches:
@@ -20,7 +31,8 @@ routes:
       path:
         prefix: /
     a2a: {}
-    # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
+    # The deny lever again, naming the agent this route reaches, so calls sent to a halted
+    # agent are denied too.
     extAuthz:
       host: "wake-proxy:9001"
       failureMode: deny
@@ -55,7 +67,8 @@ routes:
       path:
         prefix: /
     a2a: {}
-    # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
+    # The deny lever again, naming the agent this route reaches, so calls sent to a halted
+    # agent are denied too.
     extAuthz:
       host: "wake-proxy:9001"
       failureMode: deny
@@ -83,14 +96,6 @@ routes:
   - host: billing:9102
 - name: tools
   policies:
-    # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
-    extAuthz:
-      host: "wake-proxy:9001"
-      failureMode: deny
-      protocol:
-        grpc:
-          metadata:
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
     mcpGuardrails:
       processors:
       - kind: remote

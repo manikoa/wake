@@ -102,9 +102,10 @@ pub async fn serve(
     });
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let agents = options.halts.agents().clone();
     let result = tonic::transport::Server::builder()
-        .add_service(Processor::new(hooks_tx, counters.clone()).server())
-        .add_service(extproc::Processor::new(unsigned_tx.clone(), counters.clone()).server())
+        .add_service(Processor::new(hooks_tx, counters.clone(), agents.clone()).server())
+        .add_service(extproc::Processor::new(unsigned_tx.clone(), counters.clone(), agents).server())
         .add_service(Authorizer::new(options.halts.clone(), unsigned_tx, counters).server())
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
