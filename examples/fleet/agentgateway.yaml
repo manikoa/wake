@@ -6,7 +6,8 @@
 # Who's calling comes from the caller's SPIFFE ID or JWT subject, as in production, and
 # failing those from the x-fleet-agent header the fleet's agents send. That header is a
 # stand-in so the example needs no identity provider; any caller can set it, so never
-# trust it outside the example. deploy/agentgateway.yaml requires mTLS instead.
+# trust it outside the example. deploy/agentgateway.yaml requires mTLS instead. wake-proxy's
+# hooks are a Unix socket only agentgateway shares (deploy/compose.yaml).
 gateways:
   default:
     port: 3000
@@ -15,7 +16,7 @@ gateways:
     # answer, the call is denied. A caller wake-proxy can't name (agents.json) is denied
     # while any agent is halted.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "unix:/run/wake/proxy.sock"
       failureMode: deny
       protocol:
         grpc:
@@ -34,7 +35,7 @@ routes:
     # The deny lever again, naming the agent this route reaches, so calls sent to a halted
     # agent are denied too.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "unix:/run/wake/proxy.sock"
       failureMode: deny
       protocol:
         grpc:
@@ -43,7 +44,7 @@ routes:
           metadata:
             wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
     extProc:
-      host: "wake-proxy:9001"
+      host: "unix:/run/wake/proxy.sock"
       failureMode: failOpen
       processingOptions:
         requestHeaderMode: send
@@ -70,7 +71,7 @@ routes:
     # The deny lever again, naming the agent this route reaches, so calls sent to a halted
     # agent are denied too.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "unix:/run/wake/proxy.sock"
       failureMode: deny
       protocol:
         grpc:
@@ -79,7 +80,7 @@ routes:
           metadata:
             wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
     extProc:
-      host: "wake-proxy:9001"
+      host: "unix:/run/wake/proxy.sock"
       failureMode: failOpen
       processingOptions:
         requestHeaderMode: send
@@ -99,7 +100,7 @@ routes:
     mcpGuardrails:
       processors:
       - kind: remote
-        host: "wake-proxy:9001"
+        host: "unix:/run/wake/proxy.sock"
         failureMode: failOpen
         methods:
           tools/call: full

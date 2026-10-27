@@ -31,6 +31,10 @@ async fn control() -> Control {
 }
 
 async fn control_with(halts: Halts) -> Control {
+    control_limited(halts, wake_proxy::listen::CONTROL).await
+}
+
+async fn control_limited(halts: Halts, limits: wake_proxy::listen::Limits) -> Control {
     let id = dev_identity_with_tls("spiffe://wake.local/proxy", &[], Some(BRAKE)).unwrap();
     let halts = Arc::new(halts);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -44,7 +48,7 @@ async fn control_with(halts: Halts) -> Control {
     let (stop, stopped) = oneshot::channel::<()>();
     let served = halts.clone();
     tokio::spawn(async move {
-        control::serve(listener, served, tls, async {
+        control::serve_with(listener, served, tls, limits, async {
             let _ = stopped.await;
         })
         .await
@@ -323,4 +327,38 @@ async fn the_brake_initializes_a_proxy_that_lost_its_state() {
     assert!(lifted["epoch"].as_str().is_some_and(|e| !e.is_empty()));
     assert!(c.halts.deciding(Some("billing"), None).is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn clients_that_connect_and_stall_cant_keep_the_brake_out() {
+    use tokio::io::AsyncReadExt;
+    let limits = wake_proxy::listen::Limits {
+        connections: 2,
+        handshake: std::time::Duration::from_millis(300),
+        lifetime: std::time::Duration::from_secs(5),
+    };
+    let c = control_limited(Halts::in_memory(), limits).await;
+    let addr = c.url.trim_start_matches("https://").to_string();
+    // Two connections that never start TLS take every slot.
+    let mut stalled = vec![];
+    for _ in 0..2 {
+        stalled.push(tokio::net::TcpStream::connect(&addr).await.unwrap());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // A third is closed at once.
+    let mut third = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_millis(200), third.read(&mut buf)).await;
+    assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "{read:?}");
+    // The stalled ones are closed once the handshake times out, and the brake gets in.
+    for mut s in stalled {
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), s.read(&mut buf)).await;
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "{read:?}");
+    }
+    let listed = client(&c, &c.brake)
+        .get(format!("{}/v1/halts", c.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
 }

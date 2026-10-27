@@ -21,7 +21,7 @@
 //! The same state holds memory quarantines, which the SDKs' memory adapters fetch
 //! (memory.rs): agents whose memory writes are refused, and entries no longer served.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -171,7 +171,17 @@ pub struct Halts {
     disk: Mutex<Disk>,
     agents: Arc<Agents>,
     // Kept in memory only: after a restart, adapters fetch again within seconds.
-    seen: RwLock<HashMap<String, Seen>>,
+    seen: Mutex<Notes>,
+}
+
+/// The most agents whose fetches are noted. Agents name themselves, so past it the oldest
+/// note goes, and the brake can't confirm that agent's adapter until it fetches again.
+pub const SEEN_LIMIT: usize = 10_000;
+
+#[derive(Default)]
+struct Notes {
+    by_agent: HashMap<String, Seen>,
+    order: VecDeque<String>,
 }
 
 struct Disk {
@@ -225,7 +235,7 @@ impl Halts {
             current: RwLock::new(Arc::new(state)),
             disk: Mutex::new(Disk { path, unreadable }),
             agents: Arc::new(Agents::none()),
-            seen: RwLock::new(HashMap::new()),
+            seen: Mutex::new(Notes::default()),
         }
     }
 
@@ -333,16 +343,20 @@ impl Halts {
                 .find(|q| named(&q.selection.lock))
                 .map(|q| q.id.clone())
         };
-        if !agent.is_empty()
-            && let Ok(mut seen) = self.seen.write()
-        {
-            seen.insert(
-                agent.to_string(),
-                Seen {
-                    version: state.version,
-                    at: now(),
-                },
-            );
+        if !agent.is_empty() {
+            let mut notes = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            let seen = Seen {
+                version: state.version,
+                at: now(),
+            };
+            if notes.by_agent.insert(agent.to_string(), seen).is_none() {
+                notes.order.push_back(agent.to_string());
+            }
+            while notes.order.len() > SEEN_LIMIT {
+                if let Some(oldest) = notes.order.pop_front() {
+                    notes.by_agent.remove(&oldest);
+                }
+            }
         }
         MemoryRules {
             version: state.version,
@@ -353,7 +367,7 @@ impl Halts {
 
     /// Each agent whose memory adapter has fetched its rules, with the version it got.
     pub fn seen(&self) -> HashMap<String, Seen> {
-        self.seen.read().map(|s| s.clone()).unwrap_or_default()
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).by_agent.clone()
     }
 
     fn change(&self, f: impl FnOnce(&mut State)) -> Changed {
@@ -658,6 +672,18 @@ mod tests {
         let state = halts.release("q2").unwrap();
         assert_eq!((state.version, state.quarantines.len()), (4, 0));
         assert_eq!(halts.memory_rules("billing").locked_by, None);
+    }
+
+    #[test]
+    fn the_notes_of_who_fetched_are_bounded() {
+        let halts = Halts::in_memory();
+        for i in 0..SEEN_LIMIT + 10 {
+            halts.memory_rules(&format!("agent-{i}"));
+        }
+        let seen = halts.seen();
+        assert_eq!(seen.len(), SEEN_LIMIT);
+        assert!(!seen.contains_key("agent-0"), "the oldest note went");
+        assert!(seen.contains_key(&format!("agent-{}", SEEN_LIMIT + 9)));
     }
 
     #[test]

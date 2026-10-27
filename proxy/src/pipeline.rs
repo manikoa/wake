@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tonic::transport::server::Connected;
 
 use crate::authz::Authorizer;
 use crate::budget::{Budget, Events, Permit};
@@ -52,7 +53,8 @@ impl Default for Options {
 }
 
 /// Serves the processor's gRPC services, ExtMCP for MCP, ext_proc for A2A and ext_authz for
-/// the deny lever, on listener until shutdown resolves.
+/// the deny lever, on listener until shutdown resolves. Only agentgateway may reach it; see
+/// listen.rs.
 pub async fn serve(
     listener: TcpListener,
     signer: Signer,
@@ -60,6 +62,36 @@ pub async fn serve(
     counters: Arc<Counters>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    serve_incoming(incoming, signer, options, counters, shutdown).await
+}
+
+/// The same, on a Unix socket shared only with agentgateway.
+#[cfg(unix)]
+pub async fn serve_unix(
+    listener: tokio::net::UnixListener,
+    signer: Signer,
+    options: Options,
+    counters: Arc<Counters>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), tonic::transport::Error> {
+    let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+    serve_incoming(incoming, signer, options, counters, shutdown).await
+}
+
+async fn serve_incoming<I, IO, IE>(
+    incoming: I,
+    signer: Signer,
+    options: Options,
+    counters: Arc<Counters>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), tonic::transport::Error>
+where
+    I: tokio_stream::Stream<Item = Result<IO, IE>>,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Connected + Unpin + Send + 'static,
+    IO::ConnectInfo: Clone + Send + Sync + 'static,
+    IE: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let (hooks_tx, mut hooks_rx) = mpsc::channel::<(Hook, Permit)>(options.queue);
     let hooks_budget = Budget::new(options.queue_bytes);
     let (events, mut unsigned_rx) = Events::channel(options.queue, Budget::new(options.queue_bytes), counters.clone());
@@ -110,7 +142,6 @@ pub async fn serve(
         emit(capture.expire(SystemTime::now() + timeout));
     });
 
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let agents = options.halts.agents().clone();
     let bodies = Budget::new(options.queue_bytes);
     let result = tonic::transport::Server::builder()
