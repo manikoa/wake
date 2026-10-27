@@ -1,6 +1,6 @@
 # The open source recorder, for a staging environment: the collector, which signs events
-# and keeps the signed log; wake-proxy; and agentgateway in front of your MCP servers and
-# A2A agents (agentgateway.yaml). Keys and a development identity are created on first
+# and keeps the signed log; wake-proxy, which also enforces the brake's halts; and
+# agentgateway in front of your MCP servers and A2A agents (agentgateway.yaml). Keys and a development identity are created on first
 # start and kept in volumes. See deploy/README.md.
 name: wake
 
@@ -28,12 +28,13 @@ services:
     entrypoint: ["/wake-keygen"]
     command: ["-keep-existing", "-name", "wake-log", "-out", "/etc/wake/keys/log"]
     volumes: [keys:/etc/wake/keys]
-  # One-shot: a development CA standing in for SPIRE, the proxy's SVID, and the
-  # collector's TLS certificate. Production gets these from SPIRE.
+  # One-shot: a development CA standing in for SPIRE, the proxy's SVID, the collector's TLS
+  # certificate, and the brake's SVID for the proxy's control API. Production gets these
+  # from SPIRE.
   identity:
     <<: *proxy-image
     command: ["dev-identity", "--keep-existing", "--out", "/etc/wake/identity", "--spiffe-id", "spiffe://wake.local/proxy",
-              "--tls-host", "collector", "--tls-host", "localhost"]
+              "--tls-host", "collector", "--tls-host", "localhost", "--brake-id", "spiffe://wake.local/brake"]
     volumes: [identity:/etc/wake/identity]
 
   collector:
@@ -56,11 +57,17 @@ services:
       collector: {condition: service_started}
     command: ["serve", "--listen", "0.0.0.0:9001",
               "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem",
-              "--collector", "https://collector:4318", "--collector-ca", "/etc/wake/identity/bundle.pem"]
+              "--collector", "https://collector:4318", "--collector-ca", "/etc/wake/identity/bundle.pem",
+              "--state-dir", "/var/lib/wake-proxy",
+              "--control-listen", "0.0.0.0:9002", "--trust-bundle", "/etc/wake/identity/bundle.pem"]
     environment:
       RUST_LOG: info
-    volumes: [identity:/etc/wake/identity:ro]
-    # Not published: only agentgateway, on this network, may reach it.
+    volumes:
+      - identity:/etc/wake/identity:ro
+      # The halts in force, kept so a restart doesn't lift one.
+      - proxy-state:/var/lib/wake-proxy
+    # Not published. Only agentgateway may reach 9001, and only the brake, which alone has
+    # the SVID the control API checks, may use 9002.
     restart: unless-stopped
 
   agentgateway:
@@ -77,4 +84,5 @@ services:
 volumes:
   keys:
   identity:
+  proxy-state:
   data:

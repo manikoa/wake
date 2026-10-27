@@ -8,13 +8,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compil
 WORKDIR /src
 COPY proxy/ .
 RUN cargo build --release --locked --bin wake-proxy
-RUN mkdir -p /out/etc/wake/identity
+# Directories volumes mount over, owned by the user the proxy runs as.
+RUN mkdir -p /out/etc/wake/identity /out/var/lib/wake-proxy
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/wake-proxy /wake-proxy
 COPY --from=build --chown=65532:65532 /out/etc/wake /etc/wake
+COPY --from=build --chown=65532:65532 /out/var/lib/wake-proxy /var/lib/wake-proxy
 USER nonroot
-# Reachable only by agentgateway: anything that can call it can get events signed.
-EXPOSE 9001
+# 9001 is reachable only by agentgateway: anything that can call it can get events signed.
+# 9002 is the brake's control API, mTLS with the brake's SVID.
+EXPOSE 9001 9002
 ENTRYPOINT ["/wake-proxy"]
-CMD ["serve", "--listen", "0.0.0.0:9001", "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem"]
+CMD ["serve", "--listen", "0.0.0.0:9001", "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem", \
+     "--state-dir", "/var/lib/wake-proxy"]

@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://agentgateway.dev/schema/config
 #
 # agentgateway for the reference fleet: an A2A route per agent and the fleet's MCP server,
-# every call recorded by wake-proxy.
+# every call recorded by wake-proxy, and denied when the brake has halted it.
 #
 # Who's calling comes from the caller's SPIFFE ID or JWT subject, as in production, and
 # failing those from the x-fleet-agent header the fleet's agents send. That header is a
@@ -20,6 +20,16 @@ routes:
       path:
         prefix: /
     a2a: {}
+    # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
+    extAuthz:
+      host: "wake-proxy:9001"
+      failureMode: deny
+      protocol:
+        grpc:
+          context:
+            receiver: research
+          metadata:
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
     extProc:
       host: "wake-proxy:9001"
       failureMode: failOpen
@@ -45,6 +55,16 @@ routes:
       path:
         prefix: /
     a2a: {}
+    # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
+    extAuthz:
+      host: "wake-proxy:9001"
+      failureMode: deny
+      protocol:
+        grpc:
+          context:
+            receiver: billing
+          metadata:
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
     extProc:
       host: "wake-proxy:9001"
       failureMode: failOpen
@@ -63,6 +83,14 @@ routes:
   - host: billing:9102
 - name: tools
   policies:
+    # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
+    extAuthz:
+      host: "wake-proxy:9001"
+      failureMode: deny
+      protocol:
+        grpc:
+          metadata:
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
     mcpGuardrails:
       processors:
       - kind: remote

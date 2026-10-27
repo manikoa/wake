@@ -1,5 +1,5 @@
 //! Wires the processor together: the gRPC services agentgateway calls (ExtMCP for MCP,
-//! ext_proc for A2A), the capture task that pairs MCP requests with responses, signing,
+//! ext_proc for A2A, ext_authz for the deny lever), the capture task that pairs MCP requests with responses, signing,
 //! and the exporter. Each stage hands work on
 //! through a bounded queue, so a slow stage drops and counts rather than slow the call.
 
@@ -10,11 +10,13 @@ use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use crate::authz::Authorizer;
 use crate::canonical::Event;
 use crate::capture::Capture;
 use crate::export::{Counters, Exporter};
 use crate::extmcp::Processor;
 use crate::extproc;
+use crate::halts::Halts;
 use crate::signer::Signer;
 
 pub struct Options {
@@ -26,6 +28,8 @@ pub struct Options {
     pub response_timeout: Duration,
     /// How many hooks and events may wait in each queue.
     pub queue: usize,
+    /// The halts in force, which the ext_authz service enforces.
+    pub halts: Arc<Halts>,
 }
 
 impl Default for Options {
@@ -35,12 +39,13 @@ impl Default for Options {
             collector_ca: None,
             response_timeout: Duration::from_secs(60),
             queue: 10_000,
+            halts: Arc::new(Halts::in_memory()),
         }
     }
 }
 
-/// Serves the processor's gRPC services, ExtMCP for MCP and ext_proc for A2A, on listener
-/// until shutdown resolves.
+/// Serves the processor's gRPC services, ExtMCP for MCP, ext_proc for A2A and ext_authz for
+/// the deny lever, on listener until shutdown resolves.
 pub async fn serve(
     listener: TcpListener,
     signer: Signer,
@@ -99,7 +104,8 @@ pub async fn serve(
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let result = tonic::transport::Server::builder()
         .add_service(Processor::new(hooks_tx, counters.clone()).server())
-        .add_service(extproc::Processor::new(unsigned_tx, counters).server())
+        .add_service(extproc::Processor::new(unsigned_tx.clone(), counters.clone()).server())
+        .add_service(Authorizer::new(options.halts.clone(), unsigned_tx, counters).server())
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
     // The server dropped its senders, so each stage drains and ends in turn.

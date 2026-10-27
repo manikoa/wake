@@ -28,6 +28,8 @@ pub struct Counters {
     pub paired_by_id: AtomicU64,
     /// Responses paired by order within a session, because the id didn't come back.
     pub paired_in_order: AtomicU64,
+    /// Calls the deny lever denied.
+    pub denied: AtomicU64,
 }
 
 impl Counters {

@@ -9,7 +9,7 @@ Start with these fields. Add one only when the provenance view or a design partn
 | Attribute | Type | Meaning |
 |---|---|---|
 | `wake.event.id` | string (UUID) | Unique id for the event. Other events list it in `wake.parents`. |
-| `wake.event.kind` | string | `model_call`, `tool_call`, `agent_message`, `memory_read` or `memory_write` |
+| `wake.event.kind` | string | `model_call`, `tool_call`, `agent_message`, `memory_read`, `memory_write`, or `denied` for a call the brake stopped |
 | `wake.agent.id` | string | The agent that did it |
 | `wake.capture` | string | What recorded it: `sdk`, `proxy` or `memory_adapter` |
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
@@ -48,6 +48,15 @@ A message from agent A to agent B is an `agent_message` event in B's run, record
 - `wake.payload` is `{"from": "<A>", "to": "<B>", "content": ...}`.
 
 The message is a parent of B's next event. An answer going back from B to A is another `agent_message`, this time in A's run, and it's a parent of the step in A that reads it. How the link travels between processes is in [linking.md](linking.md).
+
+## Denied calls
+
+The proxy's deny lever records each call it denies as a `denied` event, captured by the proxy and signed like its other events:
+
+- `wake.agent.id` is the caller, or `unknown`.
+- `wake.parents` come from the call's link, so the event joins the caller's trace under the step that made the call.
+- `wake.brake.halt_id` names the halt that denied it, and `wake.brake.receiver` the agent the call was sent to, when there is one.
+- `wake.payload` is `{"caller", "receiver", "method", "host", "path", "halt"}`.
 
 ## Memory
 
