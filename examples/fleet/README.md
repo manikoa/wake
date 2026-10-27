@@ -1,0 +1,41 @@
+# Reference fleet
+
+Three agents on three frameworks, talking over A2A and MCP through agentgateway, recorded by Wake. It's the recorder's end to end test, run in CI, and the target for game days. It doesn't depend on any design partner's product.
+
+| Agent | Framework | Does | Talks to |
+|---|---|---|---|
+| support | LangGraph | Handles a customer's refund request, keeps a note in a memory file | CRM (MCP), research and billing (A2A) |
+| research | OpenAI Agents SDK | Reads the refund policy page | the web (MCP) |
+| billing | Claude Agent SDK | Issues refunds with an in-process tool | payments (MCP) |
+
+The tools are one MCP server (`fleet/tools.py`) with a CRM, the web and payments. The refund policy page is poisoned. Below the policy, it tells AI agents to also refund $500 to an account that has nothing to do with the order, so the run pays it out. That payment is the issue the game day catches. Following its parents in the signed log leads back through billing, support and research to the page.
+
+## Run it
+
+```bash
+./run.sh
+```
+
+It starts the staging recorder (`deploy/compose.yaml`) with this directory's `agentgateway.yaml`, plus the tools and agents. Then it sends one request through support, checks the signed log with `wake-log`, and checks provenance with `check.py`:
+
+- Every agent and every hop is recorded: by the SDKs, the memory adapter, and the proxy for A2A and MCP.
+- Everything is in one trace, and every parent is in the log.
+- Every action traces back to where its content came from (the gate's completeness metric).
+- The $500 payment traces back to the page, and the chain is printed.
+
+Or run the pieces yourself:
+
+```bash
+docker compose up -d --build --wait collector wake-proxy agentgateway tools research billing
+docker compose run --rm support "Customer jane@example.com wants a refund on order 1234."
+```
+
+## Models
+
+By default each agent runs on a scripted model, so the fleet needs no API keys and behaves the same every run. Each scripted model plugs in where its framework takes a model and reports itself the way the real one does, so Wake records exactly what it would. For Claude, a stand-in for Claude Code speaks the SDK's control protocol.
+
+With `FLEET_MODELS=real`, research runs on the OpenAI Agents SDK's default model when `OPENAI_API_KEY` is set, and billing runs on Claude Code when `ANTHROPIC_API_KEY` is set. Support stays scripted, so every run walks the same steps.
+
+## Identity
+
+agentgateway names each caller from its SPIFFE ID or JWT subject, as in production. Failing those, it uses the `x-fleet-agent` header the agents send. That header is a stand-in so the example needs no identity provider, and any caller can set it, so don't trust it outside the example. The agents get the CA certificate for the collector's TLS, and nothing else from the recorder: no keys and no identity.

@@ -12,7 +12,7 @@ go run ./cmd/wake-keygen -name wake-log -out keys/log
 
 ## Checking a log
 
-Anyone can check a log without trusting Wake or whoever stores it. `wake-log verify` checks the checkpoint's signature, that every entry is in the signed tree, and every event's signature, and exits 1 if anything doesn't hold. `-entries` also prints each entry as a JSON line.
+Anyone can check a log without trusting Wake or whoever stores it. `wake-log verify` checks the checkpoint's signature, that every entry is in the signed tree, and every event's signature, and exits 1 if anything doesn't hold. `-entries` also prints each entry as a JSON line, with its payload checked against the event's signed digest.
 
 ```bash
 go run ./cmd/wake-log verify -log ./data/log -log-key keys/log.pub \

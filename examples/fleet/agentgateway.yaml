@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# agentgateway for the reference fleet: an A2A route per agent and the fleet's MCP server,
+# every call recorded by wake-proxy.
+#
+# Who's calling comes from the caller's SPIFFE ID or JWT subject, as in production, and
+# failing those from the x-fleet-agent header the fleet's agents send. That header is a
+# stand-in so the example needs no identity provider; any caller can set it, so never
+# trust it outside the example.
+gateways:
+  default:
+    port: 3000
+routes:
+- name: research
+  matches:
+  - path:
+      pathPrefix: /agents/research
+  policies:
+    urlRewrite:
+      path:
+        prefix: /
+    a2a: {}
+    extProc:
+      host: "wake-proxy:9001"
+      failureMode: failOpen
+      processingOptions:
+        requestHeaderMode: send
+        requestBodyMode: bufferedPartial
+        responseHeaderMode: send
+        responseBodyMode: bufferedPartial
+        requestTrailerMode: skip
+        responseTrailerMode: skip
+        allowModeOverride: true
+      requestAttributes:
+        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        receiver: '"research"'
+  backends:
+  - host: research:9101
+- name: billing
+  matches:
+  - path:
+      pathPrefix: /agents/billing
+  policies:
+    urlRewrite:
+      path:
+        prefix: /
+    a2a: {}
+    extProc:
+      host: "wake-proxy:9001"
+      failureMode: failOpen
+      processingOptions:
+        requestHeaderMode: send
+        requestBodyMode: bufferedPartial
+        responseHeaderMode: send
+        responseBodyMode: bufferedPartial
+        requestTrailerMode: skip
+        responseTrailerMode: skip
+        allowModeOverride: true
+      requestAttributes:
+        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        receiver: '"billing"'
+  backends:
+  - host: billing:9102
+- name: tools
+  policies:
+    mcpGuardrails:
+      processors:
+      - kind: remote
+        host: "wake-proxy:9001"
+        failureMode: failOpen
+        methods:
+          tools/call: full
+          resources/read: full
+          prompts/get: full
+        requestHeaders:
+          allowed: [traceparent, wake-parents, mcp-session-id]
+        metadata:
+          agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+          wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
+  backends:
+  - mcp:
+      targets:
+      - name: fleet
+        mcp:
+          host: http://tools:3001/mcp
