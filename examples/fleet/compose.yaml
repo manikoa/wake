@@ -1,10 +1,11 @@
 # The reference fleet on the staging recorder (deploy/compose.yaml): three agents on three
 # frameworks and the tools they call, all through agentgateway, all recorded by Wake.
-# run.sh brings it up and sends one request through it. See README.md.
+# run.sh brings it up and sends one request through it. Each agent and the tools server
+# reaches the rest of the fleet only through agentgateway (networks.yaml). See README.md.
 name: wake-fleet
 
 include:
-  - path: ../../deploy/compose.yaml
+  - path: [../../deploy/compose.yaml, networks.yaml]
     env_file: fleet.env
 
 x-fleet: &fleet
@@ -42,11 +43,13 @@ services:
     user: "0"
     entrypoint: ["sh", "-c", "cp /etc/wake/identity/bundle.pem /etc/wake/ca/bundle.pem && chmod 0444 /etc/wake/ca/bundle.pem"]
     volumes: [identity:/etc/wake/identity:ro, ca:/etc/wake/ca]
+    network_mode: none
     depends_on:
       identity: {condition: service_completed_successfully}
 
   tools:
     <<: *fleet
+    networks: [tools]
     command: ["python", "-m", "fleet.tools"]
     healthcheck:
       <<: *listening
@@ -54,6 +57,7 @@ services:
 
   research:
     <<: *fleet
+    networks: [research]
     command: ["python", "-m", "fleet.research"]
     healthcheck:
       <<: *listening
@@ -61,6 +65,7 @@ services:
 
   billing:
     <<: *fleet
+    networks: [billing]
     command: ["python", "-m", "fleet.billing"]
     healthcheck:
       <<: *listening
@@ -69,6 +74,7 @@ services:
   # One request per run: docker compose run --rm support "<request>"
   support:
     <<: *fleet
+    networks: [support]
     command: ["python", "-m", "fleet.support"]
     profiles: [run]
     depends_on:

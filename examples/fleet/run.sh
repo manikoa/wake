@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs the reference fleet end to end: brings it up on the staging recorder, sends one
-# customer request through the support agent, checks the signed log with wake-log, and
-# checks provenance across the agents with check.py. CI runs it; it needs Docker and
-# python3.
+# customer request through the support agent, checks that each agent and the tools server
+# can reach the rest of the fleet only through agentgateway (reach.py), checks the signed
+# log with wake-log, and checks provenance across the agents with check.py. CI runs it; it
+# needs Docker and python3.
 set -euo pipefail
 cd "$(dirname "$0")"
 compose() { docker compose -f compose.yaml "$@"; }
@@ -17,6 +18,26 @@ trap finish EXIT
 
 compose up -d --build --wait collector wake-proxy agentgateway tools research billing
 compose run --rm support
+
+# Nothing of the fleet's can be reached around agentgateway (see "Network" in README.md).
+# The request just went through every backend and wake-proxy, so each one is up. Each
+# listener is tried by name and by its IP address on each of its networks.
+listeners=""
+for target in tools:3001 research:9101 billing:9102 wake-proxy:9001 wake-proxy:9002 wake-proxy:9003 collector:4318; do
+  service=${target%:*} port=${target#*:}
+  ips=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$(compose ps -q "$service")")
+  listeners+="$service $target"$'\n'
+  for ip in $ips; do listeners+="$service $ip:$port"$'\n'; done
+done
+# The listeners a container mustn't reach: all but those of the services matching $1.
+around() { printf '%s' "$listeners" | grep -Ev "^($1) " | cut -d' ' -f2; }
+compose run --rm --no-deps -T support python reach.py support agentgateway:3000 collector:4318 -- $(around 'collector')
+for agent in research billing; do
+  compose exec -T "$agent" python reach.py "$agent" agentgateway:3000 collector:4318 -- $(around "$agent|collector")
+done
+# The tools server sends no events, so it has no way to the collector either.
+compose exec -T tools python reach.py tools agentgateway:3000 -- $(around tools)
+
 # The agents send what they still have queued as they stop.
 compose stop research billing tools
 

@@ -16,7 +16,7 @@ The tools are one MCP server (`fleet/tools.py`) with a CRM, the web and payments
 ./run.sh
 ```
 
-It starts the staging recorder (`deploy/compose.yaml`) with this directory's `agentgateway.yaml`, plus the tools and agents. Then it sends one request through support, checks the signed log with `wake-log`, and checks provenance with `check.py`:
+It starts the staging recorder (`deploy/compose.yaml`) with this directory's `agentgateway.yaml`, plus the tools and agents. Then it sends one request through support, checks that nothing of the fleet's can be reached around the gateway (see [Network](#network)), checks the signed log with `wake-log`, and checks provenance with `check.py`:
 
 - Every agent and every hop is recorded: by the SDKs, the memory adapter, and the proxy for A2A and MCP.
 - Everything is in one trace, and every parent is in the log.
@@ -39,3 +39,19 @@ With `FLEET_MODELS=real`, research runs on the OpenAI Agents SDK's default model
 ## Identity
 
 agentgateway names each caller from its SPIFFE ID or JWT subject, as in production. Failing those, it uses the `x-fleet-agent` header the agents send. That header is a stand-in so the example needs no identity provider, and any caller can set it, so don't trust it outside the example. The agents get the CA certificate for the collector's TLS, and nothing else from the recorder: no keys and no identity.
+
+## Network
+
+A compromised agent can reach the rest of the fleet only through agentgateway, where wake-proxy records each call and the brake can deny it. Each agent and the tools server has a network of its own, shared with agentgateway alone, plus the collector for the agents, which send it their events:
+
+| Network | On it |
+|---|---|
+| `support`, `research`, `billing` | that agent, agentgateway, the collector |
+| `tools` | the tools server, agentgateway |
+| `default` | agentgateway, wake-proxy, the collector, and the brake when one runs next to the recorder |
+
+No fleet container is on `default`, so none can reach wake-proxy's listeners: 9001, which only agentgateway may call, or 9002, the brake's control API. The collector joins each agent's network rather than one network all the agents share, since on a shared network every agent could reach every other one. The tools server records nothing, so it has no way to the collector. `networks.yaml` attaches the recorder's services from `deploy/compose.yaml`, which is unchanged for staging.
+
+`run.sh` checks this from each agent and the tools server, right after the request: agentgateway connects, and so does the collector for the agents. The other backends and wake-proxy don't, by name or by any of their IP addresses.
+
+wake-proxy's memory endpoint (9003) is for agents' memory adapters, which read their quarantine rules from it. No fleet agent reads them yet, so it stays off the agents' networks for now. An agent that does will need a way to it that doesn't also reach 9001.

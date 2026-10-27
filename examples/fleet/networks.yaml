@@ -1,0 +1,18 @@
+# The fleet's networks, merged over the staging recorder (deploy/compose.yaml) by
+# compose.yaml's include. Each agent and the tools server has a network of its own (see
+# compose.yaml), which agentgateway joins, and the collector too for the agents, which
+# send it their events. wake-proxy stays on compose's default network with agentgateway
+# and the collector, and no fleet container joins it. See "Network" in README.md.
+services:
+  agentgateway:
+    networks: [default, support, research, billing, tools]
+  # A link to each agent rather than one network they all join: on a shared network every
+  # agent could reach every other one.
+  collector:
+    networks: [default, support, research, billing]
+
+networks:
+  support:
+  research:
+  billing:
+  tools:
