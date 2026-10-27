@@ -45,6 +45,11 @@ def test_received_keeps_only_what_looks_like_a_link():
         assert link.headers() == {"wake-parents": "a,b,c"}
     with links.received(headers={"traceparent": "garbage", "wake-parents": "x"}) as link:
         assert link.trace_id == 0
+    good = PROXY_HEADERS["traceparent"]
+    for traceparent, joins in [(good, True), (good.upper(), False), (f"{good}-extra", False),
+                               ("ff" + good[2:], False), (f"01{good[2:]}-future", True)]:
+        with links.received(headers={"traceparent": traceparent, "wake-parents": "x"}) as link:
+            assert (link.trace_id == TRACE) is joins, traceparent
     with links.received(headers={"traceparent": PROXY_HEADERS["traceparent"]}) as link:
         assert link is None, "a trace alone names no event"
     with links.received(headers={"wake-parents": ",".join(f"e{i}" for i in range(500))}) as link:

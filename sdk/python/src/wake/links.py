@@ -162,9 +162,10 @@ def _exit(frame: _Frame | None) -> None:
     _current.set(_top())
 
 
-# What a received link may carry. Headers and metadata come from another agent, so
-# anything else is dropped rather than recorded.
-_TRACEPARENT = re.compile(r"^[0-9a-f]{2}-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
+# What a received link may carry (docs/linking.md). Headers and metadata come from another
+# agent, so anything else is dropped rather than recorded. A traceparent is W3C's: version
+# 00 has exactly four fields, a later version may add more, and ff is never valid.
+_TRACEPARENT = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}(-.*)?$")
 _EVENT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _MAX_PARENTS = 64
 
@@ -179,9 +180,9 @@ def _parse(traceparent: Any, parents: Any) -> Link | None:
     if not ids:
         return None
     trace_id = span_id = 0
-    match = _TRACEPARENT.match(traceparent.strip().lower()) if isinstance(traceparent, str) else None
-    if match:
-        trace_id, span_id = int(match[1], 16), int(match[2], 16)
+    match = _TRACEPARENT.match(traceparent.strip()) if isinstance(traceparent, str) else None
+    if match and match[1] != "ff" and not (match[1] == "00" and match[4]):
+        trace_id, span_id = int(match[2], 16), int(match[3], 16)
         if not trace_id or not span_id:
             trace_id = span_id = 0
     return Link(ids[0], trace_id, span_id, tuple(ids[1:]))

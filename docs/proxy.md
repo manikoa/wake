@@ -70,7 +70,7 @@ Both halves are in `proxy/` (October 27, 2026), and both were run against agentg
 
 ### A2A
 
-agentgateway calls the processor's ext_proc service on an A2A route (`a2a: {}`). One gRPC stream is one HTTP exchange between two agents.
+agentgateway calls the processor's ext_proc service on an A2A route (`a2a: {}`). One gRPC stream is one HTTP exchange between two agents. The rules for links, which the SDKs follow too, are in [linking.md](linking.md).
 
 - **What's recorded.** A message request becomes an `agent_message` event recorded where the receiver gets it. Both protocol versions in use are read: v0.3 (`message/send`, `message/stream`) and v1.0 (`SendMessage`, `SendStreamingMessage`), which the a2a-sdk 1.x speaks. The event:
   - `wake.agent.id` is the receiver, named per route in the gateway config.
