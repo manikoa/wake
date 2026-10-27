@@ -9,6 +9,10 @@ Wake is an independent recorder and brake for multiagent AI systems. The source 
 
 Update these two lines whenever a gate is passed. The `wake-scope` skill reads them.
 
+## Repository
+
+This public repository holds only the open source recorder. The paid parts live in a separate private repository. Folders and rules are in [docs/repo-layout.md](docs/repo-layout.md).
+
 ## Skills
 
 - `wake-scope`: what may be built now and what waits. Use before starting any feature.
