@@ -12,12 +12,17 @@ go run ./cmd/wake-keygen -name wake-log -out keys/log
 
 ## Reading entries
 
-Each entry holds an event's exact signed bytes, its signature and signer, and the collector's check at append time (the format is in [docs/events.md](../docs/events.md)). `ParseEntry` reads one back without touching the signed bytes, `Verify` checks the signature again with the signer's public key, and `Decode` reads the event's fields:
+Each entry holds an event's exact signed bytes, its signature and signer, the collector's check at append time, and the event's payload when it fits (the format is in [docs/events.md](../docs/events.md)). A payload too large for its entry is stored next to the tiles at `payload/sha256/<digest>`. `ParseEntry` reads an entry back without touching the signed bytes, `Verify` checks the signature again with the signer's public key, `ReadPayload` returns the payload checked against its signed digest, and `Decode` reads the event's fields:
 
 ```go
 entry, err := wakelog.ParseEntry(data)
 ok := entry.Verify(trusted) // don't rely on entry.Valid
+payload, err := entry.ReadPayload(func(path string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(logDir, path)) // or read the bucket
+})
 event, err := entry.Decode()
 ```
 
-The collector writes entries with the same code, so the format is defined in one place.
+`ReadPayload` only calls the fetch function when the payload isn't in the entry. It returns `ErrNoPayload` for an event without one and `ErrPayloadMismatch` when the payload doesn't match the digest.
+
+The collector writes entries with the same code (`NewEntry`, `NewEntryWithPayload` and `Log.PutPayload`), so the format is defined in one place.

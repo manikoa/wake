@@ -14,8 +14,8 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.capture` | string | What recorded it: `sdk`, `proxy` or `memory_adapter` |
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
-| `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs |
-| `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload` |
+| `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it |
+| `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload`'s UTF-8 bytes. Set by the signer from the payload it received, replacing any value the sender gave |
 | `wake.signature` | string | Base64 signature, added by the signer: Ed25519 from the collector, ECDSA P-256 from the proxy (see [signing.md](signing.md)) |
 | `wake.signer` | string | SPIFFE id of the signer |
 | `wake.signature.valid` | bool | Set by the collector: whether the signature checked out. Always overwritten, so a sender can't claim it. |
@@ -60,14 +60,24 @@ The signer signs the UTF-8 bytes of this JSON object, serialized with keys sorte
 {"attributes":{...},"end_time_unix_nano":0,"span_id":"<hex>","start_time_unix_nano":0,"trace_id":"<hex>"}
 ```
 
-`attributes` holds every `wake.*` and `gen_ai.*` attribute except `wake.signer` and any attribute starting with `wake.signature`. Encode without HTML escaping, so `<`, `>` and `&` stay as they are.
+`attributes` holds every `wake.*` and `gen_ai.*` attribute except `wake.signer`, any attribute starting with `wake.signature`, and `wake.payload`. Encode without HTML escaping, so `<`, `>` and `&` stay as they are.
+
+The payload is signed through its digest. Before signing an event that has a payload, the signer sets `wake.payload.sha256` from the payload's bytes, so the signature commits to exactly that payload, however large it is and wherever it's stored. A component that signs its own events, such as the proxy, does the same and still sends `wake.payload` on the span. The collector marks an event invalid when its payload doesn't match the signed digest, the same as a bad signature. Why the payload stays out of the signed bytes is in [large-payloads.md](large-payloads.md).
 
 ## What goes in the log
 
-Each event becomes one log entry: a JSON object holding the exact signed bytes, the signature, the signer and the collector's check.
+Each event becomes one log entry: a JSON object holding the exact signed bytes, the payload when it fits, the signature, the signer and the collector's check.
 
 ```json
-{"event":{...signed bytes...},"signature":"<base64>","signer":"<name>","valid":true}
+{"event":{...signed bytes...},"payload":"<the payload>","signature":"<base64>","signer":"<name>","valid":true}
 ```
 
-Anyone with the signer's public key can check an entry on its own. Spans that only group events aren't logged.
+A log entry holds at most 65,535 bytes. `payload` is a JSON string holding the payload's exact bytes, and it's left out when the entry would be larger with it, or when the payload isn't valid UTF-8. The payload is then stored next to the log's tiles, at `payload/sha256/<wake.payload.sha256>`, in the same bucket or directory. It's written before the entry is appended. An event with no payload has neither `payload` nor a digest.
+
+Anyone with the signer's public key can check an entry on its own:
+
+1. Check `signature` over `event` with the signer's public key.
+2. Take the payload from `payload`, or from `payload/sha256/<wake.payload.sha256>` next to the log.
+3. Check that its SHA-256 is the signed `wake.payload.sha256`.
+
+The log module's `ParseEntry`, `Verify` and `ReadPayload` do these steps. Spans that only group events aren't logged.

@@ -3,6 +3,7 @@ package event
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,8 @@ const (
 	Signature      = "wake.signature"
 	Signer         = "wake.signer"
 	SignatureValid = "wake.signature.valid"
+	Payload        = "wake.payload"
+	PayloadSHA256  = wakelog.PayloadSHA256
 )
 
 // IsEvent reports whether span is a Wake event, as opposed to a span that only groups events.
@@ -31,7 +34,8 @@ func IsEvent(span ptrace.Span) bool {
 
 // Canonical returns the exact bytes a signer signs for span: a JSON object with
 // sorted keys and no whitespace, holding the span's ids, times, and every wake.*
-// and gen_ai.* attribute except the signature fields.
+// and gen_ai.* attribute except the signature fields and the payload. The payload's
+// signed digest commits to it.
 func Canonical(span ptrace.Span) ([]byte, error) {
 	attributes := map[string]any{}
 	for key, value := range span.Attributes().All() {
@@ -58,14 +62,34 @@ func Canonical(span ptrace.Span) ([]byte, error) {
 }
 
 func signed(key string) bool {
-	if key == Signer || strings.HasPrefix(key, Signature) {
+	if key == Signer || key == Payload || strings.HasPrefix(key, Signature) {
 		return false
 	}
 	return strings.HasPrefix(key, "wake.") || strings.HasPrefix(key, "gen_ai.")
 }
 
-// Sign signs span and records the signature and the signer's name on it.
+// PayloadOf returns span's payload, the bytes its digest is taken over, and whether it
+// has one.
+func PayloadOf(span ptrace.Span) ([]byte, bool) {
+	value, ok := span.Attributes().Get(Payload)
+	if !ok {
+		return nil, false
+	}
+	return []byte(value.AsString()), true
+}
+
+func digest(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+// Sign signs span and records the signature and the signer's name on it. It sets the
+// payload's digest first, from the bytes received, so the signature commits to the
+// payload that arrived and not to a digest the sender claimed.
 func Sign(span ptrace.Span, signer note.Signer) error {
+	if payload, ok := PayloadOf(span); ok {
+		span.Attributes().PutStr(PayloadSHA256, digest(payload))
+	}
 	msg, err := Canonical(span)
 	if err != nil {
 		return err
@@ -80,8 +104,14 @@ func Sign(span ptrace.Span, signer note.Signer) error {
 }
 
 // Verify reports whether span carries a valid signature from one of the trusted signers,
-// keyed by name.
+// keyed by name, and a payload, if it has one, that matches the signed digest.
 func Verify(span ptrace.Span, trusted map[string]note.Verifier) bool {
+	if payload, ok := PayloadOf(span); ok {
+		signed, _ := span.Attributes().Get(PayloadSHA256)
+		if signed.Str() != digest(payload) {
+			return false
+		}
+	}
 	sigValue, ok := span.Attributes().Get(Signature)
 	if !ok {
 		return false
@@ -98,19 +128,27 @@ func Verify(span ptrace.Span, trusted map[string]note.Verifier) bool {
 }
 
 // Entry returns what gets appended to the signed log for span: the exact signed bytes,
-// the signature and signer, and whether the collector found the signature valid. Each
-// entry can be checked on its own with the signer's public key. The entry format lives
-// in the log module, so the log's readers parse it with the same code.
-func Entry(span ptrace.Span) ([]byte, error) {
+// the signature and signer, whether the collector found the signature valid, and the
+// payload when it fits. Each entry can be checked on its own with the signer's public
+// key. When the payload doesn't fit, external is true: store PayloadOf(span) with the
+// log's PutPayload before appending the entry. The entry format lives in the log
+// module, so the log's readers parse it with the same code.
+func Entry(span ptrace.Span) (entry []byte, external bool, err error) {
 	canonical, err := Canonical(span)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	attrs := span.Attributes()
 	sig, _ := attrs.Get(Signature)
 	signer, _ := attrs.Get(Signer)
 	valid, _ := attrs.Get(SignatureValid)
-	return wakelog.NewEntry(canonical, sig.Str(), signer.Str(), valid.Bool())
+	payload, ok := PayloadOf(span)
+	if !ok {
+		entry, err = wakelog.NewEntry(canonical, sig.Str(), signer.Str(), valid.Bool())
+		return entry, false, err
+	}
+	entry, inline, err := wakelog.NewEntryWithPayload(canonical, string(payload), sig.Str(), signer.Str(), valid.Bool())
+	return entry, !inline, err
 }
 
 // marshal encodes v without HTML escaping, which would otherwise rewrite <, > and &

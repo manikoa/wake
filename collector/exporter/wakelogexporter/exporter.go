@@ -1,5 +1,6 @@
 // Package wakelogexporter appends signed Wake events to the self hosted signed log.
-// Spans that only group events aren't appended.
+// Spans that only group events aren't appended. A payload too large for its entry is
+// stored next to the log first, and the entry commits to it by its signed digest.
 package wakelogexporter
 
 import (
@@ -12,6 +13,8 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel/metric"
+	"go.uber.org/zap"
 
 	"github.com/manikoa/wake/collector/event"
 	wakelog "github.com/manikoa/wake/log"
@@ -66,7 +69,15 @@ func createTraces(ctx context.Context, set exporter.Settings, cfg component.Conf
 }
 
 func newTraces(ctx context.Context, set exporter.Settings, cfg *Config, open func(wakelog.Config) (appender, error)) (exporter.Traces, error) {
-	e := &logExporter{cfg: cfg, open: open}
+	dropped, err := set.MeterProvider.Meter("github.com/manikoa/wake/collector/exporter/wakelogexporter").Int64Counter(
+		"wake_log_dropped_events",
+		metric.WithDescription("Events that can't go in the signed log, even without their payload, and were dropped"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	e := &logExporter{cfg: cfg, open: open, logger: set.Logger, dropped: dropped}
 	return exporterhelper.NewTraces(ctx, set, cfg, e.push,
 		exporterhelper.WithStart(e.start),
 		exporterhelper.WithShutdown(e.shutdown),
@@ -78,6 +89,7 @@ func newTraces(ctx context.Context, set exporter.Settings, cfg *Config, open fun
 // appender is the part of the signed log the exporter uses.
 type appender interface {
 	Add(ctx context.Context, entries [][]byte) ([]uint64, error)
+	PutPayload(ctx context.Context, payload []byte) error
 	Close(ctx context.Context) error
 }
 
@@ -86,9 +98,11 @@ func openLog(cfg wakelog.Config) (appender, error) {
 }
 
 type logExporter struct {
-	cfg  *Config
-	open func(wakelog.Config) (appender, error)
-	log  appender
+	cfg     *Config
+	open    func(wakelog.Config) (appender, error)
+	log     appender
+	logger  *zap.Logger
+	dropped metric.Int64Counter
 }
 
 func (e *logExporter) start(context.Context, component.Host) error {
@@ -115,9 +129,20 @@ func (e *logExporter) push(ctx context.Context, td ptrace.Traces) error {
 				if !event.IsEvent(span) {
 					continue
 				}
-				entry, err := event.Entry(span)
+				entry, external, err := event.Entry(span)
 				if err != nil {
-					return err
+					// Retrying can't fix it, and failing the request would append the
+					// rest of it again on every retry.
+					e.drop(ctx, span, err)
+					continue
+				}
+				if external {
+					// Stored before the entry is appended, so no entry points to a
+					// payload that was never written. A failure retries the request.
+					payload, _ := event.PayloadOf(span)
+					if err := e.log.PutPayload(ctx, payload); err != nil {
+						return err
+					}
 				}
 				entries = append(entries, entry)
 			}
@@ -128,4 +153,13 @@ func (e *logExporter) push(ctx context.Context, td ptrace.Traces) error {
 	}
 	_, err := e.log.Add(ctx, entries)
 	return err
+}
+
+// drop logs and counts an event that can't be logged, such as one too large for an
+// entry even without its payload.
+func (e *logExporter) drop(ctx context.Context, span ptrace.Span, err error) {
+	id, _ := span.Attributes().Get("wake.event.id")
+	e.logger.Error("Dropping an event that can't go in the signed log",
+		zap.String("wake.event.id", id.Str()), zap.Error(err))
+	e.dropped.Add(ctx, 1)
 }

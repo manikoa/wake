@@ -1,18 +1,18 @@
 # Payloads larger than a log entry
 
-Proposed October 26, 2026. Not confirmed yet; nothing here is built.
+Decided October 26, 2026: the recommendation below, built in manikoa/wake#13.
 
 ## The problem
 
-A tlog-tiles entry bundle stores each entry's length in two bytes, so one entry holds at most 65,535 bytes. Tessera v1.0.4 enforces this (`DefaultEntrySizeLimit`) and has no option to raise it for a tlog-tiles log. Today each log entry holds the event's signed bytes, and those include `wake.payload`: the email body, the web page, the model's whole context. Real payloads are often larger. The limit applies to the entry, not the payload, and the payload is escaped again inside the signed JSON, so a payload full of quotes or non-ASCII text hits it well before 64 KB.
+A tlog-tiles entry bundle stores each entry's length in two bytes, so one entry holds at most 65,535 bytes. Tessera v1.0.4 enforces this (`DefaultEntrySizeLimit`) and has no option to raise it for a tlog-tiles log. Before this change each log entry held the event's signed bytes, and those included `wake.payload`: the email body, the web page, the model's whole context. Real payloads are often larger. The limit applies to the entry, not the payload, and the payload is escaped again inside the signed JSON, so a payload full of quotes or non-ASCII text hits it well before 64 KB.
 
-What happens today, shown by `collector/exporter/wakelogexporter/large_payload_test.go` with a tool call that read a 100 KB email, sent in one SDK request with two small model calls:
+What happened, shown by a test with a tool call that read a 100 KB email, sent in one SDK request with two small model calls. The same test, `TestLargePayloadLandsInTheLog` in `collector/exporter/wakelogexporter/large_payload_test.go`, now checks the fix:
 
-1. The receiver answers once the queue accepts the request, so the SDK counts every event as sent.
-2. Tessera rejects the large entry on every attempt. The exporter returns that error for the whole request, so the retry sends the whole request again.
-3. The other events in the request are appended again on every attempt. With the default retry, which gives up after 5 minutes, that's about a dozen copies of each.
-4. When the retry gives up, the request is dropped and the large event is lost. The only traces are a collector error log line and `otelcol_exporter_send_failed_spans`, which counts every span in the request, including the ones that reached the log. Nothing in Wake raises a health signal.
-5. The queue isn't blocked, but each such request holds one of its 10 consumers for up to 5 minutes. An agent that reads many large pages can hold all 10; the queue then fills and the receiver starts refusing events.
+1. The receiver answered once the queue accepted the request, so the SDK counted every event as sent.
+2. Tessera rejected the large entry on every attempt. The exporter returned that error for the whole request, so the retry sent the whole request again.
+3. The other events in the request were appended again on every attempt. With the default retry, which gives up after 5 minutes, that's about a dozen copies of each.
+4. When the retry gave up, the request was dropped and the large event was lost. The only traces were a collector error log line and `otelcol_exporter_send_failed_spans`, which counted every span in the request, including the ones that reached the log. Nothing in Wake raised a health signal.
+5. The queue wasn't blocked, but each such request held one of its 10 consumers for up to 5 minutes. An agent that read many large pages could hold all 10; the queue would then fill and the receiver start refusing events.
 
 ## Options
 
@@ -86,14 +86,11 @@ For each component:
 
 ## Not covered
 
-- **An entry too large even without its payload**, for example an event with thousands of parents. It isn't expected, but it can't be retried into the log either. The exporter will drop that one event, log it with its id, count it, and append the rest of the request.
 - **The receiver's 20 MiB request limit.** A batch of events with large payloads, such as many model calls each carrying a long context, can exceed it. The receiver refuses the request and the SDK counts the events as dropped, so it's lossy but counted and never blocks. A follow-up: cap the SDK's batches by bytes, or raise `max_request_body_size`.
 - **Bucket storage.** The log writes to local disk today. The `payload/sha256/` layout carries over to the bucket when that lands.
 
-## If confirmed
+## What was built
 
-- `log`: an optional `payload` field on `Entry`; `NewEntry` puts the payload inline or reports that it needs a file; `Log.PutPayload` writes `payload/sha256/<hex>` the way Tessera writes tiles (temporary file, link, directory sync); `PayloadPath` and a payload check for readers. Tag `log/v0.2.0`.
-- `collector/event`: leave `wake.payload` out of the signed bytes, set the digest when signing, check it when verifying, and pass the payload to the entry.
-- `wakelogexporter`: write the file before appending, and drop a single event that can't be logged without failing its whole request.
-- Tests: the 100 KB test reversed (one append, no duplicates, the file present and matching the signed digest, the signature valid); payloads just under and just over the limit; invalid UTF-8; a tampered file failing the check; a signed event whose payload doesn't match its digest.
-- `docs/events.md` and `log/README.md`.
+- **`log`** (additive, needs a `log/v0.2.0` tag): `Entry.Payload`; `NewEntryWithPayload`, which puts the payload inline or reports that it needs a file; `Log.PutPayload`, which writes `payload/sha256/<hex>` the way Tessera writes tiles (a synced temporary file, linked into place, then the directory synced); and for readers `ReadPayload`, `PayloadPath`, `MaxEntrySize`, `ErrNoPayload`, `ErrPayloadMismatch` and `ErrEntryTooLarge`. `NewEntry` now refuses an entry over the limit.
+- **`collector/event`**: `wake.payload` is out of the signed bytes, `Sign` sets the digest from the payload received, `Verify` checks the payload against it, and `Entry` reports when the payload needs a file.
+- **`wakelogexporter`**: writes the payload file before appending. An event too large for an entry even without its payload is dropped alone: logged with its `wake.event.id` and counted in `wake_log_dropped_events`, while the rest of the request is appended once.

@@ -20,7 +20,7 @@ The `wakelog` exporter uses the collector's standard `sending_queue`, so the rec
 
 ## Checking the log
 
-The log is a [tlog-tiles](https://c2sp.org/tlog-tiles) log in `data/log`, with checkpoints signed by `keys/log.pub`. Any tlog-tiles tool can check it, including Tessera's `fsck`. Each entry can be checked on its own with `keys/collector.pub`; the entry format is in [docs/events.md](../docs/events.md).
+The log is a [tlog-tiles](https://c2sp.org/tlog-tiles) log in `data/log`, with checkpoints signed by `keys/log.pub`. Any tlog-tiles tool can check it, including Tessera's `fsck`. Each entry can be checked on its own with `keys/collector.pub`; payloads too large for their entries are in `data/log/payload/sha256/`. The entry format is in [docs/events.md](../docs/events.md).
 
 ## Development
 
