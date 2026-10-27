@@ -53,7 +53,8 @@ def content_of(value: Any) -> str:
 
 
 class Memory:
-    """Records memory writes and reads for the events a WakeCallbackHandler records."""
+    """Records memory writes and reads alongside the events an SDK integration records, such as a
+    WakeCallbackHandler or a WakeClaudeAgent."""
 
     def __init__(self, handler) -> None:
         self._handler = handler
