@@ -66,8 +66,10 @@ class Researcher(AgentExecutor):
         with wake_a2a.received(context) as link:
             self.seen.append(link)
             model = GenericFakeChatModel(messages=iter([AIMessage(content="Refunds within 30 days.")]))
-            reply = await model.ainvoke(context.get_user_input(), config={"callbacks": [self.handler]})
-        await event_queue.enqueue_event(new_text_message(reply.content, context_id=context.context_id))
+            answer = await model.ainvoke(context.get_user_input(), config={"callbacks": [self.handler]})
+            # Linked here, the reply names the step that produced it.
+            reply = wake_a2a.link(new_text_message(answer.content, context_id=context.context_id))
+        await event_queue.enqueue_event(reply)
 
     async def cancel(self, context, event_queue):
         pass
@@ -183,3 +185,91 @@ def test_an_openai_agents_workflow_under_a_link_descends_from_it():
     assert call.attributes["wake.parents"] == ("sender-tool-call",)
     assert call.attributes["wake.origins"] == ()
     assert {s.context.trace_id for s in spans} == {TRACE}
+
+
+class ProxyReplyHeaders:
+    """Adds the headers the proxy puts on a reply going back to the sender."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def send_with_link(message):
+            if message["type"] == "http.response.start":
+                message["headers"] = [*message.get("headers", []), (b"wake-parents", b"proxy-reply")]
+            await send(message)
+
+        await self.app(scope, receive, send_with_link)
+
+
+def ask_from_a_graph(through_proxy: bool):
+    """A LangGraph support agent asks the researcher from a tool, then answers."""
+    from langchain_core.tools import tool
+    from langgraph.graph import START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode, tools_condition
+
+    exporter = InMemorySpanExporter()
+    research_recorder = Recorder(agent="researcher", exporter=exporter)
+    support_recorder = Recorder(agent="support", exporter=exporter)
+    card = minimal_agent_card("http://researcher/a2a", ["JSONRPC"])
+    handler = DefaultRequestHandler(agent_executor=Researcher(WakeCallbackHandler(research_recorder)),
+                                    task_store=InMemoryTaskStore(), agent_card=card)
+    app = Starlette(routes=create_jsonrpc_routes(handler, "/a2a"))
+    if through_proxy:
+        app = ProxyReplyHeaders(app)
+
+    @tool
+    async def ask_research(question: str) -> str:
+        """Ask the research agent."""
+        async with wake_a2a.http_client(transport=httpx.ASGITransport(app=app)) as http:
+            client = await create_client(card, ClientConfig(httpx_client=http, streaming=False))
+            message = wake_a2a.link(new_text_message(question, role=Role.ROLE_USER))
+            texts = []
+            async for reply in client.send_message(SendMessageRequest(message=message)):
+                wake_a2a.replied(reply)
+                texts.append(get_message_text(reply.message))
+            return "\n".join(texts)
+
+    model = GenericFakeChatModel(messages=iter([
+        AIMessage(content="", tool_calls=[{"name": "ask_research", "args": {"question": "Refund window?"}, "id": "c1"}]),
+        AIMessage(content="We can refund within 30 days."),
+    ]))
+    builder = StateGraph(MessagesState)
+    builder.add_node("model", lambda state: {"messages": [model.invoke(state["messages"])]})
+    builder.add_node("tools", ToolNode([ask_research]))
+    builder.add_edge(START, "model")
+    builder.add_conditional_edges("model", tools_condition)
+    builder.add_edge("tools", "model")
+    graph = builder.compile()
+    support = WakeCallbackHandler(support_recorder)
+    asyncio.run(graph.ainvoke({"messages": [("user", "Can we refund order 1234?")]}, config={"callbacks": [support]}))
+    research_recorder.flush()
+    support_recorder.flush()
+    return exporter.get_finished_spans()
+
+
+def events_of(spans, agent, kind):
+    return sorted((s for s in spans if s.attributes.get("wake.agent.id") == agent
+                   and s.attributes.get("wake.event.kind") == kind), key=lambda s: s.start_time)
+
+
+def test_the_reply_through_the_proxy_feeds_the_senders_next_step():
+    spans = ask_from_a_graph(through_proxy=True)
+    (ask,) = events_of(spans, "support", "tool_call")
+    _, second = events_of(spans, "support", "model_call")
+    parents = second.attributes["wake.parents"]
+    assert attr_id(ask) in parents and "proxy-reply" in parents
+    assert "proxy-reply" not in ask.attributes["wake.parents"], "the tool call can't descend from its own reply"
+
+
+def test_the_reply_without_the_proxy_names_the_receivers_last_step():
+    spans = ask_from_a_graph(through_proxy=False)
+    (answer,) = events_of(spans, "researcher", "model_call")
+    (ask,) = events_of(spans, "support", "tool_call")
+    assert answer.attributes["wake.parents"] == (attr_id(ask),), "the receiver descends from the tool call"
+    _, second = events_of(spans, "support", "model_call")
+    assert second.attributes["wake.parents"][-2:] == (attr_id(ask), attr_id(answer))
+
+
+def attr_id(span):
+    return span.attributes["wake.event.id"]

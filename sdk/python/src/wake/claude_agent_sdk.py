@@ -143,6 +143,7 @@ class _Tool:
         self.parents: list[str] = []
         self.error: str | None = None
         self.ended_at: int | None = None
+        self.frame = None  # the in-process tool's link frame, once it runs
 
 
 class _Run:
@@ -251,7 +252,10 @@ class WakeClaudeAgent(EventGraph):
             tool = None
             while waiting and tool is None:
                 tool = self._tools.get(waiting.popleft())
-        return links._enter(tool.link) if tool is not None else None
+        if tool is None:
+            return None
+        tool.frame = links._enter(tool.link)
+        return tool.frame
 
     # The message stream.
 
@@ -363,7 +367,9 @@ class WakeClaudeAgent(EventGraph):
                 else:
                     tool = self._finish_tool(block.tool_use_id, block.content, block.is_error)
                     if tool is not None:
+                        # The tool, and whatever its result came from, such as an A2A reply.
                         thread.parents.append(tool.event_id)
+                        thread.parents += links._returned(tool.frame)
             elif isinstance(block, TextBlock):
                 if block.text == thread.prompt:
                     continue  # the prompt it started with, echoed back
@@ -522,6 +528,8 @@ class WakeClaudeAgent(EventGraph):
         span.set_attributes(events.payload_attributes(json.loads(json.dumps(payload, default=str))))
         if error:
             span.set_status(Status(StatusCode.ERROR, str(error)))
+        ctx = span.get_span_context()
+        links._note(links.Link(event_id, ctx.trace_id, ctx.span_id))
 
     @_never_raise
     def _end_run(self, run: _Run | None) -> None:
