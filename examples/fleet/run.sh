@@ -15,6 +15,7 @@ finish() {
 }
 trap finish EXIT
 
+python3 test_check.py
 compose up -d --build --wait collector wake-proxy agentgateway tools research billing
 compose run --rm support
 # The agents send what they still have queued as they stop.

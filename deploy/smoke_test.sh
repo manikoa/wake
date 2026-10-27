@@ -11,7 +11,7 @@ compose up -d --build --wait collector wake-proxy agentgateway
 compose cp collector:/etc/wake/identity/bundle.pem "$work/ca.pem"
 
 # Python 3.13 checks certificates strictly by default, so the development identity must pass.
-(cd ../sdk/python && WAKE_ENDPOINT=https://localhost:4318 OTEL_EXPORTER_OTLP_CERTIFICATE="$work/ca.pem" \
+(cd ../sdk/python && WAKE_ENDPOINT=https://localhost:4318 WAKE_CA_FILE="$work/ca.pem" \
   uv run --python 3.13 --locked --all-extras python - <<'PY'
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage

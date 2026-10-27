@@ -12,6 +12,8 @@ id, the origins upstream of it (user, tool:..., agent:...), and a digest of the 
 Store the label with the entry, so a later read, by any agent in any session, knows where
 the entry came from without asking the graph.
 
+A delete is a memory_write event too, with wake.memory.deleted set and no label to keep.
+
 A read is a memory_read event with origin memory:<store>/<entry>. When the entry carries
 a label whose digest matches what was read, the read's parent is the write. An entry with
 no label, such as one planted or written outside Wake, or one changed since it was
@@ -19,17 +21,22 @@ written, gets no parent, so the completeness metric flags it rather than trustin
 
 Wrappers: WakeStore in wake.langgraph wraps LangGraph's BaseStore (and so langmem), and
 Memory.write_file / read_file handle memory files. Recording never blocks or breaks the
-agent: if it fails, the write or read still happens, unlabeled.
+agent: if it fails, the write or read still happens, unlabeled, and the failure is counted
+in the recorder's health.
 
 With a Quarantine (wake.quarantine), the adapter also enforces the brake's memory
-quarantine: a locked agent's writes raise MemoryLocked and don't happen, and a quarantined
-entry isn't served (read returns the quarantine's id, the store wrapper drops the entry,
-read_file raises MemoryQuarantined). Each refusal is recorded as a `denied` event.
+quarantine: a locked agent's writes and deletes raise MemoryLocked and don't happen, a
+quarantined entry isn't served (read returns the quarantine's id, the store wrapper drops
+the entry, read_file raises MemoryQuarantined), and deleting one raises MemoryLocked: it's
+kept, as evidence. Each refusal is recorded as a `denied` event. If checking the
+quarantine fails, the write or delete is refused and the entry isn't served.
 """
 
 import hashlib
 import json
 import logging
+import os
+import shutil
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -38,6 +45,7 @@ from typing import Any
 from opentelemetry import trace
 
 from wake import events, links
+from wake._graph import failed
 from wake.quarantine import MemoryLocked, MemoryQuarantined, Quarantine
 
 log = logging.getLogger("wake")
@@ -45,17 +53,38 @@ log = logging.getLogger("wake")
 # Where a label lives: a key in a store's entry, or a file next to a memory file.
 LABEL_KEY = "__wake__"
 LABEL_SUFFIX = ".wake.json"
+# The id a write is refused under, and an entry not served, when checking the quarantine fails.
+UNCHECKED = "quarantine-check-failed"
 
 
 def digest(content: str) -> str:
-    return hashlib.sha256(content.encode()).hexdigest()
+    return hashlib.sha256(content.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def content_of(value: Any) -> str:
-    """The text of an entry's content, as the label's digest covers it."""
+    """The text of an entry's content, as the label's digest covers it. Never raises."""
     if isinstance(value, str):
         return value
-    return json.dumps(value, sort_keys=True, default=str, ensure_ascii=False)
+    return events.dumps(value, ensure_ascii=False)
+
+
+def _event_id(value: Any) -> str | None:
+    """An event id from a label, which anything that can write the store can forge, if it
+    looks like one."""
+    return value if isinstance(value, str) and links._EVENT_ID.match(value) else None
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Replaces the file whole, keeping its mode: a reader finds the old file or the new one."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        temporary.write_text(text)
+        if path.exists():
+            shutil.copymode(path, temporary)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 class Memory:
@@ -65,6 +94,10 @@ class Memory:
     def __init__(self, handler, quarantine: Quarantine | None = None) -> None:
         self._handler = handler
         self._quarantine = quarantine
+
+    @property
+    def quarantine(self) -> Quarantine | None:
+        return self._quarantine
 
     def write(self, store: str, entry: str, content: Any) -> dict[str, Any] | None:
         """Records a write and returns the label to store with the entry, or None if
@@ -77,8 +110,25 @@ class Memory:
         try:
             return self._write(store, entry, content_of(content))
         except Exception:
-            log.warning("wake: failed to record a memory write", exc_info=True)
+            self._failed("a memory write")
             return None
+
+    def delete(self, store: str, entry: str, current: Any = None, label: Mapping[str, Any] | None = None) -> None:
+        """Records the delete of an entry, given what it holds now (None if nothing) and the
+        label stored with it. Raises MemoryLocked, before anything is deleted, when the
+        brake's quarantine locks this agent's writes, or hides the entry: a quarantined
+        entry is kept, as evidence."""
+        refused = self._locked()
+        write = _event_id(label.get("event")) if isinstance(label, Mapping) else None
+        if not refused and current is not None:
+            refused = self._hidden(store, entry, content_of(current), label)
+        if refused:
+            self._refused("delete", store, entry, refused, parents=self._linked() + ([write] if write else []))
+            raise MemoryLocked(refused, store, entry)
+        try:
+            self._delete(store, entry)
+        except Exception:
+            self._failed("a memory delete")
 
     def read(self, store: str, entry: str, content: Any, label: Mapping[str, Any] | None) -> str | None:
         """Records a read of an entry, with the label it was stored with, if any. Returns the
@@ -86,25 +136,28 @@ class Memory:
         text = content_of(content)
         hidden = self._hidden(store, entry, text, label)
         if hidden:
-            write = label.get("event") if isinstance(label, Mapping) else None
-            self._refused("read", store, entry, hidden, parents=[write] if isinstance(write, str) and write else [])
+            write = _event_id(label.get("event")) if isinstance(label, Mapping) else None
+            self._refused("read", store, entry, hidden, parents=[write] if write else [])
             return hidden
         try:
             self._read(store, entry, text, label)
         except Exception:
-            log.warning("wake: failed to record a memory read", exc_info=True)
+            self._failed("a memory read")
         return None
 
     def write_file(self, path: str | Path, text: str) -> None:
-        """Writes a memory file and its label, next to it as <file>.wake.json."""
+        """Writes a memory file and its label, next to it as <file>.wake.json. The label
+        lands first and each file is replaced whole, so the new content is never found
+        with a label that doesn't vouch for it, only the other way round, which reads as
+        changed."""
         path = Path(path)
         label = self.write("file", str(path.resolve()), text)  # raises MemoryLocked when locked
-        path.write_text(text)
         if label is not None:
             try:
-                Path(str(path) + LABEL_SUFFIX).write_text(json.dumps(label))
+                _write_atomically(Path(str(path) + LABEL_SUFFIX), json.dumps(label))
             except OSError:
-                log.warning("wake: failed to write a memory file's label", exc_info=True)
+                self._failed("a memory file's label")
+        _write_atomically(path.resolve(), text)
 
     def read_file(self, path: str | Path) -> str:
         """Reads a memory file and records the read, with its label if it has one."""
@@ -128,7 +181,7 @@ class Memory:
             return self._quarantine.locked_by() if self._quarantine else None
         except Exception:
             log.warning("wake: failed to check the memory quarantine", exc_info=True)
-            return None
+            return UNCHECKED
 
     def _hidden(self, store: str, entry: str, text: str, label: Mapping[str, Any] | None) -> str | None:
         if not self._quarantine:
@@ -138,7 +191,7 @@ class Memory:
             return self._quarantine.hiding(store, entry, label if isinstance(label, Mapping) else None, vouched)
         except Exception:
             log.warning("wake: failed to check the memory quarantine", exc_info=True)
-            return None
+            return UNCHECKED
 
     def _linked(self) -> list[str]:
         link = links.current()
@@ -162,7 +215,11 @@ class Memory:
                 payload={"store": store, "entry": entry, "refused": action, "quarantine": quarantine},
             )
         except Exception:
-            log.warning("wake: failed to record a refused memory %s", action, exc_info=True)
+            self._failed(f"a refused memory {action}")
+
+    def _failed(self, what: str) -> None:
+        log.warning("wake: failed to record %s", what, exc_info=True)
+        failed(self._handler._recorder, what)
 
     def _write(self, store: str, entry: str, content: str) -> dict[str, Any]:
         h = self._handler
@@ -189,6 +246,25 @@ class Memory:
         )
         return label
 
+    def _delete(self, store: str, entry: str) -> None:
+        h = self._handler
+        parents = self._linked()
+        origins = h._origins_upstream(parents)
+        self._emit(
+            str(uuid.uuid4()),
+            events.MEMORY_WRITE,
+            h._event_context(),
+            parents=parents,
+            origins=[],
+            attributes={
+                "wake.memory.store": store,
+                "wake.memory.entry": entry,
+                "wake.memory.deleted": True,
+                "wake.memory.origins": origins,
+            },
+            payload={"store": store, "entry": entry, "deleted": True},
+        )
+
     def _read(self, store: str, entry: str, content: str, label: Mapping[str, Any] | None) -> None:
         h = self._handler
         context = h._event_context()
@@ -198,8 +274,8 @@ class Memory:
             attributes["wake.memory.labeled"] = False
         else:
             attributes["wake.memory.labeled"] = True
-            write_id = label.get("event")
-            if label.get("sha256") == digest(content) and isinstance(write_id, str) and write_id:
+            write_id = _event_id(label.get("event"))
+            if label.get("sha256") == digest(content) and write_id:
                 parents.append(write_id)
                 origins = label.get("origins")
                 if isinstance(origins, list):

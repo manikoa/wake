@@ -2,12 +2,16 @@
 index that links events by what they carry when no ids do, and each event's parents and
 origins, so a memory write can be labeled with the origins upstream of it."""
 
+import logging
 import threading
 from collections import OrderedDict, deque
+from functools import wraps
 
 from opentelemetry import trace
 
 from wake import links
+
+log = logging.getLogger("wake")
 
 # Content matching: an output is findable by its first characters, and only
 # outputs long enough that a match is unlikely to be chance are indexed.
@@ -15,6 +19,30 @@ _SNIPPET = 160
 _MIN_MATCH = 24
 _OUTPUTS_PER_TRACE = 64
 _KEPT_OUTPUT = 2000
+
+def never_raise(method):
+    """Recording must never break the agent: a hook that fails is logged, counted in the
+    recorder's health, and returns None."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            log.warning("wake: failed to record %s", method.__name__, exc_info=True)
+            failed(self._recorder, method.__name__)
+            return None
+
+    return wrapper
+
+
+def failed(recorder, what: str) -> None:
+    """Counts an event an integration couldn't record. Never raises."""
+    try:
+        recorder._failed(what)
+    except Exception:
+        pass
+
 
 class _Recent(OrderedDict):
     """A dict that forgets its oldest entries, so a long running agent's memory stays bounded."""

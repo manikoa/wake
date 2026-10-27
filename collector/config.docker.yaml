@@ -11,7 +11,7 @@ receivers:
     protocols:
       http:
         endpoint: 0.0.0.0:4318
-        # SDKs send over TLS; give them the CA with OTEL_EXPORTER_OTLP_CERTIFICATE.
+        # SDKs send over TLS; give them the CA with WAKE_CA_FILE.
         tls:
           cert_file: ${env:WAKE_TLS_CERT:-/etc/wake/identity/collector-tls.pem}
           key_file: ${env:WAKE_TLS_KEY:-/etc/wake/identity/collector-tls.key}
