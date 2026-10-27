@@ -74,7 +74,7 @@ def main(path):
 
     recorded = {(e["agent"], e["capture"]) for e in events.values()}
     for want in [("support", "sdk"), ("research", "sdk"), ("billing", "sdk"), ("support", "memory_adapter"),
-                 ("research", "proxy"), ("billing", "proxy"), ("support", "proxy")]:
+                 ("billing", "memory_adapter"), ("research", "proxy"), ("billing", "proxy"), ("support", "proxy")]:
         if want not in recorded:
             fail(f"nothing recorded for {want[0]} by the {want[1]}")
     proxy_tools = sorted(e["tool"] for e in events.values() if e["capture"] == "proxy" and e["kind"] == "tool_call")
