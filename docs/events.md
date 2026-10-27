@@ -16,7 +16,7 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
 | `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs |
 | `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload` |
-| `wake.signature` | string | Base64 Ed25519 signature, added by the signer (see [signing.md](signing.md)) |
+| `wake.signature` | string | Base64 signature, added by the signer: Ed25519 from the collector, ECDSA P-256 from the proxy (see [signing.md](signing.md)) |
 | `wake.signer` | string | SPIFFE id of the signer |
 | `wake.signature.valid` | bool | Set by the collector: whether the signature checked out. Always overwritten, so a sender can't claim it. |
 
