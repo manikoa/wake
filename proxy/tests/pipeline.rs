@@ -69,6 +69,7 @@ async fn collector() -> (String, mpsc::UnboundedReceiver<Span>) {
 }
 
 struct Proxy {
+    addr: String,
     client: ExtMcpClient<tonic::transport::Channel>,
     counters: Arc<Counters>,
     stop: Option<oneshot::Sender<()>>,
@@ -97,7 +98,7 @@ async fn proxy(collector: &str, response_timeout: Duration) -> Proxy {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    Proxy { client, counters, stop: Some(stop), done }
+    Proxy { addr: format!("http://{addr}"), client, counters, stop: Some(stop), done }
 }
 
 impl Proxy {
@@ -290,4 +291,79 @@ async fn against_a_real_collector() {
     p.shutdown().await;
     assert_eq!(Counters::get(&counters.sent), 1);
     println!("sent {event_id}");
+}
+
+#[tokio::test]
+async fn records_an_a2a_message_and_reply_through_ext_proc() {
+    use wake_proxy::extproc::pb::ext_proc::{
+        HeaderMap, HttpBody, HttpHeaders, ProcessingRequest, ProtocolConfiguration, external_processor_client::ExternalProcessorClient,
+        processing_mode::BodySendMode, processing_request::Request as Phase,
+    };
+    use wake_proxy::extproc::pb::common::HeaderValue;
+
+    let (url, mut spans) = collector().await;
+    let p = proxy(&url, Duration::from_secs(60)).await;
+    let mut client = ExternalProcessorClient::connect(p.addr.clone()).await.unwrap();
+
+    let headers = |pairs: &[(&str, &str)]| HttpHeaders {
+        headers: Some(HeaderMap {
+            headers: pairs.iter().map(|(k, v)| HeaderValue { key: k.to_string(), raw_value: v.as_bytes().to_vec(), ..Default::default() }).collect(),
+        }),
+        ..Default::default()
+    };
+    let route: Struct = Struct {
+        fields: [("sender", "spiffe://wake.local/agent/planner"), ("receiver", "research")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), PbValue { kind: Some(Kind::StringValue(v.into())) }))
+            .collect(),
+    };
+    let messages = vec![
+        ProcessingRequest {
+            request: Some(Phase::RequestHeaders(headers(&[(":method", "POST"), ("content-type", "application/json")]))),
+            attributes: [("envoy.filters.http.ext_proc".to_string(), route)].into(),
+            protocol_config: Some(ProtocolConfiguration {
+                request_body_mode: BodySendMode::BufferedPartial as i32,
+                response_body_mode: BodySendMode::BufferedPartial as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ProcessingRequest {
+            request: Some(Phase::RequestBody(HttpBody {
+                body: br#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"Is Acme legit?"}]}}}"#.to_vec(),
+                end_of_stream: true,
+            })),
+            ..Default::default()
+        },
+        ProcessingRequest { request: Some(Phase::ResponseHeaders(headers(&[(":status", "200"), ("content-type", "application/json")]))), ..Default::default() },
+        ProcessingRequest {
+            request: Some(Phase::ResponseBody(HttpBody {
+                body: br#"{"jsonrpc":"2.0","id":1,"result":{"kind":"message","messageId":"r1","parts":[{"kind":"text","text":"Acme is unverified."}]}}"#.to_vec(),
+                end_of_stream: true,
+            })),
+            ..Default::default()
+        },
+    ];
+    let mut answers = client.process(tokio_stream::iter(messages)).await.unwrap().into_inner();
+    let mut n = 0;
+    while let Some(answer) = answers.message().await.unwrap() {
+        assert!(answer.response.is_some());
+        n += 1;
+    }
+    assert_eq!(n, 4, "every message is answered");
+
+    let mut got = vec![];
+    for _ in 0..2 {
+        got.push(tokio::time::timeout(Duration::from_secs(5), spans.recv()).await.unwrap().unwrap());
+    }
+    got.sort_by_key(|s| s.start_time_unix_nano + if s.parent_span_id.is_empty() { 0 } else { 1 });
+    let (message, reply) = (&got[0], &got[1]);
+    let (m, r) = (attrs(message), attrs(reply));
+    assert_eq!(s(&m, "wake.event.kind"), "agent_message");
+    assert_eq!(s(&m, "wake.agent.id"), "research");
+    assert_eq!(s(&r, "wake.agent.id"), "spiffe://wake.local/agent/planner");
+    assert_eq!(r["wake.parents"], Value::Strs(vec![s(&m, "wake.event.id")]));
+    verify(message);
+    verify(reply);
+    p.shutdown().await;
 }

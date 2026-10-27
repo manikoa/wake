@@ -1,12 +1,42 @@
 # yaml-language-server: $schema=https://agentgateway.dev/schema/config
 #
-# agentgateway v1.6.0 config that records MCP calls through wake-proxy. agentgateway
-# serves the agents on port 3000 and calls wake-proxy on localhost:9001 before each
-# recorded call reaches its MCP server and after the result comes back.
+# agentgateway v1.6.0 config that records MCP calls and A2A messages through wake-proxy.
+# agentgateway serves the agents on port 3000 and calls wake-proxy on localhost:9001: its
+# ExtMCP hook for MCP calls, and its ext_proc hook for A2A messages.
 gateways:
   default:
     port: 3000
 routes:
+# An A2A agent. Add one route like this per agent.
+- matches:
+  - path:
+      pathPrefix: /agents/research
+  policies:
+    a2a: {}
+    extProc:
+      host: "localhost:9001"
+      # Calls that start while wake-proxy is down go through unrecorded. One that's in
+      # progress when it dies fails: agentgateway's ext_proc fails open only until body
+      # bytes reach the processor.
+      failureMode: failOpen
+      processingOptions:
+        requestHeaderMode: send
+        requestBodyMode: bufferedPartial
+        responseHeaderMode: send
+        responseBodyMode: bufferedPartial
+        requestTrailerMode: skip
+        responseTrailerMode: skip
+        # wake-proxy switches streamed (text/event-stream) replies to full duplex, so
+        # they aren't held until they end.
+        allowModeOverride: true
+      requestAttributes:
+        # Who's sending: the agent's SPIFFE ID from mTLS, else its JWT subject.
+        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")'
+        # Who's receiving: the agent behind this route.
+        receiver: '"research"'
+  backends:
+  - host: localhost:9999
+# MCP servers.
 - policies:
     mcpGuardrails:
       processors:

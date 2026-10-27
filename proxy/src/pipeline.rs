@@ -1,5 +1,6 @@
-//! Wires the processor together: the gRPC service agentgateway calls, the capture task
-//! that pairs requests with responses, signing, and the exporter. Each stage hands work on
+//! Wires the processor together: the gRPC services agentgateway calls (ExtMCP for MCP,
+//! ext_proc for A2A), the capture task that pairs MCP requests with responses, signing,
+//! and the exporter. Each stage hands work on
 //! through a bounded queue, so a slow stage drops and counts rather than slow the call.
 
 use std::sync::Arc;
@@ -9,9 +10,11 @@ use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use crate::canonical::Event;
 use crate::capture::Capture;
 use crate::export::{Counters, Exporter};
 use crate::extmcp::Processor;
+use crate::extproc;
 use crate::signer::Signer;
 
 pub struct Options {
@@ -29,7 +32,8 @@ impl Default for Options {
     }
 }
 
-/// Serves the ExtMCP processor on listener until shutdown resolves.
+/// Serves the processor's gRPC services, ExtMCP for MCP and ext_proc for A2A, on listener
+/// until shutdown resolves.
 pub async fn serve(
     listener: TcpListener,
     signer: Signer,
@@ -38,21 +42,32 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let (hooks_tx, mut hooks_rx) = mpsc::channel(options.queue);
-    let (events_tx, events_rx) = mpsc::channel(options.queue);
+    let (unsigned_tx, mut unsigned_rx) = mpsc::channel::<Event>(options.queue);
+    let (signed_tx, signed_rx) = mpsc::channel(options.queue);
 
     let exporter = Exporter::new(&options.collector, counters.clone());
-    let exported = tokio::spawn(exporter.run(events_rx));
+    let exported = tokio::spawn(exporter.run(signed_rx));
+
+    let sign_counters = counters.clone();
+    let signed = tokio::spawn(async move {
+        while let Some(mut event) = unsigned_rx.recv().await {
+            signer.sign(&mut event);
+            if signed_tx.try_send(event).is_err() {
+                sign_counters.export_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
 
     let capture_counters = counters.clone();
+    let capture_tx = unsigned_tx.clone();
     let timeout = options.response_timeout;
     let limit = options.queue;
     let captured = tokio::spawn(async move {
         let mut capture = Capture::new(timeout, limit);
         let mut tick = tokio::time::interval(Duration::from_secs(1));
-        let emit = |events: Vec<crate::canonical::Event>| {
-            for mut event in events {
-                signer.sign(&mut event);
-                if events_tx.try_send(event).is_err() {
+        let emit = |events: Vec<Event>| {
+            for event in events {
+                if capture_tx.try_send(event).is_err() {
                     capture_counters.export_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -76,11 +91,13 @@ pub async fn serve(
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let result = tonic::transport::Server::builder()
-        .add_service(Processor::new(hooks_tx, counters).server())
+        .add_service(Processor::new(hooks_tx, counters.clone()).server())
+        .add_service(extproc::Processor::new(unsigned_tx, counters).server())
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
-    // The server dropped its sender, so the capture task drains and ends, then the exporter.
+    // The server dropped its senders, so each stage drains and ends in turn.
     let _ = captured.await;
+    let _ = signed.await;
     let _ = exported.await;
     result
 }
