@@ -9,3 +9,15 @@ Generate a key pair with:
 ```bash
 go run ./cmd/wake-keygen -name wake-log -out keys/log
 ```
+
+## Reading entries
+
+Each entry holds an event's exact signed bytes, its signature and signer, and the collector's check at append time (the format is in [docs/events.md](../docs/events.md)). `ParseEntry` reads one back without touching the signed bytes, `Verify` checks the signature again with the signer's public key, and `Decode` reads the event's fields:
+
+```go
+entry, err := wakelog.ParseEntry(data)
+ok := entry.Verify(trusted) // don't rely on entry.Valid
+event, err := entry.Decode()
+```
+
+The collector writes entries with the same code, so the format is defined in one place.
