@@ -14,6 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+claude-agent-sdk = [
+    "claude-agent-sdk>=0.2.174",
+]
 langchain = [
     "langchain-core>=1.0",
 ]
@@ -37,6 +40,7 @@ packages = ["src/wake"]
 
 [dependency-groups]
 dev = [
+    "claude-agent-sdk>=0.2.174",
     "langchain-mcp-adapters>=0.3.2",
     "langgraph>=1.2.18",
     "mcp>=1.30.0",

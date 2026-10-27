@@ -146,8 +146,12 @@ class WakeTracingProcessor(EventGraph):
             event_id = str(uuid.uuid4())
             ctx = otel.get_span_context()
             link = links._enter(links.Link(event_id, ctx.trace_id, ctx.span_id))
+            # Its arguments aren't set yet, so the responses that asked for a tool of this
+            # name stand in as its parents until it ends, for a memory write it makes.
             with self._lock:
                 self._pending[span.span_id] = {"event_id": event_id, "link": link}
+                requested_by = [r for (t, n, _), (_, r) in self._call.items() if t == span.trace_id and n == data.name]
+            self._remember_lineage(event_id, list(dict.fromkeys(requested_by)), [f"tool:{data.name}"])
 
     @_never_raise
     def on_span_end(self, span) -> None:

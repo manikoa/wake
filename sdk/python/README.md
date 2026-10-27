@@ -29,6 +29,27 @@ Wake becomes one of the Agents SDK's trace processors. Each agent's run is named
 
 Inputs and outputs are recorded when the SDK's `trace_include_sensitive_data` is on, as it is by default. Install with the `openai-agents` extra.
 
+## Claude Agent SDK
+
+```python
+from wake import Recorder
+from wake.claude_agent_sdk import WakeClaudeAgent
+
+claude = WakeClaudeAgent(Recorder(agent="support"))
+crm = create_sdk_mcp_server("crm", tools=claude.tools([lookup_order]))
+options = claude.options(ClaudeAgentOptions(mcp_servers={"crm": crm}))
+
+async for message in claude.record(query(prompt=prompt, options=options), prompt=prompt):
+    ...
+```
+
+Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. One `agent_message` hands it the task and another carries its answer back. Links come from the SDK's ids:
+- A tool call's parent is the model call that asked for it.
+- A model call's parents are the call before it and the tool results and messages new in its context.
+- With `ClaudeSDKClient`, wrap each `receive_response()`, and a later turn continues from the last.
+
+`options()` adds hooks that open each tool call before it runs. `tools()` wraps in-process tools so they run with their event current, so an MCP or A2A call they make through the proxy, or a memory write, links back to the tool call. Tools Claude Code runs itself, such as Bash, WebFetch or an external MCP server, are recorded from the stream but can't carry the link. Install with the `claude-agent-sdk` extra.
+
 ## LangChain agents written as plain Python
 
 For agents built from LangChain models and tools without LangGraph, install the handler once so every model and tool call in the process is recorded, and name the agent behind each run. `handler.uninstall()` turns it off again.
