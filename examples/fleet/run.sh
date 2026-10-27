@@ -38,5 +38,5 @@ echo "signed log holds ${last} entries"
 
 compose run --rm --no-deps --entrypoint /wake-log collector verify -log /var/lib/wake/log \
   -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem \
-  -entries > "$work/entries.jsonl"
+  -signer proxy=spiffe://wake.local/proxy -entries > "$work/entries.jsonl"
 python3 check.py "$work/entries.jsonl"

@@ -68,6 +68,18 @@
         "string": "MIIB"
       },
       {
+        "key": "wake.signature.valid",
+        "bool": true
+      },
+      {
+        "key": "wake.signature.error",
+        "string": "set by the collector"
+      },
+      {
+        "key": "wake.received_unix_nano",
+        "int": 1761552000500000000
+      },
+      {
         "key": "http.url",
         "string": "not signed"
       }
@@ -164,5 +176,59 @@
       }
     ],
     "canonical": "{\"attributes\":{\"gen_ai.a\":\"gen_ai before wake\",\"wake.A\":\"uppercase sorts first\",\"wake.big\":9007199254740993,\"wake.count\":-42,\"wake.empty_list\":[],\"wake.list\":[\"b\",\"a\",\"a\"],\"wake.no\":false,\"wake.yes\":true,\"wake.z\":\"last\",\"wake.zero\":0},\"end_time_unix_nano\":1761552000123456789,\"span_id\":\"1112131415161718\",\"start_time_unix_nano\":1761552000000000000,\"trace_id\":\"0102030405060708090a0b0c0d0e0f10\"}"
+  },
+  {
+    "name": "NaN",
+    "trace_id": "0102030405060708090a0b0c0d0e0f10",
+    "span_id": "1112131415161718",
+    "start_time_unix_nano": 1761552000000000000,
+    "end_time_unix_nano": 1761552000123456789,
+    "attributes": [
+      {
+        "key": "wake.event.id",
+        "string": "e"
+      },
+      {
+        "key": "gen_ai.request.temperature",
+        "double": "NaN"
+      }
+    ],
+    "invalid": "a double that isn't finite has no JSON form"
+  },
+  {
+    "name": "infinity",
+    "trace_id": "0102030405060708090a0b0c0d0e0f10",
+    "span_id": "1112131415161718",
+    "start_time_unix_nano": 1761552000000000000,
+    "end_time_unix_nano": 1761552000123456789,
+    "attributes": [
+      {
+        "key": "wake.event.id",
+        "string": "e"
+      },
+      {
+        "key": "gen_ai.request.temperature",
+        "double": "+Inf"
+      }
+    ],
+    "invalid": "a double that isn't finite has no JSON form"
+  },
+  {
+    "name": "negative infinity",
+    "trace_id": "0102030405060708090a0b0c0d0e0f10",
+    "span_id": "1112131415161718",
+    "start_time_unix_nano": 1761552000000000000,
+    "end_time_unix_nano": 1761552000123456789,
+    "attributes": [
+      {
+        "key": "wake.event.id",
+        "string": "e"
+      },
+      {
+        "key": "wake.score",
+        "double": "-Inf"
+      }
+    ],
+    "invalid": "a double that isn't finite has no JSON form"
   }
 ]

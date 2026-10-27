@@ -2,7 +2,7 @@
 
 `compose.yaml` runs the open source recorder in one place, such as a staging environment:
 
-- **collector:** receives events over OTLP/HTTP with TLS on port 4318, signs the SDK's events, checks the proxy's, and keeps the signed log in the `data` volume.
+- **collector:** receives events over OTLP/HTTP with TLS on port 4318, signs the SDK's events, checks the proxy's, and keeps the signed log in the `data` volume. Only `spiffe://wake.local/proxy` may sign proxy events (`WAKE_PROXY_ID` changes it). Its health check is on port 13133 and its own metrics, for Prometheus, on port 8888 at `/metrics`, both published on this host's loopback; alert on `wake_log_dropped_events`.
 - **wake-proxy:** records MCP calls and A2A messages for agentgateway. It's reachable only on the compose network.
 - **agentgateway:** your agents call MCP servers and A2A agents through it on port 3000. Point its backends at yours in `agentgateway.yaml`.
 - **First start:** one-shot containers create the collector's signing key, the log's checkpoint key, and a development identity, kept in the `keys` and `identity` volumes. The identity is a CA standing in for SPIRE, the proxy's SVID, and the collector's TLS certificate. A restart reuses them.
@@ -28,7 +28,8 @@ The signed log is in the `data` volume at `/var/lib/wake/log`, with checkpoints 
 
 ```bash
 docker compose run --rm --no-deps --entrypoint /wake-log collector verify -log /var/lib/wake/log \
-  -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem
+  -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem \
+  -signer proxy=spiffe://wake.local/proxy
 ```
 
 The provenance view and its ingester run on top of this in `manikoa/wake-platform`.

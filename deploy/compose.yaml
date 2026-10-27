@@ -47,7 +47,9 @@ services:
       - keys:/etc/wake/keys:ro
       - identity:/etc/wake/identity:ro
       - data:/var/lib/wake
-    ports: ["4318:4318"]
+    # OTLP, then the health check and the collector's metrics for Prometheus on this host.
+    # On this network they're collector:13133 and collector:8888/metrics.
+    ports: ["4318:4318", "127.0.0.1:13133:13133", "127.0.0.1:8888:8888"]
     restart: unless-stopped
 
   wake-proxy:

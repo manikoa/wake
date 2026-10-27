@@ -10,6 +10,12 @@ trap 'compose logs --no-color collector wake-proxy > "$work/logs.txt" 2>&1 || tr
 compose up -d --build --wait collector wake-proxy agentgateway
 compose cp collector:/etc/wake/identity/bundle.pem "$work/ca.pem"
 
+# The health check answers, and Prometheus can scrape the collector's own metrics.
+for _ in $(seq 1 20); do curl -fsS http://localhost:13133/ >/dev/null 2>&1 && break; sleep 1; done
+curl -fsS http://localhost:13133/ >/dev/null
+curl -fsS http://localhost:8888/metrics | grep -q '^otelcol_'
+
+
 # Python 3.13 checks certificates strictly by default, so the development identity must pass.
 (cd ../sdk/python && WAKE_ENDPOINT=https://localhost:4318 OTEL_EXPORTER_OTLP_CERTIFICATE="$work/ca.pem" \
   uv run --python 3.13 --locked --all-extras python - <<'PY'
@@ -39,7 +45,8 @@ for _ in $(seq 1 20); do
     echo "signed log holds $size entries"
     # Check it as anyone could: the checkpoint, the tree, and every event's signature.
     compose run --rm --no-deps --entrypoint /wake-log collector verify -log /var/lib/wake/log \
-      -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem
+      -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem \
+      -signer proxy=spiffe://wake.local/proxy
     exit 0
   fi
   sleep 1

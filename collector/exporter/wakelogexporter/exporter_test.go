@@ -14,10 +14,13 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/extension/extensiontest"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/manikoa/wake/collector/event"
@@ -256,5 +259,87 @@ func shutdown(t *testing.T, exp exporter.Traces, storage component.Component) {
 	}
 	if err := storage.Shutdown(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The defaults used to give up on an append after five minutes, dropping signed events
+// with nothing in Wake to say so, and to time an append out after five seconds.
+func TestDefaultsNeverGiveUp(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	if cfg.RetryConfig.MaxElapsedTime != 0 || !cfg.RetryConfig.Enabled {
+		t.Errorf("retry = %+v, want it never to give up", cfg.RetryConfig)
+	}
+	if cfg.TimeoutConfig.Timeout != 30*time.Second {
+		t.Errorf("timeout = %s", cfg.TimeoutConfig.Timeout)
+	}
+	conf := confmap.NewFromStringMap(map[string]any{"dir": "data/log", "key_file": "keys/log.key", "timeout": "2m"})
+	if err := conf.Unmarshal(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TimeoutConfig.Timeout != 2*time.Minute {
+		t.Errorf("timeout from config = %s", cfg.TimeoutConfig.Timeout)
+	}
+}
+
+func droppedFor(t *testing.T, telemetry *componenttest.Telemetry, reason string) int64 {
+	t.Helper()
+	m, err := telemetry.GetMetric("wake_log_dropped_events")
+	if err != nil {
+		return 0
+	}
+	var n int64
+	for _, dp := range m.Data.(metricdata.Sum[int64]).DataPoints {
+		if v, ok := dp.Attributes.Value(attribute.Key("reason")); ok && v.AsString() == reason {
+			n += dp.Value
+		}
+	}
+	return n
+}
+
+func startWithTelemetry(t *testing.T, cfg *Config, open func(wakelog.Config) (appender, error)) (exporter.Traces, *componenttest.Telemetry) {
+	t.Helper()
+	telemetry := componenttest.NewTelemetry()
+	t.Cleanup(func() { telemetry.Shutdown(context.Background()) })
+	set := exportertest.NewNopSettings(component.MustNewType("wakelog"))
+	set.TelemetrySettings = telemetry.NewTelemetrySettings()
+	set.Logger = zaptest.NewLogger(t)
+	exp, err := newTraces(context.Background(), set, cfg, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.Start(context.Background(), componenttest.NewNopHost()); err != nil {
+		t.Fatal(err)
+	}
+	return exp, telemetry
+}
+
+// With a time limit set, the events a retry gives up on are counted in Wake's own metric.
+func TestEventsARetryGivesUpOnAreCounted(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	cfg.RetryConfig.MaxElapsedTime = 100 * time.Millisecond
+	down := newFlakyLog(true)
+	exp, telemetry := startWithTelemetry(t, cfg, down.open)
+	consumeQuickly(t, exp, events(3))
+	waitFor(t, "the dropped events to be counted", func() bool { return droppedFor(t, telemetry, "retries_exhausted") == 3 })
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := droppedFor(t, telemetry, "unloggable"); n != 0 {
+		t.Errorf("%d counted as unloggable", n)
+	}
+}
+
+// Stopping isn't giving up: a persistent queue keeps the request for the next start.
+func TestShutdownDoesNotCountADrop(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	down := newFlakyLog(true)
+	exp, telemetry := startWithTelemetry(t, cfg, down.open)
+	consumeQuickly(t, exp, events(2))
+	waitFor(t, "a retry", func() bool { return down.attempts.Load() > 1 })
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := droppedFor(t, telemetry, "retries_exhausted"); n != 0 {
+		t.Errorf("%d events counted as dropped on shutdown", n)
 	}
 }

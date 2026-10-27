@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -24,6 +25,20 @@ const MaxEntrySize = tessera.DefaultEntrySizeLimit
 
 // PayloadSHA256 is the signed attribute that commits an event to its payload.
 const PayloadSHA256 = "wake.payload.sha256"
+
+// Capture is the signed attribute naming what recorded an event: sdk, proxy or
+// memory_adapter. Trust.Signers says who may sign each.
+const Capture = "wake.capture"
+
+// MaxClockSkew is how far a signer's clock may run ahead of the collector's, and how
+// close to the edge of its validity an X.509-SVID may be. An SVID signature is checked as
+// of when the collector received the event, give or take this.
+const MaxClockSkew = 5 * time.Minute
+
+// MaxEventAge is how long before the collector received it an event signed with an
+// X.509-SVID may have started. It bounds how far back a signer can date an event. A long
+// call, such as an A2A task, starts well before the proxy signs it, so this is generous.
+const MaxEventAge = 24 * time.Hour
 
 var (
 	// ErrEntryTooLarge means an entry is over MaxEntrySize even without its payload.
@@ -51,6 +66,11 @@ type Entry struct {
 	// base64 of the DER certificate, followed by any intermediates. Check verifies it
 	// against SPIRE trust bundles.
 	Certificate string `json:"certificate,omitempty"`
+	// Received is when the collector received the event, in Unix nanoseconds. It isn't in
+	// the event's signed bytes, since the proxy signs before the collector receives the
+	// event; the log's signed checkpoint covers it, so read entries through Verify. Check
+	// checks an SVID as of this time, as the collector did.
+	Received uint64 `json:"received_unix_nano,omitempty"`
 	// Valid is the collector's check at append time. Check again with Check; don't trust it.
 	Valid bool `json:"valid"`
 }
@@ -62,7 +82,9 @@ type Fields struct {
 	Signature   string
 	Signer      string
 	Certificate string
-	Valid       bool
+	// Received is when the collector received the event, in Unix nanoseconds.
+	Received uint64
+	Valid    bool
 }
 
 // Event is the content of an entry's signed bytes.
@@ -95,7 +117,7 @@ func Encode(event []byte, f Fields) (entry []byte, inline bool, err error) {
 	if err := checkCompact(event); err != nil {
 		return nil, false, err
 	}
-	e := Entry{Event: event, Payload: f.Payload, Signature: f.Signature, Signer: f.Signer, Certificate: f.Certificate, Valid: f.Valid}
+	e := Entry{Event: event, Payload: f.Payload, Signature: f.Signature, Signer: f.Signer, Certificate: f.Certificate, Received: f.Received, Valid: f.Valid}
 	if f.Payload == nil {
 		data, err := encode(e)
 		return data, true, err
@@ -152,7 +174,8 @@ func ParseEntry(data []byte) (Entry, error) {
 }
 
 // Verify reports whether the entry's signature is valid for its event bytes, from one of
-// the trusted note format signers, keyed by name. Check also accepts X.509-SVID signers.
+// the trusted note format signers, keyed by name. It doesn't apply Trust.Signers; Check
+// does, and also accepts X.509-SVID signers.
 func (e Entry) Verify(trusted map[string]note.Verifier) bool {
 	return VerifySignature(e.Event, e.Signature, e.Signer, trusted)
 }
@@ -164,22 +187,97 @@ type Trust struct {
 	// Bundles are the SPIRE trust bundles that X.509-SVID signers, such as the proxy,
 	// must chain to.
 	Bundles *x509.CertPool
+	// Signers says who may sign each capture. A bundle vouches for every workload in its
+	// trust domain, agents included, so an SVID signature only counts when its signer is
+	// listed for the event's capture. A note format key is trusted by being in Keys, but
+	// once a capture is listed here, only its listed signers count for it, whatever they
+	// sign with.
+	Signers Signers
 }
 
-// Check reports whether the entry's signature is valid for its event bytes under trust:
-// from a trusted note format key, or from an X.509-SVID that chains to a trusted bundle.
+// Signers lists, by wake.capture, who may sign events of that capture: signer names,
+// such as SPIFFE IDs, or path prefixes ending in "/" that match every ID below them. A
+// SPIFFE ID never ends in "/", so the two can't be confused.
+type Signers map[string][]string
+
+// Allows reports whether signer may sign events of this capture.
+func (s Signers) Allows(capture, signer string) bool {
+	for _, id := range s[capture] {
+		if id == signer || strings.HasSuffix(id, "/") && len(signer) > len(id) && strings.HasPrefix(signer, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate refuses an empty name, and a prefix that would admit a whole trust domain.
+func (s Signers) Validate() error {
+	for capture, ids := range s {
+		if len(ids) == 0 {
+			return fmt.Errorf("signers for %q: none listed", capture)
+		}
+		for _, id := range ids {
+			if id == "" {
+				return fmt.Errorf("signers for %q: an empty name", capture)
+			}
+			if rest, ok := strings.CutPrefix(id, "spiffe://"); ok && strings.HasSuffix(id, "/") && !strings.Contains(strings.TrimSuffix(rest, "/"), "/") {
+				return fmt.Errorf("signers for %q: %s would let every workload in the trust domain sign", capture, id)
+			}
+		}
+	}
+	return nil
+}
+
+// Check reports whether the entry's signature is valid for its event bytes under trust.
+// CheckSignature says why when it isn't.
 func (e Entry) Check(t Trust) bool {
-	if VerifySignature(e.Event, e.Signature, e.Signer, t.Keys) {
-		return true
-	}
-	if e.Certificate == "" || t.Bundles == nil {
-		return false
-	}
+	return e.CheckSignature(t) == nil
+}
+
+// CheckSignature returns nil when the entry's signature is valid for its event bytes
+// under trust, and otherwise why it isn't. The signer must be a trusted note format key
+// or an X.509-SVID that chains to a trusted bundle, and t.Signers must allow it to sign
+// the event's capture (see Trust). An SVID is checked as of when the collector received
+// the event, give or take MaxClockSkew, and the event must have started no more than
+// MaxEventAge before that, so a signer can't pick the time its certificate is checked at.
+// The collector runs the same check as events arrive.
+func (e Entry) CheckSignature(t Trust) error {
 	ev, err := e.Decode()
 	if err != nil {
-		return false
+		return err
 	}
-	return VerifySVIDSignature(e.Event, e.Signature, e.Signer, e.Certificate, t.Bundles, ev.StartTime()) == nil
+	if e.Signature == "" {
+		return errors.New("not signed")
+	}
+	capture := ev.String(Capture)
+	if VerifySignature(e.Event, e.Signature, e.Signer, t.Keys) {
+		if _, listed := t.Signers[capture]; listed && !t.Signers.Allows(capture, e.Signer) {
+			return fmt.Errorf("%s may not sign events captured by %q", e.Signer, capture)
+		}
+		return nil
+	}
+	if e.Certificate == "" {
+		if _, ok := t.Keys[e.Signer]; ok {
+			return errors.New("signature doesn't verify")
+		}
+		return fmt.Errorf("%s isn't a trusted signer", e.Signer)
+	}
+	if t.Bundles == nil {
+		return errors.New("signed with an X.509-SVID, and no trust bundle is given")
+	}
+	if !t.Signers.Allows(capture, e.Signer) {
+		return fmt.Errorf("%s may not sign events captured by %q", e.Signer, capture)
+	}
+	if e.Received == 0 {
+		return errors.New("no time the collector received it, to check the X.509-SVID at")
+	}
+	received := time.Unix(0, int64(e.Received))
+	if start := ev.StartTime(); start.After(received.Add(MaxClockSkew)) {
+		return fmt.Errorf("started at %s, after the collector received it at %s", start.UTC().Format(time.RFC3339), received.UTC().Format(time.RFC3339))
+	} else if received.Sub(start) > MaxEventAge {
+		return fmt.Errorf("started at %s, more than %s before the collector received it at %s", start.UTC().Format(time.RFC3339), MaxEventAge, received.UTC().Format(time.RFC3339))
+	}
+	return verifySVID(e.Event, e.Signature, e.Signer, e.Certificate, t.Bundles, received, MaxClockSkew)
 }
 
 // StartTime is when the event started.
@@ -189,11 +287,19 @@ func (ev Event) StartTime() time.Time {
 
 // VerifySVIDSignature checks a signature made with an X.509-SVID's key, as the proxy
 // signs (docs/proxy.md). certificate is base64 of the DER SVID followed by any
-// intermediates. The SVID must chain to one of bundles as of at, the time the event
-// happened, so an event can be checked long after its short lived SVID expired. It must
-// be an end-entity certificate with exactly one spiffe:// URI SAN, equal to signer, and
-// a P-256 key. signature is base64 ASN.1 DER ECDSA over the SHA-256 of msg.
+// intermediates. The SVID must chain to one of bundles as of at. It must be an
+// end-entity certificate with exactly one spiffe:// URI SAN, equal to signer, and a P-256
+// key. signature is base64 ASN.1 DER ECDSA over the SHA-256 of msg.
+//
+// It doesn't say whether signer may sign the event, or which time to check at. Use
+// Entry.CheckSignature, which checks both.
 func VerifySVIDSignature(msg []byte, signature, signer, certificate string, bundles *x509.CertPool, at time.Time) error {
+	return verifySVID(msg, signature, signer, certificate, bundles, at, 0)
+}
+
+// verifySVID is VerifySVIDSignature, accepting a certificate that became valid or expired
+// within skew of at.
+func verifySVID(msg []byte, signature, signer, certificate string, bundles *x509.CertPool, at time.Time, skew time.Duration) error {
 	der, err := base64.StdEncoding.DecodeString(certificate)
 	if err != nil {
 		return fmt.Errorf("certificate: %w", err)
@@ -212,6 +318,11 @@ func VerifySVIDSignature(msg []byte, signature, signer, certificate string, bund
 	}
 	if leaf.IsCA {
 		return errors.New("certificate: a CA can't sign events")
+	}
+	if at.Before(leaf.NotBefore) && leaf.NotBefore.Sub(at) <= skew {
+		at = leaf.NotBefore
+	} else if at.After(leaf.NotAfter) && at.Sub(leaf.NotAfter) <= skew {
+		at = leaf.NotAfter
 	}
 	if _, err := leaf.Verify(x509.VerifyOptions{
 		Roots:         bundles,

@@ -32,8 +32,8 @@ func newCA(t *testing.T, parent *ca) *ca {
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(time.Now().UnixNano()),
 		Subject:               pkix.Name{CommonName: "test trust bundle"},
-		NotBefore:             eventTime.Add(-24 * time.Hour),
-		NotAfter:              eventTime.Add(24 * time.Hour),
+		NotBefore:             eventTime.Add(-48 * time.Hour),
+		NotAfter:              eventTime.Add(48 * time.Hour),
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
@@ -105,9 +105,22 @@ func signWith(t *testing.T, key crypto.Signer, msg string) string {
 	return base64.StdEncoding.EncodeToString(sig)
 }
 
-func proxyEntry(t *testing.T, certificate, signature string) Entry {
+const proxyID = "spiffe://wake.test/proxy"
+
+// trustProxy trusts SVIDs from root, and lets only the proxy sign proxy events.
+func trustProxy(root *ca) Trust {
+	return Trust{Bundles: root.pool(), Signers: Signers{"proxy": {proxyID}}}
+}
+
+// svidEntry is an entry for event signed by signer, which the collector received at
+// received, or at no recorded time if it's zero.
+func svidEntry(t *testing.T, event, signer, certificate, signature string, received time.Time) Entry {
 	t.Helper()
-	data, _, err := Encode([]byte(svidEvent), Fields{Signature: signature, Signer: "spiffe://wake.test/proxy", Certificate: certificate, Valid: true})
+	f := Fields{Signature: signature, Signer: signer, Certificate: certificate, Valid: true}
+	if !received.IsZero() {
+		f.Received = uint64(received.UnixNano())
+	}
+	data, _, err := Encode([]byte(event), f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,33 +131,39 @@ func proxyEntry(t *testing.T, certificate, signature string) Entry {
 	return e
 }
 
+// proxyEntry is svidEvent signed by the proxy, received a second after it started.
+func proxyEntry(t *testing.T, certificate, signature string) Entry {
+	t.Helper()
+	return svidEntry(t, svidEvent, proxyID, certificate, signature, eventTime.Add(time.Second))
+}
+
 func TestCheckAcceptsAnSVIDThatChainsToTheBundle(t *testing.T) {
 	root := newCA(t, nil)
-	cert, key := issue(t, root, svid{ids: []string{"spiffe://wake.test/proxy"}})
+	cert, key := issue(t, root, svid{ids: []string{proxyID}})
 	e := proxyEntry(t, cert, signWith(t, key, svidEvent))
 	if e.Certificate != cert {
 		t.Fatal("certificate not kept in the entry")
 	}
-	if !e.Check(Trust{Bundles: root.pool()}) {
-		t.Fatal("valid SVID signature rejected")
+	if err := e.CheckSignature(trustProxy(root)); err != nil {
+		t.Fatalf("valid SVID signature rejected: %v", err)
 	}
 	// An intermediate in the chain, as SPIRE with an upstream authority issues.
 	intermediate := newCA(t, root)
-	cert, key = issue(t, intermediate, svid{ids: []string{"spiffe://wake.test/proxy"}}, intermediate)
-	if !proxyEntry(t, cert, signWith(t, key, svidEvent)).Check(Trust{Bundles: root.pool()}) {
-		t.Fatal("SVID with an intermediate rejected")
+	cert, key = issue(t, intermediate, svid{ids: []string{proxyID}}, intermediate)
+	if err := proxyEntry(t, cert, signWith(t, key, svidEvent)).CheckSignature(trustProxy(root)); err != nil {
+		t.Fatalf("SVID with an intermediate rejected: %v", err)
 	}
 }
 
 func TestCheckRejectsBadSVIDSignatures(t *testing.T) {
 	root, other := newCA(t, nil), newCA(t, nil)
 	p384, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-	good, goodKey := issue(t, root, svid{ids: []string{"spiffe://wake.test/proxy"}})
+	good, goodKey := issue(t, root, svid{ids: []string{proxyID}})
 	signed := func(s svid, issuer *ca) Entry {
 		c, k := issue(t, issuer, s)
 		return proxyEntry(t, c, signWith(t, k, svidEvent))
 	}
-	proxy := []string{"spiffe://wake.test/proxy"}
+	proxy := []string{proxyID}
 
 	cases := []struct {
 		name  string
@@ -153,7 +172,7 @@ func TestCheckRejectsBadSVIDSignatures(t *testing.T) {
 	}{
 		{"another bundle's SVID", signed(svid{ids: proxy}, other), "unknown authority"},
 		{"signer isn't the SVID's ID", signed(svid{ids: []string{"spiffe://wake.test/agent"}}, root), "want exactly"},
-		{"two SPIFFE IDs", signed(svid{ids: []string{"spiffe://wake.test/proxy", "spiffe://wake.test/other"}}, root), "want exactly"},
+		{"two SPIFFE IDs", signed(svid{ids: []string{proxyID, "spiffe://wake.test/other"}}, root), "want exactly"},
 		{"expired before the event", signed(svid{ids: proxy, notBefore: eventTime.Add(-2 * time.Hour), notAfter: eventTime.Add(-time.Hour)}, root), "expired"},
 		{"a CA signing events", signed(svid{ids: proxy, isCA: true}, root), "a CA can't sign"},
 		{"a P-384 key", signed(svid{ids: proxy, key: p384}, root), "not ECDSA P-256"},
@@ -167,21 +186,136 @@ func TestCheckRejectsBadSVIDSignatures(t *testing.T) {
 			return proxyEntry(t, good, signWith(t, k, svidEvent))
 		}(), "doesn't verify"},
 		{"garbled certificate", proxyEntry(t, "not base64!", signWith(t, goodKey, svidEvent)), "illegal base64"},
-		{"no certificate", proxyEntry(t, "", signWith(t, goodKey, svidEvent)), "none given"},
+		{"no time it was received", svidEntry(t, svidEvent, proxyID, good, signWith(t, goodKey, svidEvent), time.Time{}), "no time"},
 	}
 	for _, c := range cases {
-		if c.entry.Check(Trust{Bundles: root.pool()}) {
+		if c.entry.Check(trustProxy(root)) {
 			t.Errorf("%s: accepted", c.name)
 		}
-		e := c.entry
-		err := VerifySVIDSignature(e.Event, e.Signature, e.Signer, e.Certificate, root.pool(), eventTime)
+		err := c.entry.CheckSignature(trustProxy(root))
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err = %v, want it to mention %q", c.name, err, c.want)
 		}
 	}
+	// No certificate at all.
+	e := proxyEntry(t, "", signWith(t, goodKey, svidEvent))
+	if err := VerifySVIDSignature(e.Event, e.Signature, e.Signer, e.Certificate, root.pool(), eventTime); err == nil || !strings.Contains(err.Error(), "none given") {
+		t.Errorf("no certificate: err = %v", err)
+	}
+	if e.Check(trustProxy(root)) {
+		t.Error("no certificate: accepted")
+	}
 	// No bundles configured: no SVID signature can be accepted.
-	if proxyEntry(t, good, signWith(t, goodKey, svidEvent)).Check(Trust{}) {
+	if proxyEntry(t, good, signWith(t, goodKey, svidEvent)).Check(Trust{Signers: Signers{"proxy": proxy}}) {
 		t.Error("accepted with no trust bundles")
+	}
+}
+
+// Every workload in a trust domain has an SVID from the same bundle, agents included. An
+// agent with its own SVID must not be able to sign its record as the proxy.
+func TestCheckOnlyAcceptsSignersListedForTheCapture(t *testing.T) {
+	root := newCA(t, nil)
+	sdkEvent := strings.Replace(svidEvent, `"wake.capture":"proxy"`, `"wake.capture":"sdk"`, 1)
+	noCapture := strings.Replace(svidEvent, `"wake.capture":"proxy",`, "", 1)
+	received := eventTime.Add(time.Second)
+	signedBy := func(id, event string) Entry {
+		cert, key := issue(t, root, svid{ids: []string{id}})
+		return svidEntry(t, event, id, cert, signWith(t, key, event), received)
+	}
+	collector, collectorKeys := testSigner(t, "collector")
+	noteSigned := func(event string) Entry {
+		sig, err := collector.Sign([]byte(event))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return svidEntry(t, event, "collector", "", base64.StdEncoding.EncodeToString(sig), received)
+	}
+	prefix := Signers{"proxy": {"spiffe://wake.test/proxy/"}}
+
+	cases := []struct {
+		name    string
+		entry   Entry
+		signers Signers
+		keys    bool
+		want    string // empty when it's accepted
+	}{
+		{"the proxy signs a proxy event", signedBy(proxyID, svidEvent), nil, false, ""},
+		{"an agent signs a proxy event", signedBy("spiffe://wake.test/agent/email", svidEvent), nil, false, "may not sign"},
+		{"an agent signs an SDK event", signedBy("spiffe://wake.test/agent/email", sdkEvent), nil, false, "may not sign"},
+		{"an agent signs an event with no capture", signedBy("spiffe://wake.test/agent/email", noCapture), nil, false, "may not sign"},
+		{"the proxy signs an SDK event", signedBy(proxyID, sdkEvent), nil, false, "may not sign"},
+		{"the brake signs a proxy event", signedBy("spiffe://wake.test/brake", svidEvent), nil, false, "may not sign"},
+		{"a proxy under a listed prefix", signedBy("spiffe://wake.test/proxy/eu-1", svidEvent), prefix, false, ""},
+		{"the prefix itself isn't under it", signedBy(proxyID, svidEvent), prefix, false, "may not sign"},
+		{"a name that only starts the same", signedBy("spiffe://wake.test/proxyish", svidEvent), nil, false, "may not sign"},
+		{"the collector signs an SDK event", noteSigned(sdkEvent), nil, true, ""},
+		{"the collector signs a proxy event", noteSigned(svidEvent), nil, true, "may not sign"},
+		{"the collector's key, untrusted", noteSigned(sdkEvent), nil, false, "isn't a trusted signer"},
+	}
+	for _, c := range cases {
+		trust := trustProxy(root)
+		if c.signers != nil {
+			trust.Signers = c.signers
+		}
+		if c.keys {
+			trust.Keys = collectorKeys
+		}
+		err := c.entry.CheckSignature(trust)
+		switch {
+		case c.want == "" && err != nil:
+			t.Errorf("%s: rejected: %v", c.name, err)
+		case c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)):
+			t.Errorf("%s: err = %v, want it to mention %q", c.name, err, c.want)
+		}
+	}
+	// Trusting the bundle alone trusts no one to sign anything.
+	if signedBy(proxyID, svidEvent).Check(Trust{Bundles: root.pool()}) {
+		t.Error("an SVID signature counted with no signers listed")
+	}
+}
+
+// The signer chooses an event's start time, so the SVID is checked as of when the
+// collector received the event. Otherwise a key taken from an expired SVID could still
+// sign events dated back to when it was valid.
+func TestCheckTakesTheSVIDsTimeFromTheCollector(t *testing.T) {
+	root := newCA(t, nil)
+	cert, key := issue(t, root, svid{ids: []string{proxyID}, notBefore: eventTime.Add(-30 * time.Minute), notAfter: eventTime.Add(30 * time.Minute)})
+	at := func(received time.Time) error {
+		return svidEntry(t, svidEvent, proxyID, cert, signWith(t, key, svidEvent), received).CheckSignature(trustProxy(root))
+	}
+	if err := at(eventTime.Add(time.Second)); err != nil {
+		t.Fatalf("received while the SVID was valid: %v", err)
+	}
+	if err := at(eventTime.Add(30*time.Minute + MaxClockSkew - time.Second)); err != nil {
+		t.Errorf("received within the clock skew of the SVID expiring: %v", err)
+	}
+	if err := at(eventTime.Add(2 * time.Hour)); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Errorf("received after the SVID expired: err = %v", err)
+	}
+	if err := at(eventTime.Add(-MaxClockSkew - time.Minute)); err == nil || !strings.Contains(err.Error(), "after the collector received it") {
+		t.Errorf("started after it was received: err = %v", err)
+	}
+
+	// A signer with a valid SVID can't date an event far back either.
+	later, laterKey := issue(t, root, svid{ids: []string{proxyID}, notBefore: eventTime.Add(MaxEventAge), notAfter: eventTime.Add(MaxEventAge + time.Hour)})
+	old := svidEntry(t, svidEvent, proxyID, later, signWith(t, laterKey, svidEvent), eventTime.Add(MaxEventAge+time.Minute))
+	if err := old.CheckSignature(trustProxy(root)); err == nil || !strings.Contains(err.Error(), "more than") {
+		t.Errorf("started more than MaxEventAge before it was received: err = %v", err)
+	}
+}
+
+func TestSignersRefuseNamesThatTrustTooMuch(t *testing.T) {
+	for _, s := range []Signers{
+		{"proxy": {"spiffe://wake.test/"}},
+		{"proxy": {""}},
+		{"proxy": {}},
+	} {
+		if err := s.Validate(); err == nil {
+			t.Errorf("%v validated", s)
+		}
+	}
+	if err := (Signers{"proxy": {proxyID, "spiffe://wake.test/proxy/"}, "sdk": {"wake-collector"}}).Validate(); err != nil {
+		t.Error(err)
 	}
 }
 

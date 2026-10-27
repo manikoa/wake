@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
@@ -33,12 +34,27 @@ type Config struct {
 	// TrustBundles lists PEM files of SPIRE trust bundles. Components that sign with an
 	// X.509-SVID, such as the proxy, must chain to one of them.
 	TrustBundles []string `mapstructure:"trust_bundles"`
+	// TrustedSigners lists, by wake.capture, who may sign events of that capture: SPIFFE
+	// IDs, or path prefixes ending in "/" that match every ID below them. A trust bundle
+	// vouches for every workload in its trust domain, agents included, so an event signed
+	// with an X.509-SVID only counts when its signer is listed for its capture. Once a
+	// capture is listed, only its listed signers count for it, whatever they sign with.
+	//
+	//	trusted_signers:
+	//	  proxy: [spiffe://wake.local/proxy]
+	TrustedSigners map[string][]string `mapstructure:"trusted_signers"`
 }
 
 // Validate checks the config.
 func (c *Config) Validate() error {
 	if c.SigningKeyFile == "" {
 		return errors.New("signing_key_file is required")
+	}
+	if len(c.TrustBundles) > 0 && len(c.TrustedSigners) == 0 {
+		return errors.New("trust_bundles needs trusted_signers: a bundle vouches for every workload in its trust domain, so list who may sign each capture, such as proxy: [spiffe://wake.local/proxy]")
+	}
+	if err := wakelog.Signers(c.TrustedSigners).Validate(); err != nil {
+		return fmt.Errorf("trusted_signers: %w", err)
 	}
 	return nil
 }
@@ -64,6 +80,7 @@ func createTraces(ctx context.Context, set processor.Settings, cfg component.Con
 type signer struct {
 	key   note.Signer
 	trust wakelog.Trust
+	now   func() time.Time
 }
 
 func newSigner(cfg *Config) (*signer, error) {
@@ -87,7 +104,7 @@ func newSigner(cfg *Config) (*signer, error) {
 		}
 		trusted[verifier.Name()] = verifier
 	}
-	trust := wakelog.Trust{Keys: trusted}
+	trust := wakelog.Trust{Keys: trusted, Signers: wakelog.Signers(cfg.TrustedSigners)}
 	if len(cfg.TrustBundles) > 0 {
 		trust.Bundles = x509.NewCertPool()
 		for _, path := range cfg.TrustBundles {
@@ -100,43 +117,48 @@ func newSigner(cfg *Config) (*signer, error) {
 			}
 		}
 	}
-	return &signer{key: key, trust: trust}, nil
+	return &signer{key: key, trust: trust, now: time.Now}, nil
 }
 
 func (s *signer) processTraces(_ context.Context, td ptrace.Traces) (ptrace.Traces, error) {
 	for _, rs := range td.ResourceSpans().All() {
 		for _, ss := range rs.ScopeSpans().All() {
 			for _, span := range ss.Spans().All() {
-				if err := s.process(span); err != nil {
-					return td, err
-				}
+				s.process(span)
 			}
 		}
 	}
 	return td, nil
 }
 
-// process always overwrites wake.signature.valid, so a sender can never claim it.
-func (s *signer) process(span ptrace.Span) error {
+// process marks span valid or invalid, with the reason, and never fails: one bad event
+// must not cost the rest of its request. It always overwrites wake.signature.valid,
+// wake.signature.error and wake.received_unix_nano, so a sender can never claim them.
+func (s *signer) process(span ptrace.Span) {
 	if !event.IsEvent(span) {
-		return nil
+		return
 	}
 	attrs := span.Attributes()
+	attrs.Remove(event.SignatureError)
+	attrs.PutInt(event.Received, s.now().UnixNano())
 	if _, signed := attrs.Get(event.Signature); signed {
 		// Keep events whose signatures fail: they're evidence too.
-		attrs.PutBool(event.SignatureValid, event.Verify(span, s.trust))
-		return nil
+		mark(span, event.Verify(span, s.trust))
+		return
 	}
 	capture, _ := attrs.Get(event.Capture)
 	switch capture.Str() {
 	case "sdk", "memory_adapter":
-		if err := event.Sign(span, s.key); err != nil {
-			return err
-		}
-		attrs.PutBool(event.SignatureValid, true)
+		mark(span, event.Sign(span, s.key))
 	default:
 		// Proxies sign their own events, so an unsigned one can't be trusted.
-		attrs.PutBool(event.SignatureValid, false)
+		mark(span, fmt.Errorf("unsigned, and the collector only signs sdk and memory_adapter events, not %q", capture.Str()))
 	}
-	return nil
+}
+
+func mark(span ptrace.Span, err error) {
+	span.Attributes().PutBool(event.SignatureValid, err == nil)
+	if err != nil {
+		span.Attributes().PutStr(event.SignatureError, err.Error())
+	}
 }

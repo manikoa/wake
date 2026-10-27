@@ -2,14 +2,26 @@ package wakesignprocessor
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"go.opentelemetry.io/collector/pdata/pcommon"
+	"encoding/pem"
+	"math"
+	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
 
@@ -95,7 +107,7 @@ func TestSignsSDKEventsAndChecksProxyEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !valid(sdk) || !event.Verify(sdk, wakelog.Trust{Keys: collectorTrust}) {
+	if !valid(sdk) || event.Verify(sdk, wakelog.Trust{Keys: collectorTrust}) != nil {
 		t.Error("SDK event wasn't signed by the collector")
 	}
 	if !valid(proxyGood) {
@@ -115,6 +127,195 @@ func TestSignsSDKEventsAndChecksProxyEvents(t *testing.T) {
 func TestConfigRequiresSigningKey(t *testing.T) {
 	if err := (&Config{}).Validate(); err == nil {
 		t.Fatal("empty config validated")
+	}
+}
+
+func TestConfigRequiresSignersForTrustBundles(t *testing.T) {
+	for _, c := range []Config{
+		{SigningKeyFile: "k", TrustBundles: []string{"b.pem"}},
+		{SigningKeyFile: "k", TrustBundles: []string{"b.pem"}, TrustedSigners: map[string][]string{"proxy": {"spiffe://wake.local/"}}},
+		{SigningKeyFile: "k", TrustedSigners: map[string][]string{"proxy": {}}},
+	} {
+		if err := c.Validate(); err == nil {
+			t.Errorf("%+v validated", c)
+		}
+	}
+	ok := Config{SigningKeyFile: "k", TrustBundles: []string{"b.pem"}, TrustedSigners: map[string][]string{"proxy": {"spiffe://wake.local/proxy"}}}
+	if err := ok.Validate(); err != nil {
+		t.Error(err)
+	}
+}
+
+// identity is a stand-in SPIRE: one trust bundle, with an SVID for each workload.
+type identity struct {
+	t      *testing.T
+	ca     *x509.Certificate
+	key    *ecdsa.PrivateKey
+	bundle string
+}
+
+func newIdentity(t *testing.T, dir string) *identity {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	now := time.Now()
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: now.Add(-48 * time.Hour), NotAfter: now.Add(48 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, _ := x509.ParseCertificate(der)
+	bundle := filepath.Join(dir, "bundle.pem")
+	if err := os.WriteFile(bundle, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &identity{t: t, ca: ca, key: key, bundle: bundle}
+}
+
+// sign signs span as id would, with an SVID valid from notBefore to notAfter.
+func (i *identity) sign(span ptrace.Span, id string, notBefore, notAfter time.Time) {
+	i.t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	u, _ := url.Parse(id)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), NotBefore: notBefore, NotAfter: notAfter,
+		URIs: []*url.URL{u}, KeyUsage: x509.KeyUsageDigitalSignature}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, i.ca, key.Public(), i.key)
+	if err != nil {
+		i.t.Fatal(err)
+	}
+	msg, err := event.Canonical(span)
+	if err != nil {
+		i.t.Fatal(err)
+	}
+	digest := sha256.Sum256(msg)
+	sig, err := key.Sign(rand.Reader, digest[:], crypto.SHA256)
+	if err != nil {
+		i.t.Fatal(err)
+	}
+	attrs := span.Attributes()
+	attrs.PutStr(event.Signature, base64.StdEncoding.EncodeToString(sig))
+	attrs.PutStr(event.Signer, id)
+	attrs.PutStr(event.Certificate, base64.StdEncoding.EncodeToString(der))
+}
+
+func reason(span ptrace.Span) string {
+	v, _ := span.Attributes().Get(event.SignatureError)
+	return v.Str()
+}
+
+// Agents get SVIDs from the same SPIRE as the proxy. Before trusted_signers, any SVID in
+// the bundle could sign an event as the proxy, so an agent could forge its own record.
+func TestOnlyTrustedSignersMaySignACapture(t *testing.T) {
+	dir := t.TempDir()
+	id := newIdentity(t, dir)
+	collectorKey, _ := writeKey(t, dir, "collector")
+	s, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustBundles: []string{id.bundle},
+		TrustedSigners: map[string][]string{"proxy": {"spiffe://wake.test/proxy"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	td := ptrace.NewTraces()
+	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+	signed := func(capture, signer string) ptrace.Span {
+		span := addSpan(td, capture)
+		span.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Second)))
+		id.sign(span, signer, now.Add(-time.Hour), now.Add(time.Hour))
+		return span
+	}
+	proxy := signed("proxy", "spiffe://wake.test/proxy")
+	forged := signed("proxy", "spiffe://wake.test/agent/email")
+	forgedSDK := signed("sdk", "spiffe://wake.test/agent/email")
+	proxyAsSDK := signed("sdk", "spiffe://wake.test/proxy")
+
+	if _, err := s.processTraces(context.Background(), td); err != nil {
+		t.Fatal(err)
+	}
+	if !valid(proxy) {
+		t.Errorf("the proxy's event marked invalid: %s", reason(proxy))
+	}
+	for name, span := range map[string]ptrace.Span{"an agent signing as the proxy": forged, "an agent signing an SDK event": forgedSDK, "the proxy signing an SDK event": proxyAsSDK} {
+		if valid(span) || !strings.Contains(reason(span), "may not sign") {
+			t.Errorf("%s: valid %v, reason %q", name, valid(span), reason(span))
+		}
+	}
+}
+
+// The signer chooses an event's start time, so the collector checks the SVID as of when it
+// receives the event, and records that time for checks of the log later.
+func TestChecksTheSVIDWhenTheEventArrives(t *testing.T) {
+	dir := t.TempDir()
+	id := newIdentity(t, dir)
+	collectorKey, _ := writeKey(t, dir, "collector")
+	s, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustBundles: []string{id.bundle},
+		TrustedSigners: map[string][]string{"proxy": {"spiffe://wake.test/proxy"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	td := ptrace.NewTraces()
+	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+	// A key from an SVID that expired two hours ago, signing an event dated while it was valid.
+	stale := addSpan(td, "proxy")
+	stale.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-3 * time.Hour)))
+	stale.Attributes().PutInt(event.Received, now.Add(-3*time.Hour).UnixNano()) // a sender's claim, ignored
+	id.sign(stale, "spiffe://wake.test/proxy", now.Add(-4*time.Hour), now.Add(-2*time.Hour))
+	fresh := addSpan(td, "proxy")
+	fresh.SetStartTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Second)))
+	id.sign(fresh, "spiffe://wake.test/proxy", now.Add(-time.Hour), now.Add(time.Hour))
+
+	if _, err := s.processTraces(context.Background(), td); err != nil {
+		t.Fatal(err)
+	}
+	if valid(stale) || !strings.Contains(reason(stale), "expired") {
+		t.Errorf("an event signed with an expired SVID: valid %v, reason %q", valid(stale), reason(stale))
+	}
+	if !valid(fresh) {
+		t.Errorf("a fresh event marked invalid: %s", reason(fresh))
+	}
+	for _, span := range []ptrace.Span{stale, fresh} {
+		if got, _ := span.Attributes().Get(event.Received); got.Int() != now.UnixNano() {
+			t.Errorf("wake.received_unix_nano = %d, want the time it arrived", got.Int())
+		}
+	}
+	// The log entry carries the time, so a check of the log later reaches the same verdict.
+	data, _, err := event.Entry(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := wakelog.ParseEntry(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := entry.CheckSignature(s.trust); err != nil {
+		t.Errorf("the logged entry doesn't check: %v", err)
+	}
+}
+
+// A double that isn't finite has no canonical bytes. That event is marked invalid, and
+// the rest of its request goes on, where it used to fail the whole OTLP request.
+func TestOneEventThatCantBeSignedDoesntFailTheRequest(t *testing.T) {
+	s, _, _ := setup(t)
+	td := ptrace.NewTraces()
+	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+	before := addSpan(td, "sdk")
+	poison := addSpan(td, "sdk")
+	poison.Attributes().PutDouble("gen_ai.request.temperature", math.NaN())
+	poison.Attributes().PutStr(event.SignatureError, "a sender's claim, replaced")
+	after := addSpan(td, "memory_adapter")
+
+	if _, err := s.processTraces(context.Background(), td); err != nil {
+		t.Fatalf("one bad event failed the request: %v", err)
+	}
+	if !valid(before) || !valid(after) {
+		t.Error("the good events weren't signed")
+	}
+	if valid(poison) || !strings.Contains(reason(poison), "NaN") {
+		t.Errorf("the bad event: valid %v, reason %q", valid(poison), reason(poison))
+	}
+	if r := reason(before); r != "" {
+		t.Errorf("a valid event has a reason: %q", r)
 	}
 }
 
@@ -176,19 +377,32 @@ func TestChecksSVIDSignedEventsAgainstTrustBundles(t *testing.T) {
 		return span
 	}
 
-	with, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustBundles: []string{bundle}})
+	// The fixture was signed long ago; the collector receives it a second after it started.
+	received := func() time.Time { return time.Unix(0, int64(fixture.Start)).Add(time.Second) }
+	proxy := map[string][]string{"proxy": {"spiffe://wake.local/proxy"}}
+	with, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustBundles: []string{bundle}, TrustedSigners: proxy})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !valid(arrive(with)) {
-		t.Error("the proxy's event wasn't valid with its trust bundle configured")
+	with.now = received
+	if span := arrive(with); !valid(span) {
+		t.Errorf("the proxy's event wasn't valid with its trust bundle configured: %s", reason(span))
 	}
-	without, err := newSigner(&Config{SigningKeyFile: collectorKey})
+	without, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustedSigners: proxy})
 	if err != nil {
 		t.Fatal(err)
 	}
+	without.now = received
 	if valid(arrive(without)) {
 		t.Error("the proxy's event was valid with no trust bundle")
+	}
+	// Received today, a year after it started, the proxy's event is too old to accept.
+	late, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustBundles: []string{bundle}, TrustedSigners: proxy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if span := arrive(late); valid(span) || !strings.Contains(reason(span), "before the collector received it") {
+		t.Errorf("an event received long after it started: valid %v, reason %q", valid(span), reason(span))
 	}
 
 	empty := filepath.Join(dir, "empty.pem")

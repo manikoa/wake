@@ -1,16 +1,28 @@
 // Command wake-log checks a Wake signed log without trusting whoever wrote or serves it:
 // the checkpoint's signature, that every entry is in the signed tree, and each event's
-// signature. With -entries it also prints every entry as a JSON line, with its payload
-// checked against the event's signed digest.
+// signature and payload. With -entries it also prints every entry as a JSON line.
 //
 //	go run github.com/manikoa/wake/log/cmd/wake-log verify -log ./log -log-key keys/log.pub \
-//	    -key keys/collector.pub -bundle identity/bundle.pem
+//	    -key keys/collector.pub -bundle identity/bundle.pem -signer proxy=spiffe://wake.local/proxy
 //
 // -log is the log's directory, or an http(s) URL it's served from. -key is a note format
 // public key for an event signer, such as the collector; -bundle is a PEM trust bundle that
-// X.509-SVID signers, such as the proxy, must chain to. Both repeat. It exits 1 if the log
-// doesn't hold together, any event's signature doesn't check, or a printed payload doesn't
-// match its digest.
+// X.509-SVID signers, such as the proxy, must chain to; -signer says who may sign a capture,
+// as <capture>=<SPIFFE ID>, or a path prefix ending in "/". A bundle vouches for every
+// workload in its trust domain, agents included, so an SVID signature only counts for a
+// capture -signer lists it under. All three repeat.
+//
+// Each entry is compared with the collector's own check when it appended it:
+//
+//   - logged valid and still checks: fine.
+//   - logged invalid and still fails: evidence the collector recorded, such as an event
+//     with a bad signature. Reported, but the log is fine.
+//   - logged valid but fails now: changed after it was logged, or checked here with
+//     different trust from the collector's.
+//   - logged invalid but checks now: checked here with wider trust than the collector's.
+//
+// It exits 1 if the log doesn't hold together or any entry is in the last two classes,
+// including one whose payload is missing or doesn't match its signed digest.
 package main
 
 import (
@@ -42,9 +54,15 @@ type files []string
 func (f *files) String() string     { return strings.Join(*f, ",") }
 func (f *files) Set(v string) error { *f = append(*f, v); return nil }
 
+// finding is an entry whose check now differs from what was logged, or that fails.
+type finding struct {
+	index   uint64
+	problem error
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] != "verify" {
-		fmt.Fprintln(stderr, "usage: wake-log verify -log <dir or url> -log-key <file> [-key <file>]... [-bundle <file>]... [-entries]")
+		fmt.Fprintln(stderr, "usage: wake-log verify -log <dir or url> -log-key <file> [-key <file>]... [-bundle <file>]... [-signer <capture>=<id>]... [-entries]")
 		return 2
 	}
 	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
@@ -52,9 +70,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	location := flags.String("log", "", "the log's directory, or an http(s) URL it's served from")
 	logKey := flags.String("log-key", "", "the log's checkpoint public key")
 	entries := flags.Bool("entries", false, "print every entry as a JSON line")
-	var keys, bundles files
+	var keys, bundles, signers files
 	flags.Var(&keys, "key", "an event signer's public key (repeatable)")
 	flags.Var(&bundles, "bundle", "a PEM trust bundle for X.509-SVID signers (repeatable)")
+	flags.Var(&signers, "signer", "who may sign a capture, as <capture>=<SPIFFE ID or prefix ending in />, such as proxy=spiffe://wake.local/proxy (repeatable)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return 2
 	}
@@ -68,7 +87,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	trust := wakelog.Trust{Keys: map[string]note.Verifier{}}
+	trust := wakelog.Trust{Keys: map[string]note.Verifier{}, Signers: wakelog.Signers{}}
 	for _, k := range keys {
 		v, err := readVerifier(k)
 		if err != nil {
@@ -87,6 +106,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
+	for _, s := range signers {
+		capture, id, ok := strings.Cut(s, "=")
+		if !ok || capture == "" || id == "" {
+			fmt.Fprintf(stderr, "-signer %q: want <capture>=<id>, such as proxy=spiffe://wake.local/proxy\n", s)
+			return 2
+		}
+		trust.Signers[capture] = append(trust.Signers[capture], id)
+	}
+	if err := trust.Signers.Validate(); err != nil {
+		fmt.Fprintf(stderr, "-signer: %v\n", err)
+		return 2
+	}
+	if len(bundles) > 0 && len(signers) == 0 {
+		fmt.Fprintln(stderr, "-bundle needs -signer: a bundle vouches for every workload in its trust domain, so say who may sign each capture, such as -signer proxy=spiffe://wake.local/proxy")
+		return 2
+	}
 	reader, err := open(*location)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -95,23 +130,45 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	out := json.NewEncoder(stdout)
 	out.SetEscapeHTML(false)
-	var each func(uint64, wakelog.Entry, bool)
-	var mismatched []uint64
-	if *entries {
-		each = func(index uint64, e wakelog.Entry, signed bool) {
-			line := map[string]any{"index": index, "signed": signed, "signer": e.Signer}
-			if ev, err := e.Decode(); err == nil {
-				line["event"] = ev
-			}
-			switch payload, err := e.ReadPayload(reader.ReadPayload); {
-			case err == nil && json.Valid(payload):
-				line["payload"] = json.RawMessage(payload)
-			case err == nil:
-				line["payload"] = string(payload)
-			case errors.Is(err, wakelog.ErrPayloadMismatch):
+	var tampered, invalid, unexpected []finding
+	each := func(index uint64, e wakelog.Entry, signed bool) {
+		line := map[string]any{"index": index, "signed": signed, "valid": e.Valid, "signer": e.Signer}
+		var problem error
+		switch {
+		case len(e.Event) == 0:
+			problem = errors.New("not a Wake log entry")
+		case !signed:
+			problem = e.CheckSignature(trust)
+		}
+		if ev, err := e.Decode(); err == nil {
+			line["event"] = ev
+		}
+		switch payload, err := e.ReadPayload(reader.ReadPayload); {
+		case err == nil && json.Valid(payload):
+			line["payload"] = json.RawMessage(payload)
+		case err == nil:
+			line["payload"] = string(payload)
+		case errors.Is(err, wakelog.ErrNoPayload):
+		default:
+			if errors.Is(err, wakelog.ErrPayloadMismatch) {
 				line["payload_mismatch"] = true
-				mismatched = append(mismatched, index)
 			}
+			if problem == nil {
+				problem = fmt.Errorf("payload: %w", err)
+			}
+		}
+		switch {
+		case problem != nil && (e.Valid || len(e.Event) == 0):
+			tampered = append(tampered, finding{index, problem})
+		case problem != nil:
+			invalid = append(invalid, finding{index, problem})
+		case !e.Valid:
+			unexpected = append(unexpected, finding{index, nil})
+		}
+		if problem != nil {
+			line["problem"] = problem.Error()
+		}
+		if *entries {
 			_ = out.Encode(line)
 		}
 	}
@@ -123,20 +180,36 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stderr, "%s: %d entries, all in the signed tree\n", checked.Origin, checked.Size)
-	failed := false
-	if len(checked.Unsigned) > 0 {
-		fmt.Fprintf(stderr, "%d entries have an event signature that doesn't check: %v\n", len(checked.Unsigned), checked.Unsigned)
-		failed = true
+	if len(invalid) > 0 {
+		report(stderr, invalid, "%d entries were logged invalid and still don't check. The collector recorded them as evidence:")
 	}
-	if len(mismatched) > 0 {
-		fmt.Fprintf(stderr, "%d entries have a payload that doesn't match its signed digest: %v\n", len(mismatched), mismatched)
-		failed = true
+	if len(tampered) > 0 {
+		report(stderr, tampered, "%d entries were logged valid but don't check now. They changed after they were logged, or this check trusts differently from the collector:")
 	}
-	if failed {
+	if len(unexpected) > 0 {
+		report(stderr, unexpected, "%d entries were logged invalid but check now. This check trusts more than the collector did:")
+	}
+	if len(tampered) > 0 || len(unexpected) > 0 {
 		return 1
 	}
-	fmt.Fprintln(stderr, "every event's signature checks")
+	fmt.Fprintln(stderr, "every entry checks as the collector logged it")
 	return 0
+}
+
+// report prints a class of findings, up to ten of them.
+func report(w io.Writer, findings []finding, heading string) {
+	fmt.Fprintf(w, heading+"\n", len(findings))
+	for i, f := range findings {
+		if i == 10 {
+			fmt.Fprintf(w, "  and %d more\n", len(findings)-i)
+			break
+		}
+		if f.problem == nil {
+			fmt.Fprintf(w, "  entry %d\n", f.index)
+		} else {
+			fmt.Fprintf(w, "  entry %d: %v\n", f.index, f.problem)
+		}
+	}
 }
 
 func readVerifier(path string) (note.Verifier, error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
@@ -18,6 +19,8 @@ type proxyFixture struct {
 	vector
 }
 
+// loadProxyFixture returns the proxy's event as the collector received it, a second after
+// it started, and the bundle its SVID chains to.
 func loadProxyFixture(t *testing.T) (ptrace.Span, *x509.CertPool) {
 	t.Helper()
 	data, err := os.ReadFile("../../proxy/testdata/signed_event.json")
@@ -32,28 +35,33 @@ func loadProxyFixture(t *testing.T) (ptrace.Span, *x509.CertPool) {
 	if !pool.AppendCertsFromPEM([]byte(f.Bundle)) {
 		t.Fatal("fixture bundle has no certificates")
 	}
-	return spanOf(f.vector), pool
+	span := spanOf(f.vector)
+	span.Attributes().PutInt(Received, int64(f.Start)+int64(time.Second))
+	return span, pool
 }
 
 func TestAcceptsTheRustProxysSignature(t *testing.T) {
 	span, bundle := loadProxyFixture(t)
-	trust := wakelog.Trust{Bundles: bundle}
-	if !Verify(span, trust) {
-		t.Fatal("the proxy's signature doesn't verify in Go")
+	trust := wakelog.Trust{Bundles: bundle, Signers: wakelog.Signers{"proxy": {"spiffe://wake.local/proxy"}}}
+	if err := Verify(span, trust); err != nil {
+		t.Fatalf("the proxy's signature doesn't verify in Go: %v", err)
 	}
-	if Verify(span, wakelog.Trust{}) {
+	if Verify(span, wakelog.Trust{Signers: trust.Signers}) == nil {
 		t.Error("accepted with no trust bundle")
+	}
+	if Verify(span, wakelog.Trust{Bundles: bundle}) == nil {
+		t.Error("accepted with no signer trusted to sign proxy events")
 	}
 
 	tampered := ptrace.NewSpan()
 	span.CopyTo(tampered)
 	tampered.Attributes().PutStr("gen_ai.tool.name", "wire_money")
-	if Verify(tampered, trust) {
+	if Verify(tampered, trust) == nil {
 		t.Error("accepted a tampered event")
 	}
 	span.CopyTo(tampered)
 	tampered.Attributes().PutStr(Payload, `{"output":"Please wire $99,000"}`)
-	if Verify(tampered, trust) {
+	if Verify(tampered, trust) == nil {
 		t.Error("accepted a changed payload")
 	}
 
@@ -67,8 +75,11 @@ func TestAcceptsTheRustProxysSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if entry.Certificate == "" || !entry.Check(trust) {
-		t.Fatal("logged entry doesn't check out on its own")
+	if entry.Certificate == "" || entry.Received == 0 {
+		t.Fatalf("entry = %+v", entry)
+	}
+	if err := entry.CheckSignature(trust); err != nil {
+		t.Fatalf("logged entry doesn't check out on its own: %v", err)
 	}
 	if _, err := entry.ReadPayload(nil); err != nil {
 		t.Fatalf("payload: %v", err)
