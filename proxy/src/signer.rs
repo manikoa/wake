@@ -86,14 +86,21 @@ pub struct DevIdentity {
     /// A TLS server certificate and key signed by the same CA, for the collector's
     /// receiver, when TLS hosts were asked for.
     pub tls: Option<(String, String)>,
+    /// An SVID and key for the brake, which the control API checks, when asked for.
+    pub brake: Option<(String, String)>,
 }
 
 pub fn dev_identity(spiffe_id: &str) -> Result<DevIdentity, String> {
-    dev_identity_with_tls(spiffe_id, &[])
+    dev_identity_with_tls(spiffe_id, &[], None)
 }
 
-/// A development identity, plus a TLS server certificate for these hosts when there are any.
-pub fn dev_identity_with_tls(spiffe_id: &str, tls_hosts: &[String]) -> Result<DevIdentity, String> {
+/// A development identity, plus a TLS server certificate for these hosts when there are
+/// any, and an SVID for the brake when its SPIFFE ID is given.
+pub fn dev_identity_with_tls(
+    spiffe_id: &str,
+    tls_hosts: &[String],
+    brake_id: Option<&str>,
+) -> Result<DevIdentity, String> {
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
         PKCS_ECDSA_P256_SHA256, SanType,
@@ -131,11 +138,26 @@ pub fn dev_identity_with_tls(spiffe_id: &str, tls_hosts: &[String]) -> Result<De
         Some((tls_cert.pem(), tls_key.serialize_pem()))
     };
 
+    let brake = match brake_id {
+        None => None,
+        Some(brake_id) => {
+            let brake_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(err)?;
+            let mut client = CertificateParams::new(Vec::<String>::new()).map_err(err)?;
+            client.subject_alt_names = vec![SanType::URI(brake_id.try_into().map_err(err)?)];
+            client.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            client.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            client.use_authority_key_identifier_extension = true;
+            let brake_cert = client.signed_by(&brake_key, &issuer).map_err(err)?;
+            Some((brake_cert.pem(), brake_key.serialize_pem()))
+        }
+    };
+
     Ok(DevIdentity {
         ca_pem: ca_cert.pem(),
         cert_pem: cert.pem(),
         key_pem: key.serialize_pem(),
         tls,
+        brake,
     })
 }
 

@@ -13,11 +13,21 @@ For A2A, agentgateway calls wake-proxy's ext_proc service on each A2A route, wit
 
 An agent with a Wake SDK links its MCP calls into its own trace and provenance with two HTTP headers on the call: `traceparent`, and `wake-parents` (the comma-separated ids of the events that led to the call). agentgateway v1.6.0 drops `params._meta` before calling the processor, so headers are the way through it. The config forwards only those headers and `mcp-session-id`, never credentials.
 
+It's also the brake's deny lever. On each route with an `extAuthz` policy, agentgateway asks wake-proxy before every request whether it may go ahead. wake-proxy denies a call, with a 403 and a signed `denied` event, when the brake has halted the fleet, the agent making the call, or the agent it's sent to. The brake puts and lifts halts over the control API, which serves only the brake's SVID. Halts are kept on disk, and the deny fails closed. See "The deny lever" in [docs/proxy.md](../docs/proxy.md).
+
+```bash
+# The brake's side, with its SVID (dev-identity --brake-id writes keys/brake.pem and .key):
+PUT    https://wake-proxy:9002/v1/halts/{id}   {"scope": {"fleet": true}}  or  {"scope": {"agents": ["billing"]}}
+DELETE https://wake-proxy:9002/v1/halts/{id}
+GET    https://wake-proxy:9002/v1/halts
+```
+
 ## Run it locally
 
 ```bash
-cargo run -- dev-identity            # once: keys/bundle.pem, keys/proxy.pem, keys/proxy.key
-cargo run -- serve --key keys/proxy.key --cert keys/proxy.pem
+cargo run -- dev-identity --brake-id spiffe://wake.local/brake   # once: keys/bundle.pem, proxy and brake SVIDs
+cargo run -- serve --key keys/proxy.key --cert keys/proxy.pem \
+  --control-listen 127.0.0.1:9002 --trust-bundle keys/bundle.pem       # halts kept in ./state
 agentgateway -f agentgateway.yaml    # in another terminal; agentgateway v1.6.0
 ```
 
@@ -30,7 +40,7 @@ wake-proxy must be reachable only by agentgateway, over loopback or a pod-local 
 ```bash
 cargo test
 # Needs cargo-fuzz and a nightly toolchain. CI fuzzes every target nightly (.github/workflows/fuzz.yml).
-cargo +nightly fuzz run mcp_request   # also capture_hooks, canonical and a2a_exchange
+cargo +nightly fuzz run mcp_request   # also capture_hooks, canonical, a2a_exchange and authz_check
 ```
 
 It logs counters every minute: events sent, hooks and events dropped, and responses paired by id or by order. If responses are only ever paired by order, the gateway config isn't passing the event id back.

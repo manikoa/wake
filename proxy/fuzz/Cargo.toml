@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+prost = "0.14.4"
 serde_json = "1"
 wake-proxy = { path = ".." }
 
@@ -42,6 +43,13 @@ bench = false
 [[bin]]
 name = "a2a_exchange"
 path = "fuzz_targets/a2a_exchange.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authz_check"
+path = "fuzz_targets/authz_check.rs"
 test = false
 doc = false
 bench = false

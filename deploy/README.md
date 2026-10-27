@@ -22,6 +22,8 @@ export WAKE_ENDPOINT=https://localhost:4318 OTEL_EXPORTER_OTLP_CERTIFICATE=$PWD/
 
 **MCP and A2A:** agents call through agentgateway at `http://localhost:3000`. The A2A example route is at `/agents/research`.
 
+**The deny lever:** every route also asks wake-proxy whether the brake has halted the call, and fails closed: while wake-proxy is down, calls through the gateway are denied. The brake reaches wake-proxy's control API at `https://wake-proxy:9002` on this network, with the SVID in `identity/brake.pem` and `.key`, the only identity the API serves. Halts are kept in the `proxy-state` volume. See "The deny lever" in `docs/proxy.md`.
+
 The signed log is in the `data` volume at `/var/lib/wake/log`, with checkpoints signed by `keys/log.pub`. Check it, its tree and every event's signature, with `wake-log` (see `log/README.md`); `-entries` prints what's in it:
 
 ```bash
