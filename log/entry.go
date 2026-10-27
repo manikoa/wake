@@ -2,12 +2,16 @@ package wakelog
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 	"unicode/utf8"
 
 	"github.com/transparency-dev/tessera"
@@ -43,8 +47,22 @@ type Entry struct {
 	Payload   *string `json:"payload,omitempty"`
 	Signature string  `json:"signature"`
 	Signer    string  `json:"signer"`
-	// Valid is the collector's check at append time. Check again with Verify; don't trust it.
+	// Certificate is set for a signer that signs with an X.509-SVID, such as the proxy:
+	// base64 of the DER certificate, followed by any intermediates. Check verifies it
+	// against SPIRE trust bundles.
+	Certificate string `json:"certificate,omitempty"`
+	// Valid is the collector's check at append time. Check again with Check; don't trust it.
 	Valid bool `json:"valid"`
+}
+
+// Fields are what an entry holds besides the event's signed bytes.
+type Fields struct {
+	// Payload is the event's payload, or nil if it has none.
+	Payload     *string
+	Signature   string
+	Signer      string
+	Certificate string
+	Valid       bool
 }
 
 // Event is the content of an entry's signed bytes.
@@ -59,24 +77,30 @@ type Event struct {
 // NewEntry encodes a log entry for an event with no payload. event must be the exact
 // bytes that were signed.
 func NewEntry(event []byte, signature, signer string, valid bool) ([]byte, error) {
-	if err := checkCompact(event); err != nil {
-		return nil, err
-	}
-	return encode(Entry{Event: event, Signature: signature, Signer: signer, Valid: valid})
+	data, _, err := Encode(event, Fields{Signature: signature, Signer: signer, Valid: valid})
+	return data, err
 }
 
-// NewEntryWithPayload encodes a log entry for an event with a payload. event must be the
-// exact bytes that were signed, with the payload's digest in them and the payload left
-// out. The payload goes in the entry when the entry still fits in the log and the
-// payload is valid UTF-8, which a JSON string needs to carry it byte for byte. Otherwise
-// it's left out and inline is false: store it with Log.PutPayload before appending the
-// entry.
+// NewEntryWithPayload encodes a log entry for an event with a payload. See Encode.
 func NewEntryWithPayload(event []byte, payload string, signature, signer string, valid bool) (entry []byte, inline bool, err error) {
+	return Encode(event, Fields{Payload: &payload, Signature: signature, Signer: signer, Valid: valid})
+}
+
+// Encode encodes a log entry. event must be the exact bytes that were signed, with the
+// payload's digest in them and the payload left out. The payload goes in the entry when
+// the entry still fits in the log and the payload is valid UTF-8, which a JSON string
+// needs to carry it byte for byte. Otherwise it's left out and inline is false: store it
+// with Log.PutPayload before appending the entry. With no payload, inline is true.
+func Encode(event []byte, f Fields) (entry []byte, inline bool, err error) {
 	if err := checkCompact(event); err != nil {
 		return nil, false, err
 	}
-	e := Entry{Event: event, Payload: &payload, Signature: signature, Signer: signer, Valid: valid}
-	if utf8.ValidString(payload) {
+	e := Entry{Event: event, Payload: f.Payload, Signature: f.Signature, Signer: f.Signer, Certificate: f.Certificate, Valid: f.Valid}
+	if f.Payload == nil {
+		data, err := encode(e)
+		return data, true, err
+	}
+	if utf8.ValidString(*f.Payload) {
 		data, err := marshal(e)
 		if err != nil {
 			return nil, false, err
@@ -128,9 +152,97 @@ func ParseEntry(data []byte) (Entry, error) {
 }
 
 // Verify reports whether the entry's signature is valid for its event bytes, from one of
-// the trusted signers, keyed by name.
+// the trusted note format signers, keyed by name. Check also accepts X.509-SVID signers.
 func (e Entry) Verify(trusted map[string]note.Verifier) bool {
 	return VerifySignature(e.Event, e.Signature, e.Signer, trusted)
+}
+
+// Trust says whose signatures to accept.
+type Trust struct {
+	// Keys are note format public keys by signer name, such as the collector's.
+	Keys map[string]note.Verifier
+	// Bundles are the SPIRE trust bundles that X.509-SVID signers, such as the proxy,
+	// must chain to.
+	Bundles *x509.CertPool
+}
+
+// Check reports whether the entry's signature is valid for its event bytes under trust:
+// from a trusted note format key, or from an X.509-SVID that chains to a trusted bundle.
+func (e Entry) Check(t Trust) bool {
+	if VerifySignature(e.Event, e.Signature, e.Signer, t.Keys) {
+		return true
+	}
+	if e.Certificate == "" || t.Bundles == nil {
+		return false
+	}
+	ev, err := e.Decode()
+	if err != nil {
+		return false
+	}
+	return VerifySVIDSignature(e.Event, e.Signature, e.Signer, e.Certificate, t.Bundles, ev.StartTime()) == nil
+}
+
+// StartTime is when the event started.
+func (ev Event) StartTime() time.Time {
+	return time.Unix(0, int64(ev.StartTimeUnixNano))
+}
+
+// VerifySVIDSignature checks a signature made with an X.509-SVID's key, as the proxy
+// signs (docs/proxy.md). certificate is base64 of the DER SVID followed by any
+// intermediates. The SVID must chain to one of bundles as of at, the time the event
+// happened, so an event can be checked long after its short lived SVID expired. It must
+// be an end-entity certificate with exactly one spiffe:// URI SAN, equal to signer, and
+// a P-256 key. signature is base64 ASN.1 DER ECDSA over the SHA-256 of msg.
+func VerifySVIDSignature(msg []byte, signature, signer, certificate string, bundles *x509.CertPool, at time.Time) error {
+	der, err := base64.StdEncoding.DecodeString(certificate)
+	if err != nil {
+		return fmt.Errorf("certificate: %w", err)
+	}
+	certs, err := x509.ParseCertificates(der)
+	if err != nil {
+		return fmt.Errorf("certificate: %w", err)
+	}
+	if len(certs) == 0 {
+		return errors.New("certificate: none given")
+	}
+	leaf := certs[0]
+	intermediates := x509.NewCertPool()
+	for _, c := range certs[1:] {
+		intermediates.AddCert(c)
+	}
+	if leaf.IsCA {
+		return errors.New("certificate: a CA can't sign events")
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         bundles,
+		Intermediates: intermediates,
+		CurrentTime:   at,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}); err != nil {
+		return fmt.Errorf("certificate: %w", err)
+	}
+	var ids []string
+	for _, u := range leaf.URIs {
+		if u.Scheme == "spiffe" {
+			ids = append(ids, u.String())
+		}
+	}
+	if len(ids) != 1 || ids[0] != signer {
+		return fmt.Errorf("certificate: SPIFFE IDs %v, want exactly %q", ids, signer)
+	}
+	key, ok := leaf.PublicKey.(*ecdsa.PublicKey)
+	if !ok || key.Curve != elliptic.P256() {
+		return errors.New("certificate: key is not ECDSA P-256")
+	}
+	sig, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil {
+		return fmt.Errorf("signature: %w", err)
+	}
+	digest := sha256.Sum256(msg)
+	if !ecdsa.VerifyASN1(key, digest[:], sig) {
+		return errors.New("signature doesn't verify")
+	}
+	return nil
 }
 
 // ReadPayload returns the event's payload, checked against the signed

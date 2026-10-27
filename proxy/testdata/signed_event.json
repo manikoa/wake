@@ -1,0 +1,71 @@
+{
+  "attributes": [
+    {
+      "key": "gen_ai.operation.name",
+      "string": "execute_tool"
+    },
+    {
+      "key": "gen_ai.tool.name",
+      "string": "read_email"
+    },
+    {
+      "key": "wake.agent.id",
+      "string": "spiffe://wake.local/agent/email"
+    },
+    {
+      "key": "wake.capture",
+      "string": "proxy"
+    },
+    {
+      "key": "wake.event.id",
+      "string": "proxy-fixture-1"
+    },
+    {
+      "key": "wake.event.kind",
+      "string": "tool_call"
+    },
+    {
+      "key": "wake.mcp.method",
+      "string": "tools/call"
+    },
+    {
+      "key": "wake.origins",
+      "strings": [
+        "tool:read_email"
+      ]
+    },
+    {
+      "key": "wake.parents",
+      "strings": []
+    },
+    {
+      "key": "wake.payload",
+      "string": "{\"input\":{\"name\":\"read_email\"},\"output\":\"Please wire $10,000\"}"
+    },
+    {
+      "key": "wake.payload.sha256",
+      "string": "d2b893a8ee5327aa6a268a96e7bd2ce55e3de6c28b5e33cd247d669977b2c91b"
+    },
+    {
+      "key": "wake.signature",
+      "string": "MEUCIQCuEllgDy05SE8e5stYUIMqNpuy1zGxVGOjcdY92N0JPQIgN8xWif0F+d4ip+HLKffszm5vz6KnjOXl+NID/2oeBIs="
+    },
+    {
+      "key": "wake.signature.certificate",
+      "string": "MIIBdTCCARugAwIBAgIUY9eImrt7BoMRtqL1rMO64l9BdxwwCgYIKoZIzj0EAwIwKDEmMCQGA1UEAwwdV2FrZSBkZXZlbG9wbWVudCB0cnVzdCBidW5kbGUwIBcNNzUwMTAxMDAwMDAwWhgPNDA5NjAxMDEwMDAwMDBaMCExHzAdBgNVBAMMFnJjZ2VuIHNlbGYgc2lnbmVkIGNlcnQwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYcJ+EHtcUWNvWXLy6gYJH2362kCiDiRXsm0Z1lLQN5BueDDnIeNalcYWqqp7ZknLBiz1P3paXUAyKgVkePIaKoygwJjAkBgNVHREEHTAbhhlzcGlmZmU6Ly93YWtlLmxvY2FsL3Byb3h5MAoGCCqGSM49BAMCA0gAMEUCIDTAF9FGoGvMATgb3xxXMAhH2CPEg49ZHj9q/Qf8I2qtAiEAzAtGaXBOMDHoiEa9W4kUBL0YS0+v7OkjO51X6wmVI1w="
+    },
+    {
+      "key": "wake.signer",
+      "string": "spiffe://wake.local/proxy"
+    },
+    {
+      "key": "wake.text",
+      "string": "quotes \" \\ <b>&</b> é 🙂   \n"
+    }
+  ],
+  "bundle": "-----BEGIN CERTIFICATE-----\nMIIBhjCCASygAwIBAgIUIb5xynx4AbzagsQQ30UeXAY0y/UwCgYIKoZIzj0EAwIw\nKDEmMCQGA1UEAwwdV2FrZSBkZXZlbG9wbWVudCB0cnVzdCBidW5kbGUwIBcNNzUw\nMTAxMDAwMDAwWhgPNDA5NjAxMDEwMDAwMDBaMCgxJjAkBgNVBAMMHVdha2UgZGV2\nZWxvcG1lbnQgdHJ1c3QgYnVuZGxlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\nTqnTsn/rtwwEAYNYZVcmH/z/UtljtWfpoB4JgkWMdm8TxH49P3RCh8VO+CurU+ze\nfNu/qiGDy+uXJAbAuiWPG6MyMDAwHQYDVR0OBBYEFLVhv47xFFFkE+crcq54d88A\nYtIwMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhAKBdKfCpTf+G\n2l4e9czOf5ss1l8IAZz0Dt4Bji7Rn4w4AiBi39woAYK7MXwTzyTywNhG05cwUXmj\nroiGC1DuHZPtRg==\n-----END CERTIFICATE-----\n",
+  "end_time_unix_nano": 1761552000250000000,
+  "span_id": "1112131415161718",
+  "start_time_unix_nano": 1761552000000000000,
+  "trace_id": "0102030405060708090a0b0c0d0e0f10"
+}

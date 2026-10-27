@@ -22,6 +22,7 @@ const (
 	Signature      = "wake.signature"
 	Signer         = "wake.signer"
 	SignatureValid = "wake.signature.valid"
+	Certificate    = "wake.signature.certificate"
 	Payload        = "wake.payload"
 	PayloadSHA256  = wakelog.PayloadSHA256
 )
@@ -103,20 +104,24 @@ func Sign(span ptrace.Span, signer note.Signer) error {
 	return nil
 }
 
-// Verify reports whether span carries a valid signature from one of the trusted signers,
-// keyed by name, and a payload, if it has one, that matches the signed digest.
-func Verify(span ptrace.Span, trusted map[string]note.Verifier) bool {
+// Verify reports whether span carries a valid signature under trust, and a payload, if
+// it has one, that matches the signed digest. A signer with a note format key, such as
+// another collector, is checked against trust.Keys. A signer that signs with an
+// X.509-SVID, such as the proxy, sends its certificate in wake.signature.certificate,
+// and it's checked against trust.Bundles as of the event's start.
+func Verify(span ptrace.Span, trust wakelog.Trust) bool {
 	if payload, ok := PayloadOf(span); ok {
 		signed, _ := span.Attributes().Get(PayloadSHA256)
 		if signed.Str() != digest(payload) {
 			return false
 		}
 	}
-	sigValue, ok := span.Attributes().Get(Signature)
+	attrs := span.Attributes()
+	sigValue, ok := attrs.Get(Signature)
 	if !ok {
 		return false
 	}
-	signerValue, ok := span.Attributes().Get(Signer)
+	signerValue, ok := attrs.Get(Signer)
 	if !ok {
 		return false
 	}
@@ -124,15 +129,23 @@ func Verify(span ptrace.Span, trusted map[string]note.Verifier) bool {
 	if err != nil {
 		return false
 	}
-	return wakelog.VerifySignature(msg, sigValue.Str(), signerValue.Str(), trusted)
+	if wakelog.VerifySignature(msg, sigValue.Str(), signerValue.Str(), trust.Keys) {
+		return true
+	}
+	cert, ok := attrs.Get(Certificate)
+	if !ok || trust.Bundles == nil {
+		return false
+	}
+	at := span.StartTimestamp().AsTime()
+	return wakelog.VerifySVIDSignature(msg, sigValue.Str(), signerValue.Str(), cert.Str(), trust.Bundles, at) == nil
 }
 
 // Entry returns what gets appended to the signed log for span: the exact signed bytes,
-// the signature and signer, whether the collector found the signature valid, and the
-// payload when it fits. Each entry can be checked on its own with the signer's public
-// key. When the payload doesn't fit, external is true: store PayloadOf(span) with the
-// log's PutPayload before appending the entry. The entry format lives in the log
-// module, so the log's readers parse it with the same code.
+// the signature and signer, the signer's certificate if it signs with one, whether the
+// collector found the signature valid, and the payload when it fits. Each entry can be
+// checked on its own. When the payload doesn't fit, external is true: store
+// PayloadOf(span) with the log's PutPayload before appending the entry. The entry format
+// lives in the log module, so the log's readers parse it with the same code.
 func Entry(span ptrace.Span) (entry []byte, external bool, err error) {
 	canonical, err := Canonical(span)
 	if err != nil {
@@ -141,13 +154,14 @@ func Entry(span ptrace.Span) (entry []byte, external bool, err error) {
 	attrs := span.Attributes()
 	sig, _ := attrs.Get(Signature)
 	signer, _ := attrs.Get(Signer)
+	cert, _ := attrs.Get(Certificate)
 	valid, _ := attrs.Get(SignatureValid)
-	payload, ok := PayloadOf(span)
-	if !ok {
-		entry, err = wakelog.NewEntry(canonical, sig.Str(), signer.Str(), valid.Bool())
-		return entry, false, err
+	fields := wakelog.Fields{Signature: sig.Str(), Signer: signer.Str(), Certificate: cert.Str(), Valid: valid.Bool()}
+	if payload, ok := PayloadOf(span); ok {
+		p := string(payload)
+		fields.Payload = &p
 	}
-	entry, inline, err := wakelog.NewEntryWithPayload(canonical, string(payload), sig.Str(), signer.Str(), valid.Bool())
+	entry, inline, err := wakelog.Encode(canonical, fields)
 	return entry, !inline, err
 }
 

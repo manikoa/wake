@@ -18,6 +18,7 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload`'s UTF-8 bytes. Set by the signer from the payload it received, replacing any value the sender gave |
 | `wake.signature` | string | Base64 signature, added by the signer: Ed25519 from the collector, ECDSA P-256 from the proxy (see [signing.md](signing.md)) |
 | `wake.signer` | string | SPIFFE id of the signer |
+| `wake.signature.certificate` | string | Set by a signer that signs with an X.509-SVID, such as the proxy: base64 of the DER SVID followed by any intermediates. Not signed; the CA's signature vouches for it |
 | `wake.signature.valid` | bool | Set by the collector: whether the signature checked out. Always overwritten, so a sender can't claim it. |
 
 Framework specific context goes under the framework's name, for example `wake.langgraph.node`.
@@ -69,15 +70,17 @@ The payload is signed through its digest. Before signing an event that has a pay
 Each event becomes one log entry: a JSON object holding the exact signed bytes, the payload when it fits, the signature, the signer and the collector's check.
 
 ```json
-{"event":{...signed bytes...},"payload":"<the payload>","signature":"<base64>","signer":"<name>","valid":true}
+{"event":{...signed bytes...},"payload":"<the payload>","signature":"<base64>","signer":"<name>","certificate":"<base64>","valid":true}
 ```
 
 A log entry holds at most 65,535 bytes. `payload` is a JSON string holding the payload's exact bytes, and it's left out when the entry would be larger with it, or when the payload isn't valid UTF-8. The payload is then stored next to the log's tiles, at `payload/sha256/<wake.payload.sha256>`, in the same bucket or directory. It's written before the entry is appended. An event with no payload has neither `payload` nor a digest.
 
-Anyone with the signer's public key can check an entry on its own:
+`certificate` is there for a signer that signs with an X.509-SVID, such as the proxy, and left out otherwise.
 
-1. Check `signature` over `event` with the signer's public key.
+Anyone with the signer's public key, or for an SVID signer the SPIRE trust bundle, can check an entry on its own:
+
+1. Check `signature` over `event`. For the collector, use its public key. For an SVID signer, `certificate` must chain to the trust bundle as of the event's start time, have exactly one `spiffe://` URI SAN equal to `signer`, and hold a P-256 key, and the signature is ASN.1 DER ECDSA over the SHA-256 of `event`.
 2. Take the payload from `payload`, or from `payload/sha256/<wake.payload.sha256>` next to the log.
 3. Check that its SHA-256 is the signed `wake.payload.sha256`.
 
-The log module's `ParseEntry`, `Verify` and `ReadPayload` do these steps. Spans that only group events aren't logged.
+The log module's `ParseEntry`, `Check` and `ReadPayload` do these steps. Spans that only group events aren't logged.

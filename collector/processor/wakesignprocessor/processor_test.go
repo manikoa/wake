@@ -3,6 +3,9 @@ package wakesignprocessor
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +14,8 @@ import (
 	"golang.org/x/mod/sumdb/note"
 
 	"github.com/manikoa/wake/collector/event"
+
+	wakelog "github.com/manikoa/wake/log"
 )
 
 func writeKey(t *testing.T, dir, name string) (privatePath, publicPath string) {
@@ -90,7 +95,7 @@ func TestSignsSDKEventsAndChecksProxyEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !valid(sdk) || !event.Verify(sdk, collectorTrust) {
+	if !valid(sdk) || !event.Verify(sdk, wakelog.Trust{Keys: collectorTrust}) {
 		t.Error("SDK event wasn't signed by the collector")
 	}
 	if !valid(proxyGood) {
@@ -110,5 +115,88 @@ func TestSignsSDKEventsAndChecksProxyEvents(t *testing.T) {
 func TestConfigRequiresSigningKey(t *testing.T) {
 	if err := (&Config{}).Validate(); err == nil {
 		t.Fatal("empty config validated")
+	}
+}
+
+// The Rust proxy's signed fixture (proxy/testdata/signed_event.json) arriving at the
+// processor, checked against the trust bundle in its config.
+func TestChecksSVIDSignedEventsAgainstTrustBundles(t *testing.T) {
+	data, err := os.ReadFile("../../../proxy/testdata/signed_event.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Bundle     string `json:"bundle"`
+		TraceID    string `json:"trace_id"`
+		SpanID     string `json:"span_id"`
+		Start      uint64 `json:"start_time_unix_nano"`
+		End        uint64 `json:"end_time_unix_nano"`
+		Attributes []struct {
+			Key     string   `json:"key"`
+			String  *string  `json:"string"`
+			Strings []string `json:"strings"`
+		} `json:"attributes"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "bundle.pem")
+	if err := os.WriteFile(bundle, []byte(fixture.Bundle), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	collectorKey, _ := writeKey(t, dir, "collector")
+
+	arrive := func(s *signer) ptrace.Span {
+		td := ptrace.NewTraces()
+		span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+		var traceID pcommon.TraceID
+		var spanID pcommon.SpanID
+		hex.Decode(traceID[:], []byte(fixture.TraceID))
+		hex.Decode(spanID[:], []byte(fixture.SpanID))
+		span.SetTraceID(traceID)
+		span.SetSpanID(spanID)
+		span.SetStartTimestamp(pcommon.Timestamp(fixture.Start))
+		span.SetEndTimestamp(pcommon.Timestamp(fixture.End))
+		for _, a := range fixture.Attributes {
+			if a.String != nil {
+				span.Attributes().PutStr(a.Key, *a.String)
+				continue
+			}
+			list := span.Attributes().PutEmptySlice(a.Key)
+			for _, v := range a.Strings {
+				list.AppendEmpty().SetStr(v)
+			}
+		}
+		// A sender can't claim its own event is valid.
+		span.Attributes().PutBool(event.SignatureValid, true)
+		if _, err := s.processTraces(context.Background(), td); err != nil {
+			t.Fatal(err)
+		}
+		return span
+	}
+
+	with, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustBundles: []string{bundle}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !valid(arrive(with)) {
+		t.Error("the proxy's event wasn't valid with its trust bundle configured")
+	}
+	without, err := newSigner(&Config{SigningKeyFile: collectorKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if valid(arrive(without)) {
+		t.Error("the proxy's event was valid with no trust bundle")
+	}
+
+	empty := filepath.Join(dir, "empty.pem")
+	os.WriteFile(empty, []byte("no certificates here"), 0o644)
+	if _, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustBundles: []string{empty}}); err == nil {
+		t.Error("accepted a trust bundle with no certificates")
+	}
+	if _, err := newSigner(&Config{SigningKeyFile: collectorKey, TrustBundles: []string{filepath.Join(dir, "missing.pem")}}); err == nil {
+		t.Error("accepted a missing trust bundle")
 	}
 }
