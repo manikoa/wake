@@ -20,6 +20,11 @@ It's also the brake's deny lever. On each route with an `extAuthz` policy, agent
 PUT    https://wake-proxy:9002/v1/halts/{id}   {"scope": {"fleet": true}}  or  {"scope": {"agents": ["billing"]}}
 DELETE https://wake-proxy:9002/v1/halts/{id}
 GET    https://wake-proxy:9002/v1/halts
+PUT    https://wake-proxy:9002/v1/quarantines/{id}   {"selection": {"lock": {"agents": ["billing"]}, "origins": ["tool:fetch_page"]}}
+DELETE https://wake-proxy:9002/v1/quarantines/{id}
+GET    https://wake-proxy:9002/v1/memory/seen
+# Memory adapters, read only, with --memory-listen:
+GET    http://wake-proxy:9003/v1/memory?agent=billing
 ```
 
 ## Run it locally

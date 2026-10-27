@@ -197,3 +197,61 @@ async fn what_the_brake_puts_is_what_ext_authz_enforces() {
     let denied = recorded.try_recv().unwrap();
     assert_eq!(denied.str("wake.agent.id"), Some("spiffe://wake.local/agent/billing"));
 }
+
+#[tokio::test]
+async fn a_quarantine_reaches_the_memory_adapters() {
+    let c = control().await;
+    let brake = client(&c, &c.brake);
+    let put = brake
+        .put(format!("{}/v1/quarantines/q1", c.url))
+        .json(&serde_json::json!({"selection": {"lock": {"agents": ["billing"]}, "origins": ["tool:fetch_page"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200);
+    let state: serde_json::Value = put.json().await.unwrap();
+    assert_eq!(state["quarantines"][0]["id"], "q1");
+
+    // An adapter fetches its rules from the read-only port, with no certificate.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let memory = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(wake_proxy::memory::serve(
+        listener,
+        c.halts.clone(),
+        std::future::pending(),
+    ));
+    let rules: serde_json::Value = reqwest::get(format!("{memory}/v1/memory?agent=billing"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rules["locked_by"], "q1");
+    assert_eq!(rules["quarantines"][0]["selection"]["origins"][0], "tool:fetch_page");
+
+    // The brake sees that billing's adapter has it.
+    let seen: serde_json::Value = brake
+        .get(format!("{}/v1/memory/seen", c.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(seen["billing"]["version"], state["version"]);
+
+    let empty = brake
+        .put(format!("{}/v1/quarantines/q2", c.url))
+        .json(&serde_json::json!({"selection": {}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), 400);
+    let released = brake
+        .delete(format!("{}/v1/quarantines/q1", c.url))
+        .send()
+        .await
+        .unwrap();
+    let state: serde_json::Value = released.json().await.unwrap();
+    assert_eq!(state["quarantines"].as_array().unwrap().len(), 0);
+}

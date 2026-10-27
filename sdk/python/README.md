@@ -86,6 +86,18 @@ The label is kept in each value under `__wake__` and taken out before values rea
 
 For memory files, such as an agent's notes file, use `Memory(handler).write_file(path, text)` and `read_file(path)`. The label goes next to the file as `<file>.wake.json`. For any other store, call `memory.write(store, entry, content)` before writing, save the label it returns with the entry, and call `memory.read(store, entry, content, label)` after reading.
 
+### Quarantine
+
+When the brake quarantines memory, give the adapter the rules wake-proxy serves:
+
+```python
+from wake.quarantine import Quarantine
+
+memory = Memory(handler, quarantine=Quarantine("http://wake-proxy:9003", agent="billing"))
+```
+
+It fetches them every couple of seconds in the background. A locked agent's writes raise `MemoryLocked` and don't happen. A quarantined entry reads as absent from `WakeStore`, drops out of searches, and makes `read_file` raise `MemoryQuarantined`. Each refusal is recorded as a `denied` event. Until the first fetch succeeds nothing is enforced, and when a fetch fails the last rules stand.
+
 ## MCP calls through the proxy
 
 When an agent's MCP calls go through agentgateway, Wake's proxy records each one too. Link each call to the SDK's event for it, so the proxy's record joins the agent's trace and provenance. The link travels as two HTTP headers, `traceparent` and `wake-parents`. Install with the `mcp` extra.

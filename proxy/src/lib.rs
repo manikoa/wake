@@ -12,5 +12,6 @@ pub mod extmcp;
 pub mod extproc;
 pub mod halts;
 pub mod mcp;
+pub mod memory;
 pub mod pipeline;
 pub mod signer;

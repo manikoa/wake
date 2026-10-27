@@ -2,9 +2,12 @@
 //! force (halts.rs).
 //!
 //! ```text
-//! PUT    /v1/halts/{id}   {"scope": {"fleet": true} or {"agents": [...]}, "issued_at": <Unix ns>}
+//! PUT    /v1/halts/{id}         {"scope": {"fleet": true} or {"agents": [...]}, "issued_at": <Unix ns>}
 //! DELETE /v1/halts/{id}
-//! GET    /v1/halts
+//! GET    /v1/halts              the halts and quarantines in force
+//! PUT    /v1/quarantines/{id}   {"selection": {"lock": {...}, "agents": [...], "origins": [...], ...}}
+//! DELETE /v1/quarantines/{id}
+//! GET    /v1/memory/seen        each agent's memory adapter: the version it last fetched, and when
 //! ```
 //!
 //! Each answers with the state now in force and its version, and a change answers only
@@ -31,7 +34,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{self, RootCertStore, ServerConfig};
 
-use crate::halts::{self, Halts, Scope};
+use crate::halts::{self, Halts, Scope, Selection};
 use crate::signer::spiffe_id;
 
 /// What the control API needs to serve mTLS.
@@ -136,10 +139,56 @@ async fn list_halts(State(halts): State<Arc<Halts>>) -> Json<halts::State> {
     Json(halts.state())
 }
 
+#[derive(Deserialize)]
+struct PutQuarantine {
+    selection: Selection,
+    #[serde(default)]
+    issued_at: Option<u64>,
+}
+
+async fn put_quarantine(
+    State(halts): State<Arc<Halts>>,
+    Path(id): Path<String>,
+    Json(body): Json<PutQuarantine>,
+) -> Result<Json<halts::State>, Failure> {
+    valid_id(&id)?;
+    if body.selection.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a quarantine needs something to lock or hide".into(),
+        ));
+    }
+    let issued_at = body.issued_at.unwrap_or_else(halts::now);
+    let result = tokio::task::spawn_blocking(move || halts.quarantine(&id, body.selection, issued_at))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    stored(result)
+}
+
+async fn release_quarantine(
+    State(halts): State<Arc<Halts>>,
+    Path(id): Path<String>,
+) -> Result<Json<halts::State>, Failure> {
+    valid_id(&id)?;
+    let result = tokio::task::spawn_blocking(move || halts.release(&id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    stored(result)
+}
+
+async fn memory_seen(State(halts): State<Arc<Halts>>) -> Json<std::collections::HashMap<String, halts::Seen>> {
+    Json(halts.seen())
+}
+
 pub fn router(halts: Arc<Halts>) -> Router {
     Router::new()
         .route("/v1/halts", get(list_halts))
         .route("/v1/halts/{id}", axum::routing::put(put_halt).delete(lift_halt))
+        .route(
+            "/v1/quarantines/{id}",
+            axum::routing::put(put_quarantine).delete(release_quarantine),
+        )
+        .route("/v1/memory/seen", get(memory_seen))
         .with_state(halts)
 }
 
