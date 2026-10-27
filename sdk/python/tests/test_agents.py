@@ -65,7 +65,8 @@ def recorded():
     handler = WakeCallbackHandler(recorder).install()
     answer = asyncio.run(Supervisor(handler).answer("Should I pay Acme's invoice?"))
     recorder.flush()
-    return answer, exporter.get_finished_spans()
+    yield answer, exporter.get_finished_spans()
+    handler.uninstall()
 
 
 def wake_events(spans):
@@ -146,6 +147,18 @@ def test_agent_runs_never_break_the_agent(monkeypatch):
     with handler.agent("supervisor", input="hi", origin="user"):
         with handler.agent("email", input=STEP) as run:
             run.reply(SUMMARY)
+
+
+def test_uninstall_stops_recording_other_runs():
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="clavr", exporter=exporter)
+    handler = WakeCallbackHandler(recorder).install()
+    model("first").invoke("hi")
+    handler.uninstall()
+    model("second").invoke("hi")
+    recorder.flush()
+    calls = [s for s in exporter.get_finished_spans() if s.attributes.get("wake.event.kind") == "model_call"]
+    assert len(calls) == 1
 
 
 def test_errors_in_the_agent_still_reach_the_caller():

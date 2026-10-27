@@ -41,7 +41,7 @@ from langchain_core.tracers.context import register_configure_hook
 from opentelemetry import trace
 from opentelemetry.trace import Span, Status, StatusCode
 
-from wake import events
+from wake import events, links
 from wake.recorder import Recorder
 
 log = logging.getLogger("wake")
@@ -81,6 +81,17 @@ class _Recent(OrderedDict):
         self.move_to_end(key)
         if len(self) > self._limit:
             self.popitem(last=False)
+
+
+class _Installed:
+    """What install() registers with LangChain. LangChain asks it for the handler to add
+    to every run; a ContextVar would do, but couldn't be turned off again."""
+
+    def __init__(self, handler: "WakeCallbackHandler") -> None:
+        self.handler: WakeCallbackHandler | None = handler
+
+    def get(self) -> "WakeCallbackHandler | None":
+        return self.handler
 
 
 class AgentRun:
@@ -129,11 +140,20 @@ class WakeCallbackHandler(BaseCallbackHandler):
         self._result_by_tool_call = _Recent()  # tool call id -> tool call event id
         self._seen_user_messages = _Recent()
         self._outputs = _Recent(limit=256)  # trace id -> recent (event id, output text)
+        self._installed: _Installed | None = None
 
     def install(self) -> "WakeCallbackHandler":
         """Record every LangChain run in this process, without passing callbacks at each call."""
-        register_configure_hook(ContextVar(f"wake_handler_{id(self)}", default=self), inheritable=True)
+        if self._installed is None:
+            self._installed = _Installed(self)
+            register_configure_hook(self._installed, inheritable=True)  # type: ignore[arg-type]
+        self._installed.handler = self
         return self
+
+    def uninstall(self) -> None:
+        """Stop recording runs that don't pass this handler explicitly."""
+        if self._installed is not None:
+            self._installed.handler = None
 
     @contextmanager
     def agent(self, name: str, *, input: Any = None, origin: str | None = None) -> Iterator[AgentRun]:
@@ -417,12 +437,19 @@ class WakeCallbackHandler(BaseCallbackHandler):
         if metadata.get("langgraph_node"):
             attributes["wake.langgraph.node"] = metadata["langgraph_node"]
         span = self._recorder.tracer.start_span(name, context=context, attributes=attributes)
+        link = None
+        if kind == events.TOOL_CALL:
+            # Calls the tool makes, such as to an MCP server through the proxy, link back
+            # to this event. LangChain runs the tool in the context this callback runs in.
+            ctx = span.get_span_context()
+            link = links._enter(links.Link(event_id, ctx.trace_id, ctx.span_id))
         with self._lock:
             self._spans[run_id] = span
             self._pending[run_id] = {
                 "event_id": event_id,
                 "inputs": inputs,
                 "tool_call_id": tool_call_id,
+                "link": link,
             }
 
     def _end_event(self, run_id: UUID, outputs: Any, error: BaseException | None = None, *, text: str = "") -> None:
@@ -431,6 +458,7 @@ class WakeCallbackHandler(BaseCallbackHandler):
             pending = self._pending.pop(run_id, None)
         if span is None or pending is None:
             return
+        links._exit(pending.get("link"))
         payload = {"input": pending["inputs"], "output": outputs}
         if error is not None:
             payload["error"] = repr(error)
