@@ -32,7 +32,8 @@ log = logging.getLogger("wake")
 class WakeStore(BaseStore):
     """Wraps a LangGraph store so each put is a labeled memory write and each get or search
     a memory read. The label is kept in the stored value under __wake__ and taken out of
-    what the app gets back."""
+    what the app gets back. With a quarantine on the Memory, a locked put raises
+    MemoryLocked, and a quarantined entry reads as absent and drops out of searches."""
 
     def __init__(self, store: BaseStore, memory: Memory) -> None:
         self._store = store
@@ -68,16 +69,19 @@ class WakeStore(BaseStore):
                 if isinstance(op, GetOp) and isinstance(result, Item):
                     result = self._read(result)
                 elif isinstance(op, SearchOp) and isinstance(result, list):
-                    result = [self._read(item) if isinstance(item, Item) else item for item in result]
+                    served = (self._read(item) if isinstance(item, Item) else item for item in result)
+                    result = [item for item in served if item is not None]
             except Exception:
                 log.warning("wake: failed to record a memory read", exc_info=True)
             out.append(result)
         return out
 
-    def _read(self, item: Item) -> Item:
+    def _read(self, item: Item) -> Item | None:
+        """The item as the app gets it, or None if the quarantine stops it being served."""
         label = item.value.get(LABEL_KEY) if isinstance(item.value, dict) else None
         value = {k: v for k, v in item.value.items() if k != LABEL_KEY} if isinstance(item.value, dict) else item.value
-        self._memory.read("/".join(item.namespace), item.key, value, label if isinstance(label, dict) else None)
+        if self._memory.read("/".join(item.namespace), item.key, value, label if isinstance(label, dict) else None):
+            return None
         fields = {"value": value, "key": item.key, "namespace": item.namespace, "created_at": item.created_at, "updated_at": item.updated_at}
         if isinstance(item, SearchItem):
             return SearchItem(**fields, score=item.score)

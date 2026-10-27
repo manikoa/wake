@@ -18,6 +18,7 @@ TOOL_CALL = "tool_call"
 AGENT_MESSAGE = "agent_message"
 MEMORY_READ = "memory_read"
 MEMORY_WRITE = "memory_write"
+DENIED = "denied"
 
 ORIGIN_USER = "user"
 

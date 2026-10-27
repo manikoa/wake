@@ -51,7 +51,7 @@ The message is a parent of B's next event. An answer going back from B to A is a
 
 ## Denied calls
 
-The proxy's deny lever records each call it denies as a `denied` event, captured by the proxy and signed like its other events:
+The proxy's deny lever records each call it denies as a `denied` event, captured by the proxy and signed like its other events (the memory adapter records the memory it refuses the same way; see Memory):
 
 - `wake.agent.id` is the caller, or `unknown`.
 - `wake.parents` come from the call's link, so the event joins the caller's trace under the step that made the call.
@@ -72,6 +72,8 @@ The memory adapter records each write to a memory store or memory file as a `mem
 - **A read's origin** is `memory:<store>/<entry>`. When the entry's label digest matches what was read, the read's parent is the write, and `wake.memory.origins` repeats the label's origins. An entry with no label (`wake.memory.labeled` false), or one changed since it was written (`wake.memory.changed` true), gets no parent. So anything that follows from it is flagged, rather than trusted, by the completeness metric.
 
 The label is a pointer, not evidence: anything that can write the store can forge one. The signed `memory_write` it names, and the digest, are what make it checkable.
+
+**Quarantine.** When the brake quarantines memory, the adapter refuses the writes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence. Each refused write or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's parent is the write it came from.
 
 ## How the SDK finds parents
 

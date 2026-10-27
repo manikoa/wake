@@ -55,6 +55,9 @@ enum Command {
         /// The one SPIFFE ID the control API serves.
         #[arg(long, default_value = "spiffe://wake.local/brake")]
         brake_id: String,
+        /// Where the SDKs' memory adapters fetch the memory quarantines (read only).
+        #[arg(long)]
+        memory_listen: Option<String>,
     },
     /// Write a development identity: a stand-in trust bundle and a key and certificate
     /// signed by it. For local development only; SPIRE issues them in production.
@@ -126,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             control_listen,
             trust_bundle,
             brake_id,
+            memory_listen,
         } => {
             let key_pem = std::fs::read_to_string(key)?;
             let cert_pem = std::fs::read_to_string(cert)?;
@@ -153,6 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 halts: halts.clone(),
                 ..Default::default()
             };
+            if let Some(memory_listen) = memory_listen {
+                let listener = tokio::net::TcpListener::bind(&memory_listen).await?;
+                tracing::info!(memory_listen, "serving memory rules to memory adapters");
+                tokio::spawn(wake_proxy::memory::serve(listener, halts.clone(), stopping()));
+            }
             if let Some(control_listen) = control_listen {
                 let bundle = trust_bundle.ok_or("--control-listen needs --trust-bundle")?;
                 let tls = control::Tls {

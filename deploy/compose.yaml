@@ -59,7 +59,8 @@ services:
               "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem",
               "--collector", "https://collector:4318", "--collector-ca", "/etc/wake/identity/bundle.pem",
               "--state-dir", "/var/lib/wake-proxy",
-              "--control-listen", "0.0.0.0:9002", "--trust-bundle", "/etc/wake/identity/bundle.pem"]
+              "--control-listen", "0.0.0.0:9002", "--trust-bundle", "/etc/wake/identity/bundle.pem",
+              "--memory-listen", "0.0.0.0:9003"]
     environment:
       RUST_LOG: info
     volumes:
@@ -67,7 +68,8 @@ services:
       # The halts in force, kept so a restart doesn't lift one.
       - proxy-state:/var/lib/wake-proxy
     # Not published. Only agentgateway may reach 9001, and only the brake, which alone has
-    # the SVID the control API checks, may use 9002.
+    # the SVID the control API checks, may use 9002. Memory adapters read their quarantine
+    # rules from 9003.
     restart: unless-stopped
 
   agentgateway:

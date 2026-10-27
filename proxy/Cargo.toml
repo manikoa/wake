@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["json"] }
+axum = { version = "0.8.9", default-features = false, features = ["json", "query"] }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 hex = "0.4.3"

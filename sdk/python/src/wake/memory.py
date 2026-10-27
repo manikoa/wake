@@ -20,6 +20,11 @@ written, gets no parent, so the completeness metric flags it rather than trustin
 Wrappers: WakeStore in wake.langgraph wraps LangGraph's BaseStore (and so langmem), and
 Memory.write_file / read_file handle memory files. Recording never blocks or breaks the
 agent: if it fails, the write or read still happens, unlabeled.
+
+With a Quarantine (wake.quarantine), the adapter also enforces the brake's memory
+quarantine: a locked agent's writes raise MemoryLocked and don't happen, and a quarantined
+entry isn't served (read returns the quarantine's id, the store wrapper drops the entry,
+read_file raises MemoryQuarantined). Each refusal is recorded as a `denied` event.
 """
 
 import hashlib
@@ -33,6 +38,7 @@ from typing import Any
 from opentelemetry import trace
 
 from wake import events, links
+from wake.quarantine import MemoryLocked, MemoryQuarantined, Quarantine
 
 log = logging.getLogger("wake")
 
@@ -56,29 +62,43 @@ class Memory:
     """Records memory writes and reads alongside the events an SDK integration records, such as a
     WakeCallbackHandler or a WakeClaudeAgent."""
 
-    def __init__(self, handler) -> None:
+    def __init__(self, handler, quarantine: Quarantine | None = None) -> None:
         self._handler = handler
+        self._quarantine = quarantine
 
     def write(self, store: str, entry: str, content: Any) -> dict[str, Any] | None:
         """Records a write and returns the label to store with the entry, or None if
-        recording failed."""
+        recording failed. Raises MemoryLocked, before anything is written, when the brake's
+        quarantine locks this agent's writes."""
+        locked = self._locked()
+        if locked:
+            self._refused("write", store, entry, locked, parents=self._linked())
+            raise MemoryLocked(locked, store, entry)
         try:
             return self._write(store, entry, content_of(content))
         except Exception:
             log.warning("wake: failed to record a memory write", exc_info=True)
             return None
 
-    def read(self, store: str, entry: str, content: Any, label: Mapping[str, Any] | None) -> None:
-        """Records a read of an entry, with the label it was stored with, if any."""
+    def read(self, store: str, entry: str, content: Any, label: Mapping[str, Any] | None) -> str | None:
+        """Records a read of an entry, with the label it was stored with, if any. Returns the
+        id of the quarantine that stops the entry being served, or None to serve it."""
+        text = content_of(content)
+        hidden = self._hidden(store, entry, text, label)
+        if hidden:
+            write = label.get("event") if isinstance(label, Mapping) else None
+            self._refused("read", store, entry, hidden, parents=[write] if isinstance(write, str) and write else [])
+            return hidden
         try:
-            self._read(store, entry, content_of(content), label)
+            self._read(store, entry, text, label)
         except Exception:
             log.warning("wake: failed to record a memory read", exc_info=True)
+        return None
 
     def write_file(self, path: str | Path, text: str) -> None:
         """Writes a memory file and its label, next to it as <file>.wake.json."""
         path = Path(path)
-        label = self.write("file", str(path.resolve()), text)
+        label = self.write("file", str(path.resolve()), text)  # raises MemoryLocked when locked
         path.write_text(text)
         if label is not None:
             try:
@@ -97,8 +117,52 @@ class Memory:
                 label = json.loads(label_path.read_text())
         except (OSError, ValueError):
             log.warning("wake: failed to read a memory file's label", exc_info=True)
-        self.read("file", str(path.resolve()), text, label if isinstance(label, Mapping) else None)
+        entry = str(path.resolve())
+        hidden = self.read("file", entry, text, label if isinstance(label, Mapping) else None)
+        if hidden:
+            raise MemoryQuarantined(hidden, "file", entry)
         return text
+
+    def _locked(self) -> str | None:
+        try:
+            return self._quarantine.locked_by() if self._quarantine else None
+        except Exception:
+            log.warning("wake: failed to check the memory quarantine", exc_info=True)
+            return None
+
+    def _hidden(self, store: str, entry: str, text: str, label: Mapping[str, Any] | None) -> str | None:
+        if not self._quarantine:
+            return None
+        try:
+            vouched = isinstance(label, Mapping) and label.get("sha256") == digest(text)
+            return self._quarantine.hiding(store, entry, label if isinstance(label, Mapping) else None, vouched)
+        except Exception:
+            log.warning("wake: failed to check the memory quarantine", exc_info=True)
+            return None
+
+    def _linked(self) -> list[str]:
+        link = links.current()
+        return list(link.parents) if link is not None else []
+
+    def _refused(self, action: str, store: str, entry: str, quarantine: str, *, parents: list[str]) -> None:
+        """Records what the quarantine refused, as a denied event."""
+        try:
+            self._emit(
+                str(uuid.uuid4()),
+                events.DENIED,
+                self._handler._event_context(),
+                parents=parents,
+                origins=[],
+                attributes={
+                    "wake.memory.store": store,
+                    "wake.memory.entry": entry,
+                    "wake.memory.refused": action,
+                    "wake.brake.halt_id": quarantine,
+                },
+                payload={"store": store, "entry": entry, "refused": action, "quarantine": quarantine},
+            )
+        except Exception:
+            log.warning("wake: failed to record a refused memory %s", action, exc_info=True)
 
     def _write(self, store: str, entry: str, content: str) -> dict[str, Any]:
         h = self._handler

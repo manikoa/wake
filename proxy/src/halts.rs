@@ -8,7 +8,11 @@
 //! The brake fails closed. A halt is written to disk before it's acknowledged, so a
 //! restart doesn't lift it, and a state file that can't be read halts the fleet until a
 //! person or the brake replaces it.
+//!
+//! The same state holds memory quarantines, which the SDKs' memory adapters fetch
+//! (memory.rs): agents whose memory writes are refused, and entries no longer served.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,12 +47,71 @@ pub struct Halt {
     pub applied_at: u64,
 }
 
-/// Every halt in force, and a version that moves on with each change, so the brake can
-/// confirm the proxy holds the state it sent.
+/// Which memory a quarantine covers. Writes by the agents in `lock` are refused, and an
+/// entry is no longer served when its label says it was written by one of `agents`, carries
+/// one of `origins`, or came from one of the `writes` (memory_write event ids), when it's
+/// one of `entries` ("<store>/<entry>"), or, with `unlabeled`, when no label vouches for it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Selection {
+    #[serde(default)]
+    pub lock: Scope,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<String>,
+    #[serde(default)]
+    pub unlabeled: bool,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.lock.is_empty()
+            && self.agents.is_empty()
+            && self.origins.is_empty()
+            && self.writes.is_empty()
+            && self.entries.is_empty()
+            && !self.unlabeled
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Quarantine {
+    pub id: String,
+    pub selection: Selection,
+    pub issued_at: u64,
+    pub applied_at: u64,
+}
+
+/// What one agent's memory adapter is told: whether its writes are refused, and which
+/// entries it mustn't serve.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRules {
+    pub version: u64,
+    /// The quarantine that refuses this agent's writes, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked_by: Option<String>,
+    pub quarantines: Vec<Quarantine>,
+}
+
+/// When an agent's memory adapter last fetched its rules, and at which version.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Seen {
+    pub version: u64,
+    pub at: u64,
+}
+
+/// Every halt and quarantine in force, and a version that moves on with each change, so
+/// the brake can confirm the proxy holds the state it sent.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub version: u64,
     pub halts: Vec<Halt>,
+    #[serde(default)]
+    pub quarantines: Vec<Quarantine>,
     /// Set when the state on disk couldn't be read: everything is denied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreadable: Option<String>,
@@ -60,6 +123,8 @@ pub const UNREADABLE: &str = "unreadable-state";
 pub struct Halts {
     state: RwLock<State>,
     path: Option<PathBuf>,
+    // Kept in memory only: after a restart, adapters fetch again within seconds.
+    seen: RwLock<HashMap<String, Seen>>,
 }
 
 impl Halts {
@@ -68,6 +133,7 @@ impl Halts {
         Halts {
             state: RwLock::new(State::default()),
             path: None,
+            seen: RwLock::new(HashMap::new()),
         }
     }
 
@@ -86,6 +152,7 @@ impl Halts {
         Halts {
             state: RwLock::new(state),
             path: Some(path),
+            seen: RwLock::new(HashMap::new()),
         }
     }
 
@@ -115,6 +182,62 @@ impl Halts {
                 state.unreadable = None;
             }
         })
+    }
+
+    /// Puts a memory quarantine in force, or replaces one with the same id.
+    pub fn quarantine(&self, id: &str, selection: Selection, issued_at: u64) -> std::io::Result<State> {
+        self.change(|state| {
+            state.quarantines.retain(|q| q.id != id);
+            state.quarantines.push(Quarantine {
+                id: id.to_string(),
+                selection,
+                issued_at,
+                applied_at: now(),
+            });
+        })
+    }
+
+    /// Lifts a memory quarantine. Lifting one that isn't in force changes nothing but the
+    /// version.
+    pub fn release(&self, id: &str) -> std::io::Result<State> {
+        self.change(|state| state.quarantines.retain(|q| q.id != id))
+    }
+
+    /// The rules for one agent's memory adapter, noting that the agent has them now. A
+    /// state that can't be read refuses every write.
+    pub fn memory_rules(&self, agent: &str) -> MemoryRules {
+        let state = self.state();
+        let named = |scope: &Scope| scope.fleet || (!agent.is_empty() && scope.agents.iter().any(|a| a == agent));
+        let locked_by = if state.unreadable.is_some() {
+            Some(UNREADABLE.to_string())
+        } else {
+            state
+                .quarantines
+                .iter()
+                .find(|q| named(&q.selection.lock))
+                .map(|q| q.id.clone())
+        };
+        if !agent.is_empty()
+            && let Ok(mut seen) = self.seen.write()
+        {
+            seen.insert(
+                agent.to_string(),
+                Seen {
+                    version: state.version,
+                    at: now(),
+                },
+            );
+        }
+        MemoryRules {
+            version: state.version,
+            locked_by,
+            quarantines: state.quarantines,
+        }
+    }
+
+    /// Each agent whose memory adapter has fetched its rules, with the version it got.
+    pub fn seen(&self) -> HashMap<String, Seen> {
+        self.seen.read().map(|s| s.clone()).unwrap_or_default()
     }
 
     fn change(&self, f: impl FnOnce(&mut State)) -> std::io::Result<State> {
@@ -159,9 +282,8 @@ impl Halts {
 fn unreadable(path: &Path, error: &str) -> State {
     tracing::error!(path = %path.display(), error, "can't read the halts in force; denying every call until they're replaced");
     State {
-        version: 0,
-        halts: vec![],
         unreadable: Some(error.to_string()),
+        ..Default::default()
     }
 }
 
@@ -239,6 +361,53 @@ mod tests {
     }
 
     #[test]
+    fn quarantines_tell_each_agents_adapter_what_to_refuse() {
+        let halts = Halts::in_memory();
+        let selection = Selection {
+            lock: agents(&["billing"]),
+            origins: vec!["tool:fetch_page".into()],
+            ..Default::default()
+        };
+        let state = halts.quarantine("q1", selection, 5).unwrap();
+        assert_eq!((state.version, state.quarantines.len()), (1, 1));
+
+        let billing = halts.memory_rules("billing");
+        assert_eq!(billing.locked_by.as_deref(), Some("q1"));
+        assert_eq!(billing.quarantines[0].selection.origins, vec!["tool:fetch_page"]);
+        let support = halts.memory_rules("support");
+        assert_eq!(support.locked_by, None, "only billing's writes are refused");
+        assert_eq!(
+            support.quarantines.len(),
+            1,
+            "every agent hides the quarantined entries"
+        );
+        assert_eq!(halts.memory_rules("").locked_by, None);
+
+        let seen = halts.seen();
+        assert_eq!(seen["billing"].version, 1);
+        assert!(seen.contains_key("support") && !seen.contains_key(""));
+
+        halts
+            .quarantine(
+                "q2",
+                Selection {
+                    lock: Scope {
+                        fleet: true,
+                        agents: vec![],
+                    },
+                    ..Default::default()
+                },
+                6,
+            )
+            .unwrap();
+        assert_eq!(halts.memory_rules("support").locked_by.as_deref(), Some("q2"));
+        halts.release("q1").unwrap();
+        let state = halts.release("q2").unwrap();
+        assert_eq!((state.version, state.quarantines.len()), (4, 0));
+        assert_eq!(halts.memory_rules("billing").locked_by, None);
+    }
+
+    #[test]
     fn halts_survive_a_restart() {
         let dir = std::env::temp_dir().join(format!("wake-halts-{}", uuid::Uuid::new_v4()));
         let halts = Halts::load(&dir);
@@ -266,6 +435,11 @@ mod tests {
         let halts = Halts::load(&dir);
         assert_eq!(halts.deciding(None, None).unwrap().id, UNREADABLE);
         assert!(halts.state().unreadable.is_some());
+        assert_eq!(
+            halts.memory_rules("billing").locked_by.as_deref(),
+            Some(UNREADABLE),
+            "memory writes too"
+        );
         // Lifting it, once a person has looked, writes a good state again.
         halts.lift(UNREADABLE).unwrap();
         assert!(halts.deciding(None, None).is_none());
