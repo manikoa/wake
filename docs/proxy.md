@@ -1,6 +1,6 @@
 # The proxy on agentgateway
 
-Proposed October 26, 2026. Waiting on the open items at the end.
+Decided October 26, 2026.
 
 ## The question
 
@@ -37,14 +37,14 @@ The processor is a new parsing surface for attacker-controlled MCP and A2A bodie
 - ExtMCP's response phase carries no JSON-RPC id or request params. The plan is to return `wake_event_id` in request metadata and read it back in the response phase. The code suggests this works; a test has to show it.
 - JSON-RPC errors skip `CheckResponse`, so a failed call's outcome comes from agentgateway's own spans.
 - Server-initiated MCP messages (progress, sampling, elicitation) aren't hooked.
-- ExtMCP is synchronous: every call waits on the processor, and it fails closed by default. Recording mustn't block, so for capture the processor answers at once and does its work after replying. Whether capture fails open, which loses events, or closed, which stops agents when the processor is down, is open item 2.
+- ExtMCP is synchronous: every call waits on the processor, and it fails closed by default. Recording mustn't block, so for capture the processor answers at once and does its work after replying. Capture fails open (see the decisions below).
 - agentgateway's ext_proc is marked "very experimental" in its source. SSE with body rewriting needs testing early.
 - Per-call deny doesn't stop calls already forwarded or long-lived streams. ext_proc can cut an open stream; the Brake phase has to verify that.
 - There's no built-in "deny in force" acknowledgement. Verification would combine `/config_dump`, the processor's deny-list version, signed events for denied attempts, and a probe call with a test identity.
 
 Upstream proposals that would help, none blocking: a request id and the params in `McpResponse`, calling `CheckResponse` on JSON-RPC errors, an observe-only async mode, and an A2A hook like ExtMCP.
 
-## Open items to confirm
+## Decisions
 
-1. **Signature algorithm.** `docs/events.md` says Ed25519, but SPIRE X.509-SVID keys are P-256, P-384 or RSA-2048. Either sign proxy events with the SVID's P-256 key (ECDSA), so the collector checks two algorithms, or have the processor bind a short-lived Ed25519 key to its SVID and publish that binding. The first is simpler and keeps one identity.
-2. **Fail open or closed for capture.** When the processor is down, ExtMCP can let calls through unrecorded or block them. "Recording never blocks" points to fail open for capture, with the gap raising a health signal. Deny, in Brake, has to fail closed, so the two may need separate guardrail entries.
+1. **Proxy events are signed with ECDSA P-256, using the processor's X.509-SVID key.** SPIRE issues P-256, P-384 or RSA-2048 keys, not Ed25519, and signing with the SVID key keeps one identity per component. The collector keeps signing SDK and memory adapter events with Ed25519, so it checks two algorithms. It checks a proxy signature against the signer's SVID, and the SVID against the SPIRE trust bundle, instead of a fixed key file. How the SVID travels with each event, so anyone can check a log entry later on its own, is settled when the proxy is built.
+2. **Capture fails open.** If the processor is down or slow, agentgateway lets the call through unrecorded, because recording never blocks. The gap must not be silent: agentgateway's own spans for the call still reach the collector, and calls the proxy saw but didn't record raise a health signal. Deny, in the Brake phase, fails closed, so it goes in a separate guardrail entry with its own failure mode.

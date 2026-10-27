@@ -27,8 +27,9 @@ An SDK event is only as honest as the agent process that emitted it. That's true
 ## What it means for each component
 
 - **SDK and memory adapter:** never sign anything and never load key material. Send over TLS to the collector.
-- **Proxy:** signs each event it captures with its SPIFFE identity's key before sending it.
+- **Proxy:** signs each event it captures with its SPIFFE identity's key before sending it. "The proxy" means agentgateway plus the Wake processor it calls; the processor holds the key.
 - **Collector:** signs unsigned SDK and memory adapter events, verifies proxy signatures, and records events whose signatures fail instead of dropping them.
 - **Keys:** the collector's signing key lives in cloud KMS, or keys the customer holds. A self hosted log can use a local key file.
+- **Proxy keys:** the proxy signs with its own X.509-SVID key, ECDSA P-256, and the collector checks it against the SPIRE trust bundle. See [proxy.md](proxy.md).
 
 The exact bytes that get signed are defined in [events.md](events.md).
