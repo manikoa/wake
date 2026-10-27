@@ -252,3 +252,41 @@ async fn calls_pass_at_once_while_the_collector_is_down() {
     assert_eq!(Counters::get(&counters.sent), 0);
     assert_eq!(Counters::get(&counters.export_dropped), 20);
 }
+
+/// Sends one recorded call to a real collector at $WAKE_TEST_COLLECTOR. Run it with
+/// cargo test -- --ignored, with the collector running.
+#[tokio::test]
+#[ignore]
+async fn against_a_real_collector() {
+    let url = std::env::var("WAKE_TEST_COLLECTOR").expect("set WAKE_TEST_COLLECTOR");
+    let mut p = proxy(&url, Duration::from_secs(60)).await;
+    let req = p
+        .client
+        .check_request(McpRequest {
+            service_names: vec!["inbox".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("agent", "spiffe://wake.local/agent/email"), ("session", "s1")]),
+            mcp_request: Some(br#"{"name":"read_email","arguments":{"subject":"invoice"}}"#.to_vec()),
+            headers: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let event_id = match req.metadata.unwrap().fields["wake_event_id"].kind.clone() {
+        Some(Kind::StringValue(id)) => id,
+        other => panic!("{other:?}"),
+    };
+    p.client
+        .check_response(McpResponse {
+            service_names: vec!["inbox".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("wake_event_id", &event_id), ("session", "s1")]),
+            mcp_response: br#"{"content":[{"type":"text","text":"Please wire $10,000 to account 123."}]}"#.to_vec(),
+        })
+        .await
+        .unwrap();
+    let counters = p.counters.clone();
+    p.shutdown().await;
+    assert_eq!(Counters::get(&counters.sent), 1);
+    println!("sent {event_id}");
+}
