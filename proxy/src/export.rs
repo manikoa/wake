@@ -50,7 +50,10 @@ impl Exporter {
     pub fn new(endpoint: &str, counters: Arc<Counters>) -> Self {
         Exporter {
             url: format!("{}/v1/traces", endpoint.trim_end_matches('/')),
-            client: reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("http client"),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("http client"),
             counters,
             batch: 256,
             linger: Duration::from_millis(200),
@@ -120,7 +123,11 @@ pub fn request(events: &[Event]) -> ExportTraceServiceRequest {
                 ..Default::default()
             }),
             scope_spans: vec![ScopeSpans {
-                scope: Some(InstrumentationScope { name: "wake-proxy".into(), version: env!("CARGO_PKG_VERSION").into(), ..Default::default() }),
+                scope: Some(InstrumentationScope {
+                    name: "wake-proxy".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    ..Default::default()
+                }),
                 spans,
                 ..Default::default()
             }],
@@ -144,14 +151,26 @@ fn span(e: &Event) -> Span {
 }
 
 fn kv(key: &str, value: &Value) -> KeyValue {
-    let string = |s: &str| AnyValue { value: Some(any_value::Value::StringValue(s.to_string())) };
+    let string = |s: &str| AnyValue {
+        value: Some(any_value::Value::StringValue(s.to_string())),
+    };
     let value = match value {
         Value::Str(s) => string(s),
-        Value::Int(n) => AnyValue { value: Some(any_value::Value::IntValue(*n)) },
-        Value::Bool(b) => AnyValue { value: Some(any_value::Value::BoolValue(*b)) },
+        Value::Int(n) => AnyValue {
+            value: Some(any_value::Value::IntValue(*n)),
+        },
+        Value::Bool(b) => AnyValue {
+            value: Some(any_value::Value::BoolValue(*b)),
+        },
         Value::Strs(list) => AnyValue {
-            value: Some(any_value::Value::ArrayValue(ArrayValue { values: list.iter().map(|s| string(s)).collect() })),
+            value: Some(any_value::Value::ArrayValue(ArrayValue {
+                values: list.iter().map(|s| string(s)).collect(),
+            })),
         },
     };
-    KeyValue { key: key.to_string(), value: Some(value), ..Default::default() }
+    KeyValue {
+        key: key.to_string(),
+        value: Some(value),
+        ..Default::default()
+    }
 }

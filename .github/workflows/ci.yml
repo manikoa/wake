@@ -1,0 +1,98 @@
+# Every component's tests, on every pull request and every push to main. Each job uses
+# its component's own tooling (docs/repo-layout.md). Actions are pinned to commit SHAs.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  log:
+    name: log (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: log
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: log/go.mod
+          cache-dependency-path: log/go.sum
+      - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  collector:
+    name: collector (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: collector
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: collector/go.mod
+          cache-dependency-path: |
+            collector/go.sum
+            log/go.sum
+      - run: test -z "$(gofmt -l event exporter processor)" || (gofmt -l event exporter processor && exit 1)
+      - run: go vet ./...
+      - run: go test -race ./...
+      # The collector binary, as a partner would build it.
+      - run: go install go.opentelemetry.io/collector/cmd/builder@v0.164.0
+      - run: make build
+
+  proxy:
+    name: proxy (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: proxy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            proxy
+            proxy/fuzz
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo fmt --check
+      - run: cargo fmt --check
+        working-directory: proxy/fuzz
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # The fuzz targets need nightly to run, but must keep building.
+      - run: cargo check
+        working-directory: proxy/fuzz
+
+  sdk-python:
+    name: sdk/python (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: sdk/python/uv.lock
+      - run: uv run --python ${{ matrix.python }} --all-extras --locked pytest -q

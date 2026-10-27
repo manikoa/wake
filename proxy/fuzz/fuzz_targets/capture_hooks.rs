@@ -24,11 +24,20 @@ fuzz_target!(|data: &[u8]| {
                 server: "s".into(),
                 metadata,
                 params: Some(chunk.to_vec()),
-                headers: vec![("wake-parents".into(), chunk.to_vec()), ("mcp-session-id".into(), chunk.to_vec())],
+                headers: vec![
+                    ("wake-parents".into(), chunk.to_vec()),
+                    ("mcp-session-id".into(), chunk.to_vec()),
+                ],
                 at,
             }
         } else {
-            Hook::Response { method, server: "s".into(), metadata, result: chunk.to_vec(), at }
+            Hook::Response {
+                method,
+                server: "s".into(),
+                metadata,
+                result: chunk.to_vec(),
+                at,
+            }
         };
         for event in capture.handle(hook) {
             assert!(serde_json::from_str::<serde_json::Value>(event.str("wake.payload").unwrap()).is_ok());

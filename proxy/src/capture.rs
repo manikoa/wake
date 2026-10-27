@@ -88,27 +88,67 @@ impl Capture {
     /// Takes one hook and returns any events it completes.
     pub fn handle(&mut self, hook: Hook) -> Vec<Event> {
         match hook {
-            Hook::Request { event_id, method, server, metadata, params, headers, at } => {
+            Hook::Request {
+                event_id,
+                method,
+                server,
+                metadata,
+                params,
+                headers,
+                at,
+            } => {
                 let request = mcp::parse_request(&method, params.as_deref(), &headers);
                 // Pairing uses the session from metadata, the only place the response hook
                 // can carry it too.
                 let session = metadata.get(META_SESSION).cloned().unwrap_or_default();
-                let agent = metadata.get(META_AGENT).filter(|a| !a.is_empty()).cloned().unwrap_or_else(|| "unknown".into());
-                self.queues.entry((session.clone(), method.clone(), server.clone())).or_default().push_back(event_id.clone());
+                let agent = metadata
+                    .get(META_AGENT)
+                    .filter(|a| !a.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".into());
+                self.queues
+                    .entry((session.clone(), method.clone(), server.clone()))
+                    .or_default()
+                    .push_back(event_id.clone());
                 self.order.push_back(event_id.clone());
-                self.pending.insert(event_id, Pending { method, server, agent, session, params, request, at });
+                self.pending.insert(
+                    event_id,
+                    Pending {
+                        method,
+                        server,
+                        agent,
+                        session,
+                        params,
+                        request,
+                        at,
+                    },
+                );
                 // Never hold more than limit: the oldest goes out without its response.
                 let mut out = Vec::new();
                 while self.pending.len() > self.limit {
                     match self.order.pop_front() {
-                        Some(id) => out.extend(self.finish(&id, None, at, Some("no response seen before the processor's limit"))),
+                        Some(id) => out.extend(self.finish(
+                            &id,
+                            None,
+                            at,
+                            Some("no response seen before the processor's limit"),
+                        )),
                         None => break,
                     }
                 }
                 out
             }
-            Hook::Response { method, server, metadata, result, at } => {
-                let by_id = metadata.get(META_EVENT_ID).filter(|id| self.pending.contains_key(*id)).cloned();
+            Hook::Response {
+                method,
+                server,
+                metadata,
+                result,
+                at,
+            } => {
+                let by_id = metadata
+                    .get(META_EVENT_ID)
+                    .filter(|id| self.pending.contains_key(*id))
+                    .cloned();
                 let id = match by_id {
                     Some(id) => {
                         self.paired_by_id += 1;
@@ -116,7 +156,10 @@ impl Capture {
                     }
                     None => {
                         let session = metadata.get(META_SESSION).cloned().unwrap_or_default();
-                        let next = self.queues.get_mut(&(session, method.clone(), server.clone())).and_then(|q| q.pop_front());
+                        let next = self
+                            .queues
+                            .get_mut(&(session, method.clone(), server.clone()))
+                            .and_then(|q| q.pop_front());
                         if next.is_some() {
                             self.paired_in_order += 1;
                         }
@@ -143,7 +186,12 @@ impl Capture {
                 }
                 Some(p) if now.duration_since(p.at).unwrap_or_default() >= self.timeout => {
                     self.order.pop_front();
-                    out.extend(self.finish(&id, None, now, Some("no response seen: the call failed or the response phase isn't configured")));
+                    out.extend(self.finish(
+                        &id,
+                        None,
+                        now,
+                        Some("no response seen: the call failed or the response phase isn't configured"),
+                    ));
                 }
                 Some(_) => break,
             }
@@ -153,10 +201,14 @@ impl Capture {
 
     fn finish(&mut self, id: &str, result: Option<&[u8]>, at: SystemTime, error: Option<&str>) -> Option<Event> {
         let p = self.pending.remove(id)?;
-        if let Some(q) = self.queues.get_mut(&(p.session.clone(), p.method.clone(), p.server.clone())) {
+        if let Some(q) = self
+            .queues
+            .get_mut(&(p.session.clone(), p.method.clone(), p.server.clone()))
+        {
             q.retain(|x| x != id);
             if q.is_empty() {
-                self.queues.remove(&(p.session.clone(), p.method.clone(), p.server.clone()));
+                self.queues
+                    .remove(&(p.session.clone(), p.method.clone(), p.server.clone()));
             }
         }
         Some(build(id, &p, result, at, error))
@@ -186,14 +238,22 @@ fn build(id: &str, p: &Pending, result: Option<&[u8]>, end: SystemTime, error: O
         ..Default::default()
     };
     let target = p.request.target.clone().unwrap_or_default();
-    event.name = if p.method == "tools/call" { format!("execute_tool {target}") } else { format!("{} {target}", p.method) };
+    event.name = if p.method == "tools/call" {
+        format!("execute_tool {target}")
+    } else {
+        format!("{} {target}", p.method)
+    };
     event.set("wake.event.id", Value::Str(id.into()));
     event.set("wake.event.kind", Value::Str("tool_call".into()));
     event.set("wake.agent.id", Value::Str(p.agent.clone()));
     event.set("wake.capture", Value::Str("proxy".into()));
     event.set("wake.parents", Value::Strs(p.request.parents.clone()));
     // What came back is outside content entering the system here.
-    let origin = if target.is_empty() { format!("tool:{}", p.server) } else { format!("tool:{target}") };
+    let origin = if target.is_empty() {
+        format!("tool:{}", p.server)
+    } else {
+        format!("tool:{target}")
+    };
     event.set("wake.origins", Value::Strs(vec![origin]));
     event.set("gen_ai.operation.name", Value::Str("execute_tool".into()));
     if p.method == "tools/call" && !target.is_empty() {
@@ -201,11 +261,18 @@ fn build(id: &str, p: &Pending, result: Option<&[u8]>, end: SystemTime, error: O
     }
     event.set("wake.mcp.method", Value::Str(p.method.clone()));
     event.set("wake.mcp.server", Value::Str(p.server.clone()));
-    let session = if p.session.is_empty() { p.request.session.clone().unwrap_or_default() } else { p.session.clone() };
+    let session = if p.session.is_empty() {
+        p.request.session.clone().unwrap_or_default()
+    } else {
+        p.session.clone()
+    };
     if !session.is_empty() {
         event.set("wake.mcp.session", Value::Str(session));
     }
-    event.set("wake.payload", Value::Str(mcp::payload(p.params.as_deref(), result, error)));
+    event.set(
+        "wake.payload",
+        Value::Str(mcp::payload(p.params.as_deref(), result, error)),
+    );
     event
 }
 
@@ -213,13 +280,23 @@ fn orphan(method: &str, server: &str, metadata: &HashMap<String, String>, result
     let p = Pending {
         method: method.into(),
         server: server.into(),
-        agent: metadata.get(META_AGENT).filter(|a| !a.is_empty()).cloned().unwrap_or_else(|| "unknown".into()),
+        agent: metadata
+            .get(META_AGENT)
+            .filter(|a| !a.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "unknown".into()),
         session: metadata.get(META_SESSION).cloned().unwrap_or_default(),
         params: None,
         request: mcp::Request::default(),
         at,
     };
-    build(&uuid::Uuid::new_v4().to_string(), &p, Some(result), at, Some("response with no request seen"))
+    build(
+        &uuid::Uuid::new_v4().to_string(),
+        &p,
+        Some(result),
+        at,
+        Some("response with no request seen"),
+    )
 }
 
 #[cfg(test)]
@@ -251,7 +328,13 @@ mod tests {
         if let Some(id) = event_id {
             m.insert(META_EVENT_ID.into(), id.into());
         }
-        Hook::Response { method: "tools/call".into(), server: "inbox".into(), metadata: m, result: result.as_bytes().to_vec(), at }
+        Hook::Response {
+            method: "tools/call".into(),
+            server: "inbox".into(),
+            metadata: m,
+            result: result.as_bytes().to_vec(),
+            at,
+        }
     }
 
     #[test]
@@ -267,9 +350,18 @@ mod tests {
         assert_eq!(e.str("wake.capture"), Some("proxy"));
         assert_eq!(e.str("wake.agent.id"), Some("spiffe://wake.local/agent/email"));
         assert_eq!(e.str("gen_ai.tool.name"), Some("read_email"));
-        assert_eq!(e.attributes["wake.origins"], Value::Strs(vec!["tool:read_email".into()]));
-        assert_eq!(e.str("wake.payload"), Some(r#"{"input":{"name":"read_email","arguments":{}},"output":{"content":"second"}}"#));
-        assert_eq!((e.start_time_unix_nano, e.end_time_unix_nano), (nanos(t(1)), nanos(t(2))));
+        assert_eq!(
+            e.attributes["wake.origins"],
+            Value::Strs(vec!["tool:read_email".into()])
+        );
+        assert_eq!(
+            e.str("wake.payload"),
+            Some(r#"{"input":{"name":"read_email","arguments":{}},"output":{"content":"second"}}"#)
+        );
+        assert_eq!(
+            (e.start_time_unix_nano, e.end_time_unix_nano),
+            (nanos(t(1)), nanos(t(2)))
+        );
         assert_eq!(c.waiting(), 1);
         assert_eq!((c.paired_by_id, c.paired_in_order), (1, 0));
     }
@@ -296,7 +388,10 @@ mod tests {
         let out = c.expire(t(60));
         assert_eq!(out.len(), 1);
         let payload = out[0].str("wake.payload").unwrap();
-        assert!(payload.contains(r#""output":null"#) && payload.contains("no response seen"), "{payload}");
+        assert!(
+            payload.contains(r#""output":null"#) && payload.contains("no response seen"),
+            "{payload}"
+        );
         // A late response then has nothing to pair with and is recorded on its own.
         let late = c.handle(response("s1", Some("a"), "{}", t(61)));
         assert_eq!(late.len(), 1);
@@ -314,7 +409,10 @@ mod tests {
         assert_eq!(out[0].str("wake.event.id"), Some("a"));
         assert_eq!(c.waiting(), 2);
         // The pairing queue forgot a, so the next response pairs with b.
-        assert_eq!(c.handle(response("s1", None, "{}", t(3)))[0].str("wake.event.id"), Some("b"));
+        assert_eq!(
+            c.handle(response("s1", None, "{}", t(3)))[0].str("wake.event.id"),
+            Some("b")
+        );
     }
 
     #[test]
@@ -329,12 +427,21 @@ mod tests {
             headers: vec![("mcp-session-id".into(), b"s9".to_vec())],
             at: t(0),
         });
-        let out = c.handle(Hook::Response { method: "resources/read".into(), server: "files".into(), metadata: meta(&[(META_EVENT_ID, "a")]), result: b"{}".to_vec(), at: t(1) });
+        let out = c.handle(Hook::Response {
+            method: "resources/read".into(),
+            server: "files".into(),
+            metadata: meta(&[(META_EVENT_ID, "a")]),
+            result: b"{}".to_vec(),
+            at: t(1),
+        });
         let e = &out[0];
         assert_eq!(hex::encode(e.trace_id), "0102030405060708090a0b0c0d0e0f10");
         assert_eq!(e.parent_span_id.map(hex::encode).as_deref(), Some("1112131415161718"));
         assert_eq!(e.attributes["wake.parents"], Value::Strs(vec!["model-call-1".into()]));
-        assert_eq!(e.attributes["wake.origins"], Value::Strs(vec!["tool:file:///inbox/1.eml".into()]));
+        assert_eq!(
+            e.attributes["wake.origins"],
+            Value::Strs(vec!["tool:file:///inbox/1.eml".into()])
+        );
         assert_eq!(e.str("wake.agent.id"), Some("unknown"));
         assert_eq!(e.str("wake.mcp.session"), Some("s9"));
         assert_eq!(e.str("gen_ai.tool.name"), None);

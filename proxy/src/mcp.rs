@@ -62,7 +62,10 @@ pub fn parse_request(method: &str, params: Option<&[u8]>, headers: &[(String, Ve
             request.parents = parents;
         }
     }
-    request.session = header(HEADER_SESSION).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 256).map(str::to_string);
+    request.session = header(HEADER_SESSION)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 256)
+        .map(str::to_string);
     request
 }
 
@@ -91,7 +94,12 @@ fn parse_params(method: &str, params: Option<&[u8]>) -> Request {
                 .collect()
         })
         .unwrap_or_default();
-    Request { target, trace, parents, session: None }
+    Request {
+        target,
+        trace,
+        parents,
+        session: None,
+    }
 }
 
 /// Parses a W3C traceparent: version-traceid-spanid-flags, lowercase hex. An all-zero
@@ -164,7 +172,10 @@ mod tests {
     #[test]
     fn headers_link_the_call_when_meta_is_dropped() {
         let headers = vec![
-            ("Traceparent".to_string(), b"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01".to_vec()),
+            (
+                "Traceparent".to_string(),
+                b"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01".to_vec(),
+            ),
             ("wake-parents".to_string(), b" e1, ,e2 ".to_vec()),
             ("mcp-session-id".to_string(), b"s1".to_vec()),
             ("authorization".to_string(), b"secret".to_vec()),
@@ -172,10 +183,20 @@ mod tests {
         let r = parse_request("tools/call", Some(br#"{"name":"read_email"}"#), &headers);
         assert_eq!(r.parents, vec!["e1", "e2"]);
         assert_eq!(r.session.as_deref(), Some("s1"));
-        assert_eq!(r.trace.map(|t| hex::encode(t.trace_id)).as_deref(), Some("0102030405060708090a0b0c0d0e0f10"));
+        assert_eq!(
+            r.trace.map(|t| hex::encode(t.trace_id)).as_deref(),
+            Some("0102030405060708090a0b0c0d0e0f10")
+        );
         // A malformed header leaves what _meta said.
         let meta = br#"{"name":"t","_meta":{"dev.wake/parents":["m1"]}}"#;
-        let r = parse_request("tools/call", Some(meta), &[("wake-parents".into(), b" , ".to_vec()), ("traceparent".into(), b"bad".to_vec())]);
+        let r = parse_request(
+            "tools/call",
+            Some(meta),
+            &[
+                ("wake-parents".into(), b" , ".to_vec()),
+                ("traceparent".into(), b"bad".to_vec()),
+            ],
+        );
         assert_eq!(r.parents, vec!["m1"]);
         assert_eq!(r.trace, None);
         let r = parse_request("tools/call", None, &[("wake-parents".into(), vec![0xff])]);

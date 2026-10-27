@@ -48,7 +48,9 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     match Cli::parse().command {
         Command::DevIdentity { spiffe_id, out } => {
             let id = dev_identity(&spiffe_id)?;
@@ -56,14 +58,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::write(out.join("bundle.pem"), id.ca_pem)?;
             std::fs::write(out.join("proxy.pem"), id.cert_pem)?;
             write_private(&out.join("proxy.key"), &id.key_pem)?;
-            println!("wrote {}/bundle.pem, proxy.pem and proxy.key for {spiffe_id}", out.display());
+            println!(
+                "wrote {}/bundle.pem, proxy.pem and proxy.key for {spiffe_id}",
+                out.display()
+            );
         }
-        Command::Serve { listen, collector, key, cert, response_timeout } => {
+        Command::Serve {
+            listen,
+            collector,
+            key,
+            cert,
+            response_timeout,
+        } => {
             let signer = Signer::from_pem(&std::fs::read_to_string(key)?, &std::fs::read_to_string(cert)?)?;
             tracing::info!(listen, collector, signer = signer.id(), "serving the ExtMCP processor");
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             let counters = Arc::new(Counters::default());
-            let options = Options { collector, response_timeout: Duration::from_secs(response_timeout), ..Default::default() };
+            let options = Options {
+                collector,
+                response_timeout: Duration::from_secs(response_timeout),
+                ..Default::default()
+            };
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };

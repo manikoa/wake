@@ -36,14 +36,22 @@ pub fn parse_request(body: &[u8]) -> Request {
         return Request::default();
     };
     let message = v.get("params").and_then(|p| p.get("message"));
-    let field = |key: &str| message.and_then(|m| m.get(key)).and_then(Value::as_str).map(str::to_string);
+    let field = |key: &str| {
+        message
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
     let metadata = message.and_then(|m| m.get("metadata"));
     Request {
         method: v.get("method").and_then(Value::as_str).map(str::to_string),
         message_id: field("messageId"),
         context_id: field("contextId"),
         task_id: field("taskId"),
-        trace: metadata.and_then(|m| m.get(META_TRACEPARENT)).and_then(Value::as_str).and_then(parse_traceparent),
+        trace: metadata
+            .and_then(|m| m.get(META_TRACEPARENT))
+            .and_then(Value::as_str)
+            .and_then(parse_traceparent),
         parents: parents_in(metadata),
     }
 }
@@ -65,7 +73,10 @@ pub fn reply_parents(body: &[u8], streamed: bool) -> Vec<String> {
     for r in responses {
         let Some(result) = r.get("result") else { continue };
         // A Message, a Task whose status carries one, or a status update event.
-        for message in [Some(result), result.get("status").and_then(|s| s.get("message"))].into_iter().flatten() {
+        for message in [Some(result), result.get("status").and_then(|s| s.get("message"))]
+            .into_iter()
+            .flatten()
+        {
             for p in parents_in(message.get("metadata")) {
                 if !out.contains(&p) {
                     out.push(p);
@@ -109,11 +120,22 @@ mod tests {
             "metadata":{"traceparent":"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01","dev.wake/parents":["e1"," e2 ",""]}}}}"#;
         let r = parse_request(body);
         assert_eq!(r.method.as_deref(), Some("message/send"));
-        assert_eq!((r.message_id.as_deref(), r.context_id.as_deref(), r.task_id.as_deref()), (Some("m1"), Some("c1"), Some("t1")));
+        assert_eq!(
+            (r.message_id.as_deref(), r.context_id.as_deref(), r.task_id.as_deref()),
+            (Some("m1"), Some("c1"), Some("t1"))
+        );
         assert_eq!(r.parents, vec!["e1", "e2"]);
-        assert_eq!(r.trace.map(|t| hex::encode(t.trace_id)).as_deref(), Some("0102030405060708090a0b0c0d0e0f10"));
+        assert_eq!(
+            r.trace.map(|t| hex::encode(t.trace_id)).as_deref(),
+            Some("0102030405060708090a0b0c0d0e0f10")
+        );
         assert_eq!(parse_request(b"not json"), Request::default());
-        assert_eq!(parse_request(br#"{"method":"tasks/get","params":{"id":"t1"}}"#).method.as_deref(), Some("tasks/get"));
+        assert_eq!(
+            parse_request(br#"{"method":"tasks/get","params":{"id":"t1"}}"#)
+                .method
+                .as_deref(),
+            Some("tasks/get")
+        );
     }
 
     #[test]
