@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -42,13 +43,16 @@ func testConfig(t *testing.T, dir string) *Config {
 	return cfg
 }
 
-// events returns traces holding n events and one structure span.
+// events returns traces holding n events and one structure span. Each event has its
+// own id, as real events do; the log would keep only one of n identical entries.
 func events(n int) ptrace.Traces {
 	td := ptrace.NewTraces()
 	spans := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
 	spans.AppendEmpty() // a structure span
-	for range n {
-		spans.AppendEmpty().Attributes().PutStr(event.Kind, "model_call")
+	for i := range n {
+		attrs := spans.AppendEmpty().Attributes()
+		attrs.PutStr(event.Kind, "model_call")
+		attrs.PutStr("wake.event.id", strconv.Itoa(i))
 	}
 	return td
 }
