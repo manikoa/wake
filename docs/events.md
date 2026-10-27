@@ -73,7 +73,9 @@ The memory adapter records each write to a memory store or memory file as a `mem
 
 The label is a pointer, not evidence: anything that can write the store can forge one. The signed `memory_write` it names, and the digest, are what make it checkable.
 
-**Quarantine.** When the brake quarantines memory, the adapter refuses the writes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence. Each refused write or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's parent is the write it came from.
+- **A delete** is a `memory_write` with `wake.memory.deleted` true and no label. Its parents are the tool call making it.
+
+**Quarantine.** When the brake quarantines memory, the adapter refuses the writes and deletes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence, so deleting one is refused too. Each refused write, delete or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write`, `delete` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's or delete's parent is the write it came from. The adapter fails closed: while it holds no current rules from the proxy, or can't check them, it refuses every write and serves no entry, with `wake.brake.halt_id` `stale-rules` or `quarantine-check-failed`.
 
 ## How the SDK finds parents
 

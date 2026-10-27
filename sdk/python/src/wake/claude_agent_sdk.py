@@ -26,8 +26,6 @@ but can't carry the link.
 """
 
 import dataclasses
-import json
-import logging
 import time
 import uuid
 from collections import deque
@@ -51,29 +49,16 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
 from wake import events, links
-from wake._graph import EventGraph, _Recent
+from wake._graph import EventGraph, _Recent, never_raise
 from wake.recorder import Recorder
 
-log = logging.getLogger("wake")
 
 # The tool Claude Code starts a subagent with; older versions call it Task.
 SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
 
 
-def _never_raise(method):
-    @wraps(method)
-    def wrapper(self, *args, **kwargs):
-        try:
-            return method(self, *args, **kwargs)
-        except Exception:
-            log.warning("wake: failed to record %s", method.__name__, exc_info=True)
-            return None
-
-    return wrapper
-
-
 def _canonical(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, default=str)
+    return events.dumps(value)
 
 
 def _short_name(name: str) -> str:
@@ -210,7 +195,7 @@ class WakeClaudeAgent(EventGraph):
         self._hook_closed(hook_input, tool_use_id)
         return {}
 
-    @_never_raise
+    @never_raise
     def _hook_opened(self, hook_input, tool_use_id) -> None:
         name = hook_input.get("tool_name") or ""
         if not tool_use_id or name in SUBAGENT_TOOLS:
@@ -222,7 +207,7 @@ class WakeClaudeAgent(EventGraph):
         agent = f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
         self._open_tool(run, tool_use_id, name, hook_input.get("tool_input"), agent, run.root)
 
-    @_never_raise
+    @never_raise
     def _hook_closed(self, hook_input, tool_use_id) -> None:
         with self._lock:
             tool = self._tools.get(tool_use_id) if tool_use_id else None
@@ -244,7 +229,7 @@ class WakeClaudeAgent(EventGraph):
 
         return run_with_link
 
-    @_never_raise
+    @never_raise
     def _enter(self, name: str, arguments: Any):
         key = (name, _canonical(arguments))
         with self._lock:
@@ -259,7 +244,7 @@ class WakeClaudeAgent(EventGraph):
 
     # The message stream.
 
-    @_never_raise
+    @never_raise
     def _start_run(self, prompt: str | None) -> _Run:
         agent = self._recorder.agent
         link = links.current()
@@ -284,7 +269,7 @@ class WakeClaudeAgent(EventGraph):
             self._active.append(run)
         return run
 
-    @_never_raise
+    @never_raise
     def _observe(self, run: _Run | None, message) -> None:
         if run is None:
             return
@@ -525,13 +510,13 @@ class WakeClaudeAgent(EventGraph):
             events.ORIGINS: origins,
             **attributes,
         })
-        span.set_attributes(events.payload_attributes(json.loads(json.dumps(payload, default=str))))
+        span.set_attributes(events.payload_attributes(payload))
         if error:
             span.set_status(Status(StatusCode.ERROR, str(error)))
         ctx = span.get_span_context()
         links._note(links.Link(event_id, ctx.trace_id, ctx.span_id))
 
-    @_never_raise
+    @never_raise
     def _end_run(self, run: _Run | None) -> None:
         if run is None:
             return

@@ -9,8 +9,9 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "opentelemetry-exporter-otlp-proto-http>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-common>=1.45.1",
     "opentelemetry-sdk>=1.45.1",
+    "requests>=2.32",
 ]
 
 [project.optional-dependencies]

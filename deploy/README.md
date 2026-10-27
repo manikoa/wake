@@ -17,7 +17,7 @@ docker compose -f deploy/compose.yaml up --build
 
 ```bash
 docker compose -f deploy/compose.yaml cp collector:/etc/wake/identity/bundle.pem ./wake-ca.pem
-export WAKE_ENDPOINT=https://localhost:4318 OTEL_EXPORTER_OTLP_CERTIFICATE=$PWD/wake-ca.pem
+export WAKE_ENDPOINT=https://localhost:4318 WAKE_CA_FILE=$PWD/wake-ca.pem
 ```
 
 **MCP and A2A:** agents call through agentgateway at `http://localhost:3000`. The A2A example route is at `/agents/research`.
