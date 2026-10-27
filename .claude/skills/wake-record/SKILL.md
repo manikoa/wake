@@ -64,7 +64,7 @@ Build the 95% metric early as a query: the share of action events with an unbrok
 
 - Sign each event where it's captured, then append it to a Trillian Tessera log that writes tiles to the customer's bucket with object lock. Tessera's Merkle tree and signed checkpoints provide the append only, hash chained property. Don't build a second chain next to it.
 - The collector's Go processor checks signatures before anything reaches Postgres or ClickHouse, and records events that fail the check instead of silently dropping them.
-- Before writing signing code, settle the "where signing happens" question in the `wake-architecture` skill, because the SDK runs inside the agent's process and agents must never hold signing keys.
+- Signing happens at the first hop outside the agent's process: the collector signs SDK and memory adapter events, and the proxy signs its own (`docs/signing.md`). The SDK never holds a key. The signed bytes are defined in `docs/events.md`.
 - The open source package includes a self hosted signed log, so a team can run the recorder with no Wake account.
 
 ## Recording never blocks

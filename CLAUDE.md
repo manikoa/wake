@@ -4,9 +4,10 @@ Wake is an independent recorder and brake for multiagent AI systems. The source 
 
 ## Current phase
 
-- Phase: Validate (months 0 to 1)
+- Phase: Record (months 1 to 3), started October 26, 2026
 - IP release from Microsoft: in hand (recorded October 26, 2026)
-- Rest of the Validate gate: not yet met. It needs 5 teams with a real incident or stalled deal, and 3 design partners committed.
+- Record started early, by founder decision, before the rest of the Validate gate was met. Still open from Validate: 5 teams with a real incident or stalled deal, and 3 design partners committed. Keep running interviews alongside Record.
+- First slice: Python and LangGraph, with Clavr as the first test bed.
 
 Update these lines as each part of a gate is met and when the phase changes. The `wake-scope` skill reads them.
 
