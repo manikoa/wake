@@ -38,3 +38,10 @@ path = "fuzz_targets/canonical.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "a2a_exchange"
+path = "fuzz_targets/a2a_exchange.rs"
+test = false
+doc = false
+bench = false
