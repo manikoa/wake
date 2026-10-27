@@ -91,6 +91,10 @@ async fn proxy(collector: &str, response_timeout: Duration) -> Proxy {
     let (stop, stopped) = oneshot::channel::<()>();
     let options = Options {
         collector: collector.into(),
+        // For against_a_real_collector over TLS: the CA the collector's certificate chains to.
+        collector_ca: std::env::var("WAKE_TEST_COLLECTOR_CA")
+            .ok()
+            .map(|p| std::fs::read(p).unwrap()),
         response_timeout,
         ..Default::default()
     };

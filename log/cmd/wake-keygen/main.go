@@ -16,15 +16,24 @@ import (
 func main() {
 	name := flag.String("name", "", "signer name, for example a SPIFFE id")
 	out := flag.String("out", "", "path prefix for the .key and .pub files")
+	keep := flag.Bool("keep-existing", false, "succeed without writing if the key pair already exists, as on a restart")
 	flag.Parse()
 	if *name == "" || *out == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if *keep && exists(*out+".key") && exists(*out+".pub") {
+		return
+	}
 	if err := run(*name, *out); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func run(name, out string) error {

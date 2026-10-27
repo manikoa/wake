@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# agentgateway for deploy/compose.yaml. Point the backends at your own MCP servers and A2A
+# agents; the examples reach services on the host. Agents call agentgateway on port 3000.
+gateways:
+  default:
+    port: 3000
+routes:
+# An A2A agent. Add one route like this per agent, with its own path and receiver name.
+- matches:
+  - path:
+      pathPrefix: /agents/research
+  policies:
+    urlRewrite:
+      path:
+        prefix: /
+    a2a: {}
+    extProc:
+      host: "wake-proxy:9001"
+      # Calls that start while wake-proxy is down go through unrecorded; one in progress
+      # when it dies fails (docs/proxy.md).
+      failureMode: failOpen
+      processingOptions:
+        requestHeaderMode: send
+        requestBodyMode: bufferedPartial
+        responseHeaderMode: send
+        responseBodyMode: bufferedPartial
+        requestTrailerMode: skip
+        responseTrailerMode: skip
+        allowModeOverride: true
+      requestAttributes:
+        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")'
+        receiver: '"research"'
+  backends:
+  - host: host.docker.internal:9999
+# MCP servers.
+- policies:
+    mcpGuardrails:
+      processors:
+      - kind: remote
+        host: "wake-proxy:9001"
+        # Recording never blocks: if wake-proxy is down, calls go through unrecorded.
+        failureMode: failOpen
+        methods:
+          tools/call: full
+          resources/read: full
+          prompts/get: full
+        requestHeaders:
+          allowed: [traceparent, wake-parents, mcp-session-id]
+        metadata:
+          agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")'
+          wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
+  backends:
+  - mcp:
+      targets:
+      - name: inbox
+        mcp:
+          host: http://host.docker.internal:3001/mcp

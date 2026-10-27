@@ -1,0 +1,39 @@
+# The collector in a container (deploy/compose.yaml): TLS on the receiver, keys and the
+# trust bundle from mounted volumes, and the signed log and its queue under /var/lib/wake.
+# Step up from here: signing keys in KMS and SVIDs from SPIRE instead of files.
+extensions:
+  file_storage:
+    directory: /var/lib/wake/queue
+    create_directory: true
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        # SDKs send over TLS; give them the CA with OTEL_EXPORTER_OTLP_CERTIFICATE.
+        tls:
+          cert_file: ${env:WAKE_TLS_CERT:-/etc/wake/identity/collector-tls.pem}
+          key_file: ${env:WAKE_TLS_KEY:-/etc/wake/identity/collector-tls.key}
+
+processors:
+  wakesign:
+    signing_key_file: /etc/wake/keys/collector.key
+    # The SPIRE trust bundle the proxy's SVIDs chain to.
+    trust_bundles:
+      - ${env:WAKE_TRUST_BUNDLE:-/etc/wake/identity/bundle.pem}
+
+exporters:
+  wakelog:
+    dir: /var/lib/wake/log
+    key_file: /etc/wake/keys/log.key
+    sending_queue:
+      storage: file_storage
+
+service:
+  extensions: [file_storage]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [wakesign]
+      exporters: [wakelog]

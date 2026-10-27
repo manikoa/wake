@@ -47,13 +47,20 @@ pub struct Exporter {
 
 impl Exporter {
     /// endpoint is the collector's OTLP/HTTP base URL, such as http://localhost:4318.
-    pub fn new(endpoint: &str, counters: Arc<Counters>) -> Self {
+    /// ca, if given, is a PEM CA certificate to trust for the collector's TLS.
+    pub fn new(endpoint: &str, ca: Option<&[u8]>, counters: Arc<Counters>) -> Self {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+        if let Some(pem) = ca {
+            match reqwest::Certificate::from_pem(pem) {
+                Ok(cert) => builder = builder.add_root_certificate(cert),
+                Err(e) => {
+                    tracing::error!(error = %e, "collector CA isn't a PEM certificate; trusting only the system's")
+                }
+            }
+        }
         Exporter {
             url: format!("{}/v1/traces", endpoint.trim_end_matches('/')),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("http client"),
+            client: builder.build().expect("http client"),
             counters,
             batch: 256,
             linger: Duration::from_millis(200),

@@ -1,0 +1,11 @@
+.git
+**/target
+**/node_modules
+**/__pycache__
+**/.venv
+**/.pytest_cache
+collector/build
+collector/data
+collector/keys
+proxy/keys
+sdk/python/.venv
