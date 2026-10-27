@@ -34,7 +34,7 @@ To place a new piece of code, ask: **could an agent, with the credentials and ac
    - Recording: SDK and adapter code never raises into agent code and never adds blocking work to the agent's call path. Use a bounded buffer and send asynchronously. If the recorder is down or events are dropped, the agent keeps working and a health signal pages someone.
    - Brake: a lever counts as fired only when it is positively verified. If the brake can't confirm a lever fired, it treats that path as live: it shows it as live, keeps retrying, and never reports the fleet as stopped.
 
-5. **Open source at the core.** The open source recorder is the SDKs, the proxy, the memory adapter and a self hosted signed log, all under Apache 2.0 (the same license as agentgateway). The hosted log, provenance view and brake belong to the paid pilot. Decide where those paid parts live before adding them to this repo, since anything here is Apache licensed.
+5. **Open source at the core.** The open source recorder is the SDKs, the proxy, the memory adapter and a self hosted signed log, all under Apache 2.0 (the same license as agentgateway). Only the recorder lives in this repo. The hosted log, the dashboard (provenance and downstream views), the brake and the control plane live in a separate private repository. See `docs/repo-layout.md` for the folders and rules.
 
 6. **Score, don't convict.** Persistent problem solving and malice look alike. Detection raises a risk score and pages a human. It brakes automatically only when the customer's policy says to stop. The UI and API describe agents as risky or anomalous, never as malicious.
 
@@ -66,5 +66,4 @@ For OpenTelemetry, use the GenAI semantic conventions where they exist (they're 
 The roadmap doesn't settle these. Don't resolve them silently in code; write a short decision note in `docs/` and confirm it with the user first.
 
 - **Where signing happens.** The roadmap says events are "signed at the source" and also that "agents never hold signing keys". The SDK runs inside the agent's process, so decide how both can hold, for example by signing in a capture component outside the agent's process or with a per component SPIFFE identity, and write down why.
-- **Where the hosted and paid parts live** relative to this Apache licensed repo (see principle 5).
 - **Whether the log defaults to Wake's hosting or the customer's bucket.** This is an open question for design partners. Support the customer's bucket from the start, because principle 2 depends on it.

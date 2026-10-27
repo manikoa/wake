@@ -81,7 +81,7 @@ Write thin wrappers in the SDKs for the memory stores and memory files the desig
 
 ## The provenance view
 
-Use Next.js and React Flow in a Turborepo. The view does one thing: starting from an action, show the chain of events and origins behind it, down to the email, page or agent message. Showing what an action affected downstream is the Brake phase's downstream view; don't build it yet.
+The view is a paid part, so it's built in the private repository, not this one (see `docs/repo-layout.md`). Use Next.js and React Flow in a Turborepo. The view does one thing: starting from an action, show the chain of events and origins behind it, down to the email, page or agent message. Showing what an action affected downstream is the Brake phase's downstream view; don't build it yet.
 
 ## Releases
 
