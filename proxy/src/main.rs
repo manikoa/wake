@@ -10,6 +10,7 @@ use wake_proxy::agents::Agents;
 use wake_proxy::control;
 use wake_proxy::export::Counters;
 use wake_proxy::halts::Halts;
+use wake_proxy::listen::Hooks;
 use wake_proxy::pipeline::{self, Options};
 use wake_proxy::signer::{DevExtras, Signer, dev_identity_with};
 
@@ -24,7 +25,9 @@ struct Cli {
 enum Command {
     /// Serve the ExtMCP processor agentgateway calls.
     Serve {
-        /// Where agentgateway reaches the processor. Only agentgateway may reach it.
+        /// Where agentgateway reaches the processor's hooks: a Unix socket in a directory
+        /// only agentgateway shares (unix:/run/wake/proxy.sock), or a loopback address.
+        /// Anything that can reach them can get events signed, so nothing else is accepted.
         #[arg(long, default_value = "127.0.0.1:9001")]
         listen: String,
         /// The Wake collector's OTLP/HTTP endpoint.
@@ -239,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 signer = signer.id(),
                 "serving the ExtMCP and ext_proc processor"
             );
-            let listener = tokio::net::TcpListener::bind(&listen).await?;
+            let hooks = Hooks::parse(&listen)?;
             let counters = Arc::new(Counters::default());
             let collector_ca = collector_ca.map(std::fs::read).transpose()?;
             let options = Options {
@@ -290,7 +293,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             });
-            pipeline::serve(listener, signer, options, counters.clone(), shutdown).await?;
+            match hooks {
+                Hooks::Tcp(addr) => {
+                    let listener = tokio::net::TcpListener::bind(addr).await?;
+                    pipeline::serve(listener, signer, options, counters.clone(), shutdown).await?;
+                }
+                Hooks::Unix(path) => {
+                    let listener = wake_proxy::listen::bind_unix(&path)?;
+                    pipeline::serve_unix(listener, signer, options, counters.clone(), shutdown).await?;
+                }
+            }
             tracing::info!(
                 sent = Counters::get(&counters.sent),
                 hooks_dropped = Counters::get(&counters.hooks_dropped),

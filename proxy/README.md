@@ -43,7 +43,7 @@ agentgateway -f agentgateway.yaml    # in another terminal; agentgateway v1.6.0
 
 Agents then call `https://localhost:3000` with their SVIDs. `dev-identity` writes a stand-in trust bundle and certificates signed by it, for local development only. In production SPIRE issues short-lived SVIDs. Add the bundle to the collector's `trust_bundles` so it accepts the proxy's signatures.
 
-wake-proxy must be reachable only by agentgateway, over loopback or a pod-local socket. Anything that can call it can get events signed.
+wake-proxy must be reachable only by agentgateway: anything that can call its hooks can get events signed. `--listen` takes a Unix socket (`unix:/run/wake/proxy.sock`, in a directory only agentgateway shares) or a loopback address, and refuses anything else. `deploy/compose.yaml` uses the socket.
 
 ## Development
 

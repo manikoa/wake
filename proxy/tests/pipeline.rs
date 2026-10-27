@@ -547,3 +547,80 @@ async fn a_flood_of_large_calls_is_dropped_and_counted_not_held() {
     );
     assert_eq!(Counters::get(&counters.sent), 0);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serves_the_hooks_on_a_unix_socket() {
+    use hyper_util::rt::TokioIo;
+    use tokio::net::UnixStream;
+    use wake_proxy::pipeline::serve_unix;
+
+    let (url, mut spans) = collector().await;
+    // Short: a socket's path has to fit in about 100 bytes.
+    let dir = std::path::PathBuf::from("/tmp").join(format!("wake-hooks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("proxy.sock");
+    let listener = wake_proxy::listen::bind_unix(&path).unwrap();
+    let id = dev_identity("spiffe://wake.local/proxy").unwrap();
+    let signer = Signer::from_pem(&id.key_pem, &id.cert_pem).unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let options = Options {
+        collector: url,
+        ..Default::default()
+    };
+    let done = tokio::spawn(serve_unix(
+        listener,
+        signer,
+        options,
+        Arc::new(Counters::default()),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+
+    let socket = path.clone();
+    let channel = tonic::transport::Endpoint::try_from("http://wake-proxy")
+        .unwrap()
+        .connect_with_connector(tower::service_fn(move |_| {
+            let socket = socket.clone();
+            async move { Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(socket).await?)) }
+        }))
+        .await
+        .unwrap();
+    let mut client = ExtMcpClient::new(channel);
+    let req = client
+        .check_request(McpRequest {
+            service_names: vec!["inbox".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("session", "s1")]),
+            mcp_request: Some(br#"{"name":"read_email"}"#.to_vec()),
+            headers: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let event_id = match req.metadata.unwrap().fields["wake_event_id"].kind.clone() {
+        Some(Kind::StringValue(id)) => id,
+        other => panic!("{other:?}"),
+    };
+    client
+        .check_response(McpResponse {
+            service_names: vec!["inbox".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("wake_event_id", &event_id), ("session", "s1")]),
+            mcp_response: b"{}".to_vec(),
+        })
+        .await
+        .unwrap();
+    let span = tokio::time::timeout(Duration::from_secs(5), spans.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s(&attrs(&span), "wake.event.id"), event_id);
+    verify(&span);
+
+    drop(client);
+    let _ = stop.send(());
+    let _ = done.await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}

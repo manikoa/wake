@@ -13,6 +13,7 @@ pub mod export;
 pub mod extmcp;
 pub mod extproc;
 pub mod halts;
+pub mod listen;
 pub mod mcp;
 pub mod memory;
 pub mod pipeline;
