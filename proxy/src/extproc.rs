@@ -7,11 +7,13 @@
 //! (text/event-stream) response: there the processor asks to receive it in full duplex
 //! mode and passes every chunk straight back.
 //!
-//! A message request (message/send, message/stream) becomes an agent_message event in the
-//! receiver's name, with the sender as its origin. The reply becomes another, in the
-//! sender's name, with the receiver as its origin. The request headers forwarded to the
-//! receiver gain traceparent and wake-parents, so a receiver with a Wake SDK links its next
-//! step to the message, the same way the proxy reads a sender's links (see docs/proxy.md).
+//! A message request (message/send or SendMessage, and their streaming forms) becomes an
+//! agent_message event in the receiver's name, with the sender as its origin. The reply
+//! becomes another, in the sender's name, with the receiver as its origin. The request
+//! headers forwarded to the receiver gain traceparent and wake-parents, so a receiver with a
+//! Wake SDK links its next step to the message, the same way the proxy reads a sender's
+//! links (see docs/proxy.md). A reply to tasks/get or GetTask links to the message that
+//! started the task, which an earlier exchange recorded.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,9 +96,18 @@ pub struct Exchange {
     response_body: Vec<u8>,
     response_truncated: bool,
     reply_emitted: bool,
+    tasks: Option<Arc<a2a::Tasks>>,
 }
 
 impl Exchange {
+    /// An exchange that shares, with every other, which message started each task.
+    pub fn with_tasks(tasks: Arc<a2a::Tasks>) -> Self {
+        Exchange {
+            tasks: Some(tasks),
+            ..Default::default()
+        }
+    }
+
     /// Answers one message from the gateway and returns any events it completes. The
     /// answer is always to continue, unchanged.
     pub fn handle(&mut self, request: ProcessingRequest, now: SystemTime) -> (ProcessingResponse, Vec<Event>) {
@@ -265,7 +276,7 @@ impl Exchange {
         self.request
             .as_ref()
             .and_then(|r| r.method.as_deref())
-            .is_some_and(|m| a2a::REPLY_METHODS.contains(&m))
+            .is_some_and(a2a::replies)
     }
 
     fn finish_request(&mut self, now: SystemTime) -> Vec<Event> {
@@ -279,7 +290,8 @@ impl Exchange {
             .is_some_and(|m| a2a::MESSAGE_METHODS.contains(&m));
         self.request = Some(request);
         if !is_message {
-            // tasks/get and the like: no message goes out, but the reply still brings content back.
+            // tasks/get, GetTask and the like: no message goes out, but the reply still brings
+            // content back.
             self.message_emitted = self.replies();
             return vec![];
         }
@@ -355,16 +367,26 @@ impl Exchange {
     /// The receiver's reply, recorded where the sender gets it.
     fn reply_event(&self, now: SystemTime) -> Event {
         let (_, span) = random_ids();
-        let mut parents = a2a::reply_parents(&self.response_body, self.response_streamed);
-        if parents.is_empty()
-            && self
-                .request
-                .as_ref()
-                .and_then(|r| r.method.as_deref())
-                .is_some_and(|m| a2a::MESSAGE_METHODS.contains(&m))
-        {
-            // Coarse but true: the reply follows from the message it answers.
-            parents.push(self.message_id.clone());
+        let reply = a2a::parse_reply(&self.response_body, self.response_streamed);
+        let request = self.request.as_ref();
+        let answers_message = request
+            .and_then(|r| r.method.as_deref())
+            .is_some_and(|m| a2a::MESSAGE_METHODS.contains(&m));
+        if let (true, Some(task), Some(tasks)) = (answers_message, &reply.task_id, &self.tasks) {
+            tasks.remember(task, &self.message_id);
+        }
+        let mut parents = reply.parents;
+        if parents.is_empty() {
+            if answers_message {
+                // Coarse but true: the reply follows from the message it answers.
+                parents.push(self.message_id.clone());
+            } else if let Some(started_by) = request
+                .and_then(|r| r.task_id.as_deref())
+                .and_then(|t| self.tasks.as_ref()?.started(t))
+            {
+                // A task's later status follows from the message that started it.
+                parents.push(started_by);
+            }
         }
         let mut e = self.base(
             &uuid::Uuid::new_v4().to_string(),
@@ -489,11 +511,19 @@ fn random_ids() -> ([u8; 16], [u8; 8]) {
 pub struct Processor {
     events: mpsc::Sender<Event>,
     counters: Arc<Counters>,
+    tasks: Arc<a2a::Tasks>,
 }
+
+/// How many tasks the processor remembers the starting message of.
+pub const TASKS_REMEMBERED: usize = 10_000;
 
 impl Processor {
     pub fn new(events: mpsc::Sender<Event>, counters: Arc<Counters>) -> Self {
-        Processor { events, counters }
+        Processor {
+            events,
+            counters,
+            tasks: Arc::new(a2a::Tasks::new(TASKS_REMEMBERED)),
+        }
     }
 
     pub fn server(self) -> pb::ext_proc::external_processor_server::ExternalProcessorServer<Self> {
@@ -514,8 +544,9 @@ impl ExternalProcessor for Processor {
         let (tx, rx) = mpsc::channel(16);
         let events = self.events.clone();
         let counters = self.counters.clone();
+        let tasks = self.tasks.clone();
         tokio::spawn(async move {
-            let mut exchange = Exchange::default();
+            let mut exchange = Exchange::with_tasks(tasks);
             let emit = |list: Vec<Event>| {
                 for e in list {
                     if events.try_send(e).is_err() {
@@ -771,6 +802,84 @@ mod tests {
         fn replace_method(self, m: &str) -> Vec<u8> {
             String::from_utf8(self).unwrap().replace("message/send", m).into_bytes()
         }
+    }
+
+    /// One buffered exchange: a POST with this body, answered with this JSON.
+    fn exchange(x: &mut Exchange, request: &[u8], reply: &[u8]) -> Vec<Event> {
+        let mut out = Vec::new();
+        out.extend(x.handle(first(&[(":method", "POST")]), t(0)).1);
+        out.extend(x.handle(phase(Phase::RequestBody(body(request, true))), t(1)).1);
+        out.extend(
+            x.handle(
+                phase(Phase::ResponseHeaders(headers(&[("content-type", "application/json")]))),
+                t(2),
+            )
+            .1,
+        );
+        out.extend(x.handle(phase(Phase::ResponseBody(body(reply, true))), t(3)).1);
+        out.extend(x.finish(t(4)));
+        out
+    }
+
+    #[test]
+    fn records_version_1_messages_and_replies() {
+        let send = br#"{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"Is Acme legit?"}]}}}"#;
+        let reply = br#"{"jsonrpc":"2.0","id":"1","result":{"message":{"messageId":"r1","role":"ROLE_AGENT","parts":[{"text":"No."}],"metadata":{"dev.wake/parents":["research-step-2"]}}}}"#;
+        let events = exchange(&mut Exchange::default(), send, reply);
+        let [message, answer] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        assert_eq!(s(message, "wake.a2a.method"), "SendMessage");
+        assert_eq!(s(message, "wake.a2a.message_id"), "m1");
+        assert_eq!(s(answer, "wake.agent.id"), "spiffe://wake.local/agent/planner");
+        assert_eq!(
+            answer.attributes["wake.parents"],
+            Value::Strs(vec!["research-step-2".into()])
+        );
+    }
+
+    #[test]
+    fn a_task_read_links_to_the_message_that_started_the_task() {
+        let tasks = Arc::new(a2a::Tasks::new(16));
+        let send = br#"{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{"messageId":"m1","parts":[{"text":"Research Acme"}]}}}"#;
+        let started =
+            br#"{"jsonrpc":"2.0","id":"1","result":{"task":{"id":"t1","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+        let events = exchange(&mut Exchange::with_tasks(tasks.clone()), send, started);
+        let message_id = s(&events[0], "wake.event.id").to_string();
+
+        // Later, in another exchange: the task's result.
+        let get = br#"{"jsonrpc":"2.0","id":"2","method":"GetTask","params":{"id":"t1"}}"#;
+        let done = br#"{"jsonrpc":"2.0","id":"2","result":{"id":"t1","status":{"state":"TASK_STATE_COMPLETED"},"artifacts":[{"parts":[{"text":"Acme is unverified."}]}]}}"#;
+        let events = exchange(&mut Exchange::with_tasks(tasks.clone()), get, done);
+        let [reply] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        assert_eq!(s(reply, "wake.a2a.task_id"), "t1");
+        assert_eq!(reply.attributes["wake.parents"], Value::Strs(vec![message_id]));
+
+        // The same in v0.3, and a task nobody saw start has no parent.
+        let send =
+            br#"{"jsonrpc":"2.0","id":3,"method":"message/send","params":{"message":{"messageId":"m2","parts":[]}}}"#;
+        let events = exchange(
+            &mut Exchange::with_tasks(tasks.clone()),
+            send,
+            br#"{"result":{"kind":"task","id":"t2"}}"#,
+        );
+        let message_id = s(&events[0], "wake.event.id").to_string();
+        let get = br#"{"jsonrpc":"2.0","id":4,"method":"tasks/get","params":{"id":"t2"}}"#;
+        let events = exchange(
+            &mut Exchange::with_tasks(tasks.clone()),
+            get,
+            br#"{"result":{"kind":"task","id":"t2"}}"#,
+        );
+        assert_eq!(events[0].attributes["wake.parents"], Value::Strs(vec![message_id]));
+        let get = br#"{"jsonrpc":"2.0","id":5,"method":"GetTask","params":{"id":"t-unknown"}}"#;
+        let events = exchange(
+            &mut Exchange::with_tasks(tasks),
+            get,
+            br#"{"result":{"id":"t-unknown"}}"#,
+        );
+        assert_eq!(events[0].attributes["wake.parents"], Value::Strs(vec![]));
     }
 
     #[test]

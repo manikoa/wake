@@ -72,17 +72,18 @@ Both halves are in `proxy/` (October 27, 2026), and both were run against agentg
 
 agentgateway calls the processor's ext_proc service on an A2A route (`a2a: {}`). One gRPC stream is one HTTP exchange between two agents.
 
-- **What's recorded.** A `message/send` or `message/stream` request becomes an `agent_message` event recorded where the receiver gets it:
+- **What's recorded.** A message request becomes an `agent_message` event recorded where the receiver gets it. Both protocol versions in use are read: v0.3 (`message/send`, `message/stream`) and v1.0 (`SendMessage`, `SendStreamingMessage`), which the a2a-sdk 1.x speaks. The event:
   - `wake.agent.id` is the receiver, named per route in the gateway config.
   - The origin is `agent:<sender>`, from the sender's SPIFFE ID or JWT subject.
   - The parents come from the `wake-parents` header, or from the message's `metadata["dev.wake/parents"]`.
   - The trace comes from `traceparent`, or the message metadata's.
 
-  The reply becomes a second `agent_message`, in the sender's name with the receiver as its origin. Its parents are whatever the reply's message metadata names, else the message it answers. A `tasks/get` reply is recorded the same way. Agent cards and other GETs aren't recorded.
+  The reply becomes a second `agent_message`, in the sender's name with the receiver as its origin. Its parents are whatever the reply's message metadata names, else the message it answers. A `tasks/get` or `GetTask` reply (and a resubscription's stream) is recorded the same way, and when it names no parents it links to the message that started the task: the processor remembers which message each task came from, for the last 10,000 tasks. Agent cards and other GETs aren't recorded.
 - **Linking the receiver.** The request headers forwarded to the receiver are set to `traceparent`, carrying the message event's span, and `wake-parents`, carrying its id. A receiver with a Wake SDK, or any OTel-instrumented HTTP stack, carries the trace on, and an SDK links its next step to the message (in Python, inside `wake.a2a.received`). Rewriting `params.message.metadata` as well would mean the processor rewrites bodies, so it waits until a receiver needs it.
 - **Bodies.** agentgateway buffers request and response bodies (`bufferedPartial`), and the processor answers each with "continue" and no mutation, so the gateway forwards the original bytes. A `text/event-stream` reply would be held until it ended if buffered. So in the response headers phase the processor switches it to full duplex (`allowModeOverride`) and sends each chunk straight back; streams were checked to arrive as they're written. At most 1 MiB of each body goes into the payload, marked `truncated` beyond that. A body over the gateway's buffer limit is recorded from its prefix.
 - **Recording doesn't fully fail open here.** agentgateway applies `failOpen` only until body bytes reach the processor: "After the request body starts streaming to the server, a failure returns an error even with failOpen". The processor is also in the path of every streamed reply, because it sends each chunk back. So if the processor dies in the middle of an exchange, that one call fails; calls that start while it's down go through unrecorded. agentgateway has no ext_proc observability mode (`observability_mode` is always false). The fix is upstream: an observe-only ext_proc mode, or an A2A hook like ExtMCP. Until then, the processor answers each message before doing any of its own work.
-- **Not yet.** Linking a `tasks/get` reply to the message that created the task, which takes state across exchanges. And A2A over gRPC or REST bindings, which agentgateway doesn't treat as A2A.
+- **Checked end to end** (October 27, 2026) against agentgateway v1.6.0 with the a2a-sdk 1.2 client and server: `SendMessage` and a streamed `SendStreamingMessage` were each recorded with the sender's tool call as parent, and the receiver's next step, recorded by the Python SDK inside `wake.a2a.received`, descended from the proxy's record of the message, all in the sender's trace.
+- **Not yet.** A2A over gRPC or REST bindings, which agentgateway doesn't treat as A2A. A task started by one replica of the processor and read through another isn't linked, since each remembers its own tasks.
 
 ## How the certificate travels
 

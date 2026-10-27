@@ -14,10 +14,11 @@ use wake_proxy::extproc::pb::ext_proc::{
 
 fuzz_target!(|data: &[u8]| {
     let _ = a2a::parse_request(data);
-    let _ = a2a::reply_parents(data, false);
-    let _ = a2a::reply_parents(data, true);
+    let _ = a2a::parse_reply(data, false);
+    let _ = a2a::parse_reply(data, true);
 
-    let mut x = Exchange::default();
+    // Shared task memory, as in the processor: a reply can name a task a request asks about.
+    let mut x = Exchange::with_tasks(std::sync::Arc::new(a2a::Tasks::new(4)));
     for (i, chunk) in data.chunks(23).enumerate() {
         let b = chunk.first().copied().unwrap_or(0);
         let text = String::from_utf8_lossy(chunk).into_owned();
