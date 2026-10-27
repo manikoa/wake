@@ -50,7 +50,7 @@ func TestVerifyChecksTheTreeAndEverySignature(t *testing.T) {
 		signedEntry(t, signer, event),
 		signedEntry(t, other, event), // the right name, the wrong key
 		[]byte("not an entry"),
-		signedEntry(t, signer, event),
+		signedEntry(t, signer, eventFor("hello again")), // the same entry twice would land once
 	})
 
 	var seen []uint64

@@ -4,6 +4,8 @@ The self hosted signed log: an append only, hash chained [tlog-tiles](https://c2
 
 It stores the log on local disk for now. Writing to a customer's bucket with object lock comes when a design partner deploys it.
 
+An entry appended again while the log still remembers it (Tessera's in memory antispam) lands once, so a request the collector retries after part of it was appended doesn't duplicate anything. The log forgets on restart, so an entry the collector's queue replays after a crash can still land twice, as an identical copy.
+
 Generate a key pair with:
 
 ```bash

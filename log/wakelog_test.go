@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -54,6 +55,41 @@ func TestEntriesAreCoveredBySignedCheckpoint(t *testing.T) {
 	lines := strings.Split(signed.Text, "\n")
 	if lines[1] != "3" {
 		t.Fatalf("checkpoint tree size = %q, want 3", lines[1])
+	}
+}
+
+func TestEntryAddedAgainLandsOnce(t *testing.T) {
+	l, logDir := openTestLog(t)
+	ctx := context.Background()
+	if _, err := l.Add(ctx, [][]byte{[]byte("a"), []byte("b")}); err != nil {
+		t.Fatal(err)
+	}
+	// A retried request with one new entry, which also comes twice in the same call.
+	indexes, err := l.Add(ctx, [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint64{0, 1, 2, 2}; !slices.Equal(indexes, want) {
+		t.Fatalf("indexes = %v, want %v", indexes, want)
+	}
+	if err := l.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := os.ReadFile(filepath.Join(logDir, "checkpoint"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size := strings.Split(string(checkpoint), "\n")[1]; size != "3" {
+		t.Fatalf("log size = %s, want 3", size)
+	}
+
+	// The collector opens the log again in the same process when it reloads its config.
+	reopened, err := Open(Config{Dir: logDir, KeyFile: filepath.Join(filepath.Dir(logDir), "log.key")})
+	if err != nil {
+		t.Fatalf("reopen in the same process: %v", err)
+	}
+	if err := reopened.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
