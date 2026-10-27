@@ -12,6 +12,23 @@ handler = WakeCallbackHandler(Recorder(agent="email-agent"))
 graph.invoke(inputs, config={"callbacks": [handler]})
 ```
 
+## OpenAI Agents SDK
+
+```python
+from wake import Recorder
+from wake.openai_agents import install
+
+install(Recorder(agent="support"))
+result = await Runner.run(triage_agent, "Refund order 1234")
+```
+
+Wake becomes one of the Agents SDK's trace processors. Each agent's run is named for the agent. Responses, tool calls and handoffs are recorded, linked by the ids the SDK gives:
+- A tool call's parent is the response that requested it.
+- A response's parents are the earlier responses and tool results in its input.
+- A handoff is an `agent_message` that feeds the receiving agent's next step.
+
+Inputs and outputs are recorded when the SDK's `trace_include_sensitive_data` is on, as it is by default. Install with the `openai-agents` extra.
+
 ## LangChain agents written as plain Python
 
 For agents built from LangChain models and tools without LangGraph, install the handler once so every model and tool call in the process is recorded, and name the agent behind each run. `handler.uninstall()` turns it off again.
