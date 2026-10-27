@@ -67,7 +67,8 @@ services:
     image: cr.agentgateway.dev/agentgateway:v1.6.0
     depends_on: [wake-proxy]
     command: ["-f", "/etc/agentgateway/config.yaml"]
-    volumes: [./agentgateway.yaml:/etc/agentgateway/config.yaml:ro]
+    # WAKE_GATEWAY_CONFIG swaps in another config, as the reference fleet does.
+    volumes: ["${WAKE_GATEWAY_CONFIG:-./agentgateway.yaml}:/etc/agentgateway/config.yaml:ro"]
     ports: ["3000:3000"]
     # Lets the example backends in agentgateway.yaml reach services on the host.
     extra_hosts: ["host.docker.internal:host-gateway"]

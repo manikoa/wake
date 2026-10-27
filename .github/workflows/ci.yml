@@ -107,3 +107,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: sdk/python/uv.lock
       - run: deploy/smoke_test.sh
+
+  fleet:
+    name: reference fleet (end to end)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Three agents over A2A and MCP through agentgateway; checks provenance across them
+      # from the signed log.
+      - run: examples/fleet/run.sh

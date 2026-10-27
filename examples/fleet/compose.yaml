@@ -1,0 +1,82 @@
+# The reference fleet on the staging recorder (deploy/compose.yaml): three agents on three
+# frameworks and the tools they call, all through agentgateway, all recorded by Wake.
+# run.sh brings it up and sends one request through it. See README.md.
+name: wake-fleet
+
+include:
+  - path: ../../deploy/compose.yaml
+    env_file: fleet.env
+
+x-fleet: &fleet
+  image: wake-fleet:dev
+  build:
+    context: ../..
+    dockerfile: examples/fleet/Dockerfile
+  environment:
+    WAKE_ENDPOINT: https://collector:4318
+    OTEL_EXPORTER_OTLP_CERTIFICATE: /etc/wake/ca/bundle.pem
+    FLEET_GATEWAY: http://agentgateway:3000
+    FLEET_MODELS: ${FLEET_MODELS:-scripted}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  # Agents get the CA certificate to reach the collector over TLS, and nothing else from
+  # the recorder: no keys, no identity.
+  volumes: [ca:/etc/wake/ca:ro]
+  depends_on:
+    fleet-ca: {condition: service_completed_successfully}
+    collector: {condition: service_started}
+
+x-listening: &listening
+  interval: 2s
+  timeout: 2s
+  retries: 30
+
+services:
+  # One-shot: copies just the CA certificate out of the identity volume, which also holds
+  # the proxy's private key.
+  fleet-ca:
+    image: wake-fleet:dev
+    build:
+      context: ../..
+      dockerfile: examples/fleet/Dockerfile
+    user: "0"
+    entrypoint: ["sh", "-c", "cp /etc/wake/identity/bundle.pem /etc/wake/ca/bundle.pem && chmod 0444 /etc/wake/ca/bundle.pem"]
+    volumes: [identity:/etc/wake/identity:ro, ca:/etc/wake/ca]
+    depends_on:
+      identity: {condition: service_completed_successfully}
+
+  tools:
+    <<: *fleet
+    command: ["python", "-m", "fleet.tools"]
+    healthcheck:
+      <<: *listening
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 3001))"]
+
+  research:
+    <<: *fleet
+    command: ["python", "-m", "fleet.research"]
+    healthcheck:
+      <<: *listening
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9101))"]
+
+  billing:
+    <<: *fleet
+    command: ["python", "-m", "fleet.billing"]
+    healthcheck:
+      <<: *listening
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9102))"]
+
+  # One request per run: docker compose run --rm support "<request>"
+  support:
+    <<: *fleet
+    command: ["python", "-m", "fleet.support"]
+    profiles: [run]
+    depends_on:
+      fleet-ca: {condition: service_completed_successfully}
+      agentgateway: {condition: service_started}
+      tools: {condition: service_healthy}
+      research: {condition: service_healthy}
+      billing: {condition: service_healthy}
+
+volumes:
+  ca:

@@ -1,0 +1,28 @@
+[project]
+name = "wake-fleet"
+version = "0.1.0"
+description = "Wake's reference fleet: agents on three frameworks, talking over A2A and MCP through agentgateway."
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "a2a-sdk[http-server]>=1.2.3",
+    "langchain-mcp-adapters>=0.3.2",
+    "mcp>=1.30.0",
+    "uvicorn>=0.54.0",
+    "wake-sdk[a2a,claude-agent-sdk,langgraph,mcp,openai-agents]",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+wake-sdk = { path = "../../sdk/python", editable = true }
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["I", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fleet", "wake"]
