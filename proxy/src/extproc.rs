@@ -452,10 +452,8 @@ fn capture(into: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
 /// the wire when it's JSON, or as a string when it's a stream or not JSON.
 fn payload(from: &str, to: &str, body: &[u8], streamed: bool, truncated: bool) -> String {
     let quote = |s: &str| serde_json::Value::String(s.to_string()).to_string();
-    let content = match std::str::from_utf8(body) {
-        Ok(s) if !streamed && !truncated && serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok() => {
-            s.trim().to_string()
-        }
+    let content = match mcp::as_json(body) {
+        Some(json) if !streamed && !truncated => json.to_string(),
         _ => quote(&String::from_utf8_lossy(body)),
     };
     let mut out = format!(r#"{{"from":{},"to":{},"content":{}"#, quote(from), quote(to), content);

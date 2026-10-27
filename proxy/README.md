@@ -29,7 +29,8 @@ wake-proxy must be reachable only by agentgateway, over loopback or a pod-local 
 
 ```bash
 cargo test
-cargo +nightly fuzz run mcp_request   # also capture_hooks, canonical and a2a_exchange; needs cargo-fuzz
+# Needs cargo-fuzz and a nightly toolchain. CI fuzzes every target nightly (.github/workflows/fuzz.yml).
+cargo +nightly fuzz run mcp_request   # also capture_hooks, canonical and a2a_exchange
 ```
 
 It logs counters every minute: events sent, hooks and events dropped, and responses paired by id or by order. If responses are only ever paired by order, the gateway config isn't passing the event id back.
