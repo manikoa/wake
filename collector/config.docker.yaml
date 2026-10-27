@@ -20,7 +20,8 @@ processors:
   wakesign:
     signing_key_file: /etc/wake/keys/collector.key
     # The SPIRE trust bundle the proxy's SVIDs chain to.
-    trust_bundles: [${env:WAKE_TRUST_BUNDLE:-/etc/wake/identity/bundle.pem}]
+    trust_bundles:
+      - ${env:WAKE_TRUST_BUNDLE:-/etc/wake/identity/bundle.pem}
 
 exporters:
   wakelog:
