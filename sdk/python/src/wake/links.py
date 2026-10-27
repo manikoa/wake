@@ -40,7 +40,7 @@ class Link:
 class _Frame:
     """One recorded call's link, on top of whatever link was current when it began."""
 
-    __slots__ = ("link", "previous", "ended")
+    __slots__ = ("ended", "link", "previous")
 
     def __init__(self, link: Link, previous: "_Frame | None") -> None:
         self.link = link
