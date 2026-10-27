@@ -10,6 +10,8 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
+
+	wakelog "github.com/manikoa/wake/log"
 )
 
 // Attribute names used here. See docs/events.md for the full list.
@@ -88,24 +90,17 @@ func Verify(span ptrace.Span, trusted map[string]note.Verifier) bool {
 	if !ok {
 		return false
 	}
-	verifier, ok := trusted[signerValue.Str()]
-	if !ok {
-		return false
-	}
-	sig, err := base64.StdEncoding.DecodeString(sigValue.Str())
-	if err != nil {
-		return false
-	}
 	msg, err := Canonical(span)
 	if err != nil {
 		return false
 	}
-	return verifier.Verify(msg, sig)
+	return wakelog.VerifySignature(msg, sigValue.Str(), signerValue.Str(), trusted)
 }
 
 // Entry returns what gets appended to the signed log for span: the exact signed bytes,
 // the signature and signer, and whether the collector found the signature valid. Each
-// entry can be checked on its own with the signer's public key.
+// entry can be checked on its own with the signer's public key. The entry format lives
+// in the log module, so the log's readers parse it with the same code.
 func Entry(span ptrace.Span) ([]byte, error) {
 	canonical, err := Canonical(span)
 	if err != nil {
@@ -115,12 +110,7 @@ func Entry(span ptrace.Span) ([]byte, error) {
 	sig, _ := attrs.Get(Signature)
 	signer, _ := attrs.Get(Signer)
 	valid, _ := attrs.Get(SignatureValid)
-	return marshal(struct {
-		Event     json.RawMessage `json:"event"`
-		Signature string          `json:"signature"`
-		Signer    string          `json:"signer"`
-		Valid     bool            `json:"valid"`
-	}{canonical, sig.Str(), signer.Str(), valid.Bool()})
+	return wakelog.NewEntry(canonical, sig.Str(), signer.Str(), valid.Bool())
 }
 
 // marshal encodes v without HTML escaping, which would otherwise rewrite <, > and &

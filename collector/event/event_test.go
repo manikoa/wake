@@ -3,12 +3,13 @@ package event
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
+
+	wakelog "github.com/manikoa/wake/log"
 )
 
 func newKey(t *testing.T, name string) (note.Signer, note.Verifier) {
@@ -101,13 +102,9 @@ func TestEntryKeepsTheExactSignedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var decoded struct {
-		Event     json.RawMessage `json:"event"`
-		Signature string          `json:"signature"`
-		Signer    string          `json:"signer"`
-		Valid     bool            `json:"valid"`
-	}
-	if err := json.Unmarshal(entry, &decoded); err != nil {
+	// A reader of the log parses the entry with the log module and checks it on its own.
+	decoded, err := wakelog.ParseEntry(entry)
+	if err != nil {
 		t.Fatal(err)
 	}
 	canonical, _ := Canonical(span)
@@ -116,6 +113,9 @@ func TestEntryKeepsTheExactSignedBytes(t *testing.T) {
 	}
 	if decoded.Signer != "collector" || !decoded.Valid {
 		t.Fatalf("entry = %+v", decoded)
+	}
+	if !decoded.Verify(map[string]note.Verifier{"collector": verifier}) {
+		t.Fatal("entry doesn't verify on its own")
 	}
 	if !Verify(span, map[string]note.Verifier{"collector": verifier}) {
 		t.Fatal("entry's event doesn't verify")
