@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/manikoa/wake/log v0.0.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.164.0
+	github.com/transparency-dev/tessera v1.0.4
 	go.opentelemetry.io/collector/component v1.70.0
 	go.opentelemetry.io/collector/component/componenttest v0.164.0
 	go.opentelemetry.io/collector/config/configoptional v1.70.0
@@ -17,6 +18,9 @@ require (
 	go.opentelemetry.io/collector/pdata v1.70.0
 	go.opentelemetry.io/collector/processor v1.70.0
 	go.opentelemetry.io/collector/processor/processorhelper v0.164.0
+	go.opentelemetry.io/otel/metric v1.47.0
+	go.opentelemetry.io/otel/sdk/metric v1.47.0
+	go.uber.org/zap v1.28.0
 	golang.org/x/mod v0.42.0
 )
 
@@ -42,7 +46,6 @@ require (
 	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/transparency-dev/formats v0.0.0-20251017110053-404c0d5b696c // indirect
 	github.com/transparency-dev/merkle v0.0.2 // indirect
-	github.com/transparency-dev/tessera v1.0.4 // indirect
 	go.etcd.io/bbolt v1.5.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/collector/client v1.70.0 // indirect
@@ -64,12 +67,9 @@ require (
 	go.opentelemetry.io/collector/receiver/xreceiver v0.164.0 // indirect
 	go.opentelemetry.io/otel v1.47.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
-	go.opentelemetry.io/otel/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20240325151524-a685a6edb6d8 // indirect

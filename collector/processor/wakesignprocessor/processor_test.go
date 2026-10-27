@@ -70,15 +70,18 @@ func TestSignsSDKEventsAndChecksProxyEvents(t *testing.T) {
 	td := ptrace.NewTraces()
 	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
 	sdk := addSpan(td, "sdk")
+	// The proxy signs the payload's digest, and sends the payload outside the signed bytes.
 	proxyGood := addSpan(td, "proxy")
+	proxyGood.Attributes().PutStr(event.Payload, `{"result":"ok"}`)
 	if err := event.Sign(proxyGood, proxySigner); err != nil {
 		t.Fatal(err)
 	}
 	proxyTampered := addSpan(td, "proxy")
+	proxyTampered.Attributes().PutStr(event.Payload, `{"result":"ok"}`)
 	if err := event.Sign(proxyTampered, proxySigner); err != nil {
 		t.Fatal(err)
 	}
-	proxyTampered.Attributes().PutStr("wake.payload", "changed after signing")
+	proxyTampered.Attributes().PutStr(event.Payload, "changed after signing")
 	proxyUnsigned := addSpan(td, "proxy")
 	proxyUnsigned.Attributes().PutBool(event.SignatureValid, true) // a sender's claim, ignored
 	structure := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().AppendEmpty()

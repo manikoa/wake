@@ -3,13 +3,26 @@ package wakelog
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"testing"
 
 	"golang.org/x/mod/sumdb/note"
 )
 
-const signedEvent = `{"attributes":{"wake.event.id":"e2","wake.event.kind":"tool_call","wake.parents":["e1"],"wake.payload":"{\"output\":\"<b>wire</b> & pay — now\"}","wake.payload.size":12},"end_time_unix_nano":2,"span_id":"0102030405060708","start_time_unix_nano":1,"trace_id":"0102030405060708090a0b0c0d0e0f10"}`
+const testPayload = `{"output":"<b>wire</b> & pay — now"}`
+
+// signedEvent is an event's signed bytes, committing to testPayload by its digest.
+var signedEvent = eventFor(testPayload)
+
+// eventFor returns signed bytes for an event whose payload is payload.
+func eventFor(payload string) string {
+	sum := sha256.Sum256([]byte(payload))
+	return `{"attributes":{"wake.event.id":"e2","wake.event.kind":"tool_call","wake.parents":["e1"],"wake.payload.sha256":"` +
+		hex.EncodeToString(sum[:]) +
+		`","wake.payload.size":12},"end_time_unix_nano":2,"span_id":"0102030405060708","start_time_unix_nano":1,"trace_id":"0102030405060708090a0b0c0d0e0f10"}`
+}
 
 func testSigner(t *testing.T, name string) (note.Signer, map[string]note.Verifier) {
 	t.Helper()
