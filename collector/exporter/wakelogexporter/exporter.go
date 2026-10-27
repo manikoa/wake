@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
@@ -22,6 +23,16 @@ type Config struct {
 	Dir string `mapstructure:"dir"`
 	// KeyFile holds the note format private key that signs the log's checkpoints.
 	KeyFile string `mapstructure:"key_file"`
+
+	// QueueConfig is the collector's standard sending queue. The receiver answers once
+	// an event is queued, and appending to the log happens behind the queue, so a slow
+	// or failing log never holds an SDK's request open. Set `storage` to a file_storage
+	// extension to keep the queue on disk: events the collector has already acknowledged
+	// to the SDK then survive a crash or restart, where an in memory queue loses them and
+	// nothing upstream knows to send them again.
+	QueueConfig configoptional.Optional[exporterhelper.QueueBatchConfig] `mapstructure:"sending_queue"`
+	// RetryConfig is the collector's standard retry for failed appends.
+	RetryConfig configretry.BackOffConfig `mapstructure:"retry_on_failure"`
 }
 
 // Validate checks the config.
@@ -36,27 +47,52 @@ func (c *Config) Validate() error {
 func NewFactory() exporter.Factory {
 	return exporter.NewFactory(
 		component.MustNewType("wakelog"),
-		func() component.Config { return &Config{} },
+		createDefaultConfig,
 		exporter.WithTraces(createTraces, component.StabilityLevelDevelopment),
 	)
 }
 
+// createDefaultConfig queues in memory, because a persistent queue needs a storage
+// extension the config has to name. config.yaml turns on the persistent queue.
+func createDefaultConfig() component.Config {
+	return &Config{
+		QueueConfig: configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		RetryConfig: configretry.NewDefaultBackOffConfig(),
+	}
+}
+
 func createTraces(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Traces, error) {
-	e := &logExporter{cfg: cfg.(*Config)}
+	return newTraces(ctx, set, cfg.(*Config), openLog)
+}
+
+func newTraces(ctx context.Context, set exporter.Settings, cfg *Config, open func(wakelog.Config) (appender, error)) (exporter.Traces, error) {
+	e := &logExporter{cfg: cfg, open: open}
 	return exporterhelper.NewTraces(ctx, set, cfg, e.push,
 		exporterhelper.WithStart(e.start),
 		exporterhelper.WithShutdown(e.shutdown),
-		exporterhelper.WithRetry(configretry.NewDefaultBackOffConfig()),
+		exporterhelper.WithQueue(cfg.QueueConfig),
+		exporterhelper.WithRetry(cfg.RetryConfig),
 	)
 }
 
+// appender is the part of the signed log the exporter uses.
+type appender interface {
+	Add(ctx context.Context, entries [][]byte) ([]uint64, error)
+	Close(ctx context.Context) error
+}
+
+func openLog(cfg wakelog.Config) (appender, error) {
+	return wakelog.Open(cfg)
+}
+
 type logExporter struct {
-	cfg *Config
-	log *wakelog.Log
+	cfg  *Config
+	open func(wakelog.Config) (appender, error)
+	log  appender
 }
 
 func (e *logExporter) start(context.Context, component.Host) error {
-	l, err := wakelog.Open(wakelog.Config{Dir: e.cfg.Dir, KeyFile: e.cfg.KeyFile})
+	l, err := e.open(wakelog.Config{Dir: e.cfg.Dir, KeyFile: e.cfg.KeyFile})
 	if err != nil {
 		return err
 	}

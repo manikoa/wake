@@ -1,5 +1,12 @@
 # Local development config: plain HTTP on localhost and keys in local files.
 # A real deployment puts TLS on the receiver and keeps the signing keys in KMS.
+extensions:
+  # Holds the wakelog exporter's queue on disk. A real deployment can add
+  # `fsync: true` so queued events also survive the machine losing power.
+  file_storage:
+    directory: data/queue
+    create_directory: true
+
 receivers:
   otlp:
     protocols:
@@ -16,8 +23,14 @@ exporters:
   wakelog:
     dir: data/log
     key_file: keys/log.key
+    # The receiver answers once an event is queued; appends to the log happen
+    # behind the queue. Keeping it on disk means an event the SDK was told
+    # arrived still reaches the log if the collector crashes or restarts.
+    sending_queue:
+      storage: file_storage
 
 service:
+  extensions: [file_storage]
   pipelines:
     traces:
       receivers: [otlp]
