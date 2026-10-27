@@ -1,10 +1,10 @@
 // Package wakelog is Wake's self hosted signed log: an append only, hash chained
 // tlog-tiles log built on Trillian Tessera, with checkpoints signed by the log's key.
 //
-// Anyone can check a log with Tessera's fsck tool and the log's public key, without
-// trusting Wake:
+// Anyone can check a log without trusting Wake: its checkpoint, its tree and every
+// event's signature, with Verify or the wake-log command:
 //
-//	go run github.com/transparency-dev/tessera/cmd/fsck@v1.0.4 --storage_url=<log url> --public_key=log.pub
+//	go run github.com/manikoa/wake/log/cmd/wake-log verify -log <dir or url> -log-key log.pub -key collector.pub
 package wakelog
 
 import (

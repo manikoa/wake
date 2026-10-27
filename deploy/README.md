@@ -22,7 +22,14 @@ export WAKE_ENDPOINT=https://localhost:4318 OTEL_EXPORTER_OTLP_CERTIFICATE=$PWD/
 
 **MCP and A2A:** agents call through agentgateway at `http://localhost:3000`. The A2A example route is at `/agents/research`.
 
-The signed log is in the `data` volume at `/var/lib/wake/log`, with checkpoints signed by `keys/log.pub`, and anyone can check it with Tessera's tools (see `log/README.md`). The provenance view and its ingester run on top of this in `manikoa/wake-platform`.
+The signed log is in the `data` volume at `/var/lib/wake/log`, with checkpoints signed by `keys/log.pub`. Check it, its tree and every event's signature, with `wake-log` (see `log/README.md`); `-entries` prints what's in it:
+
+```bash
+docker compose run --rm --no-deps --entrypoint /wake-log collector verify -log /var/lib/wake/log \
+  -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem
+```
+
+The provenance view and its ingester run on top of this in `manikoa/wake-platform`.
 
 ## Before production
 
