@@ -4,11 +4,12 @@
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tonic::Request;
 use wake_proxy::authz::Authorizer;
 use wake_proxy::authz::pb::auth::authorization_server::Authorization;
 use wake_proxy::authz::pb::auth::{AttributeContext, CheckRequest, attribute_context::Peer};
+use wake_proxy::budget::{Budget, Events};
 use wake_proxy::control;
 use wake_proxy::export::Counters;
 use wake_proxy::halts::Halts;
@@ -153,8 +154,9 @@ async fn any_other_identity_is_refused() {
 #[tokio::test]
 async fn what_the_brake_puts_is_what_ext_authz_enforces() {
     let c = control().await;
-    let (events, mut recorded) = mpsc::channel(8);
-    let authz = Authorizer::new(c.halts.clone(), events, Arc::new(Counters::default()));
+    let counters = Arc::new(Counters::default());
+    let (events, mut recorded) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+    let authz = Authorizer::new(c.halts.clone(), events, counters);
     let check = || {
         Request::new(CheckRequest {
             attributes: Some(AttributeContext {
@@ -198,7 +200,7 @@ async fn what_the_brake_puts_is_what_ext_authz_enforces() {
             .code,
         7
     );
-    let denied = recorded.try_recv().unwrap();
+    let denied = recorded.try_recv().unwrap().event;
     assert_eq!(denied.str("wake.agent.id"), Some("spiffe://wake.local/agent/billing"));
 }
 

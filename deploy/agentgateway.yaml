@@ -81,6 +81,9 @@ routes:
         metadata:
           agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")'
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
+          # The caller's MCP session, in both phases, so a response whose event id didn't come
+          # back is paired in order only within its own session.
+          session: '"mcp-session-id" in request.headers ? request.headers["mcp-session-id"] : ""'
   backends:
   - mcp:
       targets:

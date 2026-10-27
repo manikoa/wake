@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::agents::Agents;
+use crate::budget::Events;
 use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
@@ -207,12 +207,12 @@ fn ids() -> ([u8; 16], [u8; 8]) {
 /// The gRPC service.
 pub struct Authorizer {
     halts: Arc<Halts>,
-    events: mpsc::Sender<Event>,
+    events: Events,
     counters: Arc<Counters>,
 }
 
 impl Authorizer {
-    pub fn new(halts: Arc<Halts>, events: mpsc::Sender<Event>, counters: Arc<Counters>) -> Self {
+    pub fn new(halts: Arc<Halts>, events: Events, counters: Arc<Counters>) -> Self {
         Authorizer {
             halts,
             events,
@@ -234,13 +234,8 @@ impl Authorization for Authorizer {
             return Ok(Response::new(allow()));
         }
         self.counters.denied.fetch_add(1, Ordering::Relaxed);
-        if self
-            .events
-            .try_send(denied_event(&call, &halts, self.halts.agents(), crate::halts::now()))
-            .is_err()
-        {
-            self.counters.export_dropped.fetch_add(1, Ordering::Relaxed);
-        }
+        self.events
+            .send(denied_event(&call, &halts, self.halts.agents(), crate::halts::now()));
         Ok(Response::new(deny(&halts)))
     }
 }
@@ -248,6 +243,7 @@ impl Authorization for Authorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::Budget;
     use crate::halts::Scope;
     use pb::auth::attribute_context::{HttpRequest, Peer, Request as AttrRequest};
     use pb::auth::{AttributeContext, CheckRequest};
@@ -308,8 +304,8 @@ mod tests {
     #[tokio::test]
     async fn denies_in_scope_records_it_and_allows_the_rest() {
         let halts = Arc::new(Halts::in_memory());
-        let (tx, mut rx) = mpsc::channel(8);
         let counters = Arc::new(Counters::default());
+        let (tx, mut rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
         let authz = Authorizer::new(halts.clone(), tx, counters.clone());
 
         let allowed = authz
@@ -347,7 +343,7 @@ mod tests {
         assert_eq!(d.status.as_ref().unwrap().code, 403);
         assert_eq!(d.headers[0].header.as_ref().unwrap().raw_value, b"halt-1");
 
-        let event = rx.try_recv().unwrap();
+        let event = rx.try_recv().unwrap().event;
         assert_eq!(event.str("wake.event.kind"), Some("denied"));
         assert_eq!(event.str("wake.agent.id"), Some("support"));
         assert_eq!(event.str("wake.brake.halt_id"), Some("halt-1"));
@@ -394,8 +390,9 @@ mod tests {
         let map =
             br#"{"billing": ["spiffe://wake.local/agent/billing"], "support": ["spiffe://wake.local/agent/support"]}"#;
         let halts = Arc::new(Halts::in_memory().with_agents(Arc::new(Agents::from_json(map).unwrap())));
-        let (tx, mut rx) = mpsc::channel(8);
-        let authz = Authorizer::new(halts.clone(), tx, Arc::new(Counters::default()));
+        let counters = Arc::new(Counters::default());
+        let (tx, mut rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let authz = Authorizer::new(halts.clone(), tx, counters);
         // The brake halts billing by its short name.
         halts.put("halt-billing", halted(&["billing"]), 1).unwrap();
 
@@ -413,7 +410,7 @@ mod tests {
             denied_by(r.get_ref()),
             Some(("halt-billing".into(), "halt-billing".into()))
         );
-        let event = rx.try_recv().unwrap();
+        let event = rx.try_recv().unwrap().event;
         assert_eq!(event.str("wake.agent.id"), Some("billing"));
         let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
         assert_eq!(payload["identity"], "spiffe://wake.local/agent/billing");
@@ -442,8 +439,9 @@ mod tests {
     #[tokio::test]
     async fn names_every_halt_that_covers_the_call() {
         let halts = Arc::new(Halts::in_memory());
-        let (tx, _rx) = mpsc::channel(8);
-        let authz = Authorizer::new(halts.clone(), tx, Arc::new(Counters::default()));
+        let counters = Arc::new(Counters::default());
+        let (tx, _rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let authz = Authorizer::new(halts.clone(), tx, counters);
         halts.put("fleet-1", halted(&[]), 1).unwrap();
         halts.put("fleet-2", halted(&[]), 2).unwrap();
         let r = authz

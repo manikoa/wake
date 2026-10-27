@@ -1,7 +1,8 @@
 //! The ExtMCP gRPC service agentgateway calls for each MCP call (its `mcpGuardrails`
 //! remote processor). For capture it always lets the call through, at once: the hook is
-//! queued for the capture task and never waits on it, and a full queue drops the hook and
-//! counts it rather than slow the call. Deny comes with the Brake phase.
+//! queued for the capture task and never waits on it, and a full queue, by count or by
+//! bytes, drops the hook and counts it rather than slow the call. The deny lever is
+//! ext_authz (authz.rs).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::agents::Agents;
+use crate::budget::{Budget, Permit};
 use crate::capture::{Hook, META_AGENT, META_EVENT_ID};
 use crate::export::Counters;
 use crate::mcp;
@@ -29,15 +31,23 @@ use pb::{McpRequest, McpRequestResult, McpResponse, McpResponseResult, Pass, mcp
 pub const MAX_MESSAGE: usize = 32 << 20;
 
 pub struct Processor {
-    hooks: mpsc::Sender<Hook>,
+    hooks: mpsc::Sender<(Hook, Permit)>,
+    budget: Arc<Budget>,
     counters: Arc<Counters>,
     agents: Arc<Agents>,
 }
 
 impl Processor {
-    pub fn new(hooks: mpsc::Sender<Hook>, counters: Arc<Counters>, agents: Arc<Agents>) -> Self {
+    /// Queues each hook on hooks with the bytes it holds, taken from budget.
+    pub fn new(
+        hooks: mpsc::Sender<(Hook, Permit)>,
+        budget: Arc<Budget>,
+        counters: Arc<Counters>,
+        agents: Arc<Agents>,
+    ) -> Self {
         Processor {
             hooks,
+            budget,
             counters,
             agents,
         }
@@ -58,7 +68,12 @@ impl Processor {
     }
 
     fn queue(&self, hook: Hook) {
-        if self.hooks.try_send(hook).is_err() {
+        let queued = self
+            .budget
+            .take(hook.size())
+            .map(|permit| self.hooks.try_send((hook, permit)).is_ok())
+            .unwrap_or(false);
+        if !queued {
             self.counters.hooks_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }

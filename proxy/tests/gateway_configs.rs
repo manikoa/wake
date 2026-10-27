@@ -113,3 +113,24 @@ fn every_a2a_route_denies_calls_to_a_halted_agent() {
         }
     }
 }
+
+#[test]
+fn mcp_capture_can_pair_each_response_with_its_request() {
+    for (path, _) in CONFIGS {
+        let config = load(path);
+        for route in config["routes"].as_vec().unwrap() {
+            let Some(processors) = route["policies"]["mcpGuardrails"]["processors"].as_vec() else {
+                continue;
+            };
+            for processor in processors {
+                let metadata = &processor["metadata"];
+                for key in ["agent", "wake_event_id", "session"] {
+                    assert!(
+                        metadata[key].as_str().is_some(),
+                        "{path}: mcpGuardrails metadata needs {key}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -4,7 +4,8 @@ Records every MCP call and every A2A message between agents that goes through [a
 
 agentgateway calls wake-proxy through its MCP guardrails hook (ExtMCP), before each `tools/call`, `resources/read` and `prompts/get` reaches its MCP server and again when the result comes back. wake-proxy:
 
-- **Never holds up a call.** It answers "pass" at once and queues the hook. A full queue drops the hook and counts it. With `failOpen`, calls go through unrecorded if wake-proxy is down.
+- **Never holds up a call.** It answers "pass" at once and queues the hook. A full queue, by count or by bytes, drops the hook and counts it. With `failOpen`, calls go through unrecorded if wake-proxy is down.
+- **Never grows without bound.** Every queue is bounded by bytes, each call's params and result go into its payload up to 1 MiB, and batches to the collector stay under its request limit, so a flood of large calls can't take down the deny lever that shares the process.
 - **Pairs each request with its response.** The request hook hands agentgateway the event's id, and the config passes it back to the response hook. When it doesn't come back, responses are paired in order within a session. A request with no response after `--response-timeout` (JSON-RPC errors skip the response hook) is recorded with no output.
 - **Signs each event.** It uses its own ECDSA P-256 key and X.509-SVID, and the certificate travels with the event. agentgateway never holds the key.
 - **Sends events to the collector** over OTLP/HTTP, in batches. If the collector can't take them, they're retried, then dropped and counted.
