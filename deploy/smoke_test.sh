@@ -79,7 +79,7 @@ for line in open(sys.argv[1]):
     a = (entry.get("event") or {}).get("attributes") or {}
     if (entry.get("signed") and a.get("wake.event.kind") == "denied" and a.get("wake.agent.id") == "smoke-test"
             and a.get("wake.brake.halt_id") == "smoke-halt" and a.get("wake.capture") == "proxy"):
-        print(f"the denial is entry {entry.get('index')}, signed by {a.get('wake.signer')}")
+        print(f"the denial is entry {entry.get('index')}, signed by {entry.get('signer')}")
         sys.exit(0)
 sys.exit(1)
 PY
