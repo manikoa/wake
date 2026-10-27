@@ -88,6 +88,7 @@ impl ExtMcp for Processor {
             server: r.service_names.into_iter().next().unwrap_or_default(),
             metadata: strings(r.metadata_context),
             params: r.mcp_request,
+            headers: r.headers.into_iter().map(|h| (h.key, h.value)).collect(),
             at: SystemTime::now(),
         });
         // Handed back so the response hook can say which call it belongs to.

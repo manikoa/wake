@@ -216,6 +216,7 @@ async fn records_a_tool_call_as_a_signed_event() {
     let counters = p.counters.clone();
     p.shutdown().await;
     assert_eq!(Counters::get(&counters.sent), 1);
+    assert_eq!(Counters::get(&counters.paired_by_id), 1);
 }
 
 #[tokio::test]

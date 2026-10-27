@@ -19,11 +19,15 @@ routes:
           tools/call: full
           resources/read: full
           prompts/get: full
+        # Only these request headers reach wake-proxy; with no list, agentgateway would
+        # forward every header, credentials included. A caller with a Wake SDK links its
+        # MCP calls into its own trace and provenance with traceparent and wake-parents.
+        requestHeaders:
+          allowed: [traceparent, wake-parents, mcp-session-id]
         # Sent to wake-proxy with each hook. A failing expression is left out.
         metadata:
           # Who's calling: the agent's SPIFFE ID from mTLS, else its JWT subject.
           agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")'
-          session: 'has(mcp.sessionId) ? mcp.sessionId : ""'
           # The event id wake-proxy handed back from the request hook, so the response
           # hook can say which call it belongs to.
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'

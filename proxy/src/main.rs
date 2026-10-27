@@ -67,11 +67,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
+            let stats = counters.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(60));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    tracing::info!(
+                        sent = Counters::get(&stats.sent),
+                        hooks_dropped = Counters::get(&stats.hooks_dropped),
+                        export_dropped = Counters::get(&stats.export_dropped),
+                        paired_by_id = Counters::get(&stats.paired_by_id),
+                        paired_in_order = Counters::get(&stats.paired_in_order),
+                        "recording"
+                    );
+                }
+            });
             pipeline::serve(listener, signer, options, counters.clone(), shutdown).await?;
             tracing::info!(
                 sent = Counters::get(&counters.sent),
                 hooks_dropped = Counters::get(&counters.hooks_dropped),
                 export_dropped = Counters::get(&counters.export_dropped),
+                paired_by_id = Counters::get(&counters.paired_by_id),
+                paired_in_order = Counters::get(&counters.paired_in_order),
                 "stopped"
             );
         }

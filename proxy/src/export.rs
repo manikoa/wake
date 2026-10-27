@@ -24,6 +24,10 @@ pub struct Counters {
     pub sent: AtomicU64,
     /// Events dropped because the collector couldn't take them.
     pub export_dropped: AtomicU64,
+    /// Responses paired with their request by the event id the gateway passed back.
+    pub paired_by_id: AtomicU64,
+    /// Responses paired by order within a session, because the id didn't come back.
+    pub paired_in_order: AtomicU64,
 }
 
 impl Counters {

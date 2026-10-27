@@ -4,8 +4,13 @@ use libfuzzer_sys::fuzz_target;
 use wake_proxy::mcp;
 
 fuzz_target!(|data: &[u8]| {
+    let headers = vec![
+        (mcp::HEADER_TRACEPARENT.to_string(), data.to_vec()),
+        (mcp::HEADER_PARENTS.to_string(), data.to_vec()),
+        (mcp::HEADER_SESSION.to_string(), data.to_vec()),
+    ];
     for method in mcp::CAPTURED {
-        let _ = mcp::parse_request(method, Some(data));
+        let _ = mcp::parse_request(method, Some(data), &headers);
     }
     if let Ok(s) = std::str::from_utf8(data) {
         let _ = mcp::parse_traceparent(s);

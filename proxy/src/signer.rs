@@ -17,12 +17,15 @@ pub struct Signer {
 }
 
 impl Signer {
-    /// Loads a PKCS#8 P-256 private key and its certificate, both PEM.
+    /// Loads a PKCS#8 P-256 private key and its certificate chain, both PEM.
     pub fn from_pem(key_pem: &str, cert_pem: &str) -> Result<Self, String> {
         let key = SigningKey::from_pkcs8_pem(key_pem).map_err(|e| format!("signing key: {e}"))?;
-        let cert = pem::parse(cert_pem).map_err(|e| format!("certificate: {e}"))?;
-        let id = spiffe_id(cert.contents())?;
-        Ok(Signer { key, id, certificate: STANDARD.encode(cert.contents()) })
+        // The SVID first, then any intermediates, as SPIRE writes them.
+        let chain = pem::parse_many(cert_pem).map_err(|e| format!("certificate: {e}"))?;
+        let leaf = chain.first().ok_or("no certificate")?;
+        let id = spiffe_id(leaf.contents())?;
+        let der: Vec<u8> = chain.iter().flat_map(|c| c.contents().to_vec()).collect();
+        Ok(Signer { key, id, certificate: STANDARD.encode(der) })
     }
 
     /// The SPIFFE ID this signer signs as.

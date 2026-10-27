@@ -18,7 +18,15 @@ fuzz_target!(|data: &[u8]| {
         }
         let method = ["tools/call", "resources/read", "prompts/get"][(b % 3) as usize].to_string();
         let hook = if b & 0x80 == 0 {
-            Hook::Request { event_id: format!("id{}", b % 7), method, server: "s".into(), metadata, params: Some(chunk.to_vec()), at }
+            Hook::Request {
+                event_id: format!("id{}", b % 7),
+                method,
+                server: "s".into(),
+                metadata,
+                params: Some(chunk.to_vec()),
+                headers: vec![("wake-parents".into(), chunk.to_vec()), ("mcp-session-id".into(), chunk.to_vec())],
+                at,
+            }
         } else {
             Hook::Response { method, server: "s".into(), metadata, result: chunk.to_vec(), at }
         };

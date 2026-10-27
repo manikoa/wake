@@ -25,6 +25,8 @@ pub enum Hook {
         server: String,
         metadata: HashMap<String, String>,
         params: Option<Vec<u8>>,
+        /// The request headers the gateway forwarded.
+        headers: Vec<(String, Vec<u8>)>,
         at: SystemTime,
     },
     Response {
@@ -54,6 +56,10 @@ struct Pending {
 type Key = (String, String, String); // session, method, server
 
 pub struct Capture {
+    /// Responses paired by the event id the gateway passed back, and by order. If only the
+    /// second grows, the gateway config isn't passing the id back.
+    pub paired_by_id: u64,
+    pub paired_in_order: u64,
     timeout: Duration,
     limit: usize,
     pending: HashMap<String, Pending>,
@@ -64,7 +70,15 @@ pub struct Capture {
 impl Capture {
     /// timeout is how long a request waits for its response; limit bounds how many wait.
     pub fn new(timeout: Duration, limit: usize) -> Self {
-        Capture { timeout, limit, pending: HashMap::new(), order: VecDeque::new(), queues: HashMap::new() }
+        Capture {
+            paired_by_id: 0,
+            paired_in_order: 0,
+            timeout,
+            limit,
+            pending: HashMap::new(),
+            order: VecDeque::new(),
+            queues: HashMap::new(),
+        }
     }
 
     pub fn waiting(&self) -> usize {
@@ -74,8 +88,10 @@ impl Capture {
     /// Takes one hook and returns any events it completes.
     pub fn handle(&mut self, hook: Hook) -> Vec<Event> {
         match hook {
-            Hook::Request { event_id, method, server, metadata, params, at } => {
-                let request = mcp::parse_request(&method, params.as_deref());
+            Hook::Request { event_id, method, server, metadata, params, headers, at } => {
+                let request = mcp::parse_request(&method, params.as_deref(), &headers);
+                // Pairing uses the session from metadata, the only place the response hook
+                // can carry it too.
                 let session = metadata.get(META_SESSION).cloned().unwrap_or_default();
                 let agent = metadata.get(META_AGENT).filter(|a| !a.is_empty()).cloned().unwrap_or_else(|| "unknown".into());
                 self.queues.entry((session.clone(), method.clone(), server.clone())).or_default().push_back(event_id.clone());
@@ -92,14 +108,21 @@ impl Capture {
                 out
             }
             Hook::Response { method, server, metadata, result, at } => {
-                let id = metadata
-                    .get(META_EVENT_ID)
-                    .filter(|id| self.pending.contains_key(*id))
-                    .cloned()
-                    .or_else(|| {
+                let by_id = metadata.get(META_EVENT_ID).filter(|id| self.pending.contains_key(*id)).cloned();
+                let id = match by_id {
+                    Some(id) => {
+                        self.paired_by_id += 1;
+                        Some(id)
+                    }
+                    None => {
                         let session = metadata.get(META_SESSION).cloned().unwrap_or_default();
-                        self.queues.get_mut(&(session, method.clone(), server.clone()))?.pop_front()
-                    });
+                        let next = self.queues.get_mut(&(session, method.clone(), server.clone())).and_then(|q| q.pop_front());
+                        if next.is_some() {
+                            self.paired_in_order += 1;
+                        }
+                        next
+                    }
+                };
                 match id {
                     Some(id) => self.finish(&id, Some(&result), at, None).into_iter().collect(),
                     // A response with no request seen, such as when only the response
@@ -178,8 +201,9 @@ fn build(id: &str, p: &Pending, result: Option<&[u8]>, end: SystemTime, error: O
     }
     event.set("wake.mcp.method", Value::Str(p.method.clone()));
     event.set("wake.mcp.server", Value::Str(p.server.clone()));
-    if !p.session.is_empty() {
-        event.set("wake.mcp.session", Value::Str(p.session.clone()));
+    let session = if p.session.is_empty() { p.request.session.clone().unwrap_or_default() } else { p.session.clone() };
+    if !session.is_empty() {
+        event.set("wake.mcp.session", Value::Str(session));
     }
     event.set("wake.payload", Value::Str(mcp::payload(p.params.as_deref(), result, error)));
     event
@@ -217,6 +241,7 @@ mod tests {
             server: "inbox".into(),
             metadata: meta(&[(META_AGENT, "spiffe://wake.local/agent/email"), (META_SESSION, session)]),
             params: Some(format!(r#"{{"name":"{tool}","arguments":{{}}}}"#).into_bytes()),
+            headers: vec![],
             at,
         }
     }
@@ -246,6 +271,7 @@ mod tests {
         assert_eq!(e.str("wake.payload"), Some(r#"{"input":{"name":"read_email","arguments":{}},"output":{"content":"second"}}"#));
         assert_eq!((e.start_time_unix_nano, e.end_time_unix_nano), (nanos(t(1)), nanos(t(2))));
         assert_eq!(c.waiting(), 1);
+        assert_eq!((c.paired_by_id, c.paired_in_order), (1, 0));
     }
 
     #[test]
@@ -259,6 +285,7 @@ mod tests {
         assert_eq!(first[0].str("wake.event.id"), Some("a"));
         assert_eq!(second[0].str("wake.event.id"), Some("b"));
         assert_eq!(c.waiting(), 1);
+        assert_eq!((c.paired_by_id, c.paired_in_order), (0, 2));
     }
 
     #[test]
@@ -299,6 +326,7 @@ mod tests {
             server: "files".into(),
             metadata: HashMap::new(),
             params: Some(br#"{"uri":"file:///inbox/1.eml","_meta":{"traceparent":"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01","dev.wake/parents":["model-call-1"]}}"#.to_vec()),
+            headers: vec![("mcp-session-id".into(), b"s9".to_vec())],
             at: t(0),
         });
         let out = c.handle(Hook::Response { method: "resources/read".into(), server: "files".into(), metadata: meta(&[(META_EVENT_ID, "a")]), result: b"{}".to_vec(), at: t(1) });
@@ -308,6 +336,7 @@ mod tests {
         assert_eq!(e.attributes["wake.parents"], Value::Strs(vec!["model-call-1".into()]));
         assert_eq!(e.attributes["wake.origins"], Value::Strs(vec!["tool:file:///inbox/1.eml".into()]));
         assert_eq!(e.str("wake.agent.id"), Some("unknown"));
+        assert_eq!(e.str("wake.mcp.session"), Some("s9"));
         assert_eq!(e.str("gen_ai.tool.name"), None);
     }
 }

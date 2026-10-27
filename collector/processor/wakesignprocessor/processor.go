@@ -5,6 +5,7 @@ package wakesignprocessor
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"golang.org/x/mod/sumdb/note"
 
 	"github.com/manikoa/wake/collector/event"
+	wakelog "github.com/manikoa/wake/log"
 )
 
 // Config for the wakesign processor.
@@ -25,9 +27,12 @@ type Config struct {
 	// SigningKeyFile holds the note format private key the collector signs SDK and
 	// memory adapter events with.
 	SigningKeyFile string `mapstructure:"signing_key_file"`
-	// TrustedKeys lists note format public key files for components that sign their
-	// own events, such as proxies.
+	// TrustedKeys lists note format public key files for other components that sign
+	// their own events with one.
 	TrustedKeys []string `mapstructure:"trusted_keys"`
+	// TrustBundles lists PEM files of SPIRE trust bundles. Components that sign with an
+	// X.509-SVID, such as the proxy, must chain to one of them.
+	TrustBundles []string `mapstructure:"trust_bundles"`
 }
 
 // Validate checks the config.
@@ -57,8 +62,8 @@ func createTraces(ctx context.Context, set processor.Settings, cfg component.Con
 }
 
 type signer struct {
-	key     note.Signer
-	trusted map[string]note.Verifier
+	key   note.Signer
+	trust wakelog.Trust
 }
 
 func newSigner(cfg *Config) (*signer, error) {
@@ -82,7 +87,20 @@ func newSigner(cfg *Config) (*signer, error) {
 		}
 		trusted[verifier.Name()] = verifier
 	}
-	return &signer{key: key, trusted: trusted}, nil
+	trust := wakelog.Trust{Keys: trusted}
+	if len(cfg.TrustBundles) > 0 {
+		trust.Bundles = x509.NewCertPool()
+		for _, path := range cfg.TrustBundles {
+			pem, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("read trust bundle: %w", err)
+			}
+			if !trust.Bundles.AppendCertsFromPEM(pem) {
+				return nil, fmt.Errorf("trust bundle %s has no certificates", path)
+			}
+		}
+	}
+	return &signer{key: key, trust: trust}, nil
 }
 
 func (s *signer) processTraces(_ context.Context, td ptrace.Traces) (ptrace.Traces, error) {
@@ -106,7 +124,7 @@ func (s *signer) process(span ptrace.Span) error {
 	attrs := span.Attributes()
 	if _, signed := attrs.Get(event.Signature); signed {
 		// Keep events whose signatures fail: they're evidence too.
-		attrs.PutBool(event.SignatureValid, event.Verify(span, s.trusted))
+		attrs.PutBool(event.SignatureValid, event.Verify(span, s.trust))
 		return nil
 	}
 	capture, _ := attrs.Get(event.Capture)

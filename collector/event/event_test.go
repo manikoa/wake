@@ -89,33 +89,33 @@ func TestSignThenVerify(t *testing.T) {
 		t.Fatal(err)
 	}
 	trusted := map[string]note.Verifier{"collector": verifier}
-	if !Verify(span, trusted) {
+	if !Verify(span, wakelog.Trust{Keys: trusted}) {
 		t.Fatal("signature doesn't verify")
 	}
 
 	// Signature fields aren't part of the signed bytes, so recording validity doesn't break it.
 	span.Attributes().PutBool(SignatureValid, true)
-	if !Verify(span, trusted) {
+	if !Verify(span, wakelog.Trust{Keys: trusted}) {
 		t.Fatal("adding wake.signature.valid broke the signature")
 	}
 
 	tampered := ptrace.NewSpan()
 	span.CopyTo(tampered)
 	tampered.Attributes().PutStr(Payload, `{"output":"pay $1"}`)
-	if Verify(tampered, trusted) {
+	if Verify(tampered, wakelog.Trust{Keys: trusted}) {
 		t.Fatal("event with a tampered payload still verifies")
 	}
 
 	span.CopyTo(tampered)
 	tampered.Attributes().PutStr(PayloadSHA256, sha256Hex(`{"output":"pay $1"}`))
 	tampered.Attributes().PutStr(Payload, `{"output":"pay $1"}`)
-	if Verify(tampered, trusted) {
+	if Verify(tampered, wakelog.Trust{Keys: trusted}) {
 		t.Fatal("event with a tampered payload and digest still verifies")
 	}
 
 	span.CopyTo(tampered)
 	tampered.Attributes().Remove(PayloadSHA256)
-	if Verify(tampered, trusted) {
+	if Verify(tampered, wakelog.Trust{Keys: trusted}) {
 		t.Fatal("event with a payload but no signed digest verifies")
 	}
 }
@@ -127,7 +127,7 @@ func TestVerifyRejectsUnknownSigner(t *testing.T) {
 	if err := Sign(span, signer); err != nil {
 		t.Fatal(err)
 	}
-	if Verify(span, map[string]note.Verifier{"collector": otherVerifier}) {
+	if Verify(span, wakelog.Trust{Keys: map[string]note.Verifier{"collector": otherVerifier}}) {
 		t.Fatal("event from an untrusted signer verifies")
 	}
 }
@@ -161,7 +161,7 @@ func TestEntryKeepsTheExactSignedBytes(t *testing.T) {
 	if !decoded.Verify(map[string]note.Verifier{"collector": verifier}) {
 		t.Fatal("entry doesn't verify on its own")
 	}
-	if !Verify(span, map[string]note.Verifier{"collector": verifier}) {
+	if !Verify(span, wakelog.Trust{Keys: map[string]note.Verifier{"collector": verifier}}) {
 		t.Fatal("entry's event doesn't verify")
 	}
 	payload, err := decoded.ReadPayload(nil)

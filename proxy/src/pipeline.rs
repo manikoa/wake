@@ -60,7 +60,11 @@ pub async fn serve(
         loop {
             tokio::select! {
                 hook = hooks_rx.recv() => match hook {
-                    Some(hook) => emit(capture.handle(hook)),
+                    Some(hook) => {
+                        emit(capture.handle(hook));
+                        capture_counters.paired_by_id.store(capture.paired_by_id, Ordering::Relaxed);
+                        capture_counters.paired_in_order.store(capture.paired_in_order, Ordering::Relaxed);
+                    }
                     None => break,
                 },
                 _ = tick.tick() => emit(capture.expire(SystemTime::now())),

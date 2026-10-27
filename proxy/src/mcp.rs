@@ -16,10 +16,25 @@ pub fn captured(method: &str) -> bool {
 pub struct Request {
     /// The tool, resource or prompt called: params.name, or params.uri for resources/read.
     pub target: Option<String>,
-    /// W3C trace context from params._meta.traceparent, so the event joins the caller's trace.
+    /// W3C trace context, so the event joins the caller's trace: the traceparent header,
+    /// else params._meta.traceparent.
     pub trace: Option<TraceParent>,
-    /// Ids of the events that led to this call, from params._meta["dev.wake/parents"].
+    /// Ids of the events that led to this call: the wake-parents header, comma
+    /// separated, else params._meta["dev.wake/parents"].
     pub parents: Vec<String>,
+    /// The MCP session, from the mcp-session-id header.
+    pub session: Option<String>,
+}
+
+/// Header names the processor reads. agentgateway v1.6.0 drops params._meta before
+/// calling the processor, so through it, a caller links a call with headers.
+pub const HEADER_TRACEPARENT: &str = "traceparent";
+pub const HEADER_PARENTS: &str = "wake-parents";
+pub const HEADER_SESSION: &str = "mcp-session-id";
+
+fn parent_id(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty() && s.len() <= 128).then(|| s.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,8 +43,30 @@ pub struct TraceParent {
     pub span_id: [u8; 8],
 }
 
-/// Reads a request's params. Anything malformed is treated as absent.
-pub fn parse_request(method: &str, params: Option<&[u8]>) -> Request {
+/// Reads a request's params and the headers the gateway forwarded. Anything malformed is
+/// treated as absent.
+pub fn parse_request(method: &str, params: Option<&[u8]>, headers: &[(String, Vec<u8>)]) -> Request {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| std::str::from_utf8(v).ok())
+    };
+    let mut request = parse_params(method, params);
+    if let Some(trace) = header(HEADER_TRACEPARENT).and_then(parse_traceparent) {
+        request.trace = Some(trace);
+    }
+    if let Some(parents) = header(HEADER_PARENTS) {
+        let parents: Vec<String> = parents.split(',').filter_map(parent_id).take(64).collect();
+        if !parents.is_empty() {
+            request.parents = parents;
+        }
+    }
+    request.session = header(HEADER_SESSION).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 256).map(str::to_string);
+    request
+}
+
+fn parse_params(method: &str, params: Option<&[u8]>) -> Request {
     let Some(params) = params.and_then(|p| serde_json::from_slice::<Value>(p).ok()) else {
         return Request::default();
     };
@@ -49,13 +86,12 @@ pub fn parse_request(method: &str, params: Option<&[u8]>) -> Request {
         .map(|list| {
             list.iter()
                 .filter_map(Value::as_str)
-                .filter(|s| !s.is_empty() && s.len() <= 128)
+                .filter_map(parent_id)
                 .take(64)
-                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default();
-    Request { target, trace, parents }
+    Request { target, trace, parents, session: None }
 }
 
 /// Parses a W3C traceparent: version-traceid-spanid-flags, lowercase hex. An all-zero
@@ -114,21 +150,42 @@ mod tests {
         let params = br#"{"name":"read_email","arguments":{"subject":"invoice"},
             "_meta":{"traceparent":"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01",
                      "dev.wake/parents":["e1","",42,"e2"]}}"#;
-        let r = parse_request("tools/call", Some(params));
+        let r = parse_request("tools/call", Some(params), &[]);
         assert_eq!(r.target.as_deref(), Some("read_email"));
         assert_eq!(r.parents, vec!["e1", "e2"]);
         let trace = r.trace.unwrap();
         assert_eq!(hex::encode(trace.trace_id), "0102030405060708090a0b0c0d0e0f10");
         assert_eq!(hex::encode(trace.span_id), "1112131415161718");
 
-        let r = parse_request("resources/read", Some(br#"{"uri":"file:///inbox/1.eml"}"#));
+        let r = parse_request("resources/read", Some(br#"{"uri":"file:///inbox/1.eml"}"#), &[]);
         assert_eq!(r.target.as_deref(), Some("file:///inbox/1.eml"));
+    }
+
+    #[test]
+    fn headers_link_the_call_when_meta_is_dropped() {
+        let headers = vec![
+            ("Traceparent".to_string(), b"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01".to_vec()),
+            ("wake-parents".to_string(), b" e1, ,e2 ".to_vec()),
+            ("mcp-session-id".to_string(), b"s1".to_vec()),
+            ("authorization".to_string(), b"secret".to_vec()),
+        ];
+        let r = parse_request("tools/call", Some(br#"{"name":"read_email"}"#), &headers);
+        assert_eq!(r.parents, vec!["e1", "e2"]);
+        assert_eq!(r.session.as_deref(), Some("s1"));
+        assert_eq!(r.trace.map(|t| hex::encode(t.trace_id)).as_deref(), Some("0102030405060708090a0b0c0d0e0f10"));
+        // A malformed header leaves what _meta said.
+        let meta = br#"{"name":"t","_meta":{"dev.wake/parents":["m1"]}}"#;
+        let r = parse_request("tools/call", Some(meta), &[("wake-parents".into(), b" , ".to_vec()), ("traceparent".into(), b"bad".to_vec())]);
+        assert_eq!(r.parents, vec!["m1"]);
+        assert_eq!(r.trace, None);
+        let r = parse_request("tools/call", None, &[("wake-parents".into(), vec![0xff])]);
+        assert!(r.parents.is_empty());
     }
 
     #[test]
     fn treats_anything_malformed_as_absent() {
         for params in [&b""[..], b"null", b"[]", b"{", b"{\"name\":7}", b"\xff\xfe"] {
-            let r = parse_request("tools/call", Some(params));
+            let r = parse_request("tools/call", Some(params), &[]);
             assert_eq!(r.target, None, "{:?}", params);
         }
         for tp in [
@@ -160,15 +217,16 @@ mod tests {
     proptest! {
         #[test]
         fn never_panics_and_payload_is_always_json(method in "[a-z/]{0,20}", params in proptest::collection::vec(any::<u8>(), 0..512)) {
-            let _ = parse_request(&method, Some(&params));
+            let headers = vec![("wake-parents".to_string(), params.clone()), ("traceparent".to_string(), params.clone())];
+            let _ = parse_request(&method, Some(&params), &headers);
             let p = payload(Some(&params), Some(&params), Some("e"));
             prop_assert!(serde_json::from_str::<Value>(&p).is_ok());
         }
 
         #[test]
         fn never_panics_on_json_shaped_input(s in r#"\{("[a-z_/.]{0,12}":("[^"]{0,20}"|[0-9]{1,5}|\[\]|\{\}|null),?){0,6}\}"#) {
-            let _ = parse_request("tools/call", Some(s.as_bytes()));
-            let _ = parse_request("resources/read", Some(s.as_bytes()));
+            let _ = parse_request("tools/call", Some(s.as_bytes()), &[]);
+            let _ = parse_request("resources/read", Some(s.as_bytes()), &[]);
         }
     }
 }

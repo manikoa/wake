@@ -9,7 +9,7 @@ agentgateway calls wake-proxy through its MCP guardrails hook (ExtMCP), before e
 - **Signs each event.** It uses its own ECDSA P-256 key and X.509-SVID, and the certificate travels with the event. agentgateway never holds the key.
 - **Sends events to the collector** over OTLP/HTTP, in batches. If the collector can't take them, they're retried, then dropped and counted.
 
-An agent with a Wake SDK can link its MCP calls into its own trace and provenance by putting `traceparent` and `dev.wake/parents` (the ids of the events that led to the call) in the call's `params._meta`.
+An agent with a Wake SDK links its MCP calls into its own trace and provenance with two HTTP headers on the call: `traceparent`, and `wake-parents` (the comma-separated ids of the events that led to the call). agentgateway v1.6.0 drops `params._meta` before calling the processor, so headers are the way through it. The config forwards only those headers and `mcp-session-id`, never credentials.
 
 ## Run it locally
 
@@ -19,7 +19,7 @@ cargo run -- serve --key keys/proxy.key --cert keys/proxy.pem
 agentgateway -f agentgateway.yaml    # in another terminal; agentgateway v1.6.0
 ```
 
-`dev-identity` writes a stand-in trust bundle and a certificate signed by it, for local development only. In production SPIRE issues short-lived SVIDs.
+`dev-identity` writes a stand-in trust bundle and a certificate signed by it, for local development only. In production SPIRE issues short-lived SVIDs. Add the bundle to the collector's `trust_bundles` so it accepts the proxy's signatures.
 
 wake-proxy must be reachable only by agentgateway, over loopback or a pod-local socket. Anything that can call it can get events signed.
 
@@ -29,5 +29,7 @@ wake-proxy must be reachable only by agentgateway, over loopback or a pod-local 
 cargo test
 cargo +nightly fuzz run mcp_request   # also capture_hooks and canonical; needs cargo-fuzz
 ```
+
+It logs counters every minute: events sent, hooks and events dropped, and responses paired by id or by order. If responses are only ever paired by order, the gateway config isn't passing the event id back.
 
 Building needs `protoc`. `proto/ext_mcp.proto` is vendored from agentgateway v1.6.0. The signed bytes must match the collector's byte for byte, so `src/canonical.rs` is tested against `../collector/event/testdata/canonical.json`, which the collector's tests generate.

@@ -16,8 +16,10 @@ receivers:
 processors:
   wakesign:
     signing_key_file: keys/collector.key
-    # Public keys of components that sign their own events, such as proxies.
-    trusted_keys: []
+    # SPIRE trust bundles (PEM) that components signing with an X.509-SVID, such as
+    # the proxy, must chain to. For local development: proxy/keys/bundle.pem from
+    # wake-proxy dev-identity.
+    trust_bundles: []
 
 exporters:
   wakelog:
