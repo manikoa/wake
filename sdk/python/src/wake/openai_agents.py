@@ -104,18 +104,26 @@ class WakeTracingProcessor(EventGraph):
         self._handed_off = _Recent()  # (trace, agent) -> handoff event id, feeding its next step
         self._seen_user = _Recent()  # (trace, digest) for user input already seen
         self._roots = _Recent(limit=1024)  # sdk trace id -> the workflow's root span
+        self._linked = _Recent(limit=1024)  # sdk trace id -> what started it, feeding its first response
         self._spans = _Recent(limit=10_000)  # sdk span id -> its open span
 
     # TracingProcessor.
 
     @_never_raise
     def on_trace_start(self, trace_obj) -> None:
-        # One root per workflow, so every agent in it, handoffs included, shares a trace.
+        # One root per workflow, so every agent in it, handoffs included, shares a trace. A
+        # workflow run inside a recorded tool call, or for a message from another agent,
+        # joins that trace, and its first response descends from it.
+        link = links.current()
         root = self._recorder.tracer.start_span(
-            f"workflow {trace_obj.name}", attributes={"wake.openai_agents.workflow": trace_obj.name or ""}
+            f"workflow {trace_obj.name}",
+            context=self._event_context(),
+            attributes={"wake.openai_agents.workflow": trace_obj.name or ""},
         )
         with self._lock:
             self._roots[trace_obj.trace_id] = root
+            if link is not None:
+                self._linked[trace_obj.trace_id] = list(link.parents)
 
     @_never_raise
     def on_trace_end(self, trace_obj) -> None:
@@ -202,6 +210,9 @@ class WakeTracingProcessor(EventGraph):
         parents: list[str] = []
         origins: list[str] = []
         with self._lock:
+            linked = self._linked.pop(trace_key, None)
+            if linked:
+                parents += linked
             handoff = self._handed_off.pop((trace_key, agent), None)
             if handoff:
                 parents.append(handoff)
@@ -213,11 +224,12 @@ class WakeTracingProcessor(EventGraph):
                 elif _field(item, "id") in self._event_by_item:
                     parents.append(self._event_by_item[_field(item, "id")])
                 elif _field(item, "role") == "user":
-                    # A user's message is new content the first time a model sees it.
+                    # A user's message is new content the first time a model sees it. In a
+                    # linked workflow, the input came from what started it.
                     digest = hashlib.sha256(_text(item).encode()).hexdigest()
                     if (trace_key, digest) not in self._seen_user:
                         self._seen_user[(trace_key, digest)] = True
-                        if events.ORIGIN_USER not in origins:
+                        if not linked and events.ORIGIN_USER not in origins:
                             origins.append(events.ORIGIN_USER)
         otel = self._take(span)
         if otel is None:

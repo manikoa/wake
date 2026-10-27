@@ -117,6 +117,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         self._event_by_tool_call = _Recent()  # tool call id -> model call that requested it
         self._result_by_tool_call = _Recent()  # tool call id -> tool call event id
         self._seen_user_messages = _Recent()
+        self._linked = _Recent()  # top level run id -> the link it started under, for its first event
         self._installed: _Installed | None = None
 
     def install(self) -> "WakeCallbackHandler":
@@ -165,9 +166,13 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         with self._lock:
             self._parent_run[run_id] = parent_run_id
         if parent_run_id is None and _current_run.get() is None:
+            # A run inside a recorded tool call, or for a message from another agent, joins
+            # that trace, and its first event descends from it.
             agent = self._recorder.agent
+            link = links.current()
             span = self._recorder.tracer.start_span(
                 f"invoke_agent {agent}",
+                context=EventGraph._event_context(self),
                 attributes={
                     "gen_ai.operation.name": "invoke_agent",
                     "gen_ai.agent.name": agent,
@@ -176,6 +181,8 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             )
             with self._lock:
                 self._spans[run_id] = span
+                if link is not None:
+                    self._linked[run_id] = {"parents": list(link.parents), "taken": False}
 
     @_never_raise
     def on_chain_end(self, outputs, *, run_id: UUID, **kwargs) -> None:
@@ -202,6 +209,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         context = [m for batch in messages for m in batch]
         parents: list[str] = []
         origins: list[str] = []
+        linked = self._is_linked(parent_run_id)
         with self._lock:
             self._parent_run[run_id] = parent_run_id
             for m in context:
@@ -209,10 +217,12 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                     parents.append(self._event_by_message[m.id])
                 elif isinstance(m, ToolMessage) and m.tool_call_id in self._result_by_tool_call:
                     parents.append(self._result_by_tool_call[m.tool_call_id])
-                elif isinstance(m, HumanMessage) and _current_run.get() is None and m.id not in self._seen_user_messages:
+                elif (isinstance(m, HumanMessage) and _current_run.get() is None and not linked
+                      and m.id not in self._seen_user_messages):
                     # A user's message is new content the first time a model sees it.
                     # Inside a named agent run, a human message is usually a prompt the
-                    # app built, so the run's input says where content came from instead.
+                    # app built, so the run's input says where content came from instead;
+                    # in a linked run, what started it does.
                     if m.id is not None:
                         self._seen_user_messages[m.id] = True
                     if events.ORIGIN_USER not in origins:
@@ -312,8 +322,12 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
 
     def _start_run(self, name: str, input: Any, origin: str | None) -> AgentRun:
         enclosing = _current_run.get()
+        link = links.current() if enclosing is None else None
         try:
-            context = trace.set_span_in_context(enclosing._span) if enclosing and enclosing._span else None
+            if enclosing is not None:
+                context = trace.set_span_in_context(enclosing._span) if enclosing._span else None
+            else:
+                context = EventGraph._event_context(self)
             span = self._recorder.tracer.start_span(
                 f"invoke_agent {name}",
                 context=context,
@@ -332,8 +346,11 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                 message_id = self._record_message(sender=enclosing, receiver=run, content=input)
                 if message_id:
                     run._next_parents.append(message_id)
-            elif origin is not None:
-                run._next_origins.append(origin)
+            else:
+                if link is not None:
+                    run._next_parents += link.parents
+                if origin is not None:
+                    run._next_origins.append(origin)
         except Exception:
             log.warning("wake: failed to record handoff", exc_info=True)
         return run
@@ -394,9 +411,13 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             next_parents, next_origins = run._take_next()
             parents = next_parents + parents
             origins = origins + [o for o in next_origins if o not in origins]
+        else:
+            parents = self._take_linked(parent_run_id) + parents
         context = self._context_for(parent_run_id)
         if context is None and run is not None and run._span is not None:
             context = trace.set_span_in_context(run._span)
+        if context is None:
+            context = EventGraph._event_context(self)
         trace_id = trace.get_current_span(context).get_span_context().trace_id if context else None
         if trace_id:
             if text:
@@ -485,6 +506,34 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             tool_call_id = pending["tool_call_id"] or getattr(output, "tool_call_id", None)
             if tool_call_id:
                 self._result_by_tool_call[tool_call_id] = pending["event_id"]
+
+    def _root_of(self, run_id: UUID) -> UUID:
+        """The top level run this one is part of. Call with the lock held."""
+        for _ in range(1000):
+            parent = self._parent_run.get(run_id)
+            if parent is None:
+                break
+            run_id = parent
+        return run_id
+
+    def _is_linked(self, parent_run_id: UUID | None) -> bool:
+        if parent_run_id is None:
+            return links.current() is not None
+        with self._lock:
+            return self._root_of(parent_run_id) in self._linked
+
+    def _take_linked(self, parent_run_id: UUID | None) -> list[str]:
+        """What started this event's top level run, if it's the run's first event."""
+        if parent_run_id is None:
+            # A call with no run around it is a top level run of its own.
+            link = links.current()
+            return list(link.parents) if link is not None else []
+        with self._lock:
+            entry = self._linked.get(self._root_of(parent_run_id))
+            if entry is None or entry["taken"]:
+                return []
+            entry["taken"] = True
+            return list(entry["parents"])
 
     def _context_for(self, parent_run_id: UUID | None):
         """Nest an event under the closest enclosing span this handler opened."""

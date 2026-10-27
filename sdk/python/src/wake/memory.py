@@ -107,7 +107,7 @@ class Memory:
         parents: list[str] = []
         link = links.current()
         if link is not None:
-            parents.append(link.event_id)
+            parents += link.parents
         if trace_id:
             parents += h._matching_outputs(trace_id, content)
         parents = list(dict.fromkeys(parents))

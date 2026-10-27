@@ -114,6 +114,30 @@ async with streamable_http_client(url, http_client=http_client()) as (read, writ
 
 For any other outgoing call, `wake.links.headers()` returns the headers for the current event, or `{}` outside a recorded tool call.
 
+## Messages between agents (A2A)
+
+When one agent sends another a message, link it so the receiver's steps join the sender's trace and descend from the step that sent it. With the a2a-sdk, send from inside a recorded tool call with Wake's HTTP client, and link the message:
+
+```python
+from wake import a2a as wake_a2a
+
+client = await create_client(url, ClientConfig(httpx_client=wake_a2a.http_client()))
+message = wake_a2a.link(new_text_message(question, role=Role.ROLE_USER))
+async for reply in client.send_message(SendMessageRequest(message=message)):
+    ...
+```
+
+On the receiving side, handle the message inside `received`:
+
+```python
+class Researcher(AgentExecutor):
+    async def execute(self, context, event_queue):
+        with wake_a2a.received(context):
+            answer = await agent.run(context.get_user_input())
+```
+
+A run started inside the block is linked whatever records it: LangChain or LangGraph, the OpenAI Agents SDK or the Claude Agent SDK. Its first step's parent is the proxy's record of the message when the message went through agentgateway, or else the sender's tool call. For other servers, pass the request's headers and the message's metadata to `wake.links.received(headers=..., metadata=...)`. The same holds for a run started inside a recorded tool call: it descends from the tool call. Install with the `a2a` extra.
+
 ## When the collector is down
 
 Events go out from a bounded queue on a background thread, so the agent never waits on the collector. Events that can't be sent are dropped and counted:
