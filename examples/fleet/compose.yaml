@@ -1,53 +1,97 @@
 # The reference fleet on the staging recorder (deploy/compose.yaml): three agents on three
-# frameworks and the tools they call, all through agentgateway, all recorded by Wake.
-# run.sh brings it up and sends one request through it. See README.md.
+# frameworks and the tools they call, all through agentgateway, all recorded by Wake, with
+# stand-ins for the identity provider and E2B the brake pulls levers on. run.sh brings it up
+# and sends one request through it. See README.md.
 name: wake-fleet
 
 include:
   - path: ../../deploy/compose.yaml
     env_file: fleet.env
 
-x-fleet: &fleet
+x-image: &image
   image: wake-fleet:dev
   build:
     context: ../..
     dockerfile: examples/fleet/Dockerfile
-  environment:
-    WAKE_ENDPOINT: https://collector:4318
-    OTEL_EXPORTER_OTLP_CERTIFICATE: /etc/wake/ca/bundle.pem
-    FLEET_GATEWAY: http://agentgateway:3000
-    FLEET_MODELS: ${FLEET_MODELS:-scripted}
-    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-  # Agents get the CA certificate to reach the collector over TLS, and nothing else from
-  # the recorder: no keys, no identity.
-  volumes: [ca:/etc/wake/ca:ro]
-  depends_on:
-    fleet-ca: {condition: service_completed_successfully}
-    collector: {condition: service_started}
 
 x-listening: &listening
   interval: 2s
   timeout: 2s
   retries: 30
 
+x-fleet: &fleet
+  <<: *image
+  environment:
+    WAKE_ENDPOINT: https://collector:4318
+    OTEL_EXPORTER_OTLP_CERTIFICATE: /etc/wake/ca/bundle.pem
+    FLEET_GATEWAY: http://agentgateway:3000
+    FLEET_IDP: http://idp:8080/oauth2/v1
+    FLEET_E2B: http://e2b:8080
+    WAKE_MEMORY_RULES: http://wake-proxy:9003
+    FLEET_MODELS: ${FLEET_MODELS:-scripted}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  # Agents get the CA certificate to reach the collector over TLS, and nothing else from
+  # the recorder: no keys, no identity. Each also gets its own credentials from the
+  # stand-ins, in a volume no other service but the stand-in issuing them mounts.
+  volumes: [ca:/etc/wake/ca:ro]
+  depends_on:
+    fleet-ca: {condition: service_completed_successfully}
+    collector: {condition: service_started}
+    idp: {condition: service_healthy}
+
+# The stand-ins start as root to write what they issue into each holder's volume, then run
+# as nobody. Their own state, revocations and pauses included, is kept in a volume of theirs.
+x-standin: &standin
+  <<: *image
+  user: "0"
+  healthcheck:
+    <<: *listening
+    test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8080))"]
+
 services:
   # One-shot: copies just the CA certificate out of the identity volume, which also holds
   # the proxy's private key.
   fleet-ca:
-    image: wake-fleet:dev
-    build:
-      context: ../..
-      dockerfile: examples/fleet/Dockerfile
+    <<: *image
     user: "0"
     entrypoint: ["sh", "-c", "cp /etc/wake/identity/bundle.pem /etc/wake/ca/bundle.pem && chmod 0444 /etc/wake/ca/bundle.pem"]
     volumes: [identity:/etc/wake/identity:ro, ca:/etc/wake/ca]
     depends_on:
       identity: {condition: service_completed_successfully}
 
+  # A stand-in for a design partner's identity provider, such as Okta, until a partner's
+  # or an Okta developer org takes its place (fleet/standins/oauth.py). It issues each agent
+  # a refresh token, gives the tools server a client to introspect tokens with, and gives
+  # the brake its client secret, an API token for global token revocation, and a copy of
+  # each agent's refresh token.
+  idp:
+    <<: *standin
+    command: ["python", "-m", "fleet.standins.oauth"]
+    environment:
+      STANDIN_ISSUER: http://idp:8080
+    volumes:
+      - idp-state:/var/lib/standin
+      - brake-secrets:/out/brake
+      - tools-secrets:/out/tools
+      - support-secrets:/out/support
+      - research-secrets:/out/research
+      - billing-secrets:/out/billing
+
+  # A stand-in for E2B, until a partner's account or one of ours takes its place
+  # (fleet/standins/e2b.py). Billing keeps a sandbox there, and the brake can freeze it.
+  e2b:
+    <<: *standin
+    command: ["python", "-m", "fleet.standins.e2b"]
+    volumes:
+      - e2b-state:/var/lib/standin
+      - brake-secrets:/out/brake
+      - billing-secrets:/out/billing
+
   tools:
     <<: *fleet
     command: ["python", "-m", "fleet.tools"]
+    volumes: [ca:/etc/wake/ca:ro, tools-secrets:/etc/fleet/secrets:ro]
     healthcheck:
       <<: *listening
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 3001))"]
@@ -55,13 +99,23 @@ services:
   research:
     <<: *fleet
     command: ["python", "-m", "fleet.research"]
+    volumes: [ca:/etc/wake/ca:ro, research-secrets:/etc/fleet/secrets:ro]
     healthcheck:
       <<: *listening
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9101))"]
 
+  # Billing's memory adapter fetches the brake's quarantines from wake-proxy, and it keeps
+  # a sandbox at E2B.
   billing:
     <<: *fleet
     command: ["python", "-m", "fleet.billing"]
+    volumes: [ca:/etc/wake/ca:ro, billing-secrets:/etc/fleet/secrets:ro]
+    depends_on:
+      fleet-ca: {condition: service_completed_successfully}
+      collector: {condition: service_started}
+      wake-proxy: {condition: service_started}
+      idp: {condition: service_healthy}
+      e2b: {condition: service_healthy}
     healthcheck:
       <<: *listening
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9102))"]
@@ -71,8 +125,10 @@ services:
     <<: *fleet
     command: ["python", "-m", "fleet.support"]
     profiles: [run]
+    volumes: [ca:/etc/wake/ca:ro, support-secrets:/etc/fleet/secrets:ro]
     depends_on:
       fleet-ca: {condition: service_completed_successfully}
+      idp: {condition: service_healthy}
       agentgateway: {condition: service_started}
       tools: {condition: service_healthy}
       research: {condition: service_healthy}
@@ -80,3 +136,13 @@ services:
 
 volumes:
   ca:
+  idp-state:
+  e2b-state:
+  # Each holder's credentials from the stand-ins. brake-secrets is what the brake gets: the
+  # stand-ins' admin credentials and its copy of each agent's refresh token. Nothing in the
+  # fleet mounts it; the brake does, in a game day.
+  brake-secrets:
+  tools-secrets:
+  support-secrets:
+  research-secrets:
+  billing-secrets:
