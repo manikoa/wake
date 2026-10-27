@@ -6,6 +6,8 @@ package wakelogexporter
 import (
 	"context"
 	"errors"
+	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configoptional"
@@ -13,7 +15,9 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
 
 	"github.com/manikoa/wake/collector/event"
@@ -27,6 +31,11 @@ type Config struct {
 	// KeyFile holds the note format private key that signs the log's checkpoints.
 	KeyFile string `mapstructure:"key_file"`
 
+	// TimeoutConfig bounds each attempt to append a request (`timeout`). An append waits
+	// for Tessera to sequence its batch and write it to disk, and one that times out is
+	// retried, so leave it room.
+	TimeoutConfig exporterhelper.TimeoutConfig `mapstructure:",squash"`
+
 	// QueueConfig is the collector's standard sending queue. The receiver answers once
 	// an event is queued, and appending to the log happens behind the queue, so a slow
 	// or failing log never holds an SDK's request open. Set `storage` to a file_storage
@@ -34,7 +43,10 @@ type Config struct {
 	// to the SDK then survive a crash or restart, where an in memory queue loses them and
 	// nothing upstream knows to send them again.
 	QueueConfig configoptional.Optional[exporterhelper.QueueBatchConfig] `mapstructure:"sending_queue"`
-	// RetryConfig is the collector's standard retry for failed appends.
+	// RetryConfig is the collector's standard retry for failed appends. By default it
+	// never gives up (max_elapsed_time 0): while the log is down the queue fills, then the
+	// receiver refuses new events, so the SDKs see it and count what they drop. Events a
+	// retry with a time limit gives up on are counted in wake_log_dropped_events.
 	RetryConfig configretry.BackOffConfig `mapstructure:"retry_on_failure"`
 }
 
@@ -58,9 +70,14 @@ func NewFactory() exporter.Factory {
 // createDefaultConfig queues in memory, because a persistent queue needs a storage
 // extension the config has to name. config.yaml turns on the persistent queue.
 func createDefaultConfig() component.Config {
+	timeout := exporterhelper.NewDefaultTimeoutConfig()
+	timeout.Timeout = 30 * time.Second
+	retry := configretry.NewDefaultBackOffConfig()
+	retry.MaxElapsedTime = 0
 	return &Config{
-		QueueConfig: configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
-		RetryConfig: configretry.NewDefaultBackOffConfig(),
+		TimeoutConfig: timeout,
+		QueueConfig:   configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		RetryConfig:   retry,
 	}
 }
 
@@ -71,19 +88,60 @@ func createTraces(ctx context.Context, set exporter.Settings, cfg component.Conf
 func newTraces(ctx context.Context, set exporter.Settings, cfg *Config, open func(wakelog.Config) (appender, error)) (exporter.Traces, error) {
 	dropped, err := set.MeterProvider.Meter("github.com/manikoa/wake/collector/exporter/wakelogexporter").Int64Counter(
 		"wake_log_dropped_events",
-		metric.WithDescription("Events that can't go in the signed log, even without their payload, and were dropped"),
+		metric.WithDescription("Events that never reached the signed log, by reason: unloggable (too large for an entry even without their payload, or no canonical bytes) or retries_exhausted (retry_on_failure gave up)"),
 		metric.WithUnit("{event}"),
 	)
 	if err != nil {
 		return nil, err
 	}
 	e := &logExporter{cfg: cfg, open: open, logger: set.Logger, dropped: dropped}
-	return exporterhelper.NewTraces(ctx, set, cfg, e.push,
+	// The retry runs in an exporterhelper of its own, behind the queue's, so the exporter
+	// sees when it gives up and can count what's lost. Its own telemetry is off; the
+	// queue's reports for both.
+	retrySet := set
+	retrySet.MeterProvider = noop.NewMeterProvider()
+	retry, err := exporterhelper.NewTraces(ctx, retrySet, cfg, e.push,
+		exporterhelper.WithTimeout(cfg.TimeoutConfig),
+		exporterhelper.WithRetry(cfg.RetryConfig),
+	)
+	if err != nil {
+		return nil, err
+	}
+	noTimeout := exporterhelper.NewDefaultTimeoutConfig()
+	noTimeout.Timeout = 0
+	queue, err := exporterhelper.NewTraces(ctx, set, cfg, e.sendThrough(retry),
 		exporterhelper.WithStart(e.start),
 		exporterhelper.WithShutdown(e.shutdown),
 		exporterhelper.WithQueue(cfg.QueueConfig),
-		exporterhelper.WithRetry(cfg.RetryConfig),
+		exporterhelper.WithTimeout(noTimeout),
 	)
+	if err != nil {
+		return nil, err
+	}
+	return &traces{Traces: queue, retry: retry, stopping: &e.stopping}, nil
+}
+
+// traces is the queue in front of the retry, started and stopped in the order a single
+// exporterhelper uses.
+type traces struct {
+	exporter.Traces
+	retry    exporter.Traces
+	stopping *atomic.Bool
+}
+
+func (t *traces) Start(ctx context.Context, host component.Host) error {
+	if err := t.retry.Start(ctx, host); err != nil {
+		return err
+	}
+	return t.Traces.Start(ctx, host)
+}
+
+// Shutdown stops retrying first, so the queue's consumers return, and a persistent queue
+// keeps what they held for the next start.
+func (t *traces) Shutdown(ctx context.Context) error {
+	t.stopping.Store(true)
+	err := t.retry.Shutdown(ctx)
+	return errors.Join(err, t.Traces.Shutdown(ctx))
 }
 
 // appender is the part of the signed log the exporter uses.
@@ -98,11 +156,12 @@ func openLog(cfg wakelog.Config) (appender, error) {
 }
 
 type logExporter struct {
-	cfg     *Config
-	open    func(wakelog.Config) (appender, error)
-	log     appender
-	logger  *zap.Logger
-	dropped metric.Int64Counter
+	cfg      *Config
+	open     func(wakelog.Config) (appender, error)
+	log      appender
+	logger   *zap.Logger
+	dropped  metric.Int64Counter
+	stopping atomic.Bool
 }
 
 func (e *logExporter) start(context.Context, component.Host) error {
@@ -155,11 +214,36 @@ func (e *logExporter) push(ctx context.Context, td ptrace.Traces) error {
 	return err
 }
 
+// sendThrough returns the queue's consumer: it hands a request to the retry, and counts
+// the events in it when the retry gives up, since the queue then drops them. Errors
+// while shutting down aren't drops: a persistent queue keeps the request.
+func (e *logExporter) sendThrough(retry exporter.Traces) func(context.Context, ptrace.Traces) error {
+	return func(ctx context.Context, td ptrace.Traces) error {
+		err := retry.ConsumeTraces(ctx, td)
+		if err == nil || e.stopping.Load() {
+			return err
+		}
+		n := 0
+		for _, rs := range td.ResourceSpans().All() {
+			for _, ss := range rs.ScopeSpans().All() {
+				for _, span := range ss.Spans().All() {
+					if event.IsEvent(span) {
+						n++
+					}
+				}
+			}
+		}
+		e.logger.Error("Dropping events the signed log never took", zap.Int("events", n), zap.Error(err))
+		e.dropped.Add(ctx, int64(n), metric.WithAttributes(attribute.String("reason", "retries_exhausted")))
+		return err
+	}
+}
+
 // drop logs and counts an event that can't be logged, such as one too large for an
 // entry even without its payload.
 func (e *logExporter) drop(ctx context.Context, span ptrace.Span, err error) {
 	id, _ := span.Attributes().Get("wake.event.id")
 	e.logger.Error("Dropping an event that can't go in the signed log",
 		zap.String("wake.event.id", id.Str()), zap.Error(err))
-	e.dropped.Add(ctx, 1)
+	e.dropped.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", "unloggable")))
 }

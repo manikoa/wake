@@ -36,7 +36,7 @@ cargo run -- serve --key keys/proxy.key --cert keys/proxy.pem \
 agentgateway -f agentgateway.yaml    # in another terminal; agentgateway v1.6.0
 ```
 
-`dev-identity` writes a stand-in trust bundle and a certificate signed by it, for local development only. In production SPIRE issues short-lived SVIDs. Add the bundle to the collector's `trust_bundles` so it accepts the proxy's signatures.
+`dev-identity` writes a stand-in trust bundle and a certificate signed by it, for local development only. In production SPIRE issues short-lived SVIDs. Add the bundle to the collector's `trust_bundles`, and the proxy's SPIFFE ID to its `trusted_signers` under `proxy`, so it accepts the proxy's signatures.
 
 wake-proxy must be reachable only by agentgateway, over loopback or a pod-local socket. Anything that can call it can get events signed.
 

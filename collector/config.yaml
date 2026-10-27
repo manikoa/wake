@@ -6,6 +6,9 @@ extensions:
   file_storage:
     directory: data/queue
     create_directory: true
+  # Answers on http://localhost:13133/ while the collector is up.
+  health_check:
+    endpoint: localhost:13133
 
 receivers:
   otlp:
@@ -20,6 +23,11 @@ processors:
     # the proxy, must chain to. For local development: proxy/keys/bundle.pem from
     # wake-proxy dev-identity.
     trust_bundles: []
+    # Who may sign each capture (wake.capture): SPIFFE IDs, or prefixes ending in "/".
+    # A bundle vouches for every workload in its trust domain, agents included, so an
+    # SVID signature only counts for a capture listed here. Needed with trust_bundles.
+    trusted_signers:
+      proxy: [spiffe://wake.local/proxy]
 
 exporters:
   wakelog:
@@ -30,11 +38,26 @@ exporters:
     # arrived still reaches the log if the collector crashes or restarts.
     sending_queue:
       storage: file_storage
+    # Retries never give up by default: while the log is down the queue fills and the
+    # receiver refuses new events, which the SDKs count as dropped. Each attempt to
+    # append has this long.
+    timeout: 30s
 
 service:
-  extensions: [file_storage]
+  extensions: [file_storage, health_check]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [wakesign]
       exporters: [wakelog]
+  # The collector's own metrics, for Prometheus at http://localhost:8888/metrics: the
+  # otelcol_* pipeline metrics, and wake_log_dropped_events for events that never
+  # reached the signed log. Page on any of those.
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: localhost
+                port: 8888

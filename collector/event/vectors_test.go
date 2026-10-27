@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -14,7 +15,8 @@ import (
 
 // Canonical bytes are rebuilt in Go to check signatures made elsewhere, such as by the
 // Rust proxy. testdata/canonical.json holds spans and their exact canonical bytes, so
-// every other signer can test that it produces the same bytes. Regenerate it with
+// every other signer can test that it produces the same bytes. A vector with "invalid"
+// has no canonical bytes: every signer must refuse to sign it. Regenerate the file with
 // WAKE_WRITE_VECTORS=1 go test ./event/.
 
 type vectorAttr struct {
@@ -23,6 +25,9 @@ type vectorAttr struct {
 	Int     *int64   `json:"int,omitempty"`
 	Bool    *bool    `json:"bool,omitempty"`
 	Strings []string `json:"strings,omitempty"`
+	// Double is a float64 written with strconv, so it can be NaN or ±Inf, which JSON
+	// numbers can't.
+	Double *string `json:"double,omitempty"`
 }
 
 type vector struct {
@@ -32,12 +37,15 @@ type vector struct {
 	Start      uint64       `json:"start_time_unix_nano"`
 	End        uint64       `json:"end_time_unix_nano"`
 	Attributes []vectorAttr `json:"attributes"`
-	Canonical  string       `json:"canonical"`
+	Canonical  string       `json:"canonical,omitempty"`
+	// Invalid says why the span has no canonical bytes.
+	Invalid string `json:"invalid,omitempty"`
 }
 
 func str(k, v string) vectorAttr       { return vectorAttr{Key: k, String: &v} }
 func num(k string, v int64) vectorAttr { return vectorAttr{Key: k, Int: &v} }
 func flag(k string, v bool) vectorAttr { return vectorAttr{Key: k, Bool: &v} }
+func double(k, v string) vectorAttr    { return vectorAttr{Key: k, Double: &v} }
 func strs(k string, v ...string) vectorAttr {
 	if v == nil {
 		v = []string{}
@@ -50,6 +58,12 @@ func vectors() []vector {
 		return vector{Name: name, TraceID: "0102030405060708090a0b0c0d0e0f10", SpanID: "1112131415161718",
 			Start: 1761552000000000000, End: 1761552000123456789, Attributes: attrs}
 	}
+	invalid := func(name, why string, attrs ...vectorAttr) vector {
+		v := base(name, attrs...)
+		v.Invalid = why
+		return v
+	}
+	const notFinite = "a double that isn't finite has no JSON form"
 	return []vector{
 		base("proxy tool call",
 			str("wake.event.id", "6f1c2a9e-1b7d-4f43-9a51-3c1f0a2b7d10"),
@@ -68,6 +82,9 @@ func vectors() []vector {
 			str("wake.signer", "spiffe://wake.local/proxy"),
 			str("wake.signature", "MEUCIQ=="),
 			str("wake.signature.certificate", "MIIB"),
+			flag("wake.signature.valid", true),
+			str("wake.signature.error", "set by the collector"),
+			num("wake.received_unix_nano", 1761552000500000000),
 			str("http.url", "not signed"),
 		),
 		base("escaping",
@@ -91,6 +108,9 @@ func vectors() []vector {
 			strs("wake.empty_list"),
 			str("wake.A", "uppercase sorts first"),
 		),
+		invalid("NaN", notFinite, str("wake.event.id", "e"), double("gen_ai.request.temperature", "NaN")),
+		invalid("infinity", notFinite, str("wake.event.id", "e"), double("gen_ai.request.temperature", "+Inf")),
+		invalid("negative infinity", notFinite, str("wake.event.id", "e"), double("wake.score", "-Inf")),
 	}
 }
 
@@ -113,6 +133,12 @@ func spanOf(v vector) ptrace.Span {
 			attrs.PutInt(a.Key, *a.Int)
 		case a.Bool != nil:
 			attrs.PutBool(a.Key, *a.Bool)
+		case a.Double != nil:
+			d, err := strconv.ParseFloat(*a.Double, 64)
+			if err != nil {
+				panic(err)
+			}
+			attrs.PutDouble(a.Key, d)
 		default:
 			list := attrs.PutEmptySlice(a.Key)
 			for _, s := range a.Strings {
@@ -127,8 +153,11 @@ func TestCanonicalVectors(t *testing.T) {
 	vs := vectors()
 	for i := range vs {
 		canonical, err := Canonical(spanOf(vs[i]))
-		if err != nil {
-			t.Fatal(err)
+		switch {
+		case vs[i].Invalid != "" && err == nil:
+			t.Fatalf("vector %q: canonical bytes for a span that has none: %s", vs[i].Name, canonical)
+		case vs[i].Invalid == "" && err != nil:
+			t.Fatalf("vector %q: %v", vs[i].Name, err)
 		}
 		vs[i].Canonical = string(canonical)
 	}

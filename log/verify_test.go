@@ -98,3 +98,25 @@ func TestVerifyRejectsATamperedLog(t *testing.T) {
 		t.Fatal("verified against another log's key")
 	}
 }
+
+// A reader holding a checkpoint asks for the partial bundle it covers. Once the bundle
+// fills, Tessera deletes the partial one, and the full bundle starts with the same entries.
+func TestVerifyFallsBackToTheFullBundle(t *testing.T) {
+	signer, trusted := testSigner(t, "collector")
+	dir, logKey := writeLog(t, [][]byte{
+		signedEntry(t, signer, eventFor("one")),
+		signedEntry(t, signer, eventFor("two")),
+		signedEntry(t, signer, eventFor("three")),
+	})
+	partial := filepath.Join(dir, layout.EntriesPath(0, 3))
+	if err := os.Rename(partial, filepath.Join(dir, layout.EntriesPath(0, 0))); err != nil {
+		t.Fatal(err)
+	}
+	checked, err := Verify(context.Background(), DirReader(dir), logKey, Trust{Keys: trusted}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked.Size != 3 || len(checked.Unsigned) != 0 {
+		t.Fatalf("checked = %+v", checked)
+	}
+}
