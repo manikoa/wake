@@ -24,6 +24,9 @@ langgraph = [
 mcp = [
     "mcp>=1.20",
 ]
+openai-agents = [
+    "openai-agents>=0.20",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -37,5 +40,6 @@ dev = [
     "langchain-mcp-adapters>=0.3.2",
     "langgraph>=1.2.18",
     "mcp>=1.30.0",
+    "openai-agents>=0.24.0",
     "pytest>=9.1.1",
 ]
