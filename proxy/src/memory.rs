@@ -3,7 +3,7 @@
 //! can reach it without reaching the control API.
 //!
 //! ```text
-//! GET /v1/memory?agent=<id>   {"version", "locked_by", "quarantines": [...]}
+//! GET /v1/memory?agent=<id>   {"version", "locked_by", "hidden_by", "quarantines": [...]}
 //! ```
 //!
 //! Each fetch is noted, and the brake reads the notes from the control API to confirm an
