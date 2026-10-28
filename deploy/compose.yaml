@@ -47,15 +47,24 @@ services:
       - keys:/etc/wake/keys:ro
       - identity:/etc/wake/identity:ro
       - data:/var/lib/wake
-    ports: ["4318:4318"]
+    # OTLP, then the health check and the collector's metrics for Prometheus on this host.
+    # On this network they're collector:13133 and collector:8888/metrics.
+    ports: ["4318:4318", "127.0.0.1:13133:13133", "127.0.0.1:8888:8888"]
     restart: unless-stopped
 
+  # wake-proxy runs in agentgateway's network namespace, as a sidecar shares its pod, and
+  # serves the hooks only on 127.0.0.1:9001, so nothing but agentgateway can reach them: a
+  # caller that could would get its own events signed as the proxy's. The control API
+  # (9002) and the memory rules (9003) are reached through agentgateway's alias,
+  # wake-proxy. If agentgateway is recreated, recreate wake-proxy with it.
   wake-proxy:
     <<: *proxy-image
+    network_mode: "service:agentgateway"
     depends_on:
       identity: {condition: service_completed_successfully}
       collector: {condition: service_started}
-    command: ["serve", "--listen", "0.0.0.0:9001",
+      agentgateway: {condition: service_started}
+    command: ["serve", "--listen", "127.0.0.1:9001",
               "--key", "/etc/wake/identity/proxy.key", "--cert", "/etc/wake/identity/proxy.pem",
               "--collector", "https://collector:4318", "--collector-ca", "/etc/wake/identity/bundle.pem",
               "--state-dir", "/var/lib/wake-proxy",
@@ -67,21 +76,31 @@ services:
       - identity:/etc/wake/identity:ro
       # The halts in force, kept so a restart doesn't lift one.
       - proxy-state:/var/lib/wake-proxy
-    # Not published. Only agentgateway may reach 9001, and only the brake, which alone has
-    # the SVID the control API checks, may use 9002. Memory adapters read their quarantine
-    # rules from 9003.
+    # Not published. Only the brake, which alone has the SVID the control API checks, may
+    # use 9002. Memory adapters read their quarantine rules from 9003.
     restart: unless-stopped
 
   agentgateway:
     image: cr.agentgateway.dev/agentgateway:v1.6.0
-    depends_on: [wake-proxy]
     command: ["-f", "/etc/agentgateway/config.yaml"]
+    # Its network namespace is wake-proxy's too (see wake-proxy), so it answers to both names.
+    # It's on the control network so the brake can reach wake-proxy's control API there.
+    networks:
+      default: {aliases: [wake-proxy]}
+      control: {aliases: [wake-proxy]}
     # WAKE_GATEWAY_CONFIG swaps in another config, as the reference fleet does.
     volumes: ["${WAKE_GATEWAY_CONFIG:-./agentgateway.yaml}:/etc/agentgateway/config.yaml:ro"]
     ports: ["3000:3000"]
     # Lets the example backends in agentgateway.yaml reach services on the host.
     extra_hosts: ["host.docker.internal:host-gateway"]
     restart: unless-stopped
+
+networks:
+  # Agents and everything they call: agentgateway, the collector.
+  default:
+  # For what agents must never reach, such as the brake (manikoa/wake-platform). No agent
+  # joins it; agentgateway does, so the brake reaches wake-proxy's control API.
+  control:
 
 volumes:
   keys:

@@ -211,3 +211,27 @@ func TestEntryTooLargeWithoutItsPayload(t *testing.T) {
 		t.Errorf("NewEntryWithPayload = %v, want ErrEntryTooLarge", err)
 	}
 }
+
+// A crash after an earlier call linked the payload, and before it synced the directory,
+// can lose the link. Storing the payload again syncs the directory before the caller
+// appends an entry that points to it.
+func TestPutPayloadSyncsWhenThePayloadIsAlreadyThere(t *testing.T) {
+	l, root := openTestLog(t)
+	payload := []byte("an email too large for its entry")
+	if err := l.PutPayload(context.Background(), payload); err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	sync := syncDir
+	syncDir = func(dir string) error {
+		synced = append(synced, dir)
+		return sync(dir)
+	}
+	t.Cleanup(func() { syncDir = sync })
+	if err := l.PutPayload(context.Background(), payload); err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(root, "payload", "sha256"); len(synced) != 1 || synced[0] != want {
+		t.Fatalf("synced %v, want [%s]", synced, want)
+	}
+}

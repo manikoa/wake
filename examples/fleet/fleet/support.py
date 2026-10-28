@@ -52,7 +52,7 @@ def remember(note: str) -> str:
 async def crm_tools() -> list:
     client = MultiServerMCPClient(
         {"fleet": {"url": f"{common.GATEWAY}/mcp", "transport": "streamable_http",
-                   "headers": {common.AGENT_HEADER: NAME}}},
+                   "headers": await common.tool_headers(NAME)}},
         tool_interceptors=[link_interceptor],
     )
     return [t for t in await client.get_tools() if t.name.endswith("lookup_order")]

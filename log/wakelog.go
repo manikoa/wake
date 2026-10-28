@@ -66,10 +66,18 @@ func Open(cfg Config) (*Log, error) {
 		cancel()
 		return nil, fmt.Errorf("open log storage: %w", err)
 	}
+	// Antispam remembers recent entries, so one appended again lands once and Add returns
+	// its first index. The collector retries a whole request when only part of it was
+	// appended, and those retries are what this catches. Only Tessera's in memory layer
+	// is used: its persistent layer (Badger) can't be closed, so the log couldn't be
+	// opened again in the same process, as the collector does when it reloads its config.
+	// After a restart the log has forgotten, so an entry the collector's queue replays
+	// after a crash can still land twice, as an identical copy.
 	opts := tessera.NewAppendOptions().
 		WithCheckpointSigner(signer).
 		WithCheckpointInterval(interval).
-		WithBatching(256, 100*time.Millisecond)
+		WithBatching(256, 100*time.Millisecond).
+		WithAntispam(tessera.DefaultAntispamInMemorySize, nil)
 	appender, shutdown, _, err := tessera.NewAppender(ctx, driver, opts)
 	if err != nil {
 		cancel()
@@ -84,19 +92,26 @@ func Open(cfg Config) (*Log, error) {
 	return &Log{dir: cfg.Dir, appender: appender, shutdown: shutdown, cancel: cancel}, nil
 }
 
-// Add appends entries and waits until each has a durable index in the log.
+// Add appends entries and waits until each has a durable index in the log. An entry
+// the log already holds from recently isn't appended again; its index is the first one.
 func (l *Log) Add(ctx context.Context, entries [][]byte) ([]uint64, error) {
 	futures := make([]tessera.IndexFuture, len(entries))
 	for i, entry := range entries {
 		futures[i] = l.appender.Add(ctx, tessera.NewEntry(entry))
 	}
+	// Wait for every entry, even after one fails: antispam forgets a failed entry once its
+	// result is read, so a retry appends it instead of getting the old failure back.
 	indexes := make([]uint64, len(entries))
+	var firstErr error
 	for i, future := range futures {
 		index, err := future()
-		if err != nil {
-			return nil, fmt.Errorf("append entry: %w", err)
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("append entry: %w", err)
 		}
 		indexes[i] = index.Index
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return indexes, nil
 }
@@ -111,12 +126,14 @@ func (l *Log) PutPayload(_ context.Context, payload []byte) error {
 		return err
 	}
 	path := filepath.Join(l.dir, filepath.FromSlash(rel))
+	dir := filepath.Dir(path)
 	if _, err := os.Stat(path); err == nil {
-		return nil
+		// An earlier call may have linked it and crashed before syncing the directory,
+		// so sync it before the caller appends an entry that points to it.
+		return syncDir(dir)
 	}
 	// As Tessera writes tiles: a synced temporary file, linked into place so a reader
 	// never sees half a payload, then the directory synced so the link survives a crash.
-	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-")
 	if err != nil {
 		return fmt.Errorf("store payload: %w", err)
@@ -159,7 +176,9 @@ func makePayloadDir(root string) error {
 	return nil
 }
 
-func syncDir(dir string) error {
+// syncDir syncs a directory, so the names linked into it survive a crash. A variable so
+// tests can see it called.
+var syncDir = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("sync %s: %w", dir, err)

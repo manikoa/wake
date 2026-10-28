@@ -5,13 +5,16 @@ extensions:
   file_storage:
     directory: /var/lib/wake/queue
     create_directory: true
+  # Answers on :13133 while the collector is up.
+  health_check:
+    endpoint: 0.0.0.0:13133
 
 receivers:
   otlp:
     protocols:
       http:
         endpoint: 0.0.0.0:4318
-        # SDKs send over TLS; give them the CA with OTEL_EXPORTER_OTLP_CERTIFICATE.
+        # SDKs send over TLS; give them the CA with WAKE_CA_FILE.
         tls:
           cert_file: ${env:WAKE_TLS_CERT:-/etc/wake/identity/collector-tls.pem}
           key_file: ${env:WAKE_TLS_KEY:-/etc/wake/identity/collector-tls.key}
@@ -22,6 +25,10 @@ processors:
     # The SPIRE trust bundle the proxy's SVIDs chain to.
     trust_bundles:
       - ${env:WAKE_TRUST_BUNDLE:-/etc/wake/identity/bundle.pem}
+    # Only the proxy may sign proxy events. Agents' SVIDs chain to the same bundle.
+    trusted_signers:
+      proxy:
+        - ${env:WAKE_PROXY_ID:-spiffe://wake.local/proxy}
 
 exporters:
   wakelog:
@@ -29,11 +36,22 @@ exporters:
     key_file: /etc/wake/keys/log.key
     sending_queue:
       storage: file_storage
+    timeout: 30s
 
 service:
-  extensions: [file_storage]
+  extensions: [file_storage, health_check]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [wakesign]
       exporters: [wakelog]
+  # Prometheus scrapes the collector's own metrics on :8888/metrics, including
+  # wake_log_dropped_events.
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

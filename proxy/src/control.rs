@@ -24,8 +24,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -35,6 +34,7 @@ use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{self, RootCertStore, ServerConfig};
 
 use crate::halts::{self, Halts, Scope, Selection};
+use crate::listen;
 use crate::signer::spiffe_id;
 
 /// What the control API needs to serve mTLS.
@@ -202,24 +202,20 @@ pub async fn serve(
     let acceptor = tls_acceptor(&tls)?;
     let brake_id = Arc::new(tls.brake_id);
     let app = router(halts);
+    let limit = listen::limit();
     tokio::pin!(shutdown);
     loop {
-        let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(error = %e, "control API: accept failed");
-                    continue;
-                }
-            },
+        let (stream, peer, permit) = tokio::select! {
+            accepted = listen::accept(&listener, &limit, "control") => accepted,
             _ = &mut shutdown => return Ok(()),
         };
         let acceptor = acceptor.clone();
         let brake_id = brake_id.clone();
         let app = app.clone();
         tokio::spawn(async move {
-            let Ok(stream) = acceptor.accept(stream).await else {
-                tracing::warn!(%peer, "control API: TLS handshake failed");
+            let _permit = permit;
+            let Ok(Ok(stream)) = tokio::time::timeout(listen::HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await else {
+                tracing::warn!(%peer, "control API: TLS handshake failed or timed out");
                 return;
             };
             let caller = stream
@@ -233,10 +229,7 @@ pub async fn serve(
                 return;
             }
             let service = TowerToHyperService::new(app);
-            if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
+            if let Err(e) = listen::http().serve_connection(TokioIo::new(stream), service).await {
                 tracing::debug!(%peer, error = %e, "control API: connection ended");
             }
         });

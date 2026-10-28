@@ -5,7 +5,10 @@ import logging
 import os
 import signal
 import sys
+import time
+from pathlib import Path
 
+import httpx
 import uvicorn
 from a2a.client import ClientConfig, create_client
 from a2a.helpers.proto_helpers import get_message_text, new_text_message
@@ -32,6 +35,10 @@ GATEWAY = os.environ.get("FLEET_GATEWAY", "http://localhost:3000").rstrip("/")
 # Who each agent says it is to the gateway. A stand-in for the SPIFFE ID or JWT the gateway
 # reads in production; see agentgateway.yaml.
 AGENT_HEADER = "x-fleet-agent"
+# The stand-in identity provider (fleet/standins/oauth.py), and where this agent's credentials
+# are: its own volume, which no other agent and not the brake reads.
+IDP = os.environ.get("FLEET_IDP", "http://localhost:8080/oauth2/v1").rstrip("/")
+SECRETS = Path(os.environ.get("FLEET_SECRETS", "/etc/fleet/secrets"))
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 log = logging.getLogger("fleet")
@@ -91,9 +98,43 @@ async def ask(sender: str, receiver: str, text: str) -> str:
         return "\n".join(texts)
 
 
+_access: dict[str, tuple[str, float]] = {}
+
+
+async def access_token(agent: str) -> str:
+    """The agent's access token for the tools, swapped for the refresh token the identity
+    provider issued it, and swapped again a minute before it expires. If the swap fails, as
+    it does once the brake has revoked the refresh token, the last one is sent anyway: the
+    tools server decides whether it's still good."""
+    token, expires = _access.get(agent, ("", 0.0))
+    if time.time() < expires - 60:
+        return token
+    try:
+        refresh = (SECRETS / "refresh-token").read_text().strip()
+        async with httpx.AsyncClient(timeout=10) as http:
+            response = await http.post(f"{IDP}/token", data={
+                "grant_type": "refresh_token", "refresh_token": refresh, "client_id": agent})
+        response.raise_for_status()
+        body = response.json()
+        token = body["access_token"]
+        _access[agent] = (token, time.time() + int(body.get("expires_in", 0)))
+    except (OSError, httpx.HTTPError, KeyError, ValueError) as e:
+        log.warning("%s couldn't get an access token: %s", agent, e)
+    return token
+
+
+async def tool_headers(agent: str) -> dict[str, str]:
+    """What an agent sends with its MCP calls: who it is, for the gateway, and its access
+    token, for the tools server, which agentgateway passes it to."""
+    headers = {AGENT_HEADER: agent}
+    if token := await access_token(agent):
+        headers["authorization"] = f"Bearer {token}"
+    return headers
+
+
 async def call_tool(caller: str, name: str, arguments: dict) -> str:
     """Call one of the fleet's MCP tools through the gateway, linked to the tool call making it."""
-    http = wake_mcp.http_client(headers={AGENT_HEADER: caller})
+    http = wake_mcp.http_client(headers=await tool_headers(caller))
     async with (
         streamable_http_client(f"{GATEWAY}/mcp", http_client=http) as (read, write, _),
         ClientSession(read, write) as session,

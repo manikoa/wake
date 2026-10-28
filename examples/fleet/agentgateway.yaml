@@ -22,7 +22,7 @@ routes:
     a2a: {}
     # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "127.0.0.1:9001"
       failureMode: deny
       protocol:
         grpc:
@@ -31,7 +31,7 @@ routes:
           metadata:
             wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
     extProc:
-      host: "wake-proxy:9001"
+      host: "127.0.0.1:9001"
       failureMode: failOpen
       processingOptions:
         requestHeaderMode: send
@@ -57,7 +57,7 @@ routes:
     a2a: {}
     # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "127.0.0.1:9001"
       failureMode: deny
       protocol:
         grpc:
@@ -66,7 +66,7 @@ routes:
           metadata:
             wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
     extProc:
-      host: "wake-proxy:9001"
+      host: "127.0.0.1:9001"
       failureMode: failOpen
       processingOptions:
         requestHeaderMode: send
@@ -85,7 +85,7 @@ routes:
   policies:
     # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "127.0.0.1:9001"
       failureMode: deny
       protocol:
         grpc:
@@ -94,7 +94,7 @@ routes:
     mcpGuardrails:
       processors:
       - kind: remote
-        host: "wake-proxy:9001"
+        host: "127.0.0.1:9001"
         failureMode: failOpen
         methods:
           tools/call: full
@@ -105,6 +105,8 @@ routes:
         metadata:
           agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
+          # The MCP session, so a response whose event id didn't come back pairs only within it.
+          session: '"mcp-session-id" in request.headers ? request.headers["mcp-session-id"] : ""'
   backends:
   - mcp:
       targets:

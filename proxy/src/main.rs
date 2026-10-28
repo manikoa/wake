@@ -23,7 +23,8 @@ struct Cli {
 enum Command {
     /// Serve the ExtMCP processor agentgateway calls.
     Serve {
-        /// Where agentgateway reaches the processor. Only agentgateway may reach it.
+        /// Where agentgateway reaches the processor, from beside it: the same pod or network
+        /// namespace. Connections from anywhere but loopback are refused.
         #[arg(long, default_value = "127.0.0.1:9001")]
         listen: String,
         /// The Wake collector's OTLP/HTTP endpoint.
@@ -194,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         paired_by_id = Counters::get(&stats.paired_by_id),
                         paired_in_order = Counters::get(&stats.paired_in_order),
                         denied = Counters::get(&stats.denied),
+                        hooks_refused = Counters::get(&stats.hooks_refused),
                         "recording"
                     );
                 }
@@ -206,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 paired_by_id = Counters::get(&counters.paired_by_id),
                 paired_in_order = Counters::get(&counters.paired_in_order),
                 denied = Counters::get(&counters.denied),
+                hooks_refused = Counters::get(&counters.hooks_refused),
                 "stopped"
             );
         }

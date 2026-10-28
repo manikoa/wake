@@ -3,6 +3,8 @@
 # agentgateway for deploy/compose.yaml. Point the backends at your own MCP servers and A2A
 # agents; the examples reach services on the host. Agents call agentgateway on port 3000.
 # Every route records through wake-proxy and is denied while the brake has halted it.
+# wake-proxy shares agentgateway's network namespace, as a sidecar would share its pod, so
+# agentgateway calls it on 127.0.0.1:9001 and nothing else can reach that port.
 gateways:
   default:
     port: 3000
@@ -18,7 +20,7 @@ routes:
     a2a: {}
     # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "127.0.0.1:9001"
       failureMode: deny
       protocol:
         grpc:
@@ -27,7 +29,7 @@ routes:
           metadata:
             wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")}'
     extProc:
-      host: "wake-proxy:9001"
+      host: "127.0.0.1:9001"
       # Calls that start while wake-proxy is down go through unrecorded; one in progress
       # when it dies fails (docs/proxy.md).
       failureMode: failOpen
@@ -48,7 +50,7 @@ routes:
 - policies:
     # The brake's deny lever. It fails closed: if wake-proxy can't answer, the call is denied.
     extAuthz:
-      host: "wake-proxy:9001"
+      host: "127.0.0.1:9001"
       failureMode: deny
       protocol:
         grpc:
@@ -57,7 +59,7 @@ routes:
     mcpGuardrails:
       processors:
       - kind: remote
-        host: "wake-proxy:9001"
+        host: "127.0.0.1:9001"
         # Recording never blocks: if wake-proxy is down, calls go through unrecorded.
         failureMode: failOpen
         methods:
@@ -69,6 +71,8 @@ routes:
         metadata:
           agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : "")'
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
+          # The MCP session, so a response whose event id didn't come back pairs only within it.
+          session: '"mcp-session-id" in request.headers ? request.headers["mcp-session-id"] : ""'
   backends:
   - mcp:
       targets:

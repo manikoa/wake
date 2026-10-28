@@ -3,7 +3,9 @@ package wakelog
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -29,8 +31,15 @@ func (d DirReader) ReadCheckpoint(context.Context) ([]byte, error) {
 	return os.ReadFile(filepath.Join(string(d), layout.CheckpointPath))
 }
 
+// ReadEntryBundle reads a bundle, falling back from a partial bundle to the full one: once
+// a bundle fills, Tessera deletes its partial versions, which a reader holding an older
+// checkpoint still asks for. The full bundle starts with the same entries.
 func (d DirReader) ReadEntryBundle(_ context.Context, index uint64, p uint8) ([]byte, error) {
-	return os.ReadFile(filepath.Join(string(d), layout.EntriesPath(index, p)))
+	data, err := os.ReadFile(filepath.Join(string(d), layout.EntriesPath(index, p)))
+	if p > 0 && errors.Is(err, fs.ErrNotExist) {
+		return os.ReadFile(filepath.Join(string(d), layout.EntriesPath(index, 0)))
+	}
+	return data, err
 }
 
 // Checked is what Verify found in a log.

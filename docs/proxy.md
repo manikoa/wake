@@ -28,7 +28,7 @@ agentgateway's own OpenTelemetry spans carry MCP and A2A attributes but no bodie
 - It implements the ExtMCP, ext_proc and ext_authz servers (tonic, with vendored Apache 2.0 protos).
 - It builds each `wake.*` event, signs it and exports it over OTLP to the collector. agentgateway can't sign, so "the proxy signs its own events" in `docs/signing.md` means this processor does.
 - It gets its own SVID from the SPIRE Workload API. agentgateway never holds the key.
-- It accepts calls only from agentgateway, over a pod-local Unix socket or mTLS checked against agentgateway's SVID. Otherwise an agent could send it fake calls and get them signed.
+- It accepts calls only from agentgateway, beside it in the same pod or network namespace, over loopback. It refuses a connection from any other address before reading a byte, and counts it (`hooks_refused`). Otherwise an agent could send it fake calls and get them signed. A gateway on another host would need mTLS checked against agentgateway's SVID, which isn't built.
 
 The processor is a new parsing surface for attacker-controlled MCP and A2A bodies, so it gets fuzz targets from the first commit.
 
@@ -55,7 +55,7 @@ Both halves are in `proxy/` (October 27, 2026), and both were run against agentg
 
 ### MCP
 
-- **Pairing request and response.** The request hook returns the event's id as `wake_event_id` metadata, and the gateway config reads it back in the response hook as `mcpGuardrails.wake_event_id`. Against agentgateway v1.6.0, every response was paired this way. If the id ever doesn't come back, responses are paired in order within the same method and server, and the processor counts which way each response was paired. A request with no response after the timeout is recorded with no output, since JSON-RPC errors skip the response hook.
+- **Pairing request and response.** The request hook returns the event's id as `wake_event_id` metadata, and the gateway config reads it back in the response hook as `mcpGuardrails.wake_event_id`. Against agentgateway v1.6.0, every response was paired this way. If the id ever doesn't come back, responses are paired in order within the same session, caller, method and server (the gateway config sends the session as `session` metadata), and the processor counts which way each response was paired. A response whose id comes back for a request no longer waiting, because it timed out or was pushed out, is recorded on its own: pairing it in order would give it another call's input, maybe another agent's. A request with no response after the timeout is recorded with no output, since JSON-RPC errors skip the response hook.
 - **The event.** Each recorded call is a `tool_call` event:
   - `wake.capture` is `proxy`.
   - `wake.agent.id` is the caller's SPIFFE ID, or its JWT subject, from gateway CEL.
@@ -90,7 +90,7 @@ agentgateway calls the processor's ext_proc service on an A2A route (`a2a: {}`).
 
 The brake's first lever (October 27, 2026). agentgateway calls the processor's ext_authz service before each request on a route with an `extAuthz` policy, every A2A and MCP route in the shipped configs, and the processor answers from the halts in force.
 
-- **A halt** covers the fleet or named agents. A call is denied when an agent in scope makes it, or when it's sent to one. The caller comes from the `wake` metadata the gateway config computes, with the same CEL as capture (SPIFFE ID, else JWT subject), and failing that from the mTLS peer's principal. The agent a route reaches comes from the route's static `receiver` context. A call whose caller is unknown is denied only by a fleet halt.
+- **A halt** covers the fleet or named agents. A call is denied when an agent in scope makes it, or when it's sent to one. The caller comes from the `wake` metadata the gateway config computes, with the same CEL as capture (SPIFFE ID, else JWT subject), and failing that from the mTLS peer's principal. The agent a route reaches comes from the route's static `receiver` context. A call whose caller is unknown is denied by any halt in force: it might come from an agent the halt names, and the brake fails closed. So where the gateway can't identify callers, as with `deploy/agentgateway.yaml` until it's given mTLS or JWT policies, halting one agent stops every caller it can't name.
 - **A denied call** gets a 403 with a `wake-halt` header naming the halt. It's recorded as a signed `denied` event (see [events.md](events.md)) in the caller's trace, with the caller's link as its parents. So the provenance view shows which step tried to act after the halt.
 - **The brake's control API** runs on its own port (`--control-listen`), with the processor's SVID as its TLS certificate. It serves only a client whose X.509-SVID chains to the trust bundle and carries the brake's SPIFFE ID (`--brake-id`). `PUT /v1/halts/{id}` with a scope puts a halt in force, `DELETE` lifts it, and `GET /v1/halts` lists what's in force with a version. A change answers once it's on disk, so that answer is the lever's acknowledgement.
 - **It fails closed.** The halts are kept in `--state-dir`, so a restart doesn't lift one, and a state file that can't be read denies every call until it's replaced. The gateway's `extAuthz` policy uses `failureMode: deny`, so if the processor can't answer, the call is denied. That's the opposite of capture, which fails open. Note what it means: with the deny lever configured, wake-proxy being down stops traffic.
@@ -112,11 +112,14 @@ Decided October 27, 2026. Anyone must be able to check a proxy event from the lo
 - The proxy sets `wake.signature.certificate`: base64 of the DER X.509-SVID, followed by any intermediates. Like every `wake.signature*` attribute, it's outside the signed bytes; the CA's signature is what vouches for it.
 - The log entry keeps it in an optional `certificate` field (`log/v0.3.0`).
 - Checking an entry, which `wakelog.Entry.Check` does:
-  - The certificate chains to a trusted SPIRE trust bundle as of the event's start time.
+  - The signer is listed for the event's `wake.capture` in the trusted signers (the collector's `trusted_signers`, `wake-log verify -signer`). Agents get SVIDs from the same SPIRE, so a bundle alone would let any of them sign as the proxy.
+  - The certificate chains to a trusted SPIRE trust bundle as of when the collector received the event (`received_unix_nano` in the entry), give or take 5 minutes. The event's start time is the signer's to choose, so it isn't used; it must fall no more than 24 hours before that receipt.
   - It isn't a CA.
   - Its one `spiffe://` URI SAN equals `signer`.
   - Its key is P-256.
   - The ECDSA signature, ASN.1 DER over SHA-256, checks out over `event`.
-- The collector (`trust_bundles`) and the ingester are configured with the trust bundles to accept. Publishing bundles next to the log is left until a design partner needs it.
+- The collector (`trust_bundles` and `trusted_signers`) and the ingester are configured with the trust bundles and signers to accept. Publishing bundles next to the log is left until a design partner needs it.
+
+Updated October 27, 2026: the signer allowlist and the receipt time were added after an audit showed an agent's SVID could sign events as the proxy, and that a key from an expired SVID could still sign events dated while it was valid. The collector checks the SVID when the event arrives, so a proxy event that reaches it more than 5 minutes after its SVID expired is logged invalid. SPIRE rotates SVIDs at half their lifetime, which leaves the proxy at least that long to deliver.
 
 The cost is about 600 bytes per proxy event. Storing each certificate once next to the log and referring to it by digest would save the bytes, but it adds a second lookup to every check, so it waits until the size matters.

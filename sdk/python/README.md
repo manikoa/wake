@@ -66,7 +66,7 @@ with handler.agent("supervisor", input=question, origin="user"):
 
 A handoff is recorded as an `agent_message` event in the receiving agent's run, and it feeds that agent's next event. When prompts are built from strings, so no message ids link one call to the next, an event's parents are the earlier events in the same trace whose output appears in its input.
 
-The recorder sends to `WAKE_ENDPOINT`, or `http://localhost:4318` by default. Install with the `langchain` or `langgraph` extra.
+The recorder sends to `WAKE_ENDPOINT`, or `http://localhost:4318` by default. Over TLS with a private CA, set `WAKE_CA_FILE` to the CA's certificate. Wake reads only its own `WAKE_*` settings: the app's `OTEL_*` variables, such as its sampler, exporter headers or attribute limits, configure the app's telemetry and never Wake's, and Wake records every event even under an unsampled parent. `flush()` waits at most its timeout, and returns False if events were dropped since the last flush. `health()` counts events sent and dropped, and `failed`, those the SDK couldn't record. Install with the `langchain` or `langgraph` extra.
 
 ## Memory
 
@@ -82,7 +82,7 @@ store = WakeStore(PostgresStore(...), Memory(handler))
 graph = builder.compile(store=store)
 ```
 
-The label is kept in each value under `__wake__` and taken out before values reach the app.
+The label is kept in each value under `__wake__` and taken out before values reach the app. A delete is recorded as a `memory_write` with `wake.memory.deleted` set.
 
 For memory files, such as an agent's notes file, use `Memory(handler).write_file(path, text)` and `read_file(path)`. The label goes next to the file as `<file>.wake.json`. For any other store, call `memory.write(store, entry, content)` before writing, save the label it returns with the entry, and call `memory.read(store, entry, content, label)` after reading.
 
@@ -96,7 +96,9 @@ from wake.quarantine import Quarantine
 memory = Memory(handler, quarantine=Quarantine("http://wake-proxy:9003", agent="billing"))
 ```
 
-It fetches them every couple of seconds in the background. A locked agent's writes raise `MemoryLocked` and don't happen. A quarantined entry reads as absent from `WakeStore`, drops out of searches, and makes `read_file` raise `MemoryQuarantined`. Each refusal is recorded as a `denied` event. Until the first fetch succeeds nothing is enforced, and when a fetch fails the last rules stand.
+It fetches them once as it starts, waiting at most a second, then every couple of seconds in the background. A locked agent's writes and deletes raise `MemoryLocked` and don't happen. A quarantined entry reads as absent from `WakeStore`, drops out of searches, makes `read_file` raise `MemoryQuarantined`, and can't be deleted: it's kept, as evidence. Each refusal is recorded as a `denied` event.
+
+It fails closed. When a fetch fails the last rules stand for `ttl` seconds (30 by default). If no fetch has succeeded, or the rules are older than that, every write raises `MemoryLocked` and no entry is served, under the id `stale-rules`, until a fetch succeeds. `quarantine.health()` says whether the rules are fresh, and going stale is logged as a warning. A forked process starts fetching on its own, and each fetch names the process as well as the agent.
 
 ## MCP calls through the proxy
 

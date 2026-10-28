@@ -3,7 +3,8 @@
 //! The brake puts and lifts halts over the control API (control.rs); agentgateway asks,
 //! through ext_authz (authz.rs), whether each call may go ahead. A halt covers the whole
 //! fleet or named agents: a call is denied when it's made by an agent in scope, or sent to
-//! one. A call whose caller is unknown is denied only by a fleet halt.
+//! one. A call whose caller is unknown is denied by any halt in force, since it might come
+//! from an agent a halt names.
 //!
 //! The brake fails closed. A halt is written to disk before it's acknowledged, so a
 //! restart doesn't lift it, and a state file that can't be read halts the fleet until a
@@ -94,8 +95,18 @@ pub struct MemoryRules {
     /// The quarantine that refuses this agent's writes, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locked_by: Option<String>,
+    /// Set when no entry may be served at all, because the proxy can't read the quarantines
+    /// it holds: the id refused reads are recorded under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_by: Option<String>,
     pub quarantines: Vec<Quarantine>,
 }
+
+/// The most agents whose fetches are noted. Past it, the one that fetched longest ago is
+/// forgotten; a working adapter fetches again within seconds. Any caller can name any
+/// agent, so without a bound a flood of names would grow the proxy's memory, and the brake's
+/// read of the notes, without end.
+pub const MAX_SEEN: usize = 4096;
 
 /// When an agent's memory adapter last fetched its rules, and at which version.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -204,22 +215,28 @@ impl Halts {
     }
 
     /// The rules for one agent's memory adapter, noting that the agent has them now. A
-    /// state that can't be read refuses every write.
+    /// state that can't be read refuses every write and serves no entry: whatever it
+    /// quarantined is unknown, so all of it might be.
     pub fn memory_rules(&self, agent: &str) -> MemoryRules {
         let state = self.state();
         let named = |scope: &Scope| scope.fleet || (!agent.is_empty() && scope.agents.iter().any(|a| a == agent));
-        let locked_by = if state.unreadable.is_some() {
-            Some(UNREADABLE.to_string())
-        } else {
+        let unreadable = state.unreadable.is_some().then(|| UNREADABLE.to_string());
+        let locked_by = unreadable.clone().or_else(|| {
             state
                 .quarantines
                 .iter()
                 .find(|q| named(&q.selection.lock))
                 .map(|q| q.id.clone())
-        };
+        });
         if !agent.is_empty()
             && let Ok(mut seen) = self.seen.write()
         {
+            if seen.len() >= MAX_SEEN
+                && !seen.contains_key(agent)
+                && let Some(oldest) = seen.iter().min_by_key(|(_, s)| s.at).map(|(name, _)| name.clone())
+            {
+                seen.remove(&oldest);
+            }
             seen.insert(
                 agent.to_string(),
                 Seen {
@@ -231,6 +248,7 @@ impl Halts {
         MemoryRules {
             version: state.version,
             locked_by,
+            hidden_by: unreadable,
             quarantines: state.quarantines,
         }
     }
@@ -272,10 +290,19 @@ impl Halts {
         let named = |agent: Option<&str>, halt: &Halt| {
             agent.is_some_and(|a| !a.is_empty() && halt.scope.agents.iter().any(|h| h == a))
         };
-        state
-            .halts
-            .into_iter()
+        // A caller the gateway can't identify might be an agent a halt names, so while any
+        // agent halt is in force it's denied too: the brake fails closed.
+        let unknown = caller.is_none_or(str::is_empty);
+        let halts = state.halts;
+        halts
+            .iter()
             .find(|h| h.scope.fleet || named(caller, h) || named(receiver, h))
+            .or_else(|| {
+                unknown
+                    .then(|| halts.iter().find(|h| !h.scope.agents.is_empty()))
+                    .flatten()
+            })
+            .cloned()
     }
 }
 
@@ -337,11 +364,12 @@ mod tests {
         assert_eq!(halts.deciding(Some("billing"), None).unwrap().id, "h1");
         assert_eq!(halts.deciding(Some("support"), Some("billing")).unwrap().id, "h1");
         assert!(halts.deciding(Some("support"), Some("research")).is_none());
-        assert!(
-            halts.deciding(None, None).is_none(),
-            "an unknown caller only a fleet halt denies"
+        assert_eq!(
+            halts.deciding(None, Some("research")).unwrap().id,
+            "h1",
+            "a caller that can't be identified might be billing"
         );
-        assert!(halts.deciding(Some(""), Some("")).is_none());
+        assert_eq!(halts.deciding(Some(""), Some("")).unwrap().id, "h1");
 
         halts
             .put(
@@ -353,11 +381,16 @@ mod tests {
                 8,
             )
             .unwrap();
-        assert!(halts.deciding(None, None).is_some());
+        assert!(halts.deciding(Some("support"), None).is_some());
         let state = halts.lift("h2").unwrap();
         assert_eq!(state.version, 3);
-        assert!(halts.deciding(None, None).is_none());
+        assert!(halts.deciding(Some("support"), None).is_none());
         assert!(halts.deciding(Some("billing"), None).is_some(), "h1 is still in force");
+        halts.lift("h1").unwrap();
+        assert!(
+            halts.deciding(None, None).is_none(),
+            "with no halt in force, unknown callers go through"
+        );
     }
 
     #[test]
@@ -386,6 +419,10 @@ mod tests {
         let seen = halts.seen();
         assert_eq!(seen["billing"].version, 1);
         assert!(seen.contains_key("support") && !seen.contains_key(""));
+        assert_eq!(
+            billing.hidden_by, None,
+            "a readable state hides only what's quarantined"
+        );
 
         halts
             .quarantine(
@@ -405,6 +442,26 @@ mod tests {
         let state = halts.release("q2").unwrap();
         assert_eq!((state.version, state.quarantines.len()), (4, 0));
         assert_eq!(halts.memory_rules("billing").locked_by, None);
+    }
+
+    #[test]
+    fn the_fetches_noted_are_bounded() {
+        let halts = Halts::in_memory();
+        halts.memory_rules("billing");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for i in 0..MAX_SEEN {
+            halts.memory_rules(&format!("made-up-{i}"));
+        }
+        let seen = halts.seen();
+        assert_eq!(seen.len(), MAX_SEEN);
+        assert!(
+            !seen.contains_key("billing"),
+            "the one that fetched longest ago is forgotten"
+        );
+        // A working adapter fetches again, and is noted again.
+        halts.memory_rules("billing");
+        assert!(halts.seen().contains_key("billing"));
+        assert_eq!(halts.seen().len(), MAX_SEEN);
     }
 
     #[test]
@@ -435,14 +492,17 @@ mod tests {
         let halts = Halts::load(&dir);
         assert_eq!(halts.deciding(None, None).unwrap().id, UNREADABLE);
         assert!(halts.state().unreadable.is_some());
+        let rules = halts.memory_rules("billing");
+        assert_eq!(rules.locked_by.as_deref(), Some(UNREADABLE), "memory writes too");
         assert_eq!(
-            halts.memory_rules("billing").locked_by.as_deref(),
+            rules.hidden_by.as_deref(),
             Some(UNREADABLE),
-            "memory writes too"
+            "and no entry is served, since what was quarantined is unknown"
         );
         // Lifting it, once a person has looked, writes a good state again.
         halts.lift(UNREADABLE).unwrap();
         assert!(halts.deciding(None, None).is_none());
+        assert_eq!(halts.memory_rules("billing").hidden_by, None);
         assert!(Halts::load(&dir).state().unreadable.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -3,7 +3,7 @@
 //! can reach it without reaching the control API.
 //!
 //! ```text
-//! GET /v1/memory?agent=<id>   {"version", "locked_by", "quarantines": [...]}
+//! GET /v1/memory?agent=<id>   {"version", "locked_by", "hidden_by", "quarantines": [...]}
 //! ```
 //!
 //! Each fetch is noted, and the brake reads the notes from the control API to confirm an
@@ -16,12 +16,12 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 
 use crate::halts::{Halts, MemoryRules};
+use crate::listen;
 
 async fn rules(State(halts): State<Arc<Halts>>, Query(query): Query<HashMap<String, String>>) -> Json<MemoryRules> {
     let agent = query.get("agent").map(String::as_str).unwrap_or("");
@@ -37,23 +37,17 @@ pub fn router(halts: Arc<Halts>) -> Router {
 /// Serves the memory rules on listener until shutdown resolves.
 pub async fn serve(listener: TcpListener, halts: Arc<Halts>, shutdown: impl std::future::Future<Output = ()> + Send) {
     let app = router(halts);
+    let limit = listen::limit();
     tokio::pin!(shutdown);
     loop {
-        let stream = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
-                Err(e) => {
-                    tracing::warn!(error = %e, "memory rules: accept failed");
-                    continue;
-                }
-            },
+        let (stream, _, permit) = tokio::select! {
+            accepted = listen::accept(&listener, &limit, "memory") => accepted,
             _ = &mut shutdown => return,
         };
         let service = TowerToHyperService::new(app.clone());
         tokio::spawn(async move {
-            let _ = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
+            let _permit = permit;
+            let _ = listen::http().serve_connection(TokioIo::new(stream), service).await;
         });
     }
 }

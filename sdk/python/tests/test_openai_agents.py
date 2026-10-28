@@ -200,3 +200,6 @@ def test_a_memory_write_in_a_tool_is_labeled_with_its_origins(tmp_path):
     (write,) = [e for e in events if attrs(e)["wake.event.kind"] == "memory_write"]
     assert attrs(write)["wake.parents"][0] == attrs(tool_call)["wake.event.id"]
     assert set(attrs(write)["wake.memory.origins"]) == {"tool:read_email", "user"}
+    # In the name of the agent whose tool wrote it, not the recorder's.
+    assert attrs(write)["wake.agent.id"] == "billing"
+    assert json.loads((tmp_path / "notes.md.wake.json").read_text())["agent"] == "billing"

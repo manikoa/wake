@@ -6,7 +6,7 @@ Three agents on three frameworks, talking over A2A and MCP through agentgateway,
 |---|---|---|---|
 | support | LangGraph | Handles a customer's refund request, keeps a note in a memory file | CRM (MCP), research and billing (A2A) |
 | research | OpenAI Agents SDK | Reads the refund policy page | the web (MCP) |
-| billing | Claude Agent SDK | Issues refunds with an in-process tool | payments (MCP) |
+| billing | Claude Agent SDK | Issues refunds with an in-process tool, keeps a ledger in a memory file, and keeps a sandbox | payments (MCP), its sandbox (E2B) |
 
 The tools are one MCP server (`fleet/tools.py`) with a CRM, the web and payments. The refund policy page is poisoned. Below the policy, it tells AI agents to also refund $500 to an account that has nothing to do with the order, so the run pays it out. That payment is the issue the game day catches. Following its parents in the signed log leads back through billing, support and research to the page.
 
@@ -16,7 +16,7 @@ The tools are one MCP server (`fleet/tools.py`) with a CRM, the web and payments
 ./run.sh
 ```
 
-It starts the staging recorder (`deploy/compose.yaml`) with this directory's `agentgateway.yaml`, plus the tools and agents. Then it sends one request through support, checks that nothing of the fleet's can be reached around the gateway (see [Network](#network)), checks the signed log with `wake-log`, and checks provenance with `check.py`:
+It starts the staging recorder (`deploy/compose.yaml`) with this directory's `agentgateway.yaml`, plus the stand-ins, the tools and the agents. Then it sends one request through support, checks that nothing of the fleet's can be reached around the gateway (see [Network](#network)), checks the signed log with `wake-log`, and checks provenance with `check.py`:
 
 - Every agent and every hop is recorded: by the SDKs, the memory adapter, and the proxy for A2A and MCP.
 - Everything is in one trace, and every parent is in the log.
@@ -35,6 +35,19 @@ docker compose run --rm support "Customer jane@example.com wants a refund on ord
 By default each agent runs on a scripted model, so the fleet needs no API keys and behaves the same every run. Each scripted model plugs in where its framework takes a model and reports itself the way the real one does, so Wake records exactly what it would. For Claude, a stand-in for Claude Code speaks the SDK's control protocol.
 
 With `FLEET_MODELS=real`, research runs on the OpenAI Agents SDK's default model when `OPENAI_API_KEY` is set, and billing runs on Claude Code when `ANTHROPIC_API_KEY` is set. Support stays scripted, so every run walks the same steps.
+
+## Something for every lever
+
+The fleet holds something for each of the brake's levers, so a game day times them all:
+
+- **Proxy deny.** Every call between agents and to the tools goes through agentgateway, which asks wake-proxy.
+- **Token revocation and Okta sign-out.** Each agent signs in as its own user at a stand-in identity provider (`fleet/standins/oauth.py`) and holds a refresh token, which it swaps for access tokens. The tools server asks the provider about the caller's access token on every call (RFC 7662), so a revoked token stops a call that goes around the gateway as well as one through it. Revoking a refresh token revokes the access tokens swapped for it.
+- **Sandbox freeze.** Billing keeps a sandbox at a stand-in E2B (`fleet/standins/e2b.py`), found by its metadata, `agent=billing`. It auto-resumes on traffic, so the brake freezes it with its filesystem only.
+- **Memory.** Billing runs as long as the fleet does, and its memory adapter fetches the brake's quarantines from wake-proxy, so the brake can confirm the adapter has a halt's memory lock. Support's adapter doesn't: it's a one-shot process, gone before a halt.
+
+The stand-ins stand in for a design partner's identity provider, such as Okta, and E2B. Each implements what the agents and the brake call, and nothing more. Real ones come later, from a partner, or an Okta developer org and an E2B account.
+
+Each credential goes into a volume only its holder mounts. Each agent gets its own refresh token, billing also an E2B key, and the tools server a client for introspection. The brake gets the rest in `brake-secrets`, which no fleet service mounts: an OAuth client that may revoke and introspect, an API token for Okta's global token revocation, an E2B key, and its copy of each agent's refresh token. The brake's credentials never pass through the agents, and no agent can read another's.
 
 ## Identity
 

@@ -7,8 +7,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
 
@@ -18,13 +21,18 @@ import (
 // Attribute names used here. See docs/events.md for the full list.
 const (
 	Kind           = "wake.event.kind"
-	Capture        = "wake.capture"
+	Capture        = wakelog.Capture
 	Signature      = "wake.signature"
 	Signer         = "wake.signer"
 	SignatureValid = "wake.signature.valid"
+	// SignatureError says why wake.signature.valid is false.
+	SignatureError = "wake.signature.error"
 	Certificate    = "wake.signature.certificate"
 	Payload        = "wake.payload"
 	PayloadSHA256  = wakelog.PayloadSHA256
+	// Received is when the collector received the event, in Unix nanoseconds. It's kept
+	// out of the signed bytes, because the proxy signs before the collector receives.
+	Received = "wake.received_unix_nano"
 )
 
 // IsEvent reports whether span is a Wake event, as opposed to a span that only groups events.
@@ -33,10 +41,32 @@ func IsEvent(span ptrace.Span) bool {
 	return ok
 }
 
+// DropRepeatedKeys keeps only the first attribute with each key and returns the first key
+// that was repeated, if any. OTLP says keys are unique, but nothing on the wire enforces
+// it, and a lookup (the first wins) and Canonical (the last wins) would read two
+// different events from one span: a sender could get a capture or a payload digest signed
+// that the collector never checked.
+func DropRepeatedKeys(span ptrace.Span) (string, bool) {
+	seen := map[string]bool{}
+	repeated := ""
+	span.Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
+		if seen[key] {
+			if repeated == "" {
+				repeated = key
+			}
+			return true
+		}
+		seen[key] = true
+		return false
+	})
+	return repeated, repeated != ""
+}
+
 // Canonical returns the exact bytes a signer signs for span: a JSON object with
 // sorted keys and no whitespace, holding the span's ids, times, and every wake.*
-// and gen_ai.* attribute except the signature fields and the payload. The payload's
-// signed digest commits to it.
+// and gen_ai.* attribute except the signature fields, the payload and the time the
+// collector received it. The payload's signed digest commits to it. It fails for a
+// double that isn't finite, which JSON can't hold.
 func Canonical(span ptrace.Span) ([]byte, error) {
 	attributes := map[string]any{}
 	for key, value := range span.Attributes().All() {
@@ -63,7 +93,7 @@ func Canonical(span ptrace.Span) ([]byte, error) {
 }
 
 func signed(key string) bool {
-	if key == Signer || key == Payload || strings.HasPrefix(key, Signature) {
+	if key == Signer || key == Payload || key == Received || strings.HasPrefix(key, Signature) {
 		return false
 	}
 	return strings.HasPrefix(key, "wake.") || strings.HasPrefix(key, "gen_ai.")
@@ -86,14 +116,21 @@ func digest(payload []byte) string {
 
 // Sign signs span and records the signature and the signer's name on it. It sets the
 // payload's digest first, from the bytes received, so the signature commits to the
-// payload that arrived and not to a digest the sender claimed.
+// payload that arrived and not to a digest the sender claimed. An event with no payload
+// gets no digest. Any signature fields the sender set, such as a certificate, are dropped
+// first, so the entry carries only what this signer adds.
 func Sign(span ptrace.Span, signer note.Signer) error {
+	span.Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
+		return key == Signer || strings.HasPrefix(key, Signature)
+	})
 	if payload, ok := PayloadOf(span); ok {
 		span.Attributes().PutStr(PayloadSHA256, digest(payload))
+	} else {
+		span.Attributes().Remove(PayloadSHA256)
 	}
 	msg, err := Canonical(span)
 	if err != nil {
-		return err
+		return fmt.Errorf("canonical bytes: %w", err)
 	}
 	sig, err := signer.Sign(msg)
 	if err != nil {
@@ -104,45 +141,43 @@ func Sign(span ptrace.Span, signer note.Signer) error {
 	return nil
 }
 
-// Verify reports whether span carries a valid signature under trust, and a payload, if
-// it has one, that matches the signed digest. A signer with a note format key, such as
-// another collector, is checked against trust.Keys. A signer that signs with an
-// X.509-SVID, such as the proxy, sends its certificate in wake.signature.certificate,
-// and it's checked against trust.Bundles as of the event's start.
-func Verify(span ptrace.Span, trust wakelog.Trust) bool {
-	if payload, ok := PayloadOf(span); ok {
-		signed, _ := span.Attributes().Get(PayloadSHA256)
-		if signed.Str() != digest(payload) {
-			return false
-		}
-	}
+// Verify returns nil when span carries a valid signature under trust, and a payload, if
+// it has one, that matches the signed digest; otherwise it says why not. A signer with a
+// note format key, such as another collector, is checked against trust.Keys. A signer
+// that signs with an X.509-SVID, such as the proxy, sends its certificate in
+// wake.signature.certificate, and it's checked against trust.Bundles as of
+// wake.received_unix_nano. Either way trust.Signers must allow the signer for the
+// event's wake.capture. The checks are wakelog's Entry.CheckSignature, so what the
+// collector decides here, anyone can check again from the log.
+func Verify(span ptrace.Span, trust wakelog.Trust) error {
 	attrs := span.Attributes()
-	sigValue, ok := attrs.Get(Signature)
-	if !ok {
-		return false
+	if payload, ok := PayloadOf(span); ok {
+		signed, _ := attrs.Get(PayloadSHA256)
+		if signed.Str() != digest(payload) {
+			return wakelog.ErrPayloadMismatch
+		}
+	} else if _, ok := attrs.Get(PayloadSHA256); ok {
+		return errors.New("signed a payload digest but sent no payload")
 	}
-	signerValue, ok := attrs.Get(Signer)
-	if !ok {
-		return false
+	if _, ok := attrs.Get(Signature); !ok {
+		return errors.New("not signed")
 	}
 	msg, err := Canonical(span)
 	if err != nil {
-		return false
+		return fmt.Errorf("canonical bytes: %w", err)
 	}
-	if wakelog.VerifySignature(msg, sigValue.Str(), signerValue.Str(), trust.Keys) {
-		return true
-	}
-	cert, ok := attrs.Get(Certificate)
-	if !ok || trust.Bundles == nil {
-		return false
-	}
-	at := span.StartTimestamp().AsTime()
-	return wakelog.VerifySVIDSignature(msg, sigValue.Str(), signerValue.Str(), cert.Str(), trust.Bundles, at) == nil
+	sig, _ := attrs.Get(Signature)
+	signer, _ := attrs.Get(Signer)
+	cert, _ := attrs.Get(Certificate)
+	received, _ := attrs.Get(Received)
+	e := wakelog.Entry{Event: msg, Signature: sig.Str(), Signer: signer.Str(), Certificate: cert.Str(), Received: uint64(received.Int())}
+	return e.CheckSignature(trust)
 }
 
 // Entry returns what gets appended to the signed log for span: the exact signed bytes,
-// the signature and signer, the signer's certificate if it signs with one, whether the
-// collector found the signature valid, and the payload when it fits. Each entry can be
+// the signature and signer, the signer's certificate if it signs with one, when the
+// collector received it, whether the collector found the signature valid, and the
+// payload when it fits. Each entry can be
 // checked on its own. When the payload doesn't fit, external is true: store
 // PayloadOf(span) with the log's PutPayload before appending the entry. The entry format
 // lives in the log module, so the log's readers parse it with the same code.
@@ -155,8 +190,9 @@ func Entry(span ptrace.Span) (entry []byte, external bool, err error) {
 	sig, _ := attrs.Get(Signature)
 	signer, _ := attrs.Get(Signer)
 	cert, _ := attrs.Get(Certificate)
+	received, _ := attrs.Get(Received)
 	valid, _ := attrs.Get(SignatureValid)
-	fields := wakelog.Fields{Signature: sig.Str(), Signer: signer.Str(), Certificate: cert.Str(), Valid: valid.Bool()}
+	fields := wakelog.Fields{Signature: sig.Str(), Signer: signer.Str(), Certificate: cert.Str(), Received: uint64(received.Int()), Valid: valid.Bool()}
 	if payload, ok := PayloadOf(span); ok {
 		p := string(payload)
 		fields.Payload = &p

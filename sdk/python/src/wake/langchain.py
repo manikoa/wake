@@ -29,7 +29,6 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import wraps
 from typing import Any
 from uuid import UUID
 
@@ -41,25 +40,12 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, Status, StatusCode
 
 from wake import events, links
-from wake._graph import _MIN_MATCH, EventGraph, _Recent
+from wake._graph import _MIN_MATCH, EventGraph, _Recent, failed, never_raise
 from wake.recorder import Recorder
 
 log = logging.getLogger("wake")
 
 _current_run: ContextVar["AgentRun | None"] = ContextVar("wake_agent_run", default=None)
-
-
-def _never_raise(callback):
-    """Recording must never break the agent, so every callback swallows its own errors."""
-
-    @wraps(callback)
-    def wrapper(self, *args, **kwargs):
-        try:
-            return callback(self, *args, **kwargs)
-        except Exception:
-            log.warning("wake: failed to record %s", callback.__name__, exc_info=True)
-
-    return wrapper
 
 
 class _Installed:
@@ -94,6 +80,7 @@ class AgentRun:
             self._handler._record_message(sender=self, receiver=self._parent, content=content)
         except Exception:
             log.warning("wake: failed to record reply", exc_info=True)
+            failed(self._handler._recorder, "reply")
 
     def _take_next(self) -> tuple[list[str], list[str]]:
         with self._lock:
@@ -162,7 +149,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
 
     # Structure: one invoke_agent span per top level run groups its events into a trace.
 
-    @_never_raise
+    @never_raise
     def on_chain_start(self, serialized, inputs, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs) -> None:
         with self._lock:
             self._parent_run[run_id] = parent_run_id
@@ -185,17 +172,17 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                 if link is not None:
                     self._linked[run_id] = {"parents": list(link.parents), "taken": False}
 
-    @_never_raise
+    @never_raise
     def on_chain_end(self, outputs, *, run_id: UUID, **kwargs) -> None:
         self._end_structure(run_id)
 
-    @_never_raise
+    @never_raise
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs) -> None:
         self._end_structure(run_id, error)
 
     # Model calls.
 
-    @_never_raise
+    @never_raise
     def on_chat_model_start(
         self,
         serialized: dict[str, Any] | None,
@@ -244,7 +231,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             text="\n".join(_text(m.content) for m in context),
         )
 
-    @_never_raise
+    @never_raise
     def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs) -> None:
         with self._lock:
             pending = self._pending.get(run_id)
@@ -269,13 +256,13 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                             self._event_by_tool_call[call["id"]] = pending["event_id"]
         self._end_event(run_id, outputs, text="\n".join(texts))
 
-    @_never_raise
+    @never_raise
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs) -> None:
         self._end_event(run_id, [], error)
 
     # Tool calls.
 
-    @_never_raise
+    @never_raise
     def on_tool_start(
         self,
         serialized: dict[str, Any] | None,
@@ -311,12 +298,12 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             arguments=None if requested_by else _argument_texts(inputs if inputs is not None else input_str),
         )
 
-    @_never_raise
+    @never_raise
     def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs) -> None:
         self._remember_tool_result(run_id, output)
         self._end_event(run_id, _tool_output(output), text=_text(output))
 
-    @_never_raise
+    @never_raise
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs) -> None:
         self._remember_tool_result(run_id, None)
         self._end_event(run_id, None, error)
@@ -342,6 +329,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             )
         except Exception:
             log.warning("wake: failed to record agent run", exc_info=True)
+            failed(self._recorder, "agent run")
             return AgentRun(self, name, None, enclosing)
         run = AgentRun(self, name, span, enclosing)
         try:
@@ -356,6 +344,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                     run._next_origins.append(origin)
         except Exception:
             log.warning("wake: failed to record handoff", exc_info=True)
+            failed(self._recorder, "handoff")
         return run
 
     def _record_message(self, *, sender: AgentRun, receiver: AgentRun, content: Any) -> str | None:
@@ -466,19 +455,22 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             pending = self._pending.pop(run_id, None)
         if span is None or pending is None:
             return
-        returned = links._returned(pending.get("link"))
-        links._exit(pending.get("link"))
-        if returned:
-            # What the tool got back came from these events, such as an A2A reply: they
-            # feed the step that reads its result.
-            with self._lock:
-                self._returned_by_event[pending["event_id"]] = returned
-        payload = {"input": pending["inputs"], "output": outputs}
-        if error is not None:
-            payload["error"] = repr(error)
-            span.set_status(Status(StatusCode.ERROR, str(error)))
-        span.set_attributes(events.payload_attributes(payload))
-        span.end()
+        try:
+            returned = links._returned(pending.get("link"))
+            links._exit(pending.get("link"))
+            if returned:
+                # What the tool got back came from these events, such as an A2A reply: they
+                # feed the step that reads its result.
+                with self._lock:
+                    self._returned_by_event[pending["event_id"]] = returned
+            payload = {"input": pending["inputs"], "output": outputs}
+            if error is not None:
+                payload["error"] = repr(error)
+                span.set_status(Status(StatusCode.ERROR, str(error)))
+            span.set_attributes(events.payload_attributes(payload))
+        finally:
+            # Whatever failed above, the event is still sent, and the failure counted.
+            span.end()
         self._remember_output(span.get_span_context().trace_id, pending["event_id"], text)
 
     def _end_structure(self, run_id: UUID, error: BaseException | None = None) -> None:
@@ -495,6 +487,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             span.end()
         except Exception:
             log.warning("wake: failed to end span", exc_info=True)
+            failed(self._recorder, "span end")
 
     def _event_context(self):
         """Under the tool call making it, else the agent run."""

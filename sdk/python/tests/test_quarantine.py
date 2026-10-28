@@ -2,8 +2,14 @@
 quarantined entries aren't served, and both are recorded. The rules come from a stand-in
 for wake-proxy's memory endpoint."""
 
+import asyncio
 import json
+import logging
+import os
 import threading
+import time
+import urllib.parse
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -12,7 +18,7 @@ from test_memory import EMAIL, Session, attr, remember_from_email
 
 from wake.langgraph import WakeStore
 from wake.memory import LABEL_KEY, Memory, content_of, digest
-from wake.quarantine import MemoryLocked, MemoryQuarantined, Quarantine
+from wake.quarantine import STALE, MemoryLocked, MemoryQuarantined, Quarantine
 
 
 class Rules:
@@ -22,6 +28,8 @@ class Rules:
     def __init__(self):
         self.rules = {"version": 1, "quarantines": []}
         self.fetched_by = []
+        self.delay = 0.0
+        self.padding = 0  # bytes of whitespace after the rules
         rules = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -30,7 +38,8 @@ class Rules:
 
             def do_GET(self):
                 rules.fetched_by.append(self.path)
-                body = json.dumps(rules.rules).encode()
+                time.sleep(rules.delay)
+                body = json.dumps(rules.rules).encode() + b" " * rules.padding
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(body)))
@@ -40,6 +49,9 @@ class Rules:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def queries(self):
+        return [urllib.parse.parse_qs(urllib.parse.urlsplit(p).query) for p in self.fetched_by]
 
     def quarantine(self, **selection):
         self.rules = {"version": 2, "locked_by": selection.pop("locked_by", None),
@@ -63,7 +75,7 @@ def test_a_locked_agent_cant_write_and_the_refusal_is_recorded(rules, tmp_path):
     session = Session("billing")
     rules.quarantine(locked_by="q1", lock={"agents": ["billing"]})
     memory = quarantined(session, rules, "billing")
-    assert rules.fetched_by[-1] == "/v1/memory?agent=billing"
+    assert rules.fetched_by[-1].startswith("/v1/memory?agent=billing&process=")
     inner = InMemoryStore()
     store = WakeStore(inner, memory)
 
@@ -108,6 +120,22 @@ def test_entries_from_a_poisoned_origin_arent_served(rules):
     assert [attr(r, "wake.memory.entry") for r in reads] == ["clean"], "only what was served is a read"
 
 
+def test_nothing_is_served_while_the_proxy_cant_read_its_quarantines(rules):
+    session = Session("support")
+    inner = InMemoryStore()
+    WakeStore(inner, Memory(session.handler)).put(("facts",), "by-support", {"text": "x"})
+    # What wake-proxy says when its state on disk is unreadable: what it quarantined is
+    # unknown, so any entry might be.
+    rules.rules = {"version": 0, "locked_by": "unreadable-state", "hidden_by": "unreadable-state", "quarantines": []}
+    store = WakeStore(inner, quarantined(session, rules, "support"))
+
+    assert store.get(("facts",), "by-support") is None
+    refused = [e for e in session.events("denied") if attr(e, "wake.memory.refused") == "read"]
+    assert [attr(e, "wake.brake.halt_id") for e in refused] == ["unreadable-state"]
+    with pytest.raises(MemoryLocked):
+        store.put(("facts",), "new", {"text": "y"})
+
+
 def test_other_selections(rules, tmp_path):
     session = Session("support")
     inner = InMemoryStore()
@@ -136,11 +164,14 @@ def test_other_selections(rules, tmp_path):
     assert memory.read_file(tmp_path / "notes.md") == "fine", "a labeled file is served"
 
 
-def test_an_unreachable_proxy_enforces_nothing_and_never_raises():
-    q = Quarantine("http://127.0.0.1:9", "billing", start=False, timeout=0.2)
-    assert q.fetch() is False
-    assert q.locked_by() is None
-    assert q.hiding("facts", "x", None, False) is None
+def test_an_unreachable_proxy_fails_closed_and_never_raises(caplog):
+    with caplog.at_level(logging.WARNING, logger="wake"):
+        q = Quarantine("http://127.0.0.1:9", "billing", start=False, timeout=0.2)
+        assert q.fetch() is False
+    assert q.locked_by() == STALE
+    assert q.hiding("facts", "x", None, False) == STALE
+    assert not q.health().ok and q.health().age is None
+    assert "couldn't fetch memory rules" in caplog.text
 
 
 def test_the_last_rules_stand_when_a_fetch_fails(rules):
@@ -151,3 +182,140 @@ def test_the_last_rules_stand_when_a_fetch_fails(rules):
     rules.server.server_close()
     assert q.fetch() is False
     assert q.locked_by() == "q1"
+
+
+def test_the_first_fetch_happens_before_the_agent_goes_on(rules):
+    rules.quarantine(locked_by="q1", lock={"agents": ["billing"]})
+    rules.delay = 0.3
+    q = Quarantine(rules.url, "billing", interval=60)
+    try:
+        assert q.locked_by() == "q1", "enforced from the first write"
+    finally:
+        q.close()
+
+
+def test_stale_rules_fail_closed(rules, tmp_path, caplog):
+    session = Session("billing")
+    q = Quarantine(rules.url, "billing", start=False, ttl=0.2)
+    assert q.fetch()
+    memory = Memory(session.handler, quarantine=q)
+    store = WakeStore(InMemoryStore(), memory)
+    store.put(("facts",), "acme", {"text": "fine"})
+    assert q.health().ok
+
+    rules.server.shutdown()
+    rules.server.server_close()
+    time.sleep(0.3)
+    with caplog.at_level(logging.WARNING, logger="wake"):
+        assert q.fetch() is False
+    assert "stale" in caplog.text
+    assert not q.health().ok
+    with pytest.raises(MemoryLocked) as raised:
+        store.put(("facts",), "acme", {"text": "changed"})
+    assert raised.value.quarantine == STALE
+    assert store.get(("facts",), "acme") is None, "nothing is served while the rules are stale"
+    refused = session.events("denied")
+    assert [attr(e, "wake.memory.refused") for e in refused] == ["write", "read"]
+    assert {attr(e, "wake.brake.halt_id") for e in refused} == {STALE}
+
+
+def test_rules_over_a_mebibyte_are_read_and_too_large_rules_are_a_warning(rules, caplog):
+    rules.quarantine(locked_by="q1", lock={"fleet": True})
+    rules.padding = 2 << 20
+    q = Quarantine(rules.url, "billing", start=False)
+    assert q.fetch(), "a large quarantine is still read"
+    assert q.locked_by() == "q1"
+
+    rules.padding = 9 << 20
+    with caplog.at_level(logging.WARNING, logger="wake"):
+        assert q.fetch() is False
+    assert "memory rules over" in caplog.text
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_a_forked_process_fetches_on_its_own(rules):
+    q = Quarantine(rules.url, "billing", interval=0.05)
+    try:
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(1)
+            os._exit(0)
+        os.waitpid(pid, 0)
+    finally:
+        q.close()
+    processes = {query["process"][0] for query in rules.queries()}
+    assert any(p.startswith(f"{os.getpid()}.") for p in processes)
+    assert any(p.startswith(f"{pid}.") for p in processes), "the child fetched, as itself"
+
+
+def test_deletes_are_recorded_and_quarantined_entries_cant_be_deleted(rules):
+    inner = InMemoryStore()
+    writer = Session("email")
+    remember_from_email(writer, WakeStore(inner, writer.memory))
+    store = WakeStore(inner, writer.memory)
+    store.put(("facts",), "old", {"text": "stale fact"})
+    store.delete(("facts",), "old")
+    assert inner.get(("facts",), "old") is None
+    deleted = [e for e in writer.events("memory_write") if attr(e, "wake.memory.deleted")]
+    assert [attr(e, "wake.memory.entry") for e in deleted] == ["old"]
+
+    # The poisoned entry is quarantined: it's evidence, so it can't be deleted.
+    rules.quarantine(origins=["tool:read_and_remember"])
+    session = Session("finance")
+    guarded = WakeStore(inner, quarantined(session, rules, "finance"))
+    with pytest.raises(MemoryLocked) as raised:
+        guarded.delete(("facts", "user-1"), "acme-bank")
+    assert raised.value.quarantine == "q1"
+    with pytest.raises(MemoryLocked):
+        asyncio.run(guarded.adelete(("facts", "user-1"), "acme-bank"))
+    assert inner.get(("facts", "user-1"), "acme-bank") is not None, "kept, as evidence"
+    refused = session.events("denied")
+    assert [attr(e, "wake.memory.refused") for e in refused] == ["delete", "delete"]
+    guarded.delete(("facts",), "missing")  # nothing there to hide
+    assert [attr(e, "wake.memory.entry") for e in session.events("memory_write")] == ["missing"]
+
+
+def test_a_locked_agent_cant_delete(rules):
+    inner = InMemoryStore()
+    inner.put(("facts",), "acme", {"text": "fine"})
+    rules.quarantine(locked_by="q1", lock={"agents": ["billing"]})
+    session = Session("billing")
+    store = WakeStore(inner, quarantined(session, rules, "billing"))
+    with pytest.raises(MemoryLocked):
+        store.delete(("facts",), "acme")
+    assert inner.get(("facts",), "acme") is not None
+    assert [attr(e, "wake.memory.refused") for e in session.events("denied")] == ["delete"]
+
+
+def test_a_quarantined_entry_json_cant_hold_isnt_served_and_its_label_never_shows(rules):
+    inner = InMemoryStore()
+    label = {"event": "w1", "origins": ["tool:read_email"], "agent": "email", "sha256": "0" * 64}
+    inner.put(("facts",), "odd", {uuid.uuid4(): "pay account 999", "note": 1, LABEL_KEY: label})
+    rules.quarantine(entries=["facts/odd"])
+    store = WakeStore(inner, quarantined(Session("finance"), rules, "finance"))
+    assert store.get(("facts",), "odd") is None
+    assert store.search(("facts",)) == []
+
+    # Without a quarantine it's served, without its label.
+    item = WakeStore(inner, Memory(Session("finance").handler)).get(("facts",), "odd")
+    assert LABEL_KEY not in item.value and item.value["note"] == 1
+
+
+def test_if_checking_the_quarantine_fails_nothing_is_served_or_written(rules, monkeypatch):
+    inner = InMemoryStore()
+    inner.put(("facts",), "acme", {"text": "fine"})
+    session = Session("finance")
+    q = Quarantine(rules.url, "finance", start=False)
+    assert q.fetch()
+
+    def bug(*args, **kwargs):
+        raise RuntimeError("quarantine bug")
+
+    monkeypatch.setattr(q, "hiding", bug)
+    monkeypatch.setattr(q, "locked_by", bug)
+    store = WakeStore(inner, Memory(session.handler, quarantine=q))
+    assert store.get(("facts",), "acme") is None
+    with pytest.raises(MemoryLocked):
+        store.put(("facts",), "acme", {"text": "changed"})
+    assert inner.get(("facts",), "acme").value == {"text": "fine"}
