@@ -7,9 +7,10 @@ import { RunnableLambda } from "@langchain/core/runnables";
 import { tool } from "@langchain/core/tools";
 import { MessagesAnnotation, START, StateGraph } from "@langchain/langgraph";
 import { ToolNode, toolsCondition } from "@langchain/langgraph/prebuilt";
+import { SpanStatusCode } from "@opentelemetry/api";
 import { z } from "zod";
 
-import { Recorder } from "../src/index.ts";
+import { links, Recorder } from "../src/index.ts";
 import { WakeCallbackHandler } from "../src/langgraph.ts";
 import { ANSWER, ask, emailAgentGraph } from "./email-agent.ts";
 import { attr, id, ids, origins, parents, parentSpanId, recorded, ScriptedChatModel, wakeEvents } from "./helpers.ts";
@@ -170,4 +171,37 @@ test("a user message with no id is new only once in a trace", async () => {
   // A run of its own sees it for the first time.
   await RunnableLambda.from(() => model.invoke([question])).invoke({}, { callbacks: [handler] });
   assert.deepEqual(origins(wakeEvents(await spans()).at(-1)!), ["user"]);
+});
+
+test("a cancelled tool call is still recorded, and its link ends", async () => {
+  const { handler, spans } = setup();
+  let inside: links.Link | undefined;
+  const waitForReply = tool(
+    async () => {
+      inside = links.current();
+      return new Promise<string>(() => {}); // never answers
+    },
+    { name: "wait_for_reply", description: "Wait for a reply to an email.", schema: z.object({ subject: z.string() }) },
+  );
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  await assert.rejects(waitForReply.invoke({ subject: "invoice" }, { callbacks: [handler], signal: controller.signal }));
+  assert.notEqual(inside, undefined);
+  // Whatever ran in the cancelled call, nothing outside it is under the tool's link.
+  assert.equal(links.current(), undefined);
+  const [call, ...more] = wakeEvents(await spans());
+  assert.equal(more.length, 0);
+  assert.equal(attr(call, "wake.event.kind"), "tool_call");
+  assert.equal(call.status.code, SpanStatusCode.ERROR);
+  assert.match(String(JSON.parse(attr(call, "wake.payload") as string).error), /abort/i);
+});
+
+test("a tool call that ends isn't ended again", async () => {
+  const { handler, spans } = setup();
+  const lookUp = tool(async () => "shipped", { name: "look_up", description: "Look up an order.", schema: z.object({ order: z.string() }) });
+  await lookUp.invoke({ order: "1234" }, { callbacks: [handler] });
+  const [call, ...more] = wakeEvents(await spans());
+  assert.equal(more.length, 0);
+  assert.notEqual(call.status.code, SpanStatusCode.ERROR);
+  assert.equal(JSON.parse(attr(call, "wake.payload") as string).output, "shipped");
 });

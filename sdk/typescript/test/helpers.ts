@@ -1,5 +1,7 @@
 /** What the tests share: a recorder whose spans stay in memory, and ways to look at them. */
 
+import { execFile } from "node:child_process";
+
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
@@ -86,4 +88,24 @@ export class ScriptedChatModel extends BaseChatModel {
 /** Waits for the timers and I/O the recorder schedules to run. */
 export function tick(ms = 0): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs an ES module's code in a child process whose environment sends HTTP through a proxy
+ * that isn't there, as an app's own settings might: NODE_USE_ENV_PROXY with HTTP_PROXY.
+ * Resolves to what it printed.
+ */
+export function withAppProxy(code: string): Promise<string> {
+  const env = { ...process.env, NODE_USE_ENV_PROXY: "1", HTTP_PROXY: "http://127.0.0.1:9", HTTPS_PROXY: "http://127.0.0.1:9", NO_PROXY: "", no_proxy: "" };
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, ["--input-type=module", "-e", code], { env, timeout: 20_000 }, (error, stdout, stderr) => {
+      if (error) reject(new Error(`${error.message}\n${stderr}`));
+      else resolve(stdout);
+    });
+  });
+}
+
+/** An import of one of the SDK's modules, for code run in a child process. */
+export function sdk(module: string): string {
+  return JSON.stringify(new URL(`../src/${module}.ts`, import.meta.url).href);
 }

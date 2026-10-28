@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { dumps, PAYLOAD, PAYLOAD_SHA256, payloadAttributes } from "../src/events.ts";
+import { dumps, MAX_PAYLOAD_BYTES, PAYLOAD, PAYLOAD_SHA256, payloadAttributes, sha256 } from "../src/events.ts";
 
 test("what JSON holds comes out as Python's json.dumps(sort_keys=True) writes it", () => {
   const payload = { b: [1, 2.5, null, true], a: { text: "café" } };
@@ -48,4 +48,24 @@ test("payload attributes never throw", () => {
   const attributes = payloadAttributes({ deep, x: 2 });
   JSON.parse(attributes[PAYLOAD]);
   assert.equal(attributes[PAYLOAD_SHA256].length, 64);
+});
+
+test("a payload too large to send whole says so", () => {
+  const page = "x".repeat(MAX_PAYLOAD_BYTES + 10);
+  const whole = dumps({ output: page });
+  const attributes = payloadAttributes({ output: page });
+  const body = attributes[PAYLOAD];
+  assert.ok(body.length <= MAX_PAYLOAD_BYTES);
+  assert.equal(attributes[PAYLOAD_SHA256], sha256(body), "the digest is of what's sent");
+  const payload = JSON.parse(body);
+  assert.equal(payload.truncated, true);
+  assert.equal(payload.bytes, whole.length);
+  assert.equal(payload.sha256, sha256(whole), "anyone holding the whole can match it");
+  assert.ok(whole.startsWith(payload.prefix) && payload.prefix.length > MAX_PAYLOAD_BYTES / 3);
+
+  // Quotes double when escaped; it still fits.
+  const quoted = payloadAttributes({ output: '"'.repeat(MAX_PAYLOAD_BYTES) })[PAYLOAD];
+  assert.ok(quoted.length <= MAX_PAYLOAD_BYTES);
+  assert.equal(JSON.parse(quoted).truncated, true);
+  assert.ok(!("truncated" in JSON.parse(payloadAttributes({ output: "fine" })[PAYLOAD])));
 });

@@ -73,7 +73,7 @@ A handoff is recorded as an `agent_message` event in the receiving agent's run, 
 
 ## The recorder
 
-The recorder sends to `WAKE_ENDPOINT`, or `http://localhost:4318` by default. Over TLS with a private CA, set `WAKE_CA_FILE` to the CA's certificate. Wake reads only its own `WAKE_*` settings: the app's `OTEL_*` variables configure the app's telemetry and never Wake's, Wake registers nothing with OpenTelemetry's global API, and it records every event even under an app span its sampler left unsampled. `flush()` waits at most its timeout, and resolves false if events were dropped since the last flush. `health()` counts events sent and dropped, and `failed`, those the SDK couldn't record. What's still queued is sent when the process has nothing left to do; call `shutdown()` before the process exits otherwise, such as on SIGTERM.
+The recorder sends to `WAKE_ENDPOINT`, or `http://localhost:4318` by default. Over TLS with a private CA, set `WAKE_CA_FILE` to the CA's certificate. Wake reads only its own `WAKE_*` settings. The app's `OTEL_*` variables configure the app's telemetry and never Wake's, and Wake registers nothing with OpenTelemetry's global API. The app's proxy settings, such as `HTTPS_PROXY` with `NODE_USE_ENV_PROXY`, apply to its own traffic, and Wake's goes straight to the collector. Wake records every event even under an app span its sampler left unsampled. `flush()` waits at most its timeout, and resolves false if events were dropped since the last flush. `health()` counts events sent and dropped, and `failed`, those the SDK couldn't record. What's still queued is sent when the process has nothing left to do; call `shutdown()` before the process exits otherwise, such as on SIGTERM.
 
 ## Memory
 
@@ -91,7 +91,11 @@ const graph = builder.compile({ store });
 
 The label is kept in each value under `__wake__` and taken out before values reach the app. A delete is recorded as a `memory_write` with `wake.memory.deleted` set.
 
-For memory files, such as an agent's notes file, use `await memory.writeFile(path, text)` and `await memory.readFile(path)`. The label goes next to the file as `<file>.wake.json`. For any other store, call `memory.write(store, entry, content)` before writing, save the label it returns with the entry, and call `memory.read(store, entry, content, label)` after reading. `new Memory(...)` takes any of the integrations: a `WakeCallbackHandler`, a `WakeTracingProcessor` or a `WakeClaudeAgent`.
+For memory files, such as an agent's notes file, use `await memory.writeFile(path, text)` and `await memory.readFile(path)`. The label goes next to the file as `<file>.wake.json`. For any other store:
+- Before writing, call `await memory.write(store, entry, content, current, label)`, where `current` and `label` are what the entry holds now and its label, if anything. Save the label it resolves to with the entry.
+- After reading, call `memory.read(store, entry, content, label)`.
+
+`new Memory(...)` takes any of the integrations: a `WakeCallbackHandler`, a `WakeTracingProcessor` or a `WakeClaudeAgent`.
 
 ### Quarantine
 
@@ -105,7 +109,12 @@ await quarantine.ready;
 const memory = new Memory(handler, { quarantine });
 ```
 
-It fetches them as it starts, waiting at most a second, which `ready` waits for, then every couple of seconds in the background. A locked agent's writes and deletes throw `MemoryLocked` and don't happen. A quarantined entry reads as absent from `WakeStore`, drops out of searches, makes `readFile` throw `MemoryQuarantined`, and can't be deleted: it's kept, as evidence. Each refusal is recorded as a `denied` event.
+It fetches them as it starts, waiting at most a second, which `ready` waits for, then every couple of seconds in the background. The fetches go straight to wake-proxy, whatever the app's proxy settings say.
+- **A locked agent:** its writes and deletes reject with `MemoryLocked` and don't happen.
+- **A quarantined entry:** it reads as absent from `WakeStore`, drops out of searches, and makes `readFile` throw `MemoryQuarantined`. It can't be overwritten or deleted: it's kept, as evidence.
+- **Every refusal** is recorded as a `denied` event.
+
+One process can host several agents, as named runs (`handler.agent("email", ...)`), Claude subagents, or the agents of an OpenAI Agents workflow. The brake locks each by its own name, so the rules are fetched for each run's name too, from the run's first write, which waits at most a second for them. A run's writes are refused when its name, or the agent the `Quarantine` was given, is locked.
 
 It fails closed. When a fetch fails the last rules stand for `ttlMillis` (30 seconds by default). If no fetch has succeeded, or the rules are older than that, every write throws `MemoryLocked` and no entry is served, under the id `stale-rules`, until a fetch succeeds. `quarantine.health()` says whether the rules are fresh, and going stale is logged as a warning. Each fetch names the process as well as the agent.
 
@@ -169,7 +178,12 @@ The current link is kept per task of execution in an `AsyncLocalStorage`, as [do
 
 ## When the collector is down
 
-Events go out from a bounded queue in the background, so the agent never waits on the collector. Events that can't be sent are dropped and counted:
+Events go out from a queue in the background, so the agent never waits on the collector.
+- **The queue:** at most 2,048 events (`maxQueueSize`) and 64 MiB (`maxQueueBytes`).
+- **Batches:** each goes in at most 8 MiB, well under the collector's request limit.
+- **Large payloads:** a payload over 4 MiB, such as a model's context late in a long run, is cut to its first 2 MiB and marked truncated, with the whole payload's size and SHA-256 (see [docs/events.md](../../docs/events.md)).
+
+Events that can't be sent are dropped and counted:
 
 ```ts
 const recorder = new Recorder({ agent: "email-agent", onDrop: (count, reason) => page(count, reason) });

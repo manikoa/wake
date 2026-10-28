@@ -1,8 +1,8 @@
 /** The recorder: sends events to the Wake collector without ever blocking the agent. */
 
 import { readFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { Agent as HttpAgent, request as httpRequest } from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 
 import { context as otelContext, ROOT_CONTEXT, type Context, type SpanOptions, type Span } from "@opentelemetry/api";
 import { ExportResultCode, suppressTracing, type ExportResult } from "@opentelemetry/core";
@@ -20,11 +20,19 @@ import { AGENT_ID } from "./events.ts";
 import { log } from "./log.ts";
 
 export const DEFAULT_ENDPOINT = "http://localhost:4318";
-// How long one export may take. Short, so a hung collector costs a flush little; a batch
-// that times out is dropped and counted.
+// How long one export may take: short, so a hung collector costs a flush little, plus a
+// second for each MiB the batch holds. A batch that times out is dropped and counted.
 const EXPORT_TIMEOUT_MILLIS = 3000;
-const SCHEDULE_DELAY_MILLIS = 5000;
-const MAX_EXPORT_BATCH_SIZE = 512;
+// What may wait to be sent. A span that would take the queue past either bound is dropped and
+// counted, so a flood of large payloads can't grow the agent's memory.
+export const MAX_QUEUE_SIZE = 2048;
+export const MAX_QUEUE_BYTES = 64 << 20;
+// What one export sends: well under the collector's 20 MiB request limit, and a payload is
+// never over events.MAX_PAYLOAD_BYTES, so every event fits a batch on its own.
+const MAX_BATCH_SIZE = 512;
+export const MAX_BATCH_BYTES = 8 << 20;
+// How long a span waits for others to send with, unless a batch fills first.
+const EXPORT_DELAY_MILLIS = 5000;
 
 export type { SpanExporter };
 
@@ -61,7 +69,10 @@ export interface RecorderOptions {
   caFile?: string;
   /** Where spans go instead of the collector, such as an in-memory exporter in tests. */
   exporter?: SpanExporter;
+  /** The most events that may wait to be sent: 2,048 by default. */
   maxQueueSize?: number;
+  /** The most bytes of events that may wait to be sent: 64 MiB by default. */
+  maxQueueBytes?: number;
   /** Called with each count of events dropped and why, after the export that dropped them. */
   onDrop?: (count: number, reason: string) => void;
 }
@@ -140,22 +151,26 @@ class Counts {
  * Sends spans to the collector as OTLP/HTTP protobuf, configured only by its arguments.
  *
  * The app's OTEL_EXPORTER_OTLP_* settings are for its own telemetry, and its headers can
- * hold its secrets, so none of them apply here. Each batch is tried once, with a short
- * timeout: a batch that fails is dropped and counted, and the next one goes on. The
- * request is made with tracing suppressed, so the app's own HTTP instrumentation, if it
- * has any, doesn't record Wake's exports.
+ * hold its secrets, so none of them apply here. Nor do its proxy settings, such as
+ * HTTPS_PROXY with NODE_USE_ENV_PROXY: events go straight to the collector, on an HTTP agent
+ * of Wake's own. Each batch is tried once, with a short timeout: a batch that fails is
+ * dropped and counted, and the next one goes on. The request is made with tracing
+ * suppressed, so the app's own HTTP instrumentation, if it has any, doesn't record Wake's
+ * exports.
  */
 class OTLPExporter implements SpanExporter {
   readonly #url: URL;
   readonly #headers: Record<string, string>;
   readonly #ca?: Buffer;
   readonly #timeout: number;
+  readonly #agent: HttpAgent;
 
   constructor(endpoint: string, headers: Record<string, string> | undefined, caFile: string | undefined, timeout: number) {
     this.#url = new URL(`${endpoint.replace(/\/+$/, "")}/v1/traces`);
     this.#headers = { ...headers, "Content-Type": "application/x-protobuf" };
     this.#ca = caFile ? readFileSync(caFile) : undefined;
     this.#timeout = timeout;
+    this.#agent = this.#url.protocol === "https:" ? new HttpsAgent() : new HttpAgent();
   }
 
   export(spans: ReadableSpan[], done: (result: ExportResult) => void): void {
@@ -167,13 +182,15 @@ class OTLPExporter implements SpanExporter {
       return;
     }
     const send = this.#url.protocol === "https:" ? httpsRequest : httpRequest;
+    const timeout = this.#timeout + ((body?.byteLength ?? 0) / (1 << 20)) * 1000;
     otelContext.with(suppressTracing(otelContext.active()), () => {
       const request = send(
         this.#url,
         {
           method: "POST",
           headers: { ...this.#headers, "Content-Length": String(body?.byteLength ?? 0) },
-          timeout: this.#timeout,
+          timeout,
+          agent: this.#agent,
           ...(this.#ca ? { ca: this.#ca } : {}),
         },
         (response) => {
@@ -186,7 +203,7 @@ class OTLPExporter implements SpanExporter {
           response.on("error", (error) => done({ code: ExportResultCode.FAILED, error }));
         },
       );
-      request.on("timeout", () => request.destroy(new Error(`no answer from the collector in ${this.#timeout}ms`)));
+      request.on("timeout", () => request.destroy(new Error(`no answer from the collector in ${Math.round(timeout)}ms`)));
       request.on("error", (error) => done({ code: ExportResultCode.FAILED, error }));
       request.end(body);
     });
@@ -198,27 +215,45 @@ class OTLPExporter implements SpanExporter {
 }
 
 /**
- * Holds ended spans in a bounded queue and exports them in batches, from timers and
- * completions, never inside the agent's call that ended the span. A span arriving at a
- * full queue pushes out the oldest one, which is counted as dropped. Exports go one at a
- * time; each is counted as sent or dropped, then drops are reported.
+ * About how many bytes a span takes on the wire: its strings, wake.payload above all, which is
+ * ASCII, so its length is its size, and a little for everything else.
+ */
+function size(span: ReadableSpan): number {
+  let n = 256;
+  for (const [key, value] of Object.entries(span.attributes ?? {})) {
+    n += key.length + 16;
+    if (typeof value === "string") n += value.length;
+    else if (Array.isArray(value)) n += value.reduce<number>((total, v) => total + (typeof v === "string" ? v.length + 8 : 16), 0);
+  }
+  return n;
+}
+
+/**
+ * Holds ended spans in a queue and exports them in batches, from timers and completions,
+ * never inside the agent's call that ended the span. The queue and each batch are bounded by
+ * count and by bytes: a span that doesn't fit the queue is dropped and counted, and a batch
+ * stays under the collector's request limit, however large the payloads. Exports go one at
+ * a time; each is counted as sent or dropped, then drops are reported.
  */
 class QueueProcessor implements SpanProcessor {
-  readonly #queue: ReadableSpan[] = [];
+  readonly #queue: [ReadableSpan, number][] = [];
+  #queuedBytes = 0;
   readonly #exporter: SpanExporter;
   readonly #counts: Counts;
   readonly #maxQueueSize: number;
+  readonly #maxQueueBytes: number;
   readonly #batchSize: number;
   #running: Promise<void> | null = null;
   #all = false;
   #timer: NodeJS.Timeout | null = null;
   #closed = false;
 
-  constructor(exporter: SpanExporter, counts: Counts, maxQueueSize: number) {
+  constructor(exporter: SpanExporter, counts: Counts, maxQueueSize: number, maxQueueBytes: number) {
     this.#exporter = exporter;
     this.#counts = counts;
     this.#maxQueueSize = Math.max(1, maxQueueSize);
-    this.#batchSize = Math.min(MAX_EXPORT_BATCH_SIZE, this.#maxQueueSize);
+    this.#maxQueueBytes = maxQueueBytes;
+    this.#batchSize = Math.min(MAX_BATCH_SIZE, this.#maxQueueSize);
   }
 
   onStart(): void {}
@@ -228,13 +263,15 @@ class QueueProcessor implements SpanProcessor {
       this.#counts.recordDropped(1, "recorder shut down");
       return;
     }
-    if (this.#queue.length >= this.#maxQueueSize) {
-      this.#queue.shift();
+    const n = size(span);
+    if (this.#queue.length >= this.#maxQueueSize || this.#queuedBytes + n > this.#maxQueueBytes) {
       this.#counts.recordDropped(1, "queue full");
+      return;
     }
-    this.#queue.push(span);
+    this.#queue.push([span, n]);
+    this.#queuedBytes += n;
     queued.add(this);
-    if (this.#queue.length >= this.#batchSize && this.#running === null) {
+    if (this.#batchReady() && this.#running === null) {
       // Started on the next turn of the event loop, so an exporter that answers at once
       // can't run onDrop inside the agent's call.
       setImmediate(() => void this.#drain(false));
@@ -257,12 +294,16 @@ class QueueProcessor implements SpanProcessor {
     await this.#exporter.shutdown();
   }
 
+  #batchReady(): boolean {
+    return this.#queue.length >= this.#batchSize || this.#queuedBytes >= MAX_BATCH_BYTES;
+  }
+
   #schedule(): void {
     if (this.#timer !== null || this.#running !== null) return;
     this.#timer = setTimeout(() => {
       this.#timer = null;
       void this.#drain(true);
-    }, SCHEDULE_DELAY_MILLIS);
+    }, EXPORT_DELAY_MILLIS);
     this.#timer.unref();
   }
 
@@ -275,8 +316,8 @@ class QueueProcessor implements SpanProcessor {
     }
     this.#running = (async () => {
       try {
-        while (this.#queue.length > 0 && (this.#all || this.#queue.length >= this.#batchSize)) {
-          await this.#export(this.#queue.splice(0, this.#batchSize));
+        while (this.#queue.length > 0 && (this.#all || this.#batchReady())) {
+          await this.#export(this.#take());
         }
       } finally {
         this.#all = false;
@@ -286,6 +327,21 @@ class QueueProcessor implements SpanProcessor {
       }
     })();
     return this.#running;
+  }
+
+  /** The next batch: at most the batch size, and MAX_BATCH_BYTES unless one span is larger. */
+  #take(): ReadableSpan[] {
+    const batch: ReadableSpan[] = [];
+    let bytes = 0;
+    while (this.#queue.length > 0 && batch.length < this.#batchSize) {
+      const [span, n] = this.#queue[0];
+      if (batch.length > 0 && bytes + n > MAX_BATCH_BYTES) break;
+      this.#queue.shift();
+      this.#queuedBytes -= n;
+      batch.push(span);
+      bytes += n;
+    }
+    return batch;
   }
 
   #export(batch: ReadableSpan[]): Promise<void> {
@@ -339,15 +395,16 @@ export class WakeTracer {
  * Owns a private OpenTelemetry pipeline, so it never touches the app's own tracing setup:
  * nothing is registered globally.
  *
- * Spans are exported from a bounded queue in the background. If the collector is slow or
- * down, events are dropped and counted, and the agent keeps working. Check health(), or
- * pass onDrop to page someone. The recorder holds no signing keys: the collector signs
- * events on arrival (see docs/signing.md).
+ * Spans are exported in the background from a queue bounded by maxQueueSize events and
+ * maxQueueBytes. If the collector is slow or down, events are dropped and counted, and the
+ * agent keeps working. Check health(), or pass onDrop to page someone. The recorder holds
+ * no signing keys: the collector signs events on arrival (see docs/signing.md).
  *
  * Its settings come from its options and WAKE_* variables only: WAKE_ENDPOINT, and
  * WAKE_CA_FILE for the CA that signed the collector's TLS certificate. The app's OTEL_*
- * variables configure the app's telemetry, not Wake's. What's still queued is sent when
- * the process has nothing left to do, or on shutdown().
+ * variables configure the app's telemetry, not Wake's, and its proxy settings its own
+ * traffic. What's still queued is sent when the process has nothing left to do, or on
+ * shutdown().
  */
 export class Recorder {
   readonly agent: string;
@@ -369,7 +426,7 @@ export class Recorder {
         EXPORT_TIMEOUT_MILLIS,
       );
     this.#counts = new Counts(options.onDrop);
-    this.#processor = new QueueProcessor(exporter, this.#counts, options.maxQueueSize ?? 2048);
+    this.#processor = new QueueProcessor(exporter, this.#counts, options.maxQueueSize ?? MAX_QUEUE_SIZE, options.maxQueueBytes ?? MAX_QUEUE_BYTES);
     // Every event is recorded: every setting is given, and attribute values aren't cut
     // short, since wake.payload must stay valid JSON.
     this.#provider = new TracerProvider({

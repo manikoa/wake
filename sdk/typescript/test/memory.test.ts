@@ -171,7 +171,7 @@ test("content JSON can't hold never breaks memory", async () => {
   const loop: Record<string, unknown> = { pay: "account 999" };
   loop.self = loop;
   const content = { when: new Date(Date.UTC(2026, 9, 27)), big: 1n, loop };
-  const label = session.memory.write("facts", "odd", content);
+  const label = await session.memory.write("facts", "odd", content);
   assert.notEqual(label, null, "labeled all the same");
   assert.equal(session.memory.read("facts", "odd", content, label), null, "and served");
   const [write] = await session.events("memory_write");

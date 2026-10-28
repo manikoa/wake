@@ -40,7 +40,7 @@ function isSearch(op: Operation): op is SearchOperation {
  * get or search a memory read. The label is kept in the stored value under __wake__ and taken
  * out of what the app gets back. With a quarantine on the Memory, a locked put or delete
  * throws MemoryLocked, a quarantined entry reads as absent and drops out of searches, and
- * deleting one throws MemoryLocked: it's kept, as evidence.
+ * overwriting or deleting one throws MemoryLocked: it's kept, as evidence.
  */
 export class WakeStore extends BaseStore {
   readonly #store: BaseStore;
@@ -56,7 +56,7 @@ export class WakeStore extends BaseStore {
     const ops = [...operations];
     const lookups = this.#lookups(ops);
     const found = lookups.length > 0 ? await this.#store.batch(lookups) : [];
-    const results = await this.#store.batch(this.#before(ops, byKey(lookups, found as (Item | null)[])));
+    const results = await this.#store.batch(await this.#before(ops, byKey(lookups, found as (Item | null)[])));
     return this.#after(ops, results as unknown[]) as OperationResults<Op>;
   }
 
@@ -69,29 +69,36 @@ export class WakeStore extends BaseStore {
   }
 
   /**
-   * What each delete would remove, so the quarantine can refuse to delete an entry it hides.
-   * Without a quarantine, there's nothing to look up.
+   * What each put or delete would replace or remove, so the quarantine can refuse to
+   * overwrite or delete an entry it hides. Without a quarantine, there's nothing to look up.
    */
   #lookups(ops: Operation[]): GetOperation[] {
     if (this.#memory.quarantine === undefined) return [];
-    return ops.filter((op): op is PutOperation => isPut(op) && op.value === null).map((op) => ({ namespace: op.namespace, key: op.key }));
+    return ops.filter(isPut).map((op) => ({ namespace: op.namespace, key: op.key }));
   }
 
-  #before(ops: Operation[], found: Map<string, Item | null>): Operation[] {
-    return ops.map((op) => {
-      if (!isPut(op)) return op;
+  async #before(ops: Operation[], found: Map<string, Item | null>): Promise<Operation[]> {
+    const out: Operation[] = [];
+    for (const op of ops) {
+      if (!isPut(op)) {
+        out.push(op);
+        continue;
+      }
       const store = op.namespace.join("/");
+      const item = found.get(keyOf(op.namespace, op.key));
+      const [current, currentLabel] = item ? split(item.value) : [undefined, null];
       if (op.value === null) {
-        const item = found.get(keyOf(op.namespace, op.key));
-        const [value, label] = item ? split(item.value) : [undefined, null];
-        this.#memory.delete(store, op.key, value, label); // throws MemoryLocked
-        return op;
+        await this.#memory.delete(store, op.key, current, currentLabel); // throws MemoryLocked
+        out.push(op);
+        continue;
       }
       const value: Record<string, unknown> = Object.fromEntries(Object.entries(op.value).filter(([k]) => k !== LABEL_KEY));
-      const label = this.#memory.write(store, op.key, value);
+      // Throws MemoryLocked when the entry it replaces is quarantined.
+      const label = await this.#memory.write(store, op.key, value, current, currentLabel);
       if (label !== null) value[LABEL_KEY] = label;
-      return { ...op, value };
-    });
+      out.push({ ...op, value });
+    }
+    return out;
   }
 
   #after(ops: Operation[], results: unknown[]): unknown[] {
