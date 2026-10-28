@@ -43,7 +43,7 @@ The fleet holds something for each of the brake's levers, so a game day times th
 - **Proxy deny.** Every call between agents and to the tools goes through agentgateway, which asks wake-proxy.
 - **Token revocation and Okta sign-out.** Each agent signs in as its own user at a stand-in identity provider (`fleet/standins/oauth.py`) and holds a refresh token, which it swaps for access tokens. The tools server asks the provider about the caller's access token on every call (RFC 7662), so a revoked token stops a call that goes around the gateway as well as one through it. Revoking a refresh token revokes the access tokens swapped for it.
 - **Sandbox freeze.** Billing keeps a sandbox at a stand-in E2B (`fleet/standins/e2b.py`), found by its metadata, `agent=billing`. It auto-resumes on traffic, so the brake freezes it with its filesystem only.
-- **Memory.** Billing runs as long as the fleet does, and its memory adapter fetches the brake's quarantines from wake-proxy, so the brake can confirm the adapter has a halt's memory lock. Support's adapter doesn't: it's a one-shot process, gone before a halt.
+- **Memory.** Billing runs as long as the fleet does, and its memory adapter fetches the brake's quarantines from wake-proxy (through `memory-rules`, see [Network](#network)), so the brake can confirm the adapter has a halt's memory lock. Support's adapter doesn't: it's a one-shot process, gone before a halt.
 
 The stand-ins stand in for a design partner's identity provider, such as Okta, and E2B. Each implements what the agents and the brake call, and nothing more. Real ones come later, from a partner, or an Okta developer org and an E2B account.
 
@@ -55,16 +55,19 @@ agentgateway names each caller from its SPIFFE ID or JWT subject, as in producti
 
 ## Network
 
-A compromised agent can reach the rest of the fleet only through agentgateway, where wake-proxy records each call and the brake can deny it. Each agent and the tools server has a network of its own, shared with agentgateway alone, plus the collector for the agents, which send it their events:
+A compromised agent can reach the rest of the fleet only through agentgateway, where wake-proxy records each call and the brake can deny it. Each agent and the tools server has a network of its own, shared with agentgateway and with what that one container calls directly: the collector for the agents, which send it their events, and the stand-ins:
 
 | Network | On it |
 |---|---|
-| `support`, `research`, `billing` | that agent, agentgateway, the collector |
-| `tools` | the tools server, agentgateway |
-| `default` | agentgateway, wake-proxy, the collector, and the brake when one runs next to the recorder |
+| `support`, `research` | that agent, agentgateway, the collector, the identity provider |
+| `billing` | billing, agentgateway, the collector, the identity provider, E2B, `memory-rules` |
+| `tools` | the tools server, agentgateway, the identity provider |
+| `default` | agentgateway, wake-proxy, the collector, the stand-ins, `memory-rules`, and the brake and Temporal when they run next to the recorder |
 
-No fleet container is on `default`, so none can reach wake-proxy's listeners: 9001, which only agentgateway may call, or 9002, the brake's control API. The collector joins each agent's network rather than one network all the agents share, since on a shared network every agent could reach every other one. The tools server records nothing, so it has no way to the collector. `networks.yaml` attaches the recorder's services from `deploy/compose.yaml`, which is unchanged for staging.
+No agent is on `default`, so none can reach wake-proxy's hooks or its control API (9002), or the brake and Temporal, any of which could undo a halt. The collector and the stand-ins join each network they serve rather than one network all the agents share, since on a shared network every agent could reach every other one. None of them forwards anything: each listens on its own port. The stand-ins are on `default` for the brake, which pulls its levers there. The tools server records nothing, so it has no way to the collector. `networks.yaml` attaches the recorder's services from `deploy/compose.yaml`, which is unchanged for staging.
 
-`run.sh` checks this from each agent and the tools server, right after the request: agentgateway connects, and so does the collector for the agents. The other backends and wake-proxy don't, by name or by any of their IP addresses.
+wake-proxy needs a network namespace of its own, not agentgateway's: in the gateway's, its control API would be at the gateway's address on every agent's network.
 
-wake-proxy's memory endpoint (9003) is for agents' memory adapters, which read their quarantine rules from it. No fleet agent reads them yet, so it stays off the agents' networks for now. An agent that does will need a way to it that doesn't also reach 9001.
+**Memory rules.** Billing's memory adapter reads its quarantine rules from wake-proxy's memory endpoint (9003). wake-proxy can't join billing's network for that, since its control API listens on the same addresses. So `memory-rules` (`fleet/relay.py`), on `default` and billing's network, passes connections to `wake-proxy:9003` and nowhere else. The rules don't go through agentgateway: a halted agent's calls are denied there, and its adapter must still fetch them, or the brake could never confirm the halt's memory lock. A route on agentgateway without the deny would put the rules on every agent's network, and any agent could fetch them in billing's name, which is what the brake counts as billing's adapter having the lock. If another agent's adapter reads rules, `memory-rules` joins that agent's network too.
+
+`run.sh` checks this from each agent and the tools server, right after the request: agentgateway connects, and so do the collector, the stand-ins and `memory-rules` from the containers they serve. Nothing else does, by name or by any of its IP addresses. A listener in another container's network namespace is tried at that container's addresses.

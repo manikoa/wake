@@ -21,23 +21,31 @@ compose up -d --build --wait collector wake-proxy agentgateway tools research bi
 compose run --rm support
 
 # Nothing of the fleet's can be reached around agentgateway (see "Network" in README.md).
-# The request just went through every backend and wake-proxy, so each one is up. Each
-# listener is tried by name and by its IP address on each of its networks.
+# The request just went through every backend, the stand-ins and wake-proxy, so each one
+# is up. Each listener is tried by name and by its IP address on each of its networks.
 listeners=""
-for target in tools:3001 research:9101 billing:9102 wake-proxy:9001 wake-proxy:9002 wake-proxy:9003 collector:4318; do
+for target in tools:3001 research:9101 billing:9102 idp:8080 e2b:8080 memory-rules:9003 \
+    wake-proxy:9001 wake-proxy:9002 wake-proxy:9003 collector:4318; do
   service=${target%:*} port=${target#*:}
-  ips=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$(compose ps -q "$service")")
+  id=$(compose ps -q "$service")
+  # A listener in another container's network namespace is at that container's addresses.
+  mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$id")
+  [ "${mode#container:}" != "$mode" ] && id=${mode#container:}
+  ips=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$id")
   listeners+="$service $target"$'\n'
   for ip in $ips; do listeners+="$service $ip:$port"$'\n'; done
 done
 # The listeners a container mustn't reach: all but those of the services matching $1.
 around() { printf '%s' "$listeners" | grep -Ev "^($1) " | cut -d' ' -f2; }
-compose run --rm --no-deps -T support python reach.py support agentgateway:3000 collector:4318 -- $(around 'collector')
-for agent in research billing; do
-  compose exec -T "$agent" python reach.py "$agent" agentgateway:3000 collector:4318 -- $(around "$agent|collector")
-done
+compose run --rm --no-deps -T support python reach.py support agentgateway:3000 collector:4318 idp:8080 \
+  -- $(around 'collector|idp')
+compose exec -T research python reach.py research agentgateway:3000 collector:4318 idp:8080 \
+  -- $(around 'research|collector|idp')
+# Billing also keeps a sandbox at E2B, and its memory adapter fetches its rules.
+compose exec -T billing python reach.py billing agentgateway:3000 collector:4318 idp:8080 e2b:8080 memory-rules:9003 \
+  -- $(around 'billing|collector|idp|e2b|memory-rules')
 # The tools server sends no events, so it has no way to the collector either.
-compose exec -T tools python reach.py tools agentgateway:3000 -- $(around tools)
+compose exec -T tools python reach.py tools agentgateway:3000 idp:8080 -- $(around 'tools|idp')
 
 # The agents send what they still have queued as they stop.
 compose stop research billing tools
