@@ -23,6 +23,7 @@ so no message ids link them, an event's parents are the earlier events in the
 same trace whose output appears in its input. See docs/events.md.
 """
 
+import hashlib
 import logging
 import threading
 import uuid
@@ -104,8 +105,9 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         self._event_by_tool_call = _Recent()  # tool call id -> model call that requested it
         self._result_by_tool_call = _Recent()  # tool call id -> tool call event id
         self._returned_by_event = _Recent()  # tool call event id -> events its result came from
-        self._seen_user_messages = _Recent()
+        self._seen_user_messages = _Recent()  # message id, or (trace id, digest) for one with no id
         self._linked = _Recent()  # top level run id -> the link it started under, for its first event
+        self._under_tool = _Recent()  # tool call run id whose nested run's first event is recorded
         self._installed: _Installed | None = None
 
     def install(self) -> "WakeCallbackHandler":
@@ -198,6 +200,9 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         parents: list[str] = []
         origins: list[str] = []
         linked = self._is_linked(parent_run_id)
+        # The trace this call joins, if it doesn't start one of its own.
+        trace_context = self._context_for(parent_run_id) or EventGraph._event_context(self)
+        trace_id = trace.get_current_span(trace_context).get_span_context().trace_id if trace_context else 0
         with self._lock:
             self._parent_run[run_id] = parent_run_id
             for m in context:
@@ -207,14 +212,19 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                     tool_event = self._result_by_tool_call[m.tool_call_id]
                     parents.append(tool_event)
                     parents += self._returned_by_event.get(tool_event, [])
-                elif (isinstance(m, HumanMessage) and _current_run.get() is None and not linked
-                      and m.id not in self._seen_user_messages):
+                elif isinstance(m, HumanMessage) and _current_run.get() is None and not linked:
                     # A user's message is new content the first time a model sees it.
                     # Inside a named agent run, a human message is usually a prompt the
                     # app built, so the run's input says where content came from instead;
-                    # in a linked run, what started it does.
-                    if m.id is not None:
-                        self._seen_user_messages[m.id] = True
+                    # in a linked run, or one inside a tool call, what started it does. A
+                    # message with no id is known by its text within its trace.
+                    key = m.id
+                    if key is None and trace_id:
+                        key = (trace_id, hashlib.sha256(_text(m.content).encode()).hexdigest())
+                    if key is not None and key in self._seen_user_messages:
+                        continue
+                    if key is not None:
+                        self._seen_user_messages[key] = True
                     if events.ORIGIN_USER not in origins:
                         origins.append(events.ORIGIN_USER)
         model = metadata.get("ls_model_name") or (serialized or {}).get("name") or ""
@@ -401,12 +411,14 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
     ) -> None:
         run = _current_run.get()
         agent = run.agent if run else self._recorder.agent
+        # A run inside a recorded tool call descends from it (docs/linking.md).
+        under_tool = self._take_tool_parent(parent_run_id)
         if run is not None:
             next_parents, next_origins = run._take_next()
-            parents = next_parents + parents
+            parents = under_tool + next_parents + parents
             origins = origins + [o for o in next_origins if o not in origins]
         else:
-            parents = self._take_linked(parent_run_id) + parents
+            parents = (under_tool or self._take_linked(parent_run_id)) + parents
         context = self._context_for(parent_run_id)
         if context is None and run is not None and run._span is not None:
             context = trace.set_span_in_context(run._span)
@@ -521,11 +533,33 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             run_id = parent
         return run_id
 
+    def _enclosing_tool(self, parent_run_id: UUID | None) -> tuple[UUID, str] | None:
+        """The recorded tool call a run runs inside, in this process, such as a graph a
+        tool invokes: its run id and event id. Call with the lock held."""
+        run = parent_run_id
+        for _ in range(1000):
+            if run is None:
+                return None
+            pending = self._pending.get(run)
+            if pending is not None and pending.get("link") is not None:
+                return run, pending["event_id"]
+            run = self._parent_run.get(run)
+        return None
+
+    def _take_tool_parent(self, parent_run_id: UUID | None) -> list[str]:
+        """The enclosing tool call, if this is the first event of a run inside it."""
+        with self._lock:
+            tool = self._enclosing_tool(parent_run_id)
+            if tool is None or tool[0] in self._under_tool:
+                return []
+            self._under_tool[tool[0]] = True
+            return [tool[1]]
+
     def _is_linked(self, parent_run_id: UUID | None) -> bool:
         if parent_run_id is None:
             return links.current() is not None
         with self._lock:
-            return self._root_of(parent_run_id) in self._linked
+            return self._enclosing_tool(parent_run_id) is not None or self._root_of(parent_run_id) in self._linked
 
     def _take_linked(self, parent_run_id: UUID | None) -> list[str]:
         """What started this event's top level run, if it's the run's first event."""

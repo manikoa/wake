@@ -27,7 +27,7 @@ Wake becomes one of the Agents SDK's trace processors. Each agent's run is named
 - A response's parents are the earlier responses and tool results in its input.
 - A handoff is an `agent_message` that feeds the receiving agent's next step.
 
-Inputs and outputs are recorded when the SDK's `trace_include_sensitive_data` is on, as it is by default. Install with the `openai-agents` extra.
+Inputs and outputs are recorded when the SDK's `trace_include_sensitive_data` is on, as it is by default. Without it, events have empty payloads, and the SDK's loop links them instead: a tool call comes from its agent's latest response, and a response reads that response and the tool results since. Chat Completions models, LiteLLM's included, link as Responses models do, and an agent run inside a tool call, such as one used as a tool, descends from that call. Install with the `openai-agents` extra.
 
 ## Claude Agent SDK
 
