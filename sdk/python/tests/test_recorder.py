@@ -15,6 +15,7 @@ from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
 from test_langgraph import ask, email_agent_graph
 
 from wake import Recorder
+from wake.recorder import MAX_BATCH_BYTES
 from wake.langgraph import WakeCallbackHandler
 
 ANSWER = "The email asks for a $10,000 wire."
@@ -85,7 +86,7 @@ def test_counts_failed_exports_and_calls_on_drop():
     assert recorder.health().dropped == 4
 
 
-def test_counts_events_pushed_out_of_a_full_queue():
+def test_counts_events_a_full_queue_turns_away():
     agent_thread = threading.get_ident()
     reported_on = []
     exporter = BlockedExporter()
@@ -95,9 +96,9 @@ def test_counts_events_pushed_out_of_a_full_queue():
         max_queue_size=8,
         on_drop=lambda n, why: reported_on.append((threading.get_ident(), n, why)),
     )
-    emit(recorder, 8)  # a full batch wakes the worker, which blocks exporting it
+    emit(recorder, 8)  # a full batch wakes the export thread, which blocks exporting it
     time.sleep(0.1)
-    # Eight more fill the queue and the next twelve push spans out.
+    # Eight more fill the queue and the next twelve are turned away.
     emit(recorder, 20)
     assert recorder.health().dropped == 12
     assert reported_on == []  # never reported from the agent's thread
@@ -345,3 +346,57 @@ def test_a_payload_json_cant_hold_is_still_recorded():
     payload = json.loads(event.attributes["wake.payload"])
     assert payload["output"] == {str(key): "2026-10-27 00:00:00", "1": "one", "two": 2}
     assert recorder.health().failed == 0
+
+
+class SizedExporter(SpanExporter):
+    """Notes how many spans, and how many payload bytes, each export carries."""
+
+    def __init__(self):
+        self.batches = []
+
+    def export(self, spans):
+        self.batches.append((len(spans), sum(len(s.attributes.get("wake.payload", "")) for s in spans)))
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self):
+        pass
+
+
+def emit_payloads(recorder, count, size):
+    for i in range(count):
+        span = recorder.tracer.start_span(f"event {i}")
+        span.set_attribute("wake.payload", "x" * size)
+        span.end()
+
+
+def test_batches_stay_under_the_collectors_request_limit():
+    exporter = SizedExporter()
+    recorder = Recorder(agent="email-agent", exporter=exporter)
+    # Five 3 MiB contexts: together past the collector's 20 MiB limit, so never one batch.
+    emit_payloads(recorder, 5, 3 << 20)
+    assert recorder.flush(timeout_millis=10_000)
+    assert recorder.health().sent == 5
+    assert sum(n for n, _ in exporter.batches) == 5
+    assert all(size <= MAX_BATCH_BYTES for _, size in exporter.batches), exporter.batches
+
+
+def test_the_queue_is_bounded_by_bytes_too():
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="email-agent", exporter=exporter, max_queue_bytes=1 << 20)
+    emit_payloads(recorder, 5, 300_000)  # the export thread waits for more before sending
+    assert recorder.health().dropped == 2
+    assert not recorder.flush()
+    assert recorder.health().sent == 3
+
+
+def test_the_apps_proxy_settings_never_reach_the_collector(monkeypatch):
+    # The app sends its own traffic through a proxy that isn't there; Wake's goes direct.
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    collector = Collector()
+    recorder = Recorder(agent="email-agent", endpoint=collector.endpoint)
+    emit(recorder, 3)
+    assert recorder.flush()
+    assert recorder.health().sent == 3 and collector.requests == 1

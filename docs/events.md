@@ -14,7 +14,7 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.capture` | string | What recorded it: `sdk`, `proxy` or `memory_adapter` |
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
-| `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it |
+| `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it. A payload too large to send whole is cut short and says so: the proxy keeps 1 MiB of each body, as a string, and adds `"truncated": true`. The SDKs send `{"truncated": true, "bytes", "sha256", "prefix"}` in place of one over 4 MiB, with the whole payload's size and hex SHA-256, and its first 2 MiB as a string |
 | `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload`'s UTF-8 bytes. Set by the signer from the payload it received, replacing any value the sender gave. An event with no payload has none: the signer removes one the sender gave |
 | `wake.signature` | string | Base64 signature, added by the signer: Ed25519 from the collector, ECDSA P-256 from the proxy (see [signing.md](signing.md)) |
 | `wake.signer` | string | SPIFFE id of the signer |

@@ -23,6 +23,7 @@ so no message ids link them, an event's parents are the earlier events in the
 same trace whose output appears in its input. See docs/events.md.
 """
 
+import asyncio
 import hashlib
 import logging
 import threading
@@ -307,6 +308,33 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             # Without a tool call id, the arguments themselves point at the model call that chose them.
             arguments=None if requested_by else _argument_texts(inputs if inputs is not None else input_str),
         )
+        self._end_if_cancelled(run_id)
+
+    def _end_if_cancelled(self, run_id: UUID) -> None:
+        """LangChain ends a tool call that raises with on_tool_error, but it only catches
+        Exception and KeyboardInterrupt, so an async tool that's cancelled ends with no
+        callback: its event never sent and its link still current. So when the task running
+        the tool is done with the call still open, it's ended as cancelled. A sync tool
+        can't be cancelled, and runs with no event loop of its own here."""
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            return
+        if task is None:
+            return
+
+        def done(_: asyncio.Task) -> None:
+            self._cancelled(run_id)
+
+        task.add_done_callback(done)
+        with self._lock:
+            pending = self._pending.get(run_id)
+            if pending is not None:
+                pending["task"] = (task, done)
+
+    @never_raise
+    def _cancelled(self, run_id: UUID) -> None:
+        self._end_event(run_id, None, asyncio.CancelledError())
 
     @never_raise
     def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs) -> None:
@@ -467,6 +495,9 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             pending = self._pending.pop(run_id, None)
         if span is None or pending is None:
             return
+        if "task" in pending:
+            task, done = pending["task"]
+            task.remove_done_callback(done)
         try:
             returned = links._returned(pending.get("link"))
             links._exit(pending.get("link"))

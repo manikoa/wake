@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -9,8 +10,9 @@ from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
-from wake import Recorder
+from wake import Recorder, links
 from wake.langgraph import WakeCallbackHandler
 
 
@@ -241,3 +243,48 @@ def test_a_user_message_with_no_id_is_new_only_once_in_a_trace(recorded):
     RunnableLambda(lambda _: model.invoke([question])).invoke({}, config={"callbacks": [handler]})
     third = wake_events(spans())[-1]
     assert third.attributes["wake.origins"] == ("user",)
+
+
+def test_a_cancelled_tool_call_is_still_recorded_and_its_link_ends(recorded):
+    handler, spans = recorded
+
+    @tool
+    async def wait_for_reply(subject: str) -> str:
+        """Wait for a reply to an email."""
+        await asyncio.sleep(60)
+        return "never"
+
+    async def cancel_it():
+        task = asyncio.create_task(wait_for_reply.ainvoke({"subject": "invoice"}, config={"callbacks": [handler]}))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        # Whatever ran in the cancelled task, nothing outside it is under the tool's link.
+        return links.current()
+
+    assert asyncio.run(cancel_it()) is None
+    (call,) = wake_events(spans())
+    assert call.attributes["wake.event.kind"] == "tool_call"
+    assert call.status.status_code == StatusCode.ERROR
+    assert "CancelledError" in json.loads(call.attributes["wake.payload"])["error"]
+    assert handler._pending == {}, "nothing is left open"
+
+
+def test_a_tool_call_that_ends_isnt_ended_again(recorded):
+    handler, spans = recorded
+
+    @tool
+    async def look_up(order: str) -> str:
+        """Look up an order."""
+        return "shipped"
+
+    async def run_and_finish():
+        await look_up.ainvoke({"order": "1234"}, config={"callbacks": [handler]})
+        await asyncio.sleep(0)
+
+    asyncio.run(run_and_finish())
+    (call,) = wake_events(spans())
+    assert call.status.status_code != StatusCode.ERROR
+    assert json.loads(call.attributes["wake.payload"])["output"] == "shipped"
