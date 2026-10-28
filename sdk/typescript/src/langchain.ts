@@ -15,6 +15,9 @@
  *       });
  *     });
  *
+ * A run started inside another agent's run is an instance of its own, <name>#<its span id>,
+ * started by that run (docs/events.md), so two runs of one agent at once can be told apart.
+ *
  * Causal edges follow the messages: a model call's parents are the events that produced the
  * AI and tool messages in its context, and a tool call's parent is the model call that
  * requested it. When an app builds its prompts from strings, so no message ids link them, an
@@ -80,6 +83,9 @@ export class AgentRun {
   readonly agent: string;
   readonly _span: Span | undefined;
   readonly _parent: AgentRun | undefined;
+  // Started inside another agent's run, it's an instance of its own, started by that one.
+  readonly instance: string | undefined;
+  readonly lineage: readonly string[] = [];
   readonly #handler: WakeCallbackHandler;
   // The message that started this run feeds its next event.
   _nextParents: string[] = [];
@@ -90,6 +96,10 @@ export class AgentRun {
     this.agent = agent;
     this._span = span;
     this._parent = parent;
+    if (parent !== undefined) {
+      this.instance = `${agent}#${span?.spanContext().spanId ?? randomUUID().replaceAll("-", "").slice(0, 16)}`;
+      this.lineage = [...parent.lineage, parent.instance ?? parent.agent];
+    }
   }
 
   /** Records this agent's answer going back to the agent that handed off to it. */
@@ -417,6 +427,7 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
       return new AgentRun(this, name, undefined, enclosing);
     }
     const run = new AgentRun(this, name, span, enclosing);
+    span.setAttributes(events.instanceAttributes(run.instance, run.lineage));
     try {
       if (enclosing !== undefined && input !== undefined && input !== null) {
         const messageId = this._recordMessage(enclosing, run, input);
@@ -451,6 +462,7 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
           [events.EVENT_ID]: eventId,
           [events.EVENT_KIND]: events.AGENT_MESSAGE,
           [events.AGENT_ID]: receiver.agent,
+          ...events.instanceAttributes(receiver.instance, receiver.lineage),
           [events.CAPTURE]: "sdk",
           [events.PARENTS]: parents,
           [events.ORIGINS]: [`agent:${sender.agent}`],
@@ -512,6 +524,7 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
       [events.EVENT_ID]: eventId,
       [events.EVENT_KIND]: event.kind,
       [events.AGENT_ID]: agent,
+      ...(run !== undefined ? events.instanceAttributes(run.instance, run.lineage) : {}),
       [events.CAPTURE]: "sdk",
       [events.PARENTS]: parents,
       [events.ORIGINS]: origins,
@@ -584,6 +597,11 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
 
   override _currentAgent(): string {
     return currentRun.getStore()?.agent ?? this._recorder.agent;
+  }
+
+  override _currentInstance(): [string | undefined, readonly string[]] {
+    const run = currentRun.getStore();
+    return run !== undefined ? [run.instance, run.lineage] : [undefined, []];
   }
 
   #rememberToolResult(runId: string, output: unknown): void {

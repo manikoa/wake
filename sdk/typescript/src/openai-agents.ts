@@ -13,8 +13,10 @@
  * Completions messages. A handoff is an agent_message in the receiving agent's name, fed by
  * the response that handed off, and it feeds that agent's next step. A function tool runs
  * with its event current, and an agent run inside it, such as an agent used as a tool,
- * descends from that tool call. Where nothing else links events, content does, as for
- * LangChain.
+ * descends from that tool call, and is an instance of its agent of its own, <agent>#<the tool
+ * call's span>, since a response can call the same agent as a tool more than once at a time
+ * (docs/events.md). Each such run is linked within itself, as a workflow of its own. Where
+ * nothing else links events, content does, as for LangChain.
  *
  * Inputs and outputs are only in the trace when the SDK's traceIncludeSensitiveData is on, as
  * it is by default. Without them, events are recorded with empty payloads, and the SDK's loop
@@ -122,18 +124,21 @@ interface Pending {
 export class WakeTracingProcessor extends EventGraph {
   readonly #agentSpan = new Recent<string, string>(); // sdk span id of an agent span -> agent name
   readonly #pending = new Recent<string, Pending>(); // sdk span id -> what onSpanStart set up
-  readonly #call = new Recent<Key, [string | undefined, string]>(); // (trace, tool name, arguments) -> (call id, response event id)
+  readonly #call = new Recent<Key, [string | undefined, string]>(); // (trace, scope, tool name, arguments) -> (call id, response event id)
   readonly #eventByCall = new Recent<string, string>(); // call id -> tool call event id
   readonly #returnedByEvent = new Recent<string, string[]>(); // tool call event id -> events its output came from
   readonly #eventByItem = new Recent<string, string>(); // response or output item id -> response event id
-  readonly #lastResponse = new Recent<Key, string>(); // (trace, agent) -> response event id
-  readonly #handedOff = new Recent<Key, string>(); // (trace, agent) -> handoff event id, feeding its next step
+  // A run's scope is the tool call it runs inside, its sdk span id, or null for the workflow's
+  // own: two copies of one agent called as tools at once never share state.
+  readonly #lastResponse = new Recent<Key, string>(); // (trace, scope, agent) -> response event id
+  readonly #handedOff = new Recent<Key, string>(); // (trace, scope, agent) -> handoff event id, feeding its next step
   readonly #seenUser = new Recent<Key, true>(); // (trace, digest) for user input already seen
   readonly #roots = new Recent<string, OtelSpan>(1024); // sdk trace id -> the workflow's root span
   readonly #linked = new Recent<string, string[]>(1024); // sdk trace id -> what started it, feeding its first response
   readonly #spans = new Recent<string, OtelSpan>(); // sdk span id -> its open span
   readonly #toolAgents = new Recent<string, string>(); // tool call event id -> the agent making it
-  readonly #toolsSince = new Recent<Key, string[]>(); // (trace, agent) -> tool calls since its last response, when inputs are hidden
+  readonly #toolInstances = new Recent<string, [string, string[]]>(); // tool call event id -> the instance making it, and its lineage
+  readonly #toolsSince = new Recent<Key, string[]>(); // (trace, scope, agent) -> tool calls since its last response, when inputs are hidden
   readonly #nested = new Recent<string, true>(); // sdk span id of a tool call whose nested run's first response is recorded
 
   constructor(recorder: Recorder) {
@@ -171,7 +176,13 @@ export class WakeTracingProcessor extends EventGraph {
       let attributes = {};
       if (kind === "agent") {
         this.#agentSpan.set(span.spanId, String(data.name));
-        attributes = { "gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": String(data.name), [events.AGENT_ID]: String(data.name) };
+        const [instance, lineage] = this.#identity(span.spanId);
+        attributes = {
+          "gen_ai.operation.name": "invoke_agent",
+          "gen_ai.agent.name": String(data.name),
+          [events.AGENT_ID]: String(data.name),
+          ...events.instanceAttributes(instance, lineage),
+        };
       }
       const name = typeof data.name === "string" ? data.name : "";
       const otel = this._recorder.tracer.startSpan(`${kind} ${name}`.trim(), { attributes }, this.#context(span));
@@ -186,15 +197,18 @@ export class WakeTracingProcessor extends EventGraph {
       // Its arguments aren't set yet, so the responses that asked for a tool of this name
       // stand in as its parents until it ends, for a memory write it makes.
       const agent = this.#agentFor(span);
+      const scope = this.#scope(span);
+      const [instance, lineage] = this.#identity(this.#agentAbove(span.parentId));
       this.#pending.set(span.spanId, { eventId, frame });
       this.#toolAgents.set(eventId, agent);
+      if (instance !== undefined) this.#toolInstances.set(eventId, [instance, lineage]);
       let requestedBy = [...this.#call.entries()]
         .filter(([k]) => {
-          const [t, n] = JSON.parse(k) as [string, string];
-          return t === span.traceId && n === name;
+          const [t, sc, n] = JSON.parse(k) as [string, string | null, string];
+          return t === span.traceId && sc === scope && n === name;
         })
         .map(([, [, response]]) => response);
-      const last = this.#lastResponse.get(key(span.traceId, agent));
+      const last = this.#lastResponse.get(key(span.traceId, scope, agent));
       // Without sensitive data no call names it: the agent's latest response did.
       if (requestedBy.length === 0 && last !== undefined) requestedBy = [last];
       this._rememberLineage(eventId, unique(requestedBy), [`tool:${name}`]);
@@ -256,6 +270,7 @@ export class WakeTracingProcessor extends EventGraph {
   #modelCall(span: SdkSpan, call: { model: string; input: unknown; output: unknown[]; responseId: string | undefined }): void {
     const traceKey = span.traceId;
     const agent = this.#agentFor(span);
+    const scope = this.#scope(span);
     // The SDK leaves the input out without sensitive data.
     const hidden = call.input === undefined || call.input === null;
     const items: unknown[] = Array.isArray(call.input) ? call.input : call.input ? [{ role: "user", content: call.input }] : [];
@@ -271,14 +286,14 @@ export class WakeTracingProcessor extends EventGraph {
       this.#nested.set(tool[0], true);
       parents.push(tool[1]);
     }
-    const handoff = this.#handedOff.pop(key(traceKey, agent));
+    const handoff = this.#handedOff.pop(key(traceKey, scope, agent));
     if (handoff !== undefined) parents.push(handoff);
     if (hidden) {
       // The SDK's loop says what this response read: the agent's last response and the
       // tool results since. Its first reads the workflow's input.
-      const last = this.#lastResponse.get(key(traceKey, agent));
+      const last = this.#lastResponse.get(key(traceKey, scope, agent));
       if (last !== undefined) parents.push(last);
-      parents.push(...(this.#toolsSince.pop(key(traceKey, agent)) ?? []));
+      parents.push(...(this.#toolsSince.pop(key(traceKey, scope, agent)) ?? []));
       if (!(linked || tool || handoff || last)) origins.push(events.ORIGIN_USER);
     }
     for (const item of items) {
@@ -311,18 +326,18 @@ export class WakeTracingProcessor extends EventGraph {
       "gen_ai.operation.name": "chat",
       "gen_ai.request.model": call.model,
     }, { input: items, output: call.output });
-    this.#lastResponse.set(key(traceKey, agent), eventId);
+    this.#lastResponse.set(key(traceKey, scope, agent), eventId);
     if (call.responseId) this.#eventByItem.set(call.responseId, eventId);
     for (const item of call.output) {
       const itemId = field(item, "id");
       if (typeof itemId === "string") this.#eventByItem.set(itemId, eventId);
       if (field(item, "type") === "function_call") {
-        this.#call.set(key(traceKey, field(item, "name"), field(item, "arguments")), [field(item, "call_id", "callId") as string | undefined, eventId]);
+        this.#call.set(key(traceKey, scope, field(item, "name"), field(item, "arguments")), [field(item, "call_id", "callId") as string | undefined, eventId]);
       }
       // Chat Completions models report an assistant message with its tool calls.
       for (const requested of (field(item, "tool_calls") as unknown[] | undefined) ?? []) {
         const fn = field(requested, "function");
-        this.#call.set(key(traceKey, field(fn, "name"), field(fn, "arguments")), [field(requested, "id") as string | undefined, eventId]);
+        this.#call.set(key(traceKey, scope, field(fn, "name"), field(fn, "arguments")), [field(requested, "id") as string | undefined, eventId]);
       }
     }
     this._rememberOutput(traceId, eventId, text(call.output));
@@ -341,14 +356,15 @@ export class WakeTracingProcessor extends EventGraph {
     // response that reads its output.
     if (returned.length > 0) this.#returnedByEvent.set(eventId, returned);
     const agent = this.#agentFor(span);
+    const scope = this.#scope(span);
     const otel = this.#take(span);
     if (otel === undefined) return;
     const traceId = otel.spanContext().traceId;
     const parents: string[] = [];
     const input = data.input;
-    const callKey = key(span.traceId, name, input);
+    const callKey = key(span.traceId, scope, name, input);
     const call = this.#call.pop(callKey);
-    const handoff = this.#handedOff.pop(key(span.traceId, agent));
+    const handoff = this.#handedOff.pop(key(span.traceId, scope, agent));
     if (handoff !== undefined) parents.push(handoff);
     if (call !== undefined) {
       const [callId, requestedBy] = call;
@@ -360,9 +376,9 @@ export class WakeTracingProcessor extends EventGraph {
     } else if (input === undefined || input === null || input === "") {
       // Without sensitive data the SDK leaves the arguments out, but a tool only runs from
       // its agent's latest response, and its result feeds the agent's next one.
-      const last = this.#lastResponse.get(key(span.traceId, agent));
-      const since = this.#toolsSince.get(key(span.traceId, agent)) ?? [];
-      this.#toolsSince.set(key(span.traceId, agent), [...since, eventId]);
+      const last = this.#lastResponse.get(key(span.traceId, scope, agent));
+      const since = this.#toolsSince.get(key(span.traceId, scope, agent)) ?? [];
+      this.#toolsSince.set(key(span.traceId, scope, agent), [...since, eventId]);
       if (last !== undefined) parents.push(last);
     }
     const attributes: Record<string, string> = { "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name };
@@ -380,14 +396,15 @@ export class WakeTracingProcessor extends EventGraph {
     const data = span.spanData;
     const source = String(data.from_agent ?? "unknown");
     const target = String(data.to_agent ?? "unknown");
-    const requestedBy = this.#lastResponse.get(key(span.traceId, source));
+    const scope = this.#scope(span);
+    const requestedBy = this.#lastResponse.get(key(span.traceId, scope, source));
     const otel = this.#take(span);
     if (otel === undefined) return;
     const eventId = randomUUID();
     this.#event(otel, span, eventId, events.AGENT_MESSAGE, `agent_message ${source} -> ${target}`, target, requestedBy ? [requestedBy] : [], [`agent:${source}`], {
       "gen_ai.agent.name": target,
     }, { from: source, to: target });
-    this.#handedOff.set(key(span.traceId, target), eventId);
+    this.#handedOff.set(key(span.traceId, scope, target), eventId);
     otel.end();
   }
 
@@ -395,11 +412,50 @@ export class WakeTracingProcessor extends EventGraph {
 
   /** The recorded tool call a span runs inside, as its sdk span id and event id, if any. */
   #enclosingTool(span: SdkSpan): [string, string] | undefined {
-    for (let sid = span.parentId, i = 0; sid !== null && sid !== undefined && i < 1000; sid = spanParents.get(sid) ?? null, i++) {
+    return this.#toolAbove(span.parentId);
+  }
+
+  /** The recorded tool call at or above sdk span sid, as its sdk span id and event id. */
+  #toolAbove(sid: string | null | undefined): [string, string] | undefined {
+    for (let i = 0; sid !== null && sid !== undefined && i < 1000; sid = spanParents.get(sid) ?? null, i++) {
       const pending = this.#pending.get(sid);
       if (pending !== undefined) return [sid, pending.eventId];
     }
     return undefined;
+  }
+
+  /** The run a span belongs to: the tool call it runs inside, or null for the workflow's own. */
+  #scope(span: SdkSpan): string | null {
+    return this.#enclosingTool(span)?.[0] ?? null;
+  }
+
+  /** The agent span at or above sdk span sid. */
+  #agentAbove(sid: string | null | undefined): string | undefined {
+    for (let i = 0; sid !== null && sid !== undefined && i < 1000; sid = spanParents.get(sid) ?? null, i++) {
+      if (this.#agentSpan.has(sid)) return sid;
+    }
+    return undefined;
+  }
+
+  /**
+   * The tool call an agent span's run is inside, and the lineage that started it: the agent
+   * that made the call, after its own lineage. Undefined for a run of the workflow's own.
+   */
+  #run(agentSid: string | undefined): [string | undefined, string[]] {
+    if (agentSid === undefined) return [undefined, []];
+    const tool = this.#toolAbove(spanParents.get(agentSid));
+    if (tool === undefined) return [undefined, []];
+    const outer = this.#agentAbove(spanParents.get(tool[0]));
+    const [outerInstance, outerLineage] = this.#identity(outer);
+    const outerName = outer !== undefined ? this.#agentSpan.get(outer)! : this._recorder.agent;
+    return [tool[0], [...outerLineage, outerInstance ?? outerName]];
+  }
+
+  /** The instance an agent span's run is, <agent>#<the tool call's sdk span id>, and the lineage that started it. */
+  #identity(agentSid: string | undefined): [string | undefined, string[]] {
+    const [tool, lineage] = this.#run(agentSid);
+    if (tool === undefined) return [undefined, []];
+    return [`${this.#agentSpan.get(agentSid!)}#${tool}`, lineage];
   }
 
   #agentFor(span: SdkSpan): string {
@@ -414,6 +470,12 @@ export class WakeTracingProcessor extends EventGraph {
   override _currentAgent(): string {
     const link = links.current();
     return (link !== undefined ? this.#toolAgents.get(link.eventId) : undefined) ?? this._recorder.agent;
+  }
+
+  /** The instance whose tool call is running, for a memory write it makes. */
+  override _currentInstance(): [string | undefined, readonly string[]] {
+    const link = links.current();
+    return (link !== undefined ? this.#toolInstances.get(link.eventId) : undefined) ?? [undefined, []];
   }
 
   /** Under the closest enclosing span Wake opened, else the workflow's root. */
@@ -444,6 +506,9 @@ export class WakeTracingProcessor extends EventGraph {
   ): void {
     parents = unique(parents);
     this._rememberLineage(eventId, parents, origins);
+    // In the run the span is in. A handoff is recorded in its target's name, and the target
+    // runs where its source did: the same run, as an instance of its own.
+    const [tool, lineage] = this.#run(this.#agentAbove(span.parentId));
     otel.updateName(name);
     otel.setAttributes({
       [events.EVENT_ID]: eventId,
@@ -452,6 +517,7 @@ export class WakeTracingProcessor extends EventGraph {
       [events.CAPTURE]: "sdk",
       [events.PARENTS]: parents,
       [events.ORIGINS]: origins,
+      ...events.instanceAttributes(tool !== undefined ? `${agent}#${tool}` : undefined, lineage),
       ...attributes,
     });
     if (span.error) {

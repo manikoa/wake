@@ -161,6 +161,41 @@ def test_uninstall_stops_recording_other_runs():
     assert len(calls) == 1
 
 
+def test_runs_of_one_agent_at_once_are_instances_of_their_own():
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="clavr", exporter=exporter)
+    handler = WakeCallbackHandler(recorder).install()
+
+    async def step(query):
+        with handler.agent("email", input=query) as run:
+            found = await search_email.arun({"query": query})
+            run.reply(found)
+
+    async def supervise():
+        with handler.agent("supervisor", input="Check both senders", origin="user"):
+            await asyncio.gather(step("from:acme-billing"), step("from:globex-billing"))
+
+    try:
+        asyncio.run(supervise())
+    finally:
+        handler.uninstall()
+    recorder.flush()
+    spans = exporter.get_finished_spans()
+    kinds: dict[str, list[str]] = {}
+    for e in wake_events(spans):
+        if attrs(e)["wake.agent.id"] == "email":
+            assert attrs(e)["wake.agent.lineage"] == ("supervisor",)
+            kinds.setdefault(attrs(e)["wake.agent.instance"], []).append(attrs(e)["wake.event.kind"])
+        else:
+            assert "wake.agent.instance" not in attrs(e), "the supervisor and the replies it reads are its own"
+    assert len(kinds) == 2 and all(sorted(k) == ["agent_message", "tool_call"] for k in kinds.values()), kinds
+    runs = [s for s in spans if s.attributes.get("gen_ai.operation.name") == "invoke_agent"
+            and s.attributes["gen_ai.agent.name"] == "email"]
+    assert {r.attributes["wake.agent.instance"] for r in runs} == set(kinds)
+    for r in runs:
+        assert r.attributes["wake.agent.instance"] == f"email#{r.context.span_id:016x}", "named for its run's span"
+
+
 def test_errors_in_the_agent_still_reach_the_caller():
     handler = WakeCallbackHandler(Recorder(agent="clavr", exporter=InMemorySpanExporter()))
     with pytest.raises(ValueError):

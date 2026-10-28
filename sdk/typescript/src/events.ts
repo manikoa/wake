@@ -6,6 +6,8 @@ import { inspect } from "node:util";
 export const EVENT_ID = "wake.event.id";
 export const EVENT_KIND = "wake.event.kind";
 export const AGENT_ID = "wake.agent.id";
+export const AGENT_INSTANCE = "wake.agent.instance";
+export const AGENT_LINEAGE = "wake.agent.lineage";
 export const CAPTURE = "wake.capture";
 export const PARENTS = "wake.parents";
 export const ORIGINS = "wake.origins";
@@ -48,6 +50,15 @@ export function dumps(value: unknown, { ensureAscii = true }: { ensureAscii?: bo
   } catch {
     return quote(`<${typeName(value)}>`, ensureAscii);
   }
+}
+
+/**
+ * The attributes naming one running instance of an agent, and what started it, for an agent
+ * that can run as several at once, such as a subagent. Empty for any other.
+ */
+export function instanceAttributes(instance: string | undefined, lineage: readonly string[]): Record<string, string | string[]> {
+  if (!instance) return {};
+  return { [AGENT_INSTANCE]: instance, [AGENT_LINEAGE]: [...lineage] };
 }
 
 /** The payload and its digest as span attributes. Never throws. */

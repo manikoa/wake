@@ -134,6 +134,14 @@ export function Graph<TBase extends Constructor>(Base: TBase) {
       return this._recorder.agent;
     }
 
+    /**
+     * The instance of the current agent and what started it, when the agent is one of several
+     * that can run at once (docs/events.md). Undefined for an agent that runs as one.
+     */
+    _currentInstance(): [string | undefined, readonly string[]] {
+      return [undefined, []];
+    }
+
     _rememberOutput(traceId: string, eventId: string, text: string): void {
       text = text.trim();
       if (text.length < MIN_MATCH || !traceId) return;

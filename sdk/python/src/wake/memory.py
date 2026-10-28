@@ -635,6 +635,7 @@ class Memory:
                 events.EVENT_ID: event_id,
                 events.EVENT_KIND: kind,
                 events.AGENT_ID: h._current_agent(),
+                **events.instance_attributes(*h._current_instance()),
                 events.CAPTURE: "memory_adapter",
                 events.PARENTS: parents,
                 events.ORIGINS: origins,

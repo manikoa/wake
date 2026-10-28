@@ -11,6 +11,8 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.event.id` | string (UUID) | Unique id for the event. Other events list it in `wake.parents`. |
 | `wake.event.kind` | string | `model_call`, `tool_call`, `agent_message`, `memory_read`, `memory_write`, or `denied` for a call the brake stopped |
 | `wake.agent.id` | string | The agent that did it |
+| `wake.agent.instance` | string | The running instance of the agent that did it, for an agent that can run as several at once, such as a subagent. Absent otherwise. See Instances |
+| `wake.agent.lineage` | string[] | With `wake.agent.instance`: the agent and instances that started it, outermost first |
 | `wake.capture` | string | What recorded it: `sdk`, `proxy` or `memory_adapter` |
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
@@ -39,6 +41,25 @@ A span without `wake.event.kind` isn't an event. It only groups events, for exam
 ## Origins and parents
 
 An event's `wake.origins` names only the content that **entered** at that event: a tool result, a user's message seen for the first time, a message from another agent, or a memory entry. Everything else an event saw arrives through `wake.parents`. The full set of origins behind an event is the union over its ancestors, computed in the provenance graph.
+
+## Instances
+
+An agent's name, `wake.agent.id`, is what the brake halts, the inventory lists and the memory adapter locks, so it stays the same however many copies of the agent run. When several can run at once, such as five subagents of one type started by the same agent, each is an **instance** of its own, and its events carry two more attributes:
+
+- `wake.agent.instance` names the instance: the agent's name, `#`, and an id unique within the agent that started it. A Claude subagent's is the id of the Agent tool use that started it, as in `support/researcher#toolu_01A9`.
+- `wake.agent.lineage` lists what started it, outermost first: the agent at the top, then each instance between it and this one. A subagent the support agent started has `["support"]`.
+
+The `agent_message` handing an instance its task is recorded in the instance's name, so it carries the instance. The answer going back is recorded in the starter's name, and carries the starter's instance, if it has one. A memory read or write made inside a tool an instance called carries the instance too. An agent that only ever runs as one has neither attribute, and neither does the agent at the top of a lineage. Origins name agents, not instances: what an instance says to another agent enters as `agent:<its agent's name>`.
+
+When an SDK can't tell which instance made a call, it leaves the instance out rather than guess. A Claude tool call can start before the message saying which subagent asked for it is read; it's attributed then only when one instance of that subagent is running.
+
+What makes an instance, by integration:
+
+- **Claude Agent SDK:** each subagent the Agent tool starts, `<agent>/<subagent type>#<the Agent tool use id>`.
+- **OpenAI Agents SDK:** an agent run inside a tool call, as with `agent.as_tool()`, `<agent>#<the tool call's span id>` (the SDK's own span id), started by the agent that made the call. A response can call one agent as a tool several times at once, so each run inside a tool call is also linked as a workflow of its own: one copy's steps never take another's as parents, whatever their arguments. An agent a handoff reaches inside such a run is an instance of that run too. Runs of the workflow's own, handoffs included, aren't instances.
+- **LangChain and LangGraph:** a named run (`handler.agent(name)`) started inside another agent's run, `<name>#<its invoke_agent span id>`, started by that run. A LangGraph node is a step of the agent running the graph, not an agent of its own, so a node run several times at once isn't an instance.
+
+These come from the SDK, inside the agent's process, so they say what the agent reported, like the rest of an SDK event. Instances of one agent share its process and credentials, so the proxy sees them as that agent.
 
 ## Messages between agents
 

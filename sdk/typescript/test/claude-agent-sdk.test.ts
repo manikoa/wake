@@ -148,6 +148,62 @@ test("one trace, with the subagent nested", async () => {
   assert.ok(calls.every((c) => parentSpanId(c) === sub.spanContext().spanId));
 });
 
+function identity(span: ReadableSpan) {
+  return [attr(span, "wake.agent.instance"), attr(span, "wake.agent.lineage")];
+}
+
+test("the subagent is an instance started by its agent", async () => {
+  const { spans } = await support();
+  for (const event of wakeEvents(spans)) {
+    if (attr(event, "wake.agent.id") === "support/researcher") {
+      assert.deepEqual(identity(event), ["support/researcher#toolu_agent", ["support"]], event.name);
+    } else {
+      assert.deepEqual(identity(event), [undefined, undefined], `${event.name} is the main agent's own`);
+    }
+  }
+  const sub = spans.find((s) => s.name === "invoke_agent support/researcher")!;
+  assert.deepEqual(identity(sub), ["support/researcher#toolu_agent", ["support"]]);
+});
+
+async function twoResearchers(cli: FakeClaudeCode): Promise<void> {
+  cli.emit({ type: "system", subtype: "init", session_id: "session-1", uuid: "u0" });
+  const asks: [string, string, string][] = [
+    ["toolu_window", "Check the refund window", "Thirty days."],
+    ["toolu_shipping", "Check who pays return shipping", "We do."],
+  ];
+  cli.assistant("msg_1", asks.map(([use, ask]) => ({ type: "tool_use", id: use, name: "Agent", input: { description: ask, prompt: ask, subagent_type: "researcher" } })));
+  for (const [use, ask, answer] of asks) {
+    cli.user([{ type: "text", text: ask }], use);
+    cli.assistant(`msg_${use}`, [{ type: "text", text: answer }], use);
+  }
+  for (const [use, , answer] of asks) cli.user([{ type: "tool_result", tool_use_id: use, content: [{ type: "text", text: answer }] }]);
+  cli.assistant("msg_2", [{ type: "text", text: ANSWER }]);
+  cli.emit({ type: "result", subtype: "success", duration_ms: 10, duration_api_ms: 8, is_error: false, num_turns: 2, session_id: "session-1", result: ANSWER });
+}
+
+test("two subagents of one type are two instances", async () => {
+  const { recorder, spans } = recorded("support");
+  await runSupport(new WakeClaudeAgent(recorder), twoResearchers);
+  const events = wakeEvents(await spans());
+  const kinds = new Map<string, string[]>();
+  for (const event of events.filter((e) => attr(e, "wake.agent.id") === "support/researcher")) {
+    const [instance, lineage] = identity(event);
+    assert.deepEqual(lineage, ["support"]);
+    kinds.set(instance as string, [...(kinds.get(instance as string) ?? []), attr(event, "wake.event.kind") as string]);
+  }
+  assert.deepEqual(
+    Object.fromEntries([...kinds].map(([instance, k]) => [instance, k.sort()])),
+    {
+      "support/researcher#toolu_window": ["agent_message", "model_call"],
+      "support/researcher#toolu_shipping": ["agent_message", "model_call"],
+    },
+    "each started its own run, under one agent name",
+  );
+  const answers = events.filter((e) => e.name === "agent_message support/researcher -> support");
+  assert.equal(answers.length, 2);
+  assert.ok(answers.every((a) => identity(a).every((v) => v === undefined)), "each answer reaches the main agent");
+});
+
 test("an in-process tool runs with its event current", async () => {
   const { spans } = await support();
   const lookup = byName(spans, "execute_tool mcp__crm__lookup_order");
@@ -203,5 +259,38 @@ test("a memory write in a tool is labeled with its origins", async () => {
   const [write] = wakeEvents(all, "memory_write");
   assert.equal(parents(write)[0], id(lookup));
   assert.equal(attr(write, "wake.agent.id"), "support");
+  assert.deepEqual(identity(write), [undefined, undefined], "the main agent wrote it");
   assert.deepEqual(new Set(attr(write, "wake.memory.origins") as string[]), new Set(["tool:mcp__crm__lookup_order", "user"]));
+});
+
+async function researcherRemembers(cli: FakeClaudeCode): Promise<void> {
+  cli.emit({ type: "system", subtype: "init", session_id: "session-1", uuid: "u0" });
+  const research = { description: "Look the order up", prompt: "Look order 1234 up", subagent_type: "researcher" };
+  cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: research }]);
+  await cli.hook("PreToolUse", "toolu_agent", { tool_name: "Agent", tool_input: research });
+  cli.user([{ type: "text", text: "Look order 1234 up" }], "toolu_agent");
+  cli.assistant("msg_2", [{ type: "tool_use", id: "toolu_order", name: "mcp__crm__lookup_order", input: { order: "1234" } }], "toolu_agent");
+  await cli.useTool("toolu_order", "mcp__crm__lookup_order", { order: "1234" }, () => cli.callTool("crm", "lookup_order", { order: "1234" }), {
+    parent: "toolu_agent",
+    agent: "researcher",
+  });
+  cli.assistant("msg_3", [{ type: "text", text: ORDER }], "toolu_agent");
+  cli.user([{ type: "tool_result", tool_use_id: "toolu_agent", content: [{ type: "text", text: ORDER }] }]);
+  cli.assistant("msg_4", [{ type: "text", text: ANSWER }]);
+  cli.emit({ type: "result", subtype: "success", duration_ms: 10, duration_api_ms: 8, is_error: false, num_turns: 4, session_id: "session-1", result: ANSWER });
+}
+
+test("a memory write in a subagent's tool names the instance", async () => {
+  const { recorder, spans } = recorded("support");
+  const claude = new WakeClaudeAgent(recorder);
+  const memory = new Memory(claude);
+  const dir = await mkdtemp(join(tmpdir(), "wake-claude-"));
+  await runSupport(claude, researcherRemembers, [lookupOrder(() => memory.writeFile(join(dir, "notes.md"), ORDER))]);
+  const all = await spans();
+  const lookup = byName(all, "execute_tool mcp__crm__lookup_order");
+  const [write] = wakeEvents(all, "memory_write");
+  assert.equal(parents(write)[0], id(lookup));
+  assert.equal(attr(write, "wake.agent.id"), "support/researcher");
+  assert.deepEqual(identity(lookup), ["support/researcher#toolu_agent", ["support"]]);
+  assert.deepEqual(identity(write), ["support/researcher#toolu_agent", ["support"]]);
 });
