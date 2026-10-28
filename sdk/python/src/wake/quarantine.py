@@ -11,7 +11,8 @@ by the agent that wrote them, their origins, the write that made them, their key
 because no label vouches for them. Quarantined entries stay in the store, as evidence;
 they're only not served, and not deleted.
 
-The brake fails closed. When a fetch fails the last rules stand, but only for a while:
+The brake fails closed. When wake-proxy can't read the quarantines it holds, it says so
+(hidden_by), and no entry is served. When a fetch fails the last rules stand, but only for a while:
 once they're older than ttl seconds, or if no fetch has succeeded yet, every write is
 refused and no entry is served, under the id STALE, until a fetch succeeds again. health()
 says whether the rules are fresh, and going stale is logged as a warning.
@@ -77,9 +78,9 @@ def _process_id() -> str:
 def _valid(rules: Any) -> bool:
     if not isinstance(rules, dict):
         return False
-    locked = rules.get("locked_by")
+    locked, hidden = rules.get("locked_by"), rules.get("hidden_by")
     quarantines = rules.get("quarantines", [])
-    if (locked is not None and not isinstance(locked, str)) or not isinstance(quarantines, list):
+    if any(v is not None and not isinstance(v, str) for v in (locked, hidden)) or not isinstance(quarantines, list):
         return False
     return all(
         isinstance(q, dict) and isinstance(q.get("id"), str) and q["id"] and isinstance(q.get("selection") or {}, dict)
@@ -213,8 +214,13 @@ class Quarantine:
 
     def hiding(self, store: str, entry: str, label: Mapping[str, Any] | None, vouched: bool) -> str | None:
         """The quarantine that stops this entry being served, if any: STALE when the rules
-        are. vouched says whether the label's digest matches the content read."""
+        are, and the proxy's hidden_by when it serves no entry at all, as when it can't read
+        the quarantines it holds. vouched says whether the label's digest matches the
+        content read."""
         rules = self.rules()
+        hidden = rules.get("hidden_by") if rules else None
+        if isinstance(hidden, str) and hidden:
+            return hidden
         key = f"{store}/{entry}"
         label = label if vouched else None
         for q in (rules or {}).get("quarantines", []):

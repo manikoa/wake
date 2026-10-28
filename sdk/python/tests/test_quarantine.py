@@ -120,6 +120,22 @@ def test_entries_from_a_poisoned_origin_arent_served(rules):
     assert [attr(r, "wake.memory.entry") for r in reads] == ["clean"], "only what was served is a read"
 
 
+def test_nothing_is_served_while_the_proxy_cant_read_its_quarantines(rules):
+    session = Session("support")
+    inner = InMemoryStore()
+    WakeStore(inner, Memory(session.handler)).put(("facts",), "by-support", {"text": "x"})
+    # What wake-proxy says when its state on disk is unreadable: what it quarantined is
+    # unknown, so any entry might be.
+    rules.rules = {"version": 0, "locked_by": "unreadable-state", "hidden_by": "unreadable-state", "quarantines": []}
+    store = WakeStore(inner, quarantined(session, rules, "support"))
+
+    assert store.get(("facts",), "by-support") is None
+    refused = [e for e in session.events("denied") if attr(e, "wake.memory.refused") == "read"]
+    assert [attr(e, "wake.brake.halt_id") for e in refused] == ["unreadable-state"]
+    with pytest.raises(MemoryLocked):
+        store.put(("facts",), "new", {"text": "y"})
+
+
 def test_other_selections(rules, tmp_path):
     session = Session("support")
     inner = InMemoryStore()

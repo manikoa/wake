@@ -124,6 +124,78 @@ func TestSignsSDKEventsAndChecksProxyEvents(t *testing.T) {
 	}
 }
 
+// spanFromWire decodes one span the way the receiver does, keeping whatever attributes
+// the sender put on it, repeated keys included.
+func spanFromWire(t *testing.T, attributes string) (ptrace.Traces, ptrace.Span) {
+	t.Helper()
+	td, err := (&ptrace.JSONUnmarshaler{}).UnmarshalTraces([]byte(`{"resourceSpans":[{"scopeSpans":[{"spans":[{
+		"traceId":"0102030405060708090a0b0c0d0e0f10","spanId":"0102030405060708","name":"x",
+		"attributes":[` + attributes + `]}]}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return td, td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+}
+
+// A key sent twice reads one way to a lookup and another in the signed bytes. Such an
+// event is kept, but neither signed nor trusted.
+func TestRefusesRepeatedAttributeKeys(t *testing.T) {
+	s, _, _ := setup(t)
+	digest := sha256.Sum256([]byte("another event's payload"))
+	for name, attributes := range map[string]string{
+		"capture": `{"key":"wake.event.kind","value":{"stringValue":"tool_call"}},
+			{"key":"wake.capture","value":{"stringValue":"sdk"}},
+			{"key":"wake.capture","value":{"stringValue":"proxy"}}`,
+		"payload digest": `{"key":"wake.event.kind","value":{"stringValue":"tool_call"}},
+			{"key":"wake.capture","value":{"stringValue":"sdk"}},
+			{"key":"wake.payload","value":{"stringValue":"what was sent"}},
+			{"key":"wake.payload.sha256","value":{"stringValue":"0000"}},
+			{"key":"wake.payload.sha256","value":{"stringValue":"` + hex.EncodeToString(digest[:]) + `"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			td, span := spanFromWire(t, attributes)
+			if _, err := s.processTraces(context.Background(), td); err != nil {
+				t.Fatal(err)
+			}
+			if valid(span) {
+				t.Fatal("an event with a repeated key was marked valid")
+			}
+			if !strings.Contains(reason(span), "more than once") {
+				t.Errorf("reason %q doesn't name the repeated key", reason(span))
+			}
+			if _, signed := span.Attributes().Get(event.Signature); signed {
+				t.Error("an event with a repeated key was signed")
+			}
+			seen := map[string]bool{}
+			for key := range span.Attributes().All() {
+				if seen[key] {
+					t.Errorf("%s is still repeated", key)
+				}
+				seen[key] = true
+			}
+		})
+	}
+}
+
+// The collector signs an SDK event with its own key, so a certificate the sender attached
+// mustn't ride along into the entry.
+func TestDropsSignatureFieldsTheSenderSet(t *testing.T) {
+	s, _, _ := setup(t)
+	td := ptrace.NewTraces()
+	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+	sdk := addSpan(td, "sdk")
+	sdk.Attributes().PutStr(event.Certificate, "c29tZSBjZXJ0aWZpY2F0ZQ==")
+	if _, err := s.processTraces(context.Background(), td); err != nil {
+		t.Fatal(err)
+	}
+	if !valid(sdk) {
+		t.Fatalf("SDK event not signed: %s", reason(sdk))
+	}
+	if _, ok := sdk.Attributes().Get(event.Certificate); ok {
+		t.Error("the sender's certificate was kept on a collector-signed event")
+	}
+}
+
 func TestConfigRequiresSigningKey(t *testing.T) {
 	if err := (&Config{}).Validate(); err == nil {
 		t.Fatal("empty config validated")
