@@ -1,9 +1,9 @@
 # Releases the open source recorder when a vX.Y.Z tag is pushed: the collector and
 # wake-proxy images on GHCR, wake-log and wake-keygen for checking a log without Wake,
-# and the Python SDK on PyPI. Every artifact is signed with Sigstore, keyless, by this
-# workflow's own identity, and gets SLSA build provenance and an SBOM; the release lists
-# every file's SHA-256 in a signed SHA256SUMS. How to cut a release and how to verify one
-# are in docs/releases.md. Actions are pinned to commit SHAs.
+# the Python SDK on PyPI and the TypeScript SDK on npm. Every artifact is signed with
+# Sigstore, keyless, by this workflow's own identity, and gets SLSA build provenance and
+# an SBOM; the release lists every file's SHA-256 in a signed SHA256SUMS. How to cut a
+# release and how to verify one are in docs/releases.md. Actions are pinned to commit SHAs.
 name: Release
 
 on:
@@ -25,13 +25,15 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The tag names the release; the SDK and the proxy must say the same version.
+      # The tag names the release; both SDKs and the proxy must say the same version.
       - id: version
         run: |
           version="${GITHUB_REF_NAME#v}"
           sdk=$(sed -n 's/^version = "\(.*\)"$/\1/p' sdk/python/pyproject.toml | head -1)
+          ts=$(jq -r .version sdk/typescript/package.json)
           proxy=$(sed -n 's/^version = "\(.*\)"$/\1/p' proxy/Cargo.toml | head -1)
           [ "$sdk" = "$version" ] || { echo "::error::sdk/python/pyproject.toml says $sdk, not $version"; exit 1; }
+          [ "$ts" = "$version" ] || { echo "::error::sdk/typescript/package.json says $ts, not $version"; exit 1; }
           [ "$proxy" = "$version" ] || { echo "::error::proxy/Cargo.toml says $proxy, not $version"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -196,9 +198,56 @@ jobs:
           name: sbom-sdk
           path: wake-sdk_${{ needs.version.outputs.version }}.spdx.json
 
+  sdk-typescript:
+    name: TypeScript SDK
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: sdk/typescript/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      # prepack builds it, and copies in the repository's LICENSE and NOTICE.
+      - name: Pack
+        working-directory: sdk/typescript
+        run: |
+          pnpm install --frozen-lockfile
+          mkdir pack && pnpm pack --pack-destination pack
+      - name: SLSA build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: sdk/typescript/pack/*
+      - name: SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: sdk/typescript
+          format: spdx-json
+          output-file: wake-sdk-typescript_${{ needs.version.outputs.version }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: sdk/typescript/pack/*
+          sbom-path: wake-sdk-typescript_${{ needs.version.outputs.version }}.spdx.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sdk-typescript
+          path: sdk/typescript/pack/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-sdk-typescript
+          path: wake-sdk-typescript_${{ needs.version.outputs.version }}.spdx.json
+
   release:
     name: GitHub release
-    needs: [version, images, cli, sdk]
+    needs: [version, images, cli, sdk, sdk-typescript]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -222,7 +271,7 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "Wake $GITHUB_REF_NAME" --generate-notes --notes "$(cat <<EOF
-          Images: \`ghcr.io/$OWNER/wake-collector:$VERSION\` and \`ghcr.io/$OWNER/wake-proxy:$VERSION\`. The SDK: \`pip install wake-sdk==$VERSION\`.
+          Images: \`ghcr.io/$OWNER/wake-collector:$VERSION\` and \`ghcr.io/$OWNER/wake-proxy:$VERSION\`. The SDKs: \`pip install wake-sdk==$VERSION\` and \`npm install wake-sdk@$VERSION\`.
 
           Every artifact is signed with Sigstore and has SLSA build provenance and an SBOM. How to check them: [docs/releases.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/docs/releases.md).
           EOF
@@ -244,3 +293,31 @@ jobs:
           name: sdk
           path: dist
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  npm:
+    name: publish the TypeScript SDK to npm
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    # npm trusts this workflow and environment, not a token (docs/releases.md).
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/wake-sdk
+    permissions:
+      id-token: write # trusted publishing, and the provenance npm shows
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdk-typescript
+          path: pack
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # The tarball the release attested, as it is: publishing it runs no build.
+      - name: Publish
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          v=$(npm --version)
+          [ "$(printf '%s\n' 11.5.1 "$v" | sort -V | head -1)" = 11.5.1 ] || { echo "::error::npm $v can't use trusted publishing, which needs 11.5.1 or later"; exit 1; }
+          npm publish "pack/wake-sdk-$VERSION.tgz" --provenance --access public

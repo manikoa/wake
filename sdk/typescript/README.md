@@ -89,13 +89,43 @@ const store = new WakeStore(new PostgresStore(...), new Memory(handler));
 const graph = builder.compile({ store });
 ```
 
-The label is kept in each value under `__wake__` and taken out before values reach the app. A delete is recorded as a `memory_write` with `wake.memory.deleted` set.
+The label is kept in each value under `__wake__` and taken out before values reach the app. A delete is recorded as a `memory_write` with `wake.memory.deleted` set. A batch is checked whole before any of it is recorded, so if one put or delete is refused, none is recorded or run.
 
 For memory files, such as an agent's notes file, use `await memory.writeFile(path, text)` and `await memory.readFile(path)`. The label goes next to the file as `<file>.wake.json`. For any other store:
 - Before writing, call `await memory.write(store, entry, content, current, label)`, where `current` and `label` are what the entry holds now and its label, if anything. Save the label it resolves to with the entry.
+- Before deleting, call `await memory.delete(store, entry, current, label)`.
 - After reading, call `memory.read(store, entry, content, label)`.
 
 `new Memory(...)` takes any of the integrations: a `WakeCallbackHandler`, a `WakeTracingProcessor` or a `WakeClaudeAgent`.
+
+Each write and read carries `wake.memory.sha256`, the digest of what was written or read, which the label holds too. A store value's digest is the same whichever SDK wrote it or reads it: JavaScript can't tell `500` from `500.0`, so both SDKs write a whole number as an integer.
+
+### Rollback
+
+`WakeStore` and memory files keep the versions an entry held, up to 16, in its label. Content changed since its label was written isn't kept. To restore a version:
+
+```ts
+await memory.rollbackFile(path);                        // the version before this one
+await memory.rollbackFile(path, targetEventId);         // the version that write made
+await store.rollback(["facts", "user-1"], "acme-bank"); // a store entry
+```
+
+A rollback is a write, so the quarantine and the gate check it as one. It also rejects with `MemoryLocked` when the quarantine wouldn't serve the version it restores. A version that names no write, or doesn't match its own digest, rejects with an `Error`, and nothing is restored. The rollback is recorded as a `memory_write` with `wake.memory.rollback_to` naming the write it restores. It resolves to the new label, which names the rollback and keeps the version it replaced, so a rollback can be rolled back too.
+
+### Write gate
+
+To vet what agents put in memory, give the adapter a gate. It's called before each write with the store, the entry, the content's text and the origins upstream of it, and before each delete with `null` for the content. It may return a promise:
+
+```ts
+const memory = new Memory(handler, {
+  gate: (store, entry, content, origins) => {
+    if (content === null) return !entry.startsWith("policy/"); // a delete
+    return !origins.includes("tool:read_email") || !content.includes("account");
+  },
+});
+```
+
+A rollback is asked about too, with the content and origins of the version it restores. A write, delete or rollback the gate refuses rejects with `MemoryLocked` and is recorded as a `denied` event under `write-gate-denied`. The gate fails closed: a gate that throws or rejects refuses, with its error in the event's payload, and so does a gate the adapter can't ask because it couldn't work out the write's origins. Without a gate, recording never holds up a write.
 
 ### Quarantine
 

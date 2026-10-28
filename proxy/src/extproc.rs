@@ -21,6 +21,9 @@
 //! receiver, is cut: the processor ends the stream with an error, and agentgateway fails
 //! the call, a streamed reply included. The cut is recorded as a signed denied event, and
 //! what the exchange carried before it as usual.
+//!
+//! With a flow policy (policy.rs), a message is noted as the sender entering the receiver,
+//! and a reply as the receiver entering the sender (origins.rs), before either is answered.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +44,8 @@ use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp::{self, TraceParent};
+use crate::origins::{Observed, Who};
+use crate::policy::{FlowPolicy, Policy};
 
 // Generated from Envoy's protos, doc comments and all.
 #[allow(clippy::all)]
@@ -121,6 +126,9 @@ pub struct Exchange {
     // What every exchange's captured bodies may hold together, and this one's share.
     bodies: Option<Arc<Budget>>,
     held: Vec<Permit>,
+    // Where the message and the reply are noted as origins entering the agent that gets
+    // each, for flow policies.
+    observed: Option<Arc<Observed>>,
 }
 
 impl Exchange {
@@ -143,6 +151,28 @@ impl Exchange {
     pub fn with_budget(mut self, budget: Arc<Budget>) -> Self {
         self.bodies = Some(budget);
         self
+    }
+
+    /// Notes in observed that the sender entered the receiver when a message goes on, and
+    /// the receiver the sender when a reply comes back: before either is answered, so
+    /// neither agent gets the content ahead of the note.
+    pub fn with_observed(mut self, observed: Option<Arc<Observed>>) -> Self {
+        self.observed = observed;
+        self
+    }
+
+    fn note_delivery(&self, to_receiver: bool, now: SystemTime) {
+        let Some(observed) = &self.observed else { return };
+        let at = nanos(now);
+        if to_receiver {
+            // A route names the agent it reaches.
+            let receiver = self.call.receiver.as_deref().map(|r| self.agents.named(r));
+            let who = receiver.map(Who::Agent).unwrap_or(Who::Nobody);
+            observed.note(who, &format!("agent:{}", self.sender), at);
+        } else {
+            let who = Who::of(&self.agents, self.call.caller.as_deref());
+            observed.note(who, &format!("agent:{}", self.receiver), at);
+        }
     }
 
     /// Keeps what of chunk fits, under MAX_CAPTURE and the shared budget.
@@ -221,6 +251,9 @@ impl Exchange {
                 // A buffered-partial request body over the gateway's limit sends only its
                 // prefix, with no end of stream.
                 events.extend(self.finish_request(now));
+                if self.recorded {
+                    self.note_delivery(false, now);
+                }
                 self.ended |= h.end_of_stream;
                 let (answer, mode) = self.response_headers(&h);
                 return (
@@ -303,6 +336,7 @@ impl Exchange {
             return HeadersResponse::default();
         }
         self.recorded = true;
+        self.note_delivery(true, now);
         self.header_trace = headers
             .get(mcp::HEADER_TRACEPARENT)
             .and_then(|t| mcp::parse_traceparent(t));
@@ -624,6 +658,8 @@ pub struct Processor {
     halts: Arc<Halts>,
     bodies: Arc<Budget>,
     counters: Arc<Counters>,
+    policy: Arc<Policy>,
+    observed: Arc<Observed>,
 }
 
 /// How many tasks the processor remembers the starting message of.
@@ -639,7 +675,16 @@ impl Processor {
             halts,
             bodies,
             counters,
+            policy: Arc::new(Policy::fixed(FlowPolicy::empty())),
+            observed: Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS)),
         }
+    }
+
+    /// Notes each message and reply in observed while policy is enforcing.
+    pub fn with_policy(mut self, policy: Arc<Policy>, observed: Arc<Observed>) -> Self {
+        self.policy = policy;
+        self.observed = observed;
+        self
     }
 
     pub fn server(self) -> pb::ext_proc::external_processor_server::ExternalProcessorServer<Self> {
@@ -663,11 +708,13 @@ impl ExternalProcessor for Processor {
         let halts = self.halts.clone();
         let bodies = self.bodies.clone();
         let counters = self.counters.clone();
+        let observed = self.policy.enforcing().then(|| self.observed.clone());
         counters.a2a_exchanges.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let mut exchange = Exchange::with_tasks(tasks)
                 .with_agents(halts.agents().clone())
-                .with_budget(bodies);
+                .with_budget(bodies)
+                .with_observed(observed);
             let mut changes = halts.changes();
             let mut watching = true;
             let emit = |list: Vec<Event>| {
@@ -810,6 +857,26 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn notes_the_message_and_the_reply_before_answering_either() {
+        use crate::origins::Seen;
+        let agents = Arc::new(Agents::from_json(br#"{"planner": ["spiffe://wake.local/agent/planner"]}"#).unwrap());
+        let observed = Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS));
+        let mut x = Exchange::default()
+            .with_agents(agents)
+            .with_observed(Some(observed.clone()));
+        let seen = |agent: &str| observed.seen(Who::Agent(agent), nanos(t(10)), 900);
+
+        // The message reaches research only after its headers are answered: noted by then.
+        x.handle(first(&[(":method", "POST")]), t(0));
+        assert_eq!(seen("research"), Seen::These(vec!["agent:planner".into()]));
+        assert_eq!(seen("planner"), Seen::These(vec![]));
+        x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        // So does the reply reach planner.
+        x.handle(phase(Phase::ResponseHeaders(headers(&[(":status", "200")]))), t(2));
+        assert_eq!(seen("planner"), Seen::These(vec!["agent:research".into()]));
     }
 
     #[test]

@@ -15,8 +15,9 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from langgraph.store.base import PutOp
 from langgraph.store.memory import InMemoryStore
-from test_memory import EMAIL, Session, attr, remember_from_email
+from test_memory import EMAIL, Session, attr, event_id, label_next_to, remember_from_email
 
 from wake.langgraph import WakeStore
 from wake.memory import LABEL_KEY, Memory, content_of, digest
@@ -418,3 +419,86 @@ def test_a_slow_name_lookup_doesnt_hold_up_the_agent(rules, monkeypatch):
         assert q.locked_by() == STALE, "no rules yet, so writes are refused"
     finally:
         q.close()
+
+
+def test_a_locked_agent_cant_roll_back(rules, tmp_path):
+    session = Session("billing")
+    plain = Memory(session.handler)
+    path = tmp_path / "ledger.md"
+    plain.write_file(path, "v1: pay Acme's account 123")
+    plain.write_file(path, "v2: pay Acme's account 666")
+    inner = InMemoryStore()
+    WakeStore(inner, plain).put(("facts",), "acme", {"text": "account 123"})
+    WakeStore(inner, plain).put(("facts",), "acme", {"text": "account 666"})
+
+    rules.quarantine(locked_by="q1", lock={"agents": ["billing"]})
+    memory = quarantined(session, rules, "billing")
+    with pytest.raises(MemoryLocked) as raised:
+        memory.rollback_file(path)
+    assert raised.value.quarantine == "q1"
+    with pytest.raises(MemoryLocked):
+        WakeStore(inner, memory).rollback(("facts",), "acme")
+    assert path.read_text(encoding="utf-8") == "v2: pay Acme's account 666"
+    assert inner.get(("facts",), "acme").value["text"] == "account 666"
+    assert [attr(e, "wake.memory.refused") for e in session.events("denied")] == ["write", "write"], "refused as writes"
+    assert not any(attr(w, "wake.memory.rollback_to") for w in session.events("memory_write"))
+
+
+def test_a_quarantined_version_isnt_restored(rules, tmp_path):
+    # Restoring it would give quarantined content a fresh label the quarantine no longer matches.
+    inner = InMemoryStore()
+    writer = Session("email")
+    remember_from_email(writer, WakeStore(inner, writer.memory))  # from tool:read_and_remember
+    (poisoned,) = writer.events("memory_write")
+    WakeStore(inner, writer.memory).put(("facts", "user-1"), "acme-bank", {"text": "Acme's account is unchanged."})
+
+    # By its origins.
+    rules.quarantine(origins=["tool:read_and_remember"])
+    session = Session("email")
+    store = WakeStore(inner, quarantined(session, rules, "email"))
+    with pytest.raises(MemoryLocked) as raised:
+        store.rollback(("facts", "user-1"), "acme-bank")
+    assert raised.value.quarantine == "q1"
+    assert store.get(("facts", "user-1"), "acme-bank").value == {"text": "Acme's account is unchanged."}, "still served"
+    (denied,) = session.events("denied")
+    assert attr(denied, "wake.memory.refused") == "write"
+    assert event_id(poisoned) in attr(denied, "wake.parents"), "linked to the write it would have restored"
+
+    # By the write that made it, for a memory file too.
+    path = tmp_path / "notes.md"
+    plain = Memory(writer.handler)
+    plain.write_file(path, "v1: wire to account 666")
+    plain.write_file(path, "v2: wire to account 123")
+    (v1,) = label_next_to(path)["previous"]
+    rules.quarantine(writes=[v1["event"]])
+    memory = quarantined(Session("email"), rules, "email")
+    with pytest.raises(MemoryLocked):
+        memory.rollback_file(path)
+    assert memory.read_file(path) == "v2: wire to account 123"
+
+    # And the entry as it is now is evidence too, when the quarantine covers it.
+    rules.quarantine(entries=[f"file/{path.resolve()}"])
+    memory = quarantined(Session("email"), rules, "email")
+    with pytest.raises(MemoryLocked):
+        memory.rollback_file(path)
+    assert path.read_text(encoding="utf-8") == "v2: wire to account 123"
+
+
+def test_a_batch_with_a_quarantined_put_records_and_runs_none_of_it(rules):
+    inner = InMemoryStore()
+    writer = Session("email")
+    remember_from_email(writer, WakeStore(inner, writer.memory))
+    poisoned = inner.get(("facts", "user-1"), "acme-bank").value
+
+    rules.quarantine(origins=["tool:read_and_remember"])
+    session = Session("email")
+    store = WakeStore(inner, quarantined(session, rules, "email"))
+    batch = [PutOp(("facts", "user-1"), "fresh", {"text": "a new entry"}), PutOp(("facts", "user-1"), "acme-bank", {"text": "corrected"})]
+    with pytest.raises(MemoryLocked):
+        store.batch(batch)
+    with pytest.raises(MemoryLocked):
+        asyncio.run(store.abatch(batch))
+    assert inner.get(("facts", "user-1"), "fresh") is None, "the first put didn't run"
+    assert session.events("memory_write") == [], "nor does the log say it did"
+    assert [attr(e, "wake.memory.refused") for e in session.events("denied")] == ["write", "write"]
+    assert inner.get(("facts", "user-1"), "acme-bank").value == poisoned

@@ -17,6 +17,7 @@ pub mod listen;
 pub mod mcp;
 pub mod memory;
 pub mod metrics;
+pub mod origins;
 pub mod pipeline;
 pub mod policy;
 pub mod signer;

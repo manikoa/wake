@@ -9,6 +9,10 @@
 //! from it, as the gateway's error, and recorded as cut. The tool already ran; the agent
 //! never gets what it returned. The hook fails open, as capture does, so this holds only
 //! while wake-proxy answers; ext_authz fails closed for every call after.
+//!
+//! It also checks the flow policy's rules that name tools, since only this hook sees which
+//! tool a call is for, and notes the tool as an origin entering its caller (origins.rs)
+//! before the call goes on, so the result never reaches the caller ahead of the note.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +30,8 @@ use crate::capture::{Hook, META_AGENT, META_EVENT_ID};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts, now};
 use crate::mcp;
+use crate::origins::{Observed, Who};
+use crate::policy::{At, FlowPolicy, Policy, Target};
 
 pub mod pb {
     tonic::include_proto!("agentgateway.dev.ext_mcp");
@@ -47,6 +53,8 @@ pub struct Processor {
     counters: Arc<Counters>,
     halts: Arc<Halts>,
     events: Events,
+    policy: Arc<Policy>,
+    observed: Arc<Observed>,
 }
 
 impl Processor {
@@ -66,7 +74,16 @@ impl Processor {
             counters,
             halts,
             events,
+            policy: Arc::new(Policy::fixed(FlowPolicy::empty())),
+            observed: Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS)),
         }
+    }
+
+    /// Checks policy's rules that name tools, and notes each tool called in observed.
+    pub fn with_policy(mut self, policy: Arc<Policy>, observed: Arc<Observed>) -> Self {
+        self.policy = policy;
+        self.observed = observed;
+        self
     }
 
     fn agents(&self) -> &Arc<Agents> {
@@ -131,6 +148,15 @@ fn halted(halts: &[Halt]) -> AuthorizationError {
     }
 }
 
+/// The call's link headers, for the record of refusing it.
+fn link_headers(headers: &[(String, Vec<u8>)]) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(k, _)| k == mcp::HEADER_TRACEPARENT || k == mcp::HEADER_PARENTS)
+        .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+        .collect()
+}
+
 /// The string values in the CEL metadata the gateway config sends. Others are ignored.
 fn strings(s: Option<Struct>) -> HashMap<String, String> {
     s.map(|s| {
@@ -161,11 +187,7 @@ impl ExtMcp for Processor {
                 method: r.method,
                 host: server,
                 path: String::new(),
-                headers: headers
-                    .iter()
-                    .filter(|(k, _)| k == mcp::HEADER_TRACEPARENT || k == mcp::HEADER_PARENTS)
-                    .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
-                    .collect(),
+                headers: link_headers(&headers),
             };
             self.counters.denied.fetch_add(1, Ordering::Relaxed);
             self.events
@@ -178,6 +200,42 @@ impl ExtMcp for Processor {
         }
         if !mcp::captured(&r.method) {
             return Ok(pass_request(None));
+        }
+        if self.policy.enforcing() {
+            // What the tool returns enters the caller, so the call is checked against what
+            // entered it already, and then noted, before it goes on.
+            let at = now();
+            let target = mcp::parse_request(&r.method, r.mcp_request.as_deref(), &[]).target;
+            let tool = target.filter(|t| !t.is_empty()).unwrap_or_else(|| server.clone());
+            let who = Who::of(self.agents(), caller.as_deref());
+            let policy = self.policy.current();
+            let checked = Target {
+                caller: who,
+                receiver: None,
+                path: None,
+                tool: Some(&tool),
+            };
+            if let Some(denial) = authz::check_policy(&policy, &self.observed, self.agents(), At::Mcp, &checked, at) {
+                let call = Call {
+                    caller,
+                    receiver: None,
+                    method: r.method,
+                    host: server,
+                    path: String::new(),
+                    headers: link_headers(&headers),
+                };
+                self.counters.denied.fetch_add(1, Ordering::Relaxed);
+                self.events
+                    .send(authz::policy_denied_event(&call, &denial, self.agents(), at));
+                return Ok(Response::new(McpRequestResult {
+                    result: Some(mcp_request_result::Result::Error(halted(std::slice::from_ref(
+                        &denial.halt,
+                    )))),
+                    header_mutation: None,
+                    metadata: None,
+                }));
+            }
+            self.observed.note(who, &format!("tool:{tool}"), at);
         }
         self.counters.mcp_calls.fetch_add(1, Ordering::Relaxed);
         let event_id = uuid::Uuid::new_v4().to_string();
@@ -246,5 +304,96 @@ impl ExtMcp for Processor {
         Ok(Response::new(McpResponseResult {
             result: Some(mcp_response_result::Result::Error(halted(&covering))),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::origins::Seen;
+
+    fn call(agent: &str, tool: &str) -> Request<McpRequest> {
+        Request::new(McpRequest {
+            service_names: vec!["tools".into()],
+            method: "tools/call".into(),
+            metadata_context: Some(Struct {
+                fields: [(
+                    META_AGENT.to_string(),
+                    PbValue {
+                        kind: Some(Kind::StringValue(agent.into())),
+                    },
+                )]
+                .into(),
+            }),
+            mcp_request: Some(format!(r#"{{"name":"{tool}","arguments":{{}}}}"#).into_bytes()),
+            headers: vec![],
+        })
+    }
+
+    fn refused(r: &McpRequestResult) -> Option<&str> {
+        match &r.result {
+            Some(mcp_request_result::Result::Error(e)) => Some(&e.reason),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_rule_is_checked_against_the_tools_the_caller_called() {
+        let counters = Arc::new(Counters::default());
+        let (hooks, _hooks_rx) = mpsc::channel(16);
+        let (events, mut events_rx) = Events::channel(16, Budget::new(1 << 20), counters.clone());
+        let policy = FlowPolicy::parse(
+            br#"{"rules": [{"id": "no-pay-after-web", "callers": ["billing"], "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}]}"#,
+        )
+        .unwrap();
+        let observed = Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS));
+        let p = Processor::new(
+            hooks,
+            Budget::new(1 << 20),
+            counters.clone(),
+            Arc::new(Halts::in_memory()),
+            events,
+        )
+        .with_policy(Arc::new(Policy::fixed(policy)), observed.clone());
+
+        // Billing may pay while nothing it fetched has come back to it.
+        let r = p.check_request(call("billing", "pay")).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None);
+        // Fetching a page is a call like any other: it passes, and is noted first.
+        let r = p.check_request(call("billing", "fetch_page")).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None);
+        assert!(
+            matches!(observed.seen(Who::Agent("billing"), now(), 900), Seen::These(o) if o.contains(&"tool:fetch_page".to_string()))
+        );
+        // Now paying is refused, recorded, and named.
+        let r = p.check_request(call("billing", "pay")).await.unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+        let event = events_rx.try_recv().unwrap().event;
+        assert_eq!(event.str("wake.event.kind"), Some("denied"));
+        assert_eq!(event.str("wake.brake.halt_id"), Some("policy:no-pay-after-web"));
+        let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["origins"], serde_json::json!(["tool:fetch_page"]));
+        // Support fetched nothing, and the rule isn't about support anyway.
+        let r = p.check_request(call("support", "pay")).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None);
+    }
+
+    #[tokio::test]
+    async fn without_a_policy_nothing_is_checked_or_noted() {
+        let counters = Arc::new(Counters::default());
+        let (hooks, _hooks_rx) = mpsc::channel(16);
+        let (events, _events_rx) = Events::channel(16, Budget::new(1 << 20), counters.clone());
+        let observed = Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS));
+        let p = Processor::new(
+            hooks,
+            Budget::new(1 << 20),
+            counters,
+            Arc::new(Halts::in_memory()),
+            events,
+        )
+        .with_policy(Arc::new(Policy::fixed(FlowPolicy::empty())), observed.clone());
+        let r = p.check_request(call("billing", "fetch_page")).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None);
+        assert_eq!(observed.seen(Who::Agent("billing"), now(), 900), Seen::These(vec![]));
     }
 }
