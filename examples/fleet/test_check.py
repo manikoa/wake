@@ -7,11 +7,12 @@ import subprocess
 import sys
 import tempfile
 
-from check import rooted
+from check import rooted, stray_user_origins
 
 
-def event(event_id, kind, parents=(), origins=()):
-    return {"id": event_id, "kind": kind, "parents": list(parents), "origins": list(origins)}
+def event(event_id, kind, parents=(), origins=(), agent="support", capture="sdk", start=0):
+    return {"id": event_id, "kind": kind, "parents": list(parents), "origins": list(origins), "agent": agent,
+            "capture": capture, "start": start}
 
 
 def graph(*events):
@@ -42,17 +43,41 @@ def test_what_follows_from_an_unlabeled_memory_read_isnt_complete():
     assert not rooted(events, "pay"), "even though it also descends from the user"
 
 
-def entry(event_id, kind, *, parents=(), origins=(), capture="sdk", tool="", agent="support", payload=None):
+def test_an_action_whose_parent_never_reached_the_log_isnt_complete():
+    events = graph(
+        event("ask", "model_call", origins=["user"]),
+        event("pay", "tool_call", ["ask", "lost"], ["tool:refund"]),
+    )
+    assert not rooted(events, "pay"), "even though its other parent descends from the user"
+
+
+def test_a_receiver_that_took_its_message_for_a_users_request_is_caught():
+    events = graph(
+        event("ask", "model_call", origins=["user"], start=1),
+        event("ask-research", "tool_call", ["ask"], ["tool:ask_research"], start=2),
+        # research lost the link, so its first step looks like a user's request: complete,
+        # but not stitched to support.
+        event("research", "model_call", origins=["user"], agent="research", start=3),
+        event("answer", "model_call", ["ask", "ask-research"], start=4),
+    )
+    assert all(rooted(events, e) for e in events)
+    assert [e["id"] for e in stray_user_origins(events)] == ["research"]
+    del events["research"]
+    assert stray_user_origins(events) == []
+
+
+def entry(event_id, kind, *, parents=(), origins=(), capture="sdk", tool="", agent="support", payload=None, start=2):
     attributes = {"wake.event.id": event_id, "wake.event.kind": kind, "wake.agent.id": agent, "wake.capture": capture,
                   "wake.parents": list(parents), "wake.origins": list(origins)}
     if tool:
         attributes["gen_ai.tool.name"] = tool
-    return {"signed": True, "event": {"trace_id": "t", "attributes": attributes}, "payload": payload}
+    return {"signed": True, "event": {"trace_id": "t", "start_time_unix_nano": str(start), "attributes": attributes},
+            "payload": payload}
 
 
 def test_two_payments_to_the_account_fail_with_a_message_not_a_crash():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.py")
-    entries = [entry("ask", "model_call", origins=["user"])]
+    entries = [entry("ask", "model_call", origins=["user"], start=1)]
     for agent, capture in [("support", "sdk"), ("research", "sdk"), ("billing", "sdk"), ("support", "memory_adapter"),
                            ("billing", "memory_adapter"), ("research", "proxy"), ("billing", "proxy"),
                            ("support", "proxy")]:
