@@ -10,31 +10,37 @@
 //! GET    /v1/memory/seen        each agent's memory adapter: the version it last fetched, and when
 //! ```
 //!
-//! Each answers with the state now in force and its version, and a change answers only
-//! once it's on disk, so the brake can count that answer as the lever's acknowledgement.
+//! Each answers with the state now in force and its version, and a change answers 200 only
+//! once it's on disk, so the brake can count that answer as the lever's acknowledgement. A
+//! change that couldn't be written is in force anyway: it answers 500 with the state, whose
+//! `not_persisted` says why, and a restart would lose it. Until the state is initialized,
+//! or while it can't be read, every call is denied; lifting `uninitialized-state` or
+//! `unreadable-state` starts it over with a new `epoch`.
 //!
 //! It listens on its own port, apart from the hooks agentgateway calls, over TLS with the
 //! proxy's SVID, and serves only clients that present an X.509-SVID chained to the trust
 //! bundle with the brake's SPIFFE ID. An agent can neither reach it nor present that
-//! identity, so no agent can lift a halt.
+//! identity, so no agent can lift a halt. It takes a few connections at once, each with a
+//! handshake timeout and a lifetime (listen::CONTROL), so a client that connects and stalls
+//! can't keep the brake out.
 
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use hyper_util::rt::TokioIo;
-use hyper_util::service::TowerToHyperService;
 use serde::Deserialize;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{self, RootCertStore, ServerConfig};
 
 use crate::halts::{self, Halts, Scope, Selection};
-use crate::listen;
+use crate::listen::{self, Limits};
 use crate::signer::spiffe_id;
 
 /// What the control API needs to serve mTLS.
@@ -98,41 +104,30 @@ fn valid_id(id: &str) -> Result<(), Failure> {
     ))
 }
 
-fn stored(result: std::io::Result<halts::State>) -> Result<Json<halts::State>, Failure> {
-    result.map(Json).map_err(|e| {
-        tracing::error!(error = %e, "couldn't store the halts");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("couldn't store the halts: {e}"),
-        )
-    })
+fn stored(result: Result<halts::Changed, tokio::task::JoinError>) -> Response {
+    match result {
+        Ok(Ok(state)) => Json(state).into_response(),
+        Ok(Err(not_persisted)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(*not_persisted.state)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
-async fn put_halt(
-    State(halts): State<Arc<Halts>>,
-    Path(id): Path<String>,
-    Json(body): Json<PutHalt>,
-) -> Result<Json<halts::State>, Failure> {
-    valid_id(&id)?;
+async fn put_halt(State(halts): State<Arc<Halts>>, Path(id): Path<String>, Json(body): Json<PutHalt>) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
     if body.scope.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "a halt needs a scope: the fleet, or agents".into(),
-        ));
+        return (StatusCode::BAD_REQUEST, "a halt needs a scope: the fleet, or agents").into_response();
     }
     let issued_at = body.issued_at.unwrap_or_else(halts::now);
-    let result = tokio::task::spawn_blocking(move || halts.put(&id, body.scope, issued_at))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    stored(result)
+    stored(tokio::task::spawn_blocking(move || halts.put(&id, body.scope, issued_at)).await)
 }
 
-async fn lift_halt(State(halts): State<Arc<Halts>>, Path(id): Path<String>) -> Result<Json<halts::State>, Failure> {
-    valid_id(&id)?;
-    let result = tokio::task::spawn_blocking(move || halts.lift(&id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    stored(result)
+async fn lift_halt(State(halts): State<Arc<Halts>>, Path(id): Path<String>) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
+    stored(tokio::task::spawn_blocking(move || halts.lift(&id)).await)
 }
 
 async fn list_halts(State(halts): State<Arc<Halts>>) -> Json<halts::State> {
@@ -150,30 +145,22 @@ async fn put_quarantine(
     State(halts): State<Arc<Halts>>,
     Path(id): Path<String>,
     Json(body): Json<PutQuarantine>,
-) -> Result<Json<halts::State>, Failure> {
-    valid_id(&id)?;
+) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
     if body.selection.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "a quarantine needs something to lock or hide".into(),
-        ));
+        return (StatusCode::BAD_REQUEST, "a quarantine needs something to lock or hide").into_response();
     }
     let issued_at = body.issued_at.unwrap_or_else(halts::now);
-    let result = tokio::task::spawn_blocking(move || halts.quarantine(&id, body.selection, issued_at))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    stored(result)
+    stored(tokio::task::spawn_blocking(move || halts.quarantine(&id, body.selection, issued_at)).await)
 }
 
-async fn release_quarantine(
-    State(halts): State<Arc<Halts>>,
-    Path(id): Path<String>,
-) -> Result<Json<halts::State>, Failure> {
-    valid_id(&id)?;
-    let result = tokio::task::spawn_blocking(move || halts.release(&id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    stored(result)
+async fn release_quarantine(State(halts): State<Arc<Halts>>, Path(id): Path<String>) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
+    stored(tokio::task::spawn_blocking(move || halts.release(&id)).await)
 }
 
 async fn memory_seen(State(halts): State<Arc<Halts>>) -> Json<std::collections::HashMap<String, halts::Seen>> {
@@ -199,23 +186,44 @@ pub async fn serve(
     tls: Tls,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), String> {
+    serve_with(listener, halts, tls, listen::CONTROL, shutdown).await
+}
+
+/// Serves the control API with these limits.
+pub async fn serve_with(
+    listener: TcpListener,
+    halts: Arc<Halts>,
+    tls: Tls,
+    limits: Limits,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), String> {
     let acceptor = tls_acceptor(&tls)?;
     let brake_id = Arc::new(tls.brake_id);
     let app = router(halts);
-    let limit = listen::limit();
+    let open = Arc::new(Semaphore::new(limits.connections));
     tokio::pin!(shutdown);
     loop {
-        let (stream, peer, permit) = tokio::select! {
-            accepted = listen::accept(&listener, &limit, "control") => accepted,
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(error = %e, "control API: accept failed");
+                    continue;
+                }
+            },
             _ = &mut shutdown => return Ok(()),
+        };
+        let Ok(slot) = open.clone().try_acquire_owned() else {
+            tracing::warn!(%peer, "control API: too many connections; closed one");
+            continue;
         };
         let acceptor = acceptor.clone();
         let brake_id = brake_id.clone();
         let app = app.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            let Ok(Ok(stream)) = tokio::time::timeout(listen::HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await else {
-                tracing::warn!(%peer, "control API: TLS handshake failed or timed out");
+            let _slot = slot;
+            let Ok(Ok(stream)) = tokio::time::timeout(limits.handshake, acceptor.accept(stream)).await else {
+                tracing::warn!(%peer, "control API: TLS handshake failed or took too long");
                 return;
             };
             let caller = stream
@@ -228,10 +236,7 @@ pub async fn serve(
                 tracing::warn!(%peer, ?caller, "control API: refused a caller that isn't the brake");
                 return;
             }
-            let service = TowerToHyperService::new(app);
-            if let Err(e) = listen::http().serve_connection(TokioIo::new(stream), service).await {
-                tracing::debug!(%peer, error = %e, "control API: connection ended");
-            }
+            listen::serve_for(stream, app, limits).await;
         });
     }
 }

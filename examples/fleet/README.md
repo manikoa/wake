@@ -51,7 +51,7 @@ Each credential goes into a volume only its holder mounts. Each agent gets its o
 
 ## Identity
 
-agentgateway names each caller from its SPIFFE ID or JWT subject, as in production. Failing those, it uses the `x-fleet-agent` header the agents send. That header is a stand-in so the example needs no identity provider, and any caller can set it, so don't trust it outside the example. The agents get the CA certificate for the collector's TLS, and nothing else from the recorder: no keys and no identity.
+agentgateway names each caller from its SPIFFE ID or JWT subject, as in production. Failing those, it uses the `x-fleet-agent` header the agents send. That header is a stand-in so the example needs no identity provider, and any caller can set it, so don't trust it outside the example; `deploy/agentgateway.yaml` requires each agent's SVID instead. `agents.json` lists the names wake-proxy accepts, so a call naming anyone else, or no one, is denied while any agent is halted. The agents get the CA certificate for the collector's TLS, and nothing else from the recorder: no keys and no identity.
 
 ## Network
 

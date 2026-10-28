@@ -1,6 +1,8 @@
 //! Sends signed events to the collector over OTLP/HTTP, in batches, from a bounded queue.
-//! When the collector is down, events are retried a few times and then dropped and
-//! counted; the processor and agentgateway never wait on it.
+//! A batch holds at most MAX_BATCH_BYTES, well under the collector's 20 MiB request limit,
+//! so a run of large events goes out in several requests rather than one it refuses. When
+//! the collector is down, events are retried a few times and then dropped and counted; the
+//! processor and agentgateway never wait on it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +15,11 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, spa
 use prost::Message;
 use tokio::sync::mpsc;
 
+use crate::budget::{Permit, Queued};
 use crate::canonical::{Event, Value};
+
+/// The most a batch holds, by the events' weight. An event over it goes out on its own.
+pub const MAX_BATCH_BYTES: usize = 4 << 20;
 
 /// What the processor has done since it started. Logged, and checked by tests.
 #[derive(Default)]
@@ -30,8 +36,6 @@ pub struct Counters {
     pub paired_in_order: AtomicU64,
     /// Calls the deny lever denied.
     pub denied: AtomicU64,
-    /// Hook connections refused because they came from off the processor's host.
-    pub hooks_refused: AtomicU64,
 }
 
 impl Counters {
@@ -45,6 +49,7 @@ pub struct Exporter {
     client: reqwest::Client,
     counters: Arc<Counters>,
     batch: usize,
+    batch_bytes: usize,
     linger: Duration,
     attempts: u32,
 }
@@ -67,24 +72,40 @@ impl Exporter {
             client: builder.build().expect("http client"),
             counters,
             batch: 256,
+            batch_bytes: MAX_BATCH_BYTES,
             linger: Duration::from_millis(200),
             attempts: 3,
         }
     }
 
     /// Sends events from rx until it closes, then sends what's left.
-    pub async fn run(self, mut rx: mpsc::Receiver<Event>) {
-        let mut batch = Vec::with_capacity(self.batch);
+    pub async fn run(self, mut rx: mpsc::Receiver<Queued>) {
+        let mut batch: Vec<Queued> = Vec::with_capacity(self.batch);
+        // An event that didn't fit the last batch starts the next.
+        let mut held: Option<Queued> = None;
         loop {
-            let first = rx.recv().await;
-            let Some(first) = first else { break };
+            let first = match held.take() {
+                Some(q) => q,
+                None => match rx.recv().await {
+                    Some(q) => q,
+                    None => break,
+                },
+            };
+            let mut bytes = first.permit.bytes();
             batch.push(first);
             let deadline = tokio::time::sleep(self.linger);
             tokio::pin!(deadline);
             while batch.len() < self.batch {
                 tokio::select! {
                     next = rx.recv() => match next {
-                        Some(e) => batch.push(e),
+                        Some(q) if bytes + q.permit.bytes() > self.batch_bytes => {
+                            held = Some(q);
+                            break;
+                        }
+                        Some(q) => {
+                            bytes += q.permit.bytes();
+                            batch.push(q);
+                        }
                         None => break,
                     },
                     _ = &mut deadline => break,
@@ -94,9 +115,12 @@ impl Exporter {
         }
     }
 
-    async fn send(&self, events: Vec<Event>) {
-        let n = events.len() as u64;
+    async fn send(&self, batch: Vec<Queued>) {
+        let n = batch.len() as u64;
+        // The bytes stay taken until the request is done with them.
+        let (events, _permits): (Vec<Event>, Vec<Permit>) = batch.into_iter().map(|q| (q.event, q.permit)).unzip();
         let body = request(&events).encode_to_vec();
+        drop(events);
         let mut delay = Duration::from_millis(200);
         for attempt in 1..=self.attempts {
             let result = self

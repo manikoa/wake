@@ -142,26 +142,52 @@ pub fn parse_traceparent(s: &str) -> Option<TraceParent> {
 /// The event's payload: what the call sent and what came back, kept byte for byte when
 /// they're JSON, and as a string when they aren't.
 pub fn payload(input: Option<&[u8]>, output: Option<&[u8]>, error: Option<&str>) -> String {
+    capped_payload((input, false), (output, false), error)
+}
+
+/// The payload of a call whose params or result may have been cut to a prefix (see
+/// budget::MAX_CAPTURE). A prefix goes in as a string, since it may not be JSON, or may be
+/// JSON that says something else, and the payload is marked truncated.
+pub fn capped_payload(
+    (input, input_cut): (Option<&[u8]>, bool),
+    (output, output_cut): (Option<&[u8]>, bool),
+    error: Option<&str>,
+) -> String {
     let mut out = String::from(r#"{"input":"#);
-    push_json(&mut out, input);
+    push_json(&mut out, input, input_cut);
     out.push_str(r#","output":"#);
-    push_json(&mut out, output);
+    push_json(&mut out, output, output_cut);
     if let Some(error) = error {
         out.push_str(r#","error":"#);
         out.push_str(&Value::String(error.to_string()).to_string());
+    }
+    if input_cut || output_cut {
+        out.push_str(r#","truncated":true"#);
     }
     out.push('}');
     out
 }
 
-fn push_json(out: &mut String, bytes: Option<&[u8]>) {
+fn push_json(out: &mut String, bytes: Option<&[u8]>, cut: bool) {
+    let quoted = |b: &[u8]| Value::String(String::from_utf8_lossy(b).into_owned()).to_string();
     match bytes {
         None => out.push_str("null"),
+        Some(b) if cut => out.push_str(&quoted(b)),
         Some(b) => match as_json(b) {
             Some(json) => out.push_str(json),
-            None => out.push_str(&Value::String(String::from_utf8_lossy(b).into_owned()).to_string()),
+            None => out.push_str(&quoted(b)),
         },
     }
+}
+
+/// At most limit bytes, and whether any were cut off.
+pub fn cap(mut bytes: Vec<u8>, limit: usize) -> (Vec<u8>, bool) {
+    if bytes.len() <= limit {
+        return (bytes, false);
+    }
+    bytes.truncate(limit);
+    bytes.shrink_to_fit();
+    (bytes, true)
 }
 
 /// How deep JSON may nest to go into a payload as it is. Parsers cap nesting (serde_json
@@ -293,6 +319,18 @@ mod tests {
         );
         let p = payload(Some(b"\xff"), Some(b"{"), None);
         assert!(serde_json::from_str::<Value>(&p).is_ok(), "{p}");
+    }
+
+    #[test]
+    fn a_cut_payload_is_quoted_and_marked() {
+        let (cut, truncated) = cap(br#"{"content":[{"text":"12345"}]}"#.to_vec(), 13);
+        assert!(truncated);
+        let p = capped_payload((Some(b"12"), false), (Some(&cut), true), None);
+        assert_eq!(p, r#"{"input":12,"output":"{\"content\":[{","truncated":true}"#);
+        // A prefix that happens to be JSON still goes in as a string.
+        let p = capped_payload((Some(b"12"), true), (None, false), None);
+        assert_eq!(p, r#"{"input":"12","output":null,"truncated":true}"#);
+        assert_eq!(cap(b"abc".to_vec(), 3), (b"abc".to_vec(), false));
     }
 
     #[test]
