@@ -14,6 +14,7 @@ import sys
 from collections import deque
 
 ACTIONS = ("tool_call", "agent_message", "memory_write")
+AGENTS = ("support", "research", "billing", "notify")
 POISONED_ACCOUNT = "999-1234"
 
 
@@ -93,19 +94,19 @@ def main(path):
     print(f"{len(events)} events in the signed log")
 
     recorded = {(e["agent"], e["capture"]) for e in events.values()}
-    for want in [("support", "sdk"), ("research", "sdk"), ("billing", "sdk"), ("support", "memory_adapter"),
-                 ("billing", "memory_adapter"), ("research", "proxy"), ("billing", "proxy"), ("support", "proxy")]:
+    for want in [*((agent, "sdk") for agent in AGENTS), *((agent, "proxy") for agent in AGENTS),
+                 ("support", "memory_adapter"), ("billing", "memory_adapter"), ("notify", "memory_adapter")]:
         if want not in recorded:
             fail(f"nothing recorded for {want[0]} by the {want[1]}")
     proxy_tools = sorted(e["tool"] for e in events.values() if e["capture"] == "proxy" and e["kind"] == "tool_call")
-    if proxy_tools != ["fetch_page", "lookup_order", "refund", "refund"]:
+    if proxy_tools != ["fetch_page", "lookup_order", "refund", "refund", "send_email"]:
         fail(f"the proxy recorded these MCP calls: {proxy_tools}")
     print("every agent and every hop was recorded: SDKs, the memory adapter, and the proxy for A2A and MCP")
 
     traces = {e["trace"] for e in events.values()}
     if len(traces) != 1:
         fail(f"the run spans {len(traces)} traces; stitching broke")
-    print("one trace across the three agents")
+    print(f"one trace across the {len(AGENTS)} agents")
 
     dangling = [(e["id"], p) for e in events.values() for p in e["parents"] if p not in events]
     if dangling:

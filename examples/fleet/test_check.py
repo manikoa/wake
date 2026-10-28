@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 
-from check import rooted
+from check import AGENTS, rooted
 
 
 def event(event_id, kind, parents=(), origins=()):
@@ -53,11 +53,10 @@ def entry(event_id, kind, *, parents=(), origins=(), capture="sdk", tool="", age
 def test_two_payments_to_the_account_fail_with_a_message_not_a_crash():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.py")
     entries = [entry("ask", "model_call", origins=["user"])]
-    for agent, capture in [("support", "sdk"), ("research", "sdk"), ("billing", "sdk"), ("support", "memory_adapter"),
-                           ("billing", "memory_adapter"), ("research", "proxy"), ("billing", "proxy"),
-                           ("support", "proxy")]:
+    for agent, capture in [*((a, "sdk") for a in AGENTS), *((a, "proxy") for a in AGENTS), ("support", "memory_adapter"),
+                           ("billing", "memory_adapter"), ("notify", "memory_adapter")]:
         entries.append(entry(f"{agent}-{capture}", "model_call", parents=["ask"], capture=capture, agent=agent))
-    for i, tool in enumerate(["fetch_page", "lookup_order", "refund", "refund"]):
+    for i, tool in enumerate(["fetch_page", "lookup_order", "refund", "refund", "send_email"]):
         entries.append(entry(f"tool-{i}", "tool_call", parents=["ask"], capture="proxy", tool=tool, agent="billing",
                              payload={"account": "999-1234"}))
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:

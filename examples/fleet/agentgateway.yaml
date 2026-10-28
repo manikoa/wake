@@ -95,6 +95,42 @@ routes:
         receiver: '"billing"'
   backends:
   - host: billing:9102
+- name: notify
+  matches:
+  - path:
+      pathPrefix: /agents/notify
+  policies:
+    urlRewrite:
+      path:
+        prefix: /
+    a2a: {}
+    # The deny lever again, naming the agent this route reaches, so calls sent to a halted
+    # agent are denied too.
+    extAuthz:
+      host: "unix:/run/wake/proxy.sock"
+      failureMode: deny
+      protocol:
+        grpc:
+          context:
+            receiver: notify
+          metadata:
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
+    extProc:
+      host: "unix:/run/wake/proxy.sock"
+      failureMode: failOpen
+      processingOptions:
+        requestHeaderMode: send
+        requestBodyMode: bufferedPartial
+        responseHeaderMode: send
+        responseBodyMode: bufferedPartial
+        requestTrailerMode: skip
+        responseTrailerMode: skip
+        allowModeOverride: true
+      requestAttributes:
+        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        receiver: '"notify"'
+  backends:
+  - host: notify:9103
 - name: tools
   policies:
     mcpGuardrails:

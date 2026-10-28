@@ -25,7 +25,7 @@ docs/
 
 - Each folder uses its own language's standard tooling: cargo for `proxy/`, a separate Go module each for `collector/` and `log/`, uv for `sdk/python/`, and pnpm for `sdk/typescript/`. Don't add a cross-language build system. Each component's Dockerfile lives in its folder; `deploy/` only puts the images together.
 - The memory adapter lives inside the SDKs, as the roadmap describes, not in a folder of its own.
-- `examples/` holds runnable examples that use the recorder, not parts of it. The reference fleet is a uv project that depends on `sdk/python` by path.
+- `examples/` holds runnable examples that use the recorder, not parts of it. The reference fleet is a uv project that depends on `sdk/python` by path, and its TypeScript agent (`examples/fleet/notify/`) a pnpm project that depends on `sdk/typescript` by path.
 - Create a folder when its first code lands, not before.
 
 ## Rules

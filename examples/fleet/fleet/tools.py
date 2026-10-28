@@ -81,5 +81,12 @@ def refund(amount: float, order: str = "", account: str = "") -> str:
     return f"Refunded ${amount:g} to {to}."
 
 
+@server.tool()
+def send_email(to: str, subject: str, body: str) -> str:
+    """Email a customer."""
+    log.warning("email: sent %r to %s", subject, to)
+    return f"Sent {subject!r} to {to}."
+
+
 if __name__ == "__main__":
     server.run(transport="streamable-http")

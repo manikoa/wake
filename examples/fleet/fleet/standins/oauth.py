@@ -38,7 +38,7 @@ from fleet.standins import digest, drop_privileges, hand_out, load, matches, new
 log = logging.getLogger("idp")
 
 ISSUER = os.environ.get("STANDIN_ISSUER", "http://idp:8080")
-AGENTS = os.environ.get("STANDIN_AGENTS", "support research billing").split()
+AGENTS = os.environ.get("STANDIN_AGENTS", "support research billing notify").split()
 BRAKE = "wake-brake"
 TOOLS = "fleet-tools"
 # The audience and scope of the access tokens: the fleet's tools server.

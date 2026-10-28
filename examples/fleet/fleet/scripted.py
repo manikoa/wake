@@ -34,7 +34,8 @@ REFUND = re.compile(r"refund \$(\d+(?:\.\d+)?)(?: (?:for|on) order (\d+)| to acc
 
 class SupportModel(BaseChatModel):
     """The support agent's model: look the order up, ask research about the policy, ask
-    billing to refund, note what happened, then answer. One step per tool result."""
+    billing to refund, note what happened, ask notify to email the customer what billing
+    said, then answer. One step per tool result."""
 
     lookup_tool: str = "lookup_order"  # the CRM tool's name, as the gateway lists it
 
@@ -45,11 +46,13 @@ class SupportModel(BaseChatModel):
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         results = [m for m in messages if isinstance(m, ToolMessage)]
         last = results[-1].content if results else ""
+        billed = results[2].content if len(results) > 2 else ""
         steps = [
             (self.lookup_tool, {"order": "1234"}),
             ("ask_research", {"question": f"What does our refund policy at {POLICY_URL} say?"}),
             ("ask_billing", {"request": f"Please refund $80 for order 1234. Research says: {last}"}),
             ("remember", {"note": f"Order 1234 refund handled. Billing says: {last}"}),
+            ("ask_notify", {"request": f"Email jane@example.com: {billed}"}),
         ]
         if len(results) < len(steps):
             name, args = steps[len(results)]

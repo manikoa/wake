@@ -17,14 +17,14 @@ finish() {
 trap finish EXIT
 
 python3 test_check.py
-compose up -d --build --wait collector wake-proxy agentgateway tools research billing
+compose up -d --build --wait collector wake-proxy agentgateway tools research billing notify
 compose run --rm support
 
 # Nothing of the fleet's can be reached around agentgateway (see "Network" in README.md).
 # The request just went through every backend, the stand-ins and wake-proxy, so each one
 # is up. Each listener is tried by name and by its IP address on each of its networks.
 listeners=""
-for target in tools:3001 research:9101 billing:9102 idp:8080 e2b:8080 memory-rules:9003 \
+for target in tools:3001 research:9101 billing:9102 notify:9103 idp:8080 e2b:8080 memory-rules:9003 \
     wake-proxy:9001 wake-proxy:9002 wake-proxy:9003 collector:4318; do
   service=${target%:*} port=${target#*:}
   id=$(compose ps -q "$service")
@@ -44,11 +44,14 @@ compose exec -T research python reach.py research agentgateway:3000 collector:43
 # Billing also keeps a sandbox at E2B, and its memory adapter fetches its rules.
 compose exec -T billing python reach.py billing agentgateway:3000 collector:4318 idp:8080 e2b:8080 memory-rules:9003 \
   -- $(around 'billing|collector|idp|e2b|memory-rules')
+# Notify, the TypeScript agent, has python3 for this check only.
+compose exec -T notify python3 /src/examples/fleet/reach.py notify agentgateway:3000 collector:4318 idp:8080 \
+  -- $(around 'notify|collector|idp')
 # The tools server sends no events, so it has no way to the collector either.
 compose exec -T tools python reach.py tools agentgateway:3000 idp:8080 -- $(around 'tools|idp')
 
 # The agents send what they still have queued as they stop.
-compose stop research billing tools
+compose stop research billing notify tools
 
 # Wait until the log's signed checkpoint stops growing: every event is in.
 last=-1 steady=0
