@@ -2,7 +2,7 @@
 
 Decided October 27, 2026.
 
-How Wake stitches one trace and one provenance graph across processes: agents, the proxy, and the tools and agents they call. Every SDK, in any language, and the proxy follow these rules, so their events link to each other. The Python SDK (`sdk/python/src/wake/links.py`) and the proxy (`proxy/src/extproc.rs`, `proxy/src/mcp.rs`) implement them, and the reference fleet (`examples/fleet`) checks them end to end. A new SDK implements this page, and it's done when it can join the fleet.
+How Wake stitches one trace and one provenance graph across processes: agents, the proxy, and the tools and agents they call. Every SDK, in any language, and the proxy follow these rules, so their events link to each other. The Python SDK (`sdk/python/src/wake/links.py`), the TypeScript SDK (`sdk/typescript/src/links.ts`) and the proxy (`proxy/src/extproc.rs`, `proxy/src/mcp.rs`) implement them, and the reference fleet (`examples/fleet`) checks them end to end. A new SDK implements this page, and it's done when it can join the fleet.
 
 Nothing standard carries trace context and causal parents across A2A yet ([A2A issue 2103](https://github.com/a2aproject/A2A/issues/2103)), so Wake carries its own. Switch to the standard when one lands.
 

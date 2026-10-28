@@ -6,11 +6,11 @@
 # the agents' networks they serve in compose.yaml. See "Network" in README.md.
 services:
   agentgateway:
-    networks: [default, support, research, billing, tools]
+    networks: [default, support, research, billing, notify, tools]
   # A link to each agent rather than one network they all join: on a shared network every
   # agent could reach every other one.
   collector:
-    networks: [default, support, research, billing]
+    networks: [default, support, research, billing, notify]
     # Docker takes a published port at the container's own address from every network, even
     # one published on 127.0.0.1 only, so the tools server could reach these. The agents reach
     # the collector on their own networks, and nothing on the host needs it.
@@ -20,4 +20,5 @@ networks:
   support:
   research:
   billing:
+  notify:
   tools:

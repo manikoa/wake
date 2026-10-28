@@ -1,5 +1,6 @@
 {
   "support": ["support"],
   "research": ["research"],
-  "billing": ["billing"]
+  "billing": ["billing"],
+  "notify": ["notify"]
 }

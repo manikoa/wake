@@ -9,3 +9,4 @@ collector/data
 collector/keys
 proxy/keys
 sdk/python/.venv
+sdk/typescript/dist

@@ -1,8 +1,9 @@
-# The reference fleet on the staging recorder (deploy/compose.yaml): three agents on three
-# frameworks and the tools they call, all through agentgateway, all recorded by Wake, with
-# stand-ins for the identity provider and E2B the brake pulls levers on. run.sh brings it up
-# and sends one request through it. Each agent and the tools server reaches the rest of the
-# fleet only through agentgateway (networks.yaml). See README.md.
+# The reference fleet on the staging recorder (deploy/compose.yaml): agents on three
+# frameworks, in Python and TypeScript, and the tools they call, all through agentgateway,
+# all recorded by Wake, with stand-ins for the identity provider and E2B the brake pulls
+# levers on. run.sh brings it up and sends one request through it. Each agent and the tools
+# server reaches the rest of the fleet only through agentgateway (networks.yaml). See
+# README.md.
 name: wake-fleet
 
 include:
@@ -71,7 +72,7 @@ services:
     <<: *standin
     # Each agent signs in there and the tools server introspects tokens there, each from its
     # own network. The brake reaches it on default.
-    networks: [default, support, research, billing, tools]
+    networks: [default, support, research, billing, notify, tools]
     command: ["python", "-m", "fleet.standins.oauth"]
     environment:
       STANDIN_ISSUER: http://idp:8080
@@ -82,6 +83,7 @@ services:
       - support-secrets:/out/support
       - research-secrets:/out/research
       - billing-secrets:/out/billing
+      - notify-secrets:/out/notify
 
   # A stand-in for E2B, until a partner's account or one of ours takes its place
   # (fleet/standins/e2b.py). Billing keeps a sandbox there, and the brake can freeze it.
@@ -141,6 +143,19 @@ services:
       <<: *listening
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9102))"]
 
+  # The TypeScript agent: Wake's TypeScript SDK on LangGraph.js, in an image of its own.
+  notify:
+    <<: *fleet
+    image: wake-fleet-notify:dev
+    build:
+      context: ../..
+      dockerfile: examples/fleet/notify/Dockerfile
+    networks: [notify]
+    volumes: [ca:/etc/wake/ca:ro, notify-secrets:/etc/fleet/secrets:ro]
+    healthcheck:
+      <<: *listening
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('localhost', 9103))"]
+
   # One request per run: docker compose run --rm support "<request>"
   support:
     <<: *fleet
@@ -155,6 +170,7 @@ services:
       tools: {condition: service_healthy}
       research: {condition: service_healthy}
       billing: {condition: service_healthy}
+      notify: {condition: service_healthy}
 
 volumes:
   ca:
@@ -168,3 +184,4 @@ volumes:
   support-secrets:
   research-secrets:
   billing-secrets:
+  notify-secrets:

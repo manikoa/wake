@@ -1,6 +1,7 @@
 """The support agent, on LangGraph: handles one customer request. It looks the order up in
-the CRM (MCP), asks research about the refund policy and billing to pay out (A2A), and
-keeps a note of what it did in a memory file. Run it once per request:
+the CRM (MCP), asks research about the refund policy, billing to pay out and notify to
+email the customer (A2A), and keeps a note of what it did in a memory file. Run it once
+per request:
 
     python -m fleet.support "Customer jane@example.com wants a refund on order 1234."
 """
@@ -42,6 +43,12 @@ async def ask_billing(request: str) -> str:
 
 
 @tool
+async def ask_notify(request: str) -> str:
+    """Ask the notify agent to email a customer."""
+    return await common.ask(NAME, "notify", request)
+
+
+@tool
 def remember(note: str) -> str:
     """Keep a note for later conversations."""
     NOTES.parent.mkdir(parents=True, exist_ok=True)
@@ -61,7 +68,7 @@ async def crm_tools() -> list:
 async def handle(request: str) -> str:
     crm = await crm_tools()
     model = scripted.SupportModel(lookup_tool=crm[0].name)
-    tools = [*crm, ask_research, ask_billing, remember]
+    tools = [*crm, ask_research, ask_billing, remember, ask_notify]
     builder = StateGraph(MessagesState)
     builder.add_node("model", lambda state: {"messages": [model.invoke(state["messages"])]})
     builder.add_node("tools", ToolNode(tools))

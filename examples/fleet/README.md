@@ -1,14 +1,15 @@
 # Reference fleet
 
-Three agents on three frameworks, talking over A2A and MCP through agentgateway, recorded by Wake. It's the recorder's end to end test, run in CI, and the target for game days. It doesn't depend on any design partner's product.
+Four agents on three frameworks, in Python and TypeScript, talking over A2A and MCP through agentgateway, recorded by Wake's SDKs in both languages. It's the recorder's end to end test, run in CI, and the target for game days. It doesn't depend on any design partner's product.
 
 | Agent | Framework | Does | Talks to |
 |---|---|---|---|
-| support | LangGraph | Handles a customer's refund request, keeps a note in a memory file | CRM (MCP), research and billing (A2A) |
+| support | LangGraph | Handles a customer's refund request, keeps a note in a memory file | CRM (MCP), research, billing and notify (A2A) |
 | research | OpenAI Agents SDK | Reads the refund policy page | the web (MCP) |
 | billing | Claude Agent SDK | Issues refunds with an in-process tool, keeps a ledger in a memory file, and keeps a sandbox | payments (MCP), its sandbox (E2B) |
+| notify | LangGraph.js, on Wake's TypeScript SDK | Emails the customer what support asks it to, keeps an outbox in a memory file | email (MCP) |
 
-The tools are one MCP server (`fleet/tools.py`) with a CRM, the web and payments. The refund policy page is poisoned. Below the policy, it tells AI agents to also refund $500 to an account that has nothing to do with the order, so the run pays it out. That payment is the issue the game day catches. Following its parents in the signed log leads back through billing, support and research to the page.
+Notify is the TypeScript agent (`notify/`, a pnpm project with an image of its own), so the fleet checks that the two SDKs link to each other across agents. The tools are one MCP server (`fleet/tools.py`) with a CRM, the web, payments and email. The refund policy page is poisoned. Below the policy, it tells AI agents to also refund $500 to an account that has nothing to do with the order, so the run pays it out. That payment is the issue the game day catches. Following its parents in the signed log leads back through billing, support and research to the page.
 
 ## Run it
 
@@ -26,7 +27,7 @@ It starts the staging recorder (`deploy/compose.yaml`) with this directory's `ag
 Or run the pieces yourself:
 
 ```bash
-docker compose up -d --build --wait collector wake-proxy agentgateway tools research billing
+docker compose up -d --build --wait collector wake-proxy agentgateway tools research billing notify
 docker compose run --rm support "Customer jane@example.com wants a refund on order 1234."
 ```
 
@@ -34,7 +35,7 @@ docker compose run --rm support "Customer jane@example.com wants a refund on ord
 
 By default each agent runs on a scripted model, so the fleet needs no API keys and behaves the same every run. Each scripted model plugs in where its framework takes a model and reports itself the way the real one does, so Wake records exactly what it would. For Claude, a stand-in for Claude Code speaks the SDK's control protocol.
 
-With `FLEET_MODELS=real`, research runs on the OpenAI Agents SDK's default model when `OPENAI_API_KEY` is set, and billing runs on Claude Code when `ANTHROPIC_API_KEY` is set. Support stays scripted, so every run walks the same steps.
+With `FLEET_MODELS=real`, research runs on the OpenAI Agents SDK's default model when `OPENAI_API_KEY` is set, and billing runs on Claude Code when `ANTHROPIC_API_KEY` is set. Support and notify stay scripted, so every run walks the same steps.
 
 ## Something for every lever
 
@@ -59,7 +60,7 @@ A compromised agent can reach the rest of the fleet only through agentgateway, w
 
 | Network | On it |
 |---|---|
-| `support`, `research` | that agent, agentgateway, the collector, the identity provider |
+| `support`, `research`, `notify` | that agent, agentgateway, the collector, the identity provider |
 | `billing` | billing, agentgateway, the collector, the identity provider, E2B, `memory-rules` |
 | `tools` | the tools server, agentgateway, the identity provider |
 | `default` | agentgateway, wake-proxy, the collector, the stand-ins, `memory-rules`, and the brake and Temporal when they run next to the recorder |
