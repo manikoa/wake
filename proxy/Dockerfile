@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # wake-proxy. Build from the repo root:
 #   docker build -f proxy/Dockerfile -t wake-proxy .
-FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS build
+FROM rust:1.99-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS build
 # libprotobuf-dev has the well-known types (google/protobuf/*.proto) the protos import.
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
