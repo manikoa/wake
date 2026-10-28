@@ -1,0 +1,30 @@
+# Keeps the release's pins current: actions pinned to commit SHAs, and the base images and
+# agentgateway pinned by digest (docs/releases.md). Each pull request moves a pin and its
+# version comment together, and CI checks it like any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directories: [/collector, /proxy]
+    schedule:
+      interval: weekly
+    groups:
+      base-images:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directory: /deploy
+    schedule:
+      interval: weekly
+    ignore:
+      # The proxy is checked against one agentgateway release, and moves to the next by
+      # hand (docs/proxy.md). Patches and new digests still come through.
+      - dependency-name: cr.agentgateway.dev/agentgateway
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

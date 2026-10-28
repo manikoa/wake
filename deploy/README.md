@@ -11,6 +11,12 @@
 docker compose -f deploy/compose.yaml up --build
 ```
 
+To run a release instead of images built here, check its signatures and provenance first ([docs/releases.md](../docs/releases.md)), then set its version:
+
+```bash
+WAKE_VERSION=0.1.0 docker compose -f deploy/compose.yaml up
+```
+
 ## Pointing agents at it
 
 **SDK:** send events to the collector over TLS, trusting the development CA:
