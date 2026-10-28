@@ -120,6 +120,49 @@ The brake's first lever (October 27, 2026). agentgateway calls the processor's e
   - **Checked in CI** against `deploy/`'s mTLS gateway (agentgateway v1.6.0), by `deploy/smoke_test.sh`. The `smoke-test` agent starts a streamed A2A call to a stand-in that streams for a minute, and is halted after two events. The stream ended by the time the halt was acknowledged, with no event after it, and the cut was signed into the log and counted in the metrics.
 - **Not yet.** In the example fleet, the caller's name comes from a header any caller can set, so an agent-scoped halt there trusts it; in `deploy/` it comes from SPIFFE IDs.
 
+### Flow policies
+
+Contain's first control (October 28, 2026): rules that keep content from untrusted origins, such as a page a tool fetched or another agent's message, from triggering privileged calls. `--policy-file` names a JSON file:
+
+```json
+{"window_seconds": 900,
+ "rules": [
+   {"id": "no-pay-after-web", "callers": ["billing"], "tools": ["pay", "wire_*"],
+    "forbid_origins": ["tool:fetch_page", "agent:research"]},
+   {"id": "billing-hears-support-only", "receivers": ["billing"], "allow_origins": ["agent:support"]}
+ ]}
+```
+
+- **What a rule decides on.** What entered the caller through the proxy within the window:
+  - `tool:<target>`, once it has called that MCP tool, resource or prompt (the target its `tool_call` event records);
+  - `agent:<sender>`, once a message from that agent was forwarded to it;
+  - `agent:<receiver>`, once a reply from that agent came back.
+
+  It never decides on what the caller says: nothing the caller sends, such as a `wake-origins` header, is read. The proxy notes each origin before the call or the message goes on, so content can't reach an agent ahead of its note.
+- **What a rule applies to.** A rule applies to a call when every list it gives matches:
+  - `callers`: agent names or identities;
+  - `receivers`: the agent an A2A route reaches;
+  - `path_prefixes`: the request path;
+  - `tools`: MCP tools, resource URIs or prompts, each exact or a prefix ending in `*`.
+
+  The MCP hook checks the rules that name tools, since only it sees the tool. It sees no receiver or path, so a rule can't name tools with either. ext_authz checks the rest, on every request.
+- **Denying.**
+  - `forbid_origins` denies a call when any origin that entered the caller matches. `allow_origins` denies it when one matches none, so a caller nothing entered passes. Patterns are exact, or a prefix ending in `*`.
+  - The first rule that denies is the one named. The call gets a 403 from ext_authz, or the gateway's error from the MCP hook, naming `policy:<id>` as `wake-halt` does. It's recorded as a signed `denied` event whose payload names the origins behind the denial (see [events.md](events.md)).
+- **It's coarse.** The proxy sees what reached an agent, not which of it feeds a given call, so everything that entered within the window counts for every call. A rule that forbids `agent:research` for billing's payments denies them for a window after any message from research. Tracking each piece of content needs the agents' SDKs, and isn't built.
+- **It fails closed.** In each of these cases a caller counts as having every origin, so any rule that applies to its calls denies them:
+  - for one window after wake-proxy starts, or after a reload lengthens the window, since what entered before isn't known;
+  - when it has no identity;
+  - past 256 origins within a window for one agent;
+  - past 10,000 agents, for an agent not remembered.
+
+  A caller the agents file doesn't list counts as matching every rule's `callers`. A file that can't be read or isn't valid denies every call under `policy:unreadable-policy`. Invalid means an unknown field, a rule with no origins to keep, a repeated id, a `*` anywhere but at the end of a pattern, or a window outside 1 to 86,400 seconds. The file is read again within 2 seconds of a change.
+- **Not yet.**
+  - Several replicas each see only the calls through them, so an origin one noted isn't known to another.
+  - Content entering through MCP paths the hooks don't see, such as `tools/list` descriptions and server-initiated messages, isn't noted.
+  - The window counts from when a tool call was made, not from when its result came back.
+  - The rules are a small JSON format of Wake's own, not Cedar, which the roadmap's stack names for policies in the proxy.
+
 ### Metrics
 
 With `--metrics-listen`, wake-proxy serves its counters for Prometheus at `/metrics` (`deploy/compose.yaml` publishes it on the host's loopback, at 9464):

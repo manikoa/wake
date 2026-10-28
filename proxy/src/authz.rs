@@ -21,7 +21,8 @@ use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp;
-use crate::policy::FlowPolicy;
+use crate::origins::{Observed, Who};
+use crate::policy::{At, Denial, FlowPolicy, Policy, Target};
 
 // Generated from Envoy's protos, doc comments and all.
 #[allow(clippy::all)]
@@ -174,7 +175,6 @@ pub fn denied_event(call: &Call, halts: &[Halt], agents: &Agents, at: u64) -> Ev
     e.set("wake.capture", Value::Str("proxy".into()));
     e.set("wake.agent.id", Value::Str(caller.clone()));
     e.set("wake.parents", Value::Strs(parents));
-    e.set("wake.origins", Value::Strs(FlowPolicy::origins_of(call)));
     let first = halts.first().map(|h| h.id.clone()).unwrap_or_default();
     e.set("wake.brake.halt_id", Value::Str(first.clone()));
     if let Some(receiver) = &call.receiver {
@@ -217,6 +217,36 @@ pub fn cut_event(call: &Call, halts: &[Halt], agents: &Agents, at: u64, recorded
     e
 }
 
+/// The signed record of a call a flow policy denied: a denied event whose payload also says
+/// which origins, of those that entered the caller, the rule kept from the call. They go in
+/// the payload, not in wake.origins: no content entered at this event.
+pub fn policy_denied_event(call: &Call, denial: &Denial, agents: &Agents, at: u64) -> Event {
+    let mut e = denied_event(call, std::slice::from_ref(&denial.halt), agents, at);
+    if let Some(Value::Str(payload)) = e.attributes.get("wake.payload")
+        && let Ok(serde_json::Value::Object(mut p)) = serde_json::from_str::<serde_json::Value>(payload)
+    {
+        p.insert("origins".into(), denial.origins.clone().into());
+        if let Some(why) = denial.every {
+            p.insert("every_origin".into(), why.into());
+        }
+        e.set("wake.payload", Value::Str(serde_json::Value::Object(p).to_string()));
+    }
+    e
+}
+
+/// What a policy decides on for a call from caller: what entered it within the window.
+pub fn check_policy(
+    policy: &FlowPolicy,
+    observed: &Observed,
+    agents: &Agents,
+    at_hook: At,
+    target: &Target<'_>,
+    now: u64,
+) -> Option<Denial> {
+    let seen = observed.seen(target.caller, now, policy.window_seconds);
+    policy.deciding(at_hook, target, &seen, agents)
+}
+
 fn ids() -> ([u8; 16], [u8; 8]) {
     let mut span = [0u8; 8];
     span.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
@@ -226,20 +256,35 @@ fn ids() -> ([u8; 16], [u8; 8]) {
 /// The gRPC service.
 pub struct Authorizer {
     halts: Arc<Halts>,
-    policy: Arc<FlowPolicy>,
+    policy: Arc<Policy>,
+    observed: Arc<Observed>,
     events: Events,
     counters: Arc<Counters>,
 }
 
 impl Authorizer {
     pub fn new(halts: Arc<Halts>, events: Events, counters: Arc<Counters>) -> Self {
-        Self::with_policy(halts, Arc::new(FlowPolicy::empty()), events, counters)
+        Self::with_policy(
+            halts,
+            Arc::new(Policy::fixed(FlowPolicy::empty())),
+            Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS)),
+            events,
+            counters,
+        )
     }
 
-    pub fn with_policy(halts: Arc<Halts>, policy: Arc<FlowPolicy>, events: Events, counters: Arc<Counters>) -> Self {
+    /// Also denies the calls policy denies, given what observed saw enter each caller.
+    pub fn with_policy(
+        halts: Arc<Halts>,
+        policy: Arc<Policy>,
+        observed: Arc<Observed>,
+        events: Events,
+        counters: Arc<Counters>,
+    ) -> Self {
         Authorizer {
             halts,
             policy,
+            observed,
             events,
             counters,
         }
@@ -254,19 +299,27 @@ impl Authorizer {
 impl Authorization for Authorizer {
     async fn check(&self, request: Request<CheckRequest>) -> Result<Response<CheckResponse>, Status> {
         let call = read_call(request.get_ref());
-        let mut halts = self.halts.deciding(call.caller.as_deref(), call.receiver.as_deref());
-        if halts.is_empty()
-            && let Some(policy_halt) = self.policy.deciding(&call)
-        {
-            halts.push(policy_halt);
+        let now = crate::halts::now();
+        let agents = self.halts.agents();
+        let halts = self.halts.deciding(call.caller.as_deref(), call.receiver.as_deref());
+        if !halts.is_empty() {
+            self.counters.denied.fetch_add(1, Ordering::Relaxed);
+            self.events.send(denied_event(&call, &halts, agents, now));
+            return Ok(Response::new(deny(&halts)));
         }
-        if halts.is_empty() {
+        let target = Target {
+            caller: Who::of(agents, call.caller.as_deref()),
+            receiver: call.receiver.as_deref(),
+            path: Some(&call.path),
+            tool: None,
+        };
+        let policy = self.policy.current();
+        let Some(denial) = check_policy(&policy, &self.observed, agents, At::Authz, &target, now) else {
             return Ok(Response::new(allow()));
-        }
+        };
         self.counters.denied.fetch_add(1, Ordering::Relaxed);
-        self.events
-            .send(denied_event(&call, &halts, self.halts.agents(), crate::halts::now()));
-        Ok(Response::new(deny(&halts)))
+        self.events.send(policy_denied_event(&call, &denial, agents, now));
+        Ok(Response::new(deny(std::slice::from_ref(&denial.halt))))
     }
 }
 
@@ -461,6 +514,48 @@ mod tests {
                 None,
                 &[],
             )))
+            .await
+            .unwrap();
+        assert_eq!(r.get_ref().status.as_ref().unwrap().code, 0);
+    }
+
+    #[tokio::test]
+    async fn a_policy_decides_on_what_entered_the_caller_not_on_what_it_sends() {
+        let halts = Arc::new(Halts::in_memory());
+        let counters = Arc::new(Counters::default());
+        let (tx, mut rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let policy = FlowPolicy::parse(
+            br#"{"rules": [{"id": "billing-hears-support-only", "receivers": ["billing"], "allow_origins": ["agent:support"]}]}"#,
+        )
+        .unwrap();
+        let observed = Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS));
+        let authz = Authorizer::with_policy(halts, Arc::new(Policy::fixed(policy)), observed.clone(), tx, counters);
+        let to_billing =
+            |origins: &'static str| check(Some("planner"), "", Some("billing"), &[("wake-origins", origins)]);
+
+        // Nothing has entered planner: its message to billing goes through, whatever it claims.
+        let r = authz.check(Request::new(to_billing("tool:fetch_page"))).await.unwrap();
+        assert_eq!(r.get_ref().status.as_ref().unwrap().code, 0);
+        assert!(rx.try_recv().is_err());
+
+        // A page planner fetched entered it: denied, and claiming otherwise changes nothing.
+        observed.note(Who::Agent("planner"), "tool:fetch_page", crate::halts::now());
+        let r = authz.check(Request::new(to_billing("agent:support"))).await.unwrap();
+        let id = "policy:billing-hears-support-only";
+        assert_eq!(denied_by(r.get_ref()), Some((id.into(), id.into())));
+        let event = rx.try_recv().unwrap().event;
+        assert_eq!(event.str("wake.brake.halt_id"), Some(id));
+        assert_eq!(event.str("wake.agent.id"), Some("planner"));
+        assert!(
+            !event.attributes.contains_key("wake.origins"),
+            "nothing entered at a denial"
+        );
+        let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["origins"], serde_json::json!(["tool:fetch_page"]));
+
+        // Planner's calls to other agents aren't covered.
+        let r = authz
+            .check(Request::new(check(Some("planner"), "", Some("research"), &[])))
             .await
             .unwrap();
         assert_eq!(r.get_ref().status.as_ref().unwrap().code, 0);
