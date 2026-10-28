@@ -20,3 +20,4 @@ pub mod metrics;
 pub mod pipeline;
 pub mod policy;
 pub mod signer;
+pub mod svid;

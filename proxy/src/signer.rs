@@ -17,13 +17,19 @@ pub struct Signer {
 }
 
 impl Signer {
-    /// Loads a PKCS#8 P-256 private key and its certificate chain, both PEM.
+    /// Loads a PKCS#8 P-256 private key and its certificate chain, both PEM. The key must
+    /// be the certificate's: otherwise every event it signed would fail its check.
     pub fn from_pem(key_pem: &str, cert_pem: &str) -> Result<Self, String> {
         let key = SigningKey::from_pkcs8_pem(key_pem).map_err(|e| format!("signing key: {e}"))?;
         // The SVID first, then any intermediates, as SPIRE writes them.
         let chain = pem::parse_many(cert_pem).map_err(|e| format!("certificate: {e}"))?;
         let leaf = chain.first().ok_or("no certificate")?;
         let id = spiffe_id(leaf.contents())?;
+        let certified = p256::ecdsa::VerifyingKey::from_sec1_bytes(&public_key(leaf.contents())?)
+            .map_err(|e| format!("certificate key: {e}"))?;
+        if certified != *key.verifying_key() {
+            return Err("the signing key isn't the certificate's".into());
+        }
         let der: Vec<u8> = chain.iter().flat_map(|c| c.contents().to_vec()).collect();
         Ok(Signer {
             key,
@@ -50,6 +56,13 @@ impl Signer {
         event.set("wake.signer", Value::Str(self.id.clone()));
         event.set("wake.signature.certificate", Value::Str(self.certificate.clone()));
     }
+}
+
+/// The public key in a certificate, as SEC1 bytes.
+fn public_key(der: &[u8]) -> Result<Vec<u8>, String> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(der).map_err(|e| format!("certificate: {e}"))?;
+    Ok(cert.public_key().subject_public_key.data.to_vec())
 }
 
 /// The SPIFFE ID in a certificate: its one spiffe:// URI SAN.

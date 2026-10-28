@@ -22,7 +22,8 @@
 //! bundle with the brake's SPIFFE ID. An agent can neither reach it nor present that
 //! identity, so no agent can lift a halt. It takes a few connections at once, each with a
 //! handshake timeout and a lifetime (listen::CONTROL), so a client that connects and stalls
-//! can't keep the brake out.
+//! can't keep the brake out. As SPIRE rotates the SVID and the trust bundle, each new
+//! connection gets the ones in use (svid.rs).
 
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ use tokio_rustls::rustls::{self, RootCertStore, ServerConfig};
 use crate::halts::{self, Halts, Scope, Selection};
 use crate::listen::{self, Limits};
 use crate::signer::spiffe_id;
+use crate::svid::Svid;
 
 /// What the control API needs to serve mTLS.
 pub struct Tls {
@@ -52,6 +54,52 @@ pub struct Tls {
     pub bundle_pem: String,
     /// The one SPIFFE ID allowed to call.
     pub brake_id: String,
+}
+
+/// Where the control API's TLS comes from: fixed, or the processor's SVID and the trust
+/// bundle as SPIRE rotates them.
+pub enum TlsSource {
+    Fixed(Tls),
+    Svid { svid: Arc<Svid>, brake_id: String },
+}
+
+impl From<Tls> for TlsSource {
+    fn from(tls: Tls) -> Self {
+        TlsSource::Fixed(tls)
+    }
+}
+
+impl TlsSource {
+    fn brake_id(&self) -> &str {
+        match self {
+            TlsSource::Fixed(tls) => &tls.brake_id,
+            TlsSource::Svid { brake_id, .. } => brake_id,
+        }
+    }
+
+    /// The acceptor for what's in use now, and what identifies it, unless that's what the
+    /// acceptor in hand already serves.
+    fn fresh(&self, serving: Option<[u8; 32]>) -> Result<Option<([u8; 32], TlsAcceptor)>, String> {
+        match self {
+            TlsSource::Fixed(tls) => match serving {
+                Some(_) => Ok(None),
+                None => Ok(Some(([0; 32], tls_acceptor(tls)?))),
+            },
+            TlsSource::Svid { svid, brake_id } => {
+                let m = svid.current();
+                if serving == Some(m.digest()) {
+                    return Ok(None);
+                }
+                let tls = Tls {
+                    cert_pem: m.cert_pem.clone(),
+                    key_pem: m.key_pem.clone(),
+                    bundle_pem: m.bundle_pem.clone().ok_or("the control API needs a trust bundle")?,
+                    brake_id: brake_id.clone(),
+                };
+                Ok(Some((m.digest(), tls_acceptor(&tls)?)))
+            }
+        }
+    }
 }
 
 pub fn tls_acceptor(tls: &Tls) -> Result<TlsAcceptor, String> {
@@ -183,7 +231,7 @@ pub fn router(halts: Arc<Halts>) -> Router {
 pub async fn serve(
     listener: TcpListener,
     halts: Arc<Halts>,
-    tls: Tls,
+    tls: impl Into<TlsSource>,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), String> {
     serve_with(listener, halts, tls, listen::CONTROL, shutdown).await
@@ -193,12 +241,13 @@ pub async fn serve(
 pub async fn serve_with(
     listener: TcpListener,
     halts: Arc<Halts>,
-    tls: Tls,
+    tls: impl Into<TlsSource>,
     limits: Limits,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), String> {
-    let acceptor = tls_acceptor(&tls)?;
-    let brake_id = Arc::new(tls.brake_id);
+    let source = tls.into();
+    let (mut serving, mut acceptor) = source.fresh(None)?.ok_or("no TLS")?;
+    let brake_id = Arc::new(source.brake_id().to_string());
     let app = router(halts);
     let open = Arc::new(Semaphore::new(limits.connections));
     tokio::pin!(shutdown);
@@ -217,6 +266,13 @@ pub async fn serve_with(
             tracing::warn!(%peer, "control API: too many connections; closed one");
             continue;
         };
+        // A rotated SVID or bundle serves from this connection on; one that won't build
+        // keeps the TLS in use.
+        match source.fresh(Some(serving)) {
+            Ok(Some((digest, fresh))) => (serving, acceptor) = (digest, fresh),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(error, "control API: can't use the new SVID; keeping the one in use"),
+        }
         let acceptor = acceptor.clone();
         let brake_id = brake_id.clone();
         let app = app.clone();

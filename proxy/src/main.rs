@@ -13,7 +13,8 @@ use wake_proxy::halts::Halts;
 use wake_proxy::listen::Hooks;
 use wake_proxy::pipeline::{self, Options};
 use wake_proxy::policy::FlowPolicy;
-use wake_proxy::signer::{DevExtras, Signer, dev_identity_with};
+use wake_proxy::signer::{DevExtras, dev_identity_with};
+use wake_proxy::svid::Svid;
 
 #[derive(Parser)]
 #[command(version, about = "Records MCP calls through agentgateway as signed Wake events")]
@@ -226,9 +227,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metrics_listen,
             policy_file,
         } => {
-            let key_pem = std::fs::read_to_string(key)?;
-            let cert_pem = std::fs::read_to_string(cert)?;
-            let signer = Signer::from_pem(&key_pem, &cert_pem)?;
+            // The SVID SPIRE writes, read again as it rotates. The trust bundle is read with
+            // it for the control API, which checks the brake against it.
+            let bundle = if control_listen.is_some() {
+                Some(trust_bundle.ok_or("--control-listen needs --trust-bundle")?)
+            } else {
+                None
+            };
+            let svid = Arc::new(Svid::from_files(&cert, &key, bundle.as_deref())?);
+            tokio::spawn(svid.clone().watch(stopping()));
             absolute(&state_dir)?;
             let agents = match agents {
                 Some(path) => {
@@ -255,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(
                 listen,
                 collector,
-                signer = signer.id(),
+                signer = svid.current().signer.id(),
                 "serving the ExtMCP and ext_proc processor"
             );
             let hooks = Hooks::parse(&listen)?;
@@ -285,14 +292,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             if let Some(control_listen) = control_listen {
-                let bundle = trust_bundle.ok_or("--control-listen needs --trust-bundle")?;
-                let tls = control::Tls {
-                    cert_pem: cert_pem.clone(),
-                    key_pem: key_pem.clone(),
-                    bundle_pem: std::fs::read_to_string(bundle)?,
+                let tls = control::TlsSource::Svid {
+                    svid: svid.clone(),
                     brake_id: brake_id.clone(),
                 };
-                control::tls_acceptor(&tls)?;
+                let m = svid.current();
+                control::tls_acceptor(&control::Tls {
+                    cert_pem: m.cert_pem.clone(),
+                    key_pem: m.key_pem.clone(),
+                    bundle_pem: m.bundle_pem.clone().unwrap_or_default(),
+                    brake_id: brake_id.clone(),
+                })?;
                 let control_listener = tokio::net::TcpListener::bind(&control_listen).await?;
                 tracing::info!(control_listen, brake_id, "serving the brake's control API");
                 let halts = halts.clone();
@@ -325,11 +335,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match hooks {
                 Hooks::Tcp(addr) => {
                     let listener = tokio::net::TcpListener::bind(addr).await?;
-                    pipeline::serve(listener, signer, options, counters.clone(), shutdown).await?;
+                    pipeline::serve(listener, svid, options, counters.clone(), shutdown).await?;
                 }
                 Hooks::Unix(path) => {
                     let listener = wake_proxy::listen::bind_unix(&path)?;
-                    pipeline::serve_unix(listener, signer, options, counters.clone(), shutdown).await?;
+                    pipeline::serve_unix(listener, svid, options, counters.clone(), shutdown).await?;
                 }
             }
             tracing::info!(
