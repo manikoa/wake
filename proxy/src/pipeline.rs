@@ -20,7 +20,8 @@ use crate::export::{Counters, Exporter};
 use crate::extmcp::Processor;
 use crate::extproc;
 use crate::halts::Halts;
-use crate::policy::FlowPolicy;
+use crate::origins::Observed;
+use crate::policy::{DEFAULT_WINDOW_SECS, FlowPolicy, Policy};
 use crate::signer::Signer;
 
 pub struct Options {
@@ -39,8 +40,12 @@ pub struct Options {
     /// The halts in force, which the ext_authz service enforces, and ext_proc and ExtMCP
     /// enforce on calls already under way.
     pub halts: Arc<Halts>,
-    /// Optional origin flow policies enforced at ext_authz.
-    pub policy: Arc<FlowPolicy>,
+    /// The origin flow policy in force: ext_authz checks its rules that name no tools, and
+    /// ExtMCP those that do.
+    pub policy: Arc<Policy>,
+    /// What entered each agent through the proxy, which ExtMCP and ext_proc note and the
+    /// policy decides on.
+    pub observed: Arc<Observed>,
 }
 
 impl Default for Options {
@@ -52,7 +57,8 @@ impl Default for Options {
             queue: 10_000,
             queue_bytes: 64 << 20,
             halts: Arc::new(Halts::in_memory()),
-            policy: Arc::new(FlowPolicy::empty()),
+            policy: Arc::new(Policy::fixed(FlowPolicy::empty())),
+            observed: Arc::new(Observed::starting(crate::halts::now(), DEFAULT_WINDOW_SECS)),
         }
     }
 }
@@ -157,10 +163,24 @@ where
                 options.halts.clone(),
                 events.clone(),
             )
+            .with_policy(options.policy.clone(), options.observed.clone())
             .server(),
         )
-        .add_service(extproc::Processor::new(events.clone(), options.halts.clone(), bodies, counters.clone()).server())
-        .add_service(Authorizer::with_policy(options.halts.clone(), options.policy.clone(), events, counters).server())
+        .add_service(
+            extproc::Processor::new(events.clone(), options.halts.clone(), bodies, counters.clone())
+                .with_policy(options.policy.clone(), options.observed.clone())
+                .server(),
+        )
+        .add_service(
+            Authorizer::with_policy(
+                options.halts.clone(),
+                options.policy.clone(),
+                options.observed.clone(),
+                events,
+                counters,
+            )
+            .server(),
+        )
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
     // The server dropped its senders, so each stage drains and ends in turn.

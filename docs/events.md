@@ -60,6 +60,10 @@ The proxy's deny lever records each call it denies as a `denied` event, captured
 - `wake.brake.halt_id` names the first halt that denied it, and `wake.brake.receiver` the agent the call was sent to, when there is one.
 - `wake.payload` is `{"caller", "identity", "receiver", "method", "host", "path", "halt", "halts"}`: `identity` is what the caller authenticated as, when its name differs, and `halts` every halt that covered the call.
 
+A call a **flow policy** denies (see [proxy.md](proxy.md)) is recorded the same way, under `wake.brake.halt_id` `policy:<rule id>`.
+- **Payload:** it adds `origins`, the origins that entered the caller and that the rule keeps from the call. When the caller counted as having every origin, it's `*`, and `every_origin` says why.
+- **No `wake.origins`:** no content entered at the denial.
+
 A call already under way when a halt lands is **cut**, and recorded the same way: an A2A exchange the proxy is carrying, such as a streamed reply, or an MCP call whose result was on its way back to the caller.
 - **Payload:** it adds `"cut": true`, and `recorded_as`, the id of the event that recorded the call, when there is one.
 - **Its MCP form:** the `method` is the MCP method and the `host` the MCP server. The event's parent is the call's own `tool_call`, which records what the tool returned, though the caller never got it.
