@@ -152,11 +152,16 @@ fn parents_in(metadata: Option<&Value>) -> Vec<String> {
 }
 
 /// Which message started each task, so a later tasks/get reply links back to it. Shared by
-/// every exchange, bounded, oldest forgotten first.
+/// every exchange, bounded, oldest forgotten first. A task id is only unique at the agent
+/// that made it, so each is kept under the agent the message went to: another agent's
+/// task with the same id doesn't link to it.
 pub struct Tasks {
-    inner: Mutex<(HashMap<String, String>, VecDeque<String>)>,
+    inner: Mutex<(HashMap<TaskKey, String>, VecDeque<TaskKey>)>,
     limit: usize,
 }
+
+/// The agent a task was made by, and its id there.
+type TaskKey = (String, String);
 
 impl Tasks {
     pub fn new(limit: usize) -> Self {
@@ -166,11 +171,12 @@ impl Tasks {
         }
     }
 
-    pub fn remember(&self, task_id: &str, message_event: &str) {
+    pub fn remember(&self, receiver: &str, task_id: &str, message_event: &str) {
         let Ok(mut guard) = self.inner.lock() else { return };
         let (map, order) = &mut *guard;
-        if map.insert(task_id.to_string(), message_event.to_string()).is_none() {
-            order.push_back(task_id.to_string());
+        let key = (receiver.to_string(), task_id.to_string());
+        if map.insert(key.clone(), message_event.to_string()).is_none() {
+            order.push_back(key);
         }
         while order.len() > self.limit {
             if let Some(old) = order.pop_front() {
@@ -179,8 +185,13 @@ impl Tasks {
         }
     }
 
-    pub fn started(&self, task_id: &str) -> Option<String> {
-        self.inner.lock().ok()?.0.get(task_id).cloned()
+    pub fn started(&self, receiver: &str, task_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()?
+            .0
+            .get(&(receiver.to_string(), task_id.to_string()))
+            .cloned()
     }
 }
 
@@ -277,13 +288,23 @@ mod tests {
     #[test]
     fn tasks_forget_the_oldest() {
         let tasks = Tasks::new(2);
-        tasks.remember("t1", "m1");
-        tasks.remember("t2", "m2");
-        tasks.remember("t1", "m1b");
-        assert_eq!(tasks.started("t1").as_deref(), Some("m1b"));
-        tasks.remember("t3", "m3");
-        assert_eq!(tasks.started("t1"), None);
-        assert_eq!(tasks.started("t3").as_deref(), Some("m3"));
+        tasks.remember("research", "t1", "m1");
+        tasks.remember("research", "t2", "m2");
+        tasks.remember("research", "t1", "m1b");
+        assert_eq!(tasks.started("research", "t1").as_deref(), Some("m1b"));
+        tasks.remember("research", "t3", "m3");
+        assert_eq!(tasks.started("research", "t1"), None);
+        assert_eq!(tasks.started("research", "t3").as_deref(), Some("m3"));
+    }
+
+    #[test]
+    fn a_task_id_belongs_to_the_agent_that_made_it() {
+        let tasks = Tasks::new(8);
+        tasks.remember("research", "1", "m-research");
+        assert_eq!(tasks.started("billing", "1"), None, "billing's task 1 is another task");
+        tasks.remember("billing", "1", "m-billing");
+        assert_eq!(tasks.started("research", "1").as_deref(), Some("m-research"));
+        assert_eq!(tasks.started("billing", "1").as_deref(), Some("m-billing"));
     }
 
     proptest! {

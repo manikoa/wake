@@ -1,0 +1,6 @@
+# For smoke_test.sh only: publishes wake-proxy's control API on this machine's loopback, so
+# the test can put a halt the way the brake does, with the brake's SVID. Never use it in
+# staging, where only the brake reaches the control API.
+services:
+  wake-proxy:
+    ports: ["127.0.0.1:9002:9002"]

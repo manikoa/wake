@@ -5,16 +5,18 @@
 //! A call is identified by what the gateway config computes: the caller from the `wake`
 //! metadata's `agent` (the same CEL as capture: SPIFFE ID, else JWT subject), falling back
 //! to the mTLS peer's principal, and the agent a route reaches from its static `receiver`
-//! context. A denied call gets a 403 with a `wake-halt` header naming the halt, and is
+//! context. The identity map (agents.rs) names both. A denied call gets a 403 whose
+//! `wake-halts` header names every halt that covers it, and `wake-halt` the first, and is
 //! recorded as a signed `denied` event, linked to the step that made it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
+use crate::agents::Agents;
+use crate::budget::Events;
 use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
@@ -50,8 +52,11 @@ pub const METADATA: &str = "wake";
 pub const METADATA_AGENT: &str = "agent";
 /// The static context key naming the agent a route reaches.
 pub const CONTEXT_RECEIVER: &str = "receiver";
-/// The response header naming the halt that denied a call.
+/// The response header naming the first halt that denied a call.
 pub const HEADER_HALT: &str = "wake-halt";
+/// The response header naming every halt that denied a call, comma separated, in the order
+/// they were put. A probe for any one of them finds it here.
+pub const HEADER_HALTS: &str = "wake-halts";
 
 const PERMISSION_DENIED: i32 = 7;
 
@@ -111,32 +116,37 @@ pub fn allow() -> CheckResponse {
     }
 }
 
-pub fn deny(halt: &Halt) -> CheckResponse {
+/// The answer for a call these halts deny. halts isn't empty.
+pub fn deny(halts: &[Halt]) -> CheckResponse {
+    let first = halts.first().map(|h| h.id.as_str()).unwrap_or_default();
+    let ids: Vec<&str> = halts.iter().map(|h| h.id.as_str()).collect();
+    let header = |key: &str, value: String| HeaderValueOption {
+        header: Some(HeaderValue {
+            key: key.into(),
+            raw_value: value.into_bytes(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     CheckResponse {
         status: Some(pb::common::Status {
             code: PERMISSION_DENIED,
-            message: format!("halted by Wake ({})", halt.id),
+            message: format!("halted by Wake ({})", ids.join(", ")),
             ..Default::default()
         }),
         http_response: Some(check_response::HttpResponse::DeniedResponse(DeniedHttpResponse {
             status: Some(HttpStatus { code: 403 }),
-            headers: vec![HeaderValueOption {
-                header: Some(HeaderValue {
-                    key: HEADER_HALT.into(),
-                    raw_value: halt.id.clone().into_bytes(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            body: serde_json::json!({"error": "halted", "halt": halt.id}).to_string(),
+            headers: vec![header(HEADER_HALT, first.into()), header(HEADER_HALTS, ids.join(","))],
+            body: serde_json::json!({"error": "halted", "halt": first, "halts": ids}).to_string(),
         })),
         ..Default::default()
     }
 }
 
-/// The signed record of a denied call: who tried, what, under which halt, and which of the
-/// caller's steps it came from.
-pub fn denied_event(call: &Call, halt: &Halt, at: u64) -> Event {
+/// The signed record of a denied call: who tried, what, under which halts, and which of the
+/// caller's steps it came from. halts isn't empty; the first is the one named. The caller is
+/// recorded under its agent's name, with the identity it authenticated as when that differs.
+pub fn denied_event(call: &Call, halts: &[Halt], agents: &Agents, at: u64) -> Event {
     let header = |name: &str| call.headers.get(name).map(String::as_str);
     let trace = header(mcp::HEADER_TRACEPARENT).and_then(mcp::parse_traceparent);
     let parents = header(mcp::HEADER_PARENTS)
@@ -151,7 +161,12 @@ pub fn denied_event(call: &Call, halt: &Halt, at: u64) -> Event {
         end_time_unix_nano: at,
         ..Default::default()
     };
-    let caller = call.caller.clone().unwrap_or_else(|| "unknown".into());
+    let caller = call
+        .caller
+        .as_deref()
+        .map(|c| agents.record(c).to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let identity = call.caller.as_deref().filter(|c| *c != caller);
     e.name = format!("denied {} {}", call.method, call.path).trim().to_string();
     e.set("wake.event.id", Value::Str(uuid::Uuid::new_v4().to_string()));
     e.set("wake.event.kind", Value::Str("denied".into()));
@@ -159,7 +174,8 @@ pub fn denied_event(call: &Call, halt: &Halt, at: u64) -> Event {
     e.set("wake.agent.id", Value::Str(caller.clone()));
     e.set("wake.parents", Value::Strs(parents));
     e.set("wake.origins", Value::Strs(vec![]));
-    e.set("wake.brake.halt_id", Value::Str(halt.id.clone()));
+    let first = halts.first().map(|h| h.id.clone()).unwrap_or_default();
+    e.set("wake.brake.halt_id", Value::Str(first.clone()));
     if let Some(receiver) = &call.receiver {
         e.set("wake.brake.receiver", Value::Str(receiver.clone()));
     }
@@ -168,11 +184,13 @@ pub fn denied_event(call: &Call, halt: &Halt, at: u64) -> Event {
         Value::Str(
             serde_json::json!({
                 "caller": caller,
+                "identity": identity,
                 "receiver": call.receiver,
                 "method": call.method,
                 "host": call.host,
                 "path": call.path,
-                "halt": halt.id,
+                "halt": first,
+                "halts": halts.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
             })
             .to_string(),
         ),
@@ -189,12 +207,12 @@ fn ids() -> ([u8; 16], [u8; 8]) {
 /// The gRPC service.
 pub struct Authorizer {
     halts: Arc<Halts>,
-    events: mpsc::Sender<Event>,
+    events: Events,
     counters: Arc<Counters>,
 }
 
 impl Authorizer {
-    pub fn new(halts: Arc<Halts>, events: mpsc::Sender<Event>, counters: Arc<Counters>) -> Self {
+    pub fn new(halts: Arc<Halts>, events: Events, counters: Arc<Counters>) -> Self {
         Authorizer {
             halts,
             events,
@@ -211,24 +229,21 @@ impl Authorizer {
 impl Authorization for Authorizer {
     async fn check(&self, request: Request<CheckRequest>) -> Result<Response<CheckResponse>, Status> {
         let call = read_call(request.get_ref());
-        let Some(halt) = self.halts.deciding(call.caller.as_deref(), call.receiver.as_deref()) else {
+        let halts = self.halts.deciding(call.caller.as_deref(), call.receiver.as_deref());
+        if halts.is_empty() {
             return Ok(Response::new(allow()));
-        };
-        self.counters.denied.fetch_add(1, Ordering::Relaxed);
-        if self
-            .events
-            .try_send(denied_event(&call, &halt, crate::halts::now()))
-            .is_err()
-        {
-            self.counters.export_dropped.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(Response::new(deny(&halt)))
+        self.counters.denied.fetch_add(1, Ordering::Relaxed);
+        self.events
+            .send(denied_event(&call, &halts, self.halts.agents(), crate::halts::now()));
+        Ok(Response::new(deny(&halts)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::Budget;
     use crate::halts::Scope;
     use pb::auth::attribute_context::{HttpRequest, Peer, Request as AttrRequest};
     use pb::auth::{AttributeContext, CheckRequest};
@@ -289,8 +304,8 @@ mod tests {
     #[tokio::test]
     async fn denies_in_scope_records_it_and_allows_the_rest() {
         let halts = Arc::new(Halts::in_memory());
-        let (tx, mut rx) = mpsc::channel(8);
         let counters = Arc::new(Counters::default());
+        let (tx, mut rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
         let authz = Authorizer::new(halts.clone(), tx, counters.clone());
 
         let allowed = authz
@@ -328,7 +343,7 @@ mod tests {
         assert_eq!(d.status.as_ref().unwrap().code, 403);
         assert_eq!(d.headers[0].header.as_ref().unwrap().raw_value, b"halt-1");
 
-        let event = rx.try_recv().unwrap();
+        let event = rx.try_recv().unwrap().event;
         assert_eq!(event.str("wake.event.kind"), Some("denied"));
         assert_eq!(event.str("wake.agent.id"), Some("support"));
         assert_eq!(event.str("wake.brake.halt_id"), Some("halt-1"));
@@ -346,5 +361,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.get_ref().status.as_ref().unwrap().code, 0);
+    }
+
+    fn denied_by(response: &CheckResponse) -> Option<(String, String)> {
+        let Some(check_response::HttpResponse::DeniedResponse(d)) = &response.http_response else {
+            return None;
+        };
+        let header = |name: &str| {
+            d.headers
+                .iter()
+                .filter_map(|h| h.header.as_ref())
+                .find(|h| h.key == name)
+                .map(|h| String::from_utf8(h.raw_value.clone()).unwrap())
+                .unwrap_or_default()
+        };
+        Some((header(HEADER_HALT), header(HEADER_HALTS)))
+    }
+
+    fn halted(agents: &[&str]) -> Scope {
+        Scope {
+            fleet: agents.is_empty(),
+            agents: agents.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_halt_denies_the_agents_own_calls_and_unknown_callers() {
+        let map =
+            br#"{"billing": ["spiffe://wake.local/agent/billing"], "support": ["spiffe://wake.local/agent/support"]}"#;
+        let halts = Arc::new(Halts::in_memory().with_agents(Arc::new(Agents::from_json(map).unwrap())));
+        let counters = Arc::new(Counters::default());
+        let (tx, mut rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let authz = Authorizer::new(halts.clone(), tx, counters);
+        // The brake halts billing by its short name.
+        halts.put("halt-billing", halted(&["billing"]), 1).unwrap();
+
+        // Billing calling an MCP tool: an mTLS peer, no receiver.
+        let r = authz
+            .check(Request::new(check(
+                None,
+                "spiffe://wake.local/agent/billing",
+                None,
+                &[],
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            denied_by(r.get_ref()),
+            Some(("halt-billing".into(), "halt-billing".into()))
+        );
+        let event = rx.try_recv().unwrap().event;
+        assert_eq!(event.str("wake.agent.id"), Some("billing"));
+        let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["identity"], "spiffe://wake.local/agent/billing");
+
+        // A caller with no identity, or one the map doesn't list, could be billing.
+        for (agent, principal) in [(None, ""), (Some(""), ""), (None, "spiffe://wake.local/agent/new")] {
+            let r = authz
+                .check(Request::new(check(agent, principal, None, &[])))
+                .await
+                .unwrap();
+            assert!(denied_by(r.get_ref()).is_some(), "{agent:?} {principal:?}");
+        }
+        // Support may still call its tools.
+        let r = authz
+            .check(Request::new(check(
+                None,
+                "spiffe://wake.local/agent/support",
+                None,
+                &[],
+            )))
+            .await
+            .unwrap();
+        assert_eq!(r.get_ref().status.as_ref().unwrap().code, 0);
+    }
+
+    #[tokio::test]
+    async fn names_every_halt_that_covers_the_call() {
+        let halts = Arc::new(Halts::in_memory());
+        let counters = Arc::new(Counters::default());
+        let (tx, _rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let authz = Authorizer::new(halts.clone(), tx, counters);
+        halts.put("fleet-1", halted(&[]), 1).unwrap();
+        halts.put("fleet-2", halted(&[]), 2).unwrap();
+        let r = authz
+            .check(Request::new(check(Some("support"), "", None, &[])))
+            .await
+            .unwrap();
+        // A probe for the second fleet halt finds it too.
+        assert_eq!(
+            denied_by(r.get_ref()),
+            Some(("fleet-1".into(), "fleet-1,fleet-2".into()))
+        );
+        let Some(check_response::HttpResponse::DeniedResponse(d)) = &r.get_ref().http_response else {
+            unreachable!()
+        };
+        let body: serde_json::Value = serde_json::from_str(&d.body).unwrap();
+        assert_eq!(body["halts"], serde_json::json!(["fleet-1", "fleet-2"]));
     }
 }

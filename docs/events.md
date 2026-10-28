@@ -55,10 +55,10 @@ The message is a parent of B's next event. An answer going back from B to A is a
 
 The proxy's deny lever records each call it denies as a `denied` event, captured by the proxy and signed like its other events (the memory adapter records the memory it refuses the same way; see Memory):
 
-- `wake.agent.id` is the caller, or `unknown`.
+- `wake.agent.id` is the caller, under its agent's name when the proxy's agents file lists its identity, or `unknown`.
 - `wake.parents` come from the call's link, so the event joins the caller's trace under the step that made the call.
-- `wake.brake.halt_id` names the halt that denied it, and `wake.brake.receiver` the agent the call was sent to, when there is one.
-- `wake.payload` is `{"caller", "receiver", "method", "host", "path", "halt"}`.
+- `wake.brake.halt_id` names the first halt that denied it, and `wake.brake.receiver` the agent the call was sent to, when there is one.
+- `wake.payload` is `{"caller", "identity", "receiver", "method", "host", "path", "halt", "halts"}`: `identity` is what the caller authenticated as, when its name differs, and `halts` every halt that covered the call.
 
 ## Memory
 
@@ -77,7 +77,7 @@ The label is a pointer, not evidence: anything that can write the store can forg
 
 - **A delete** is a `memory_write` with `wake.memory.deleted` true and no label. Its parents are the tool call making it.
 
-**Quarantine.** When the brake quarantines memory, the adapter refuses the writes and deletes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence, so deleting one is refused too. Each refused write, delete or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write`, `delete` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's or delete's parent is the write it came from. The adapter fails closed: while it holds no current rules from the proxy, or can't check them, it refuses every write and serves no entry, with `wake.brake.halt_id` `stale-rules` or `quarantine-check-failed`. It does the same when the proxy can't read the quarantines it holds, whose rules then carry `hidden_by` `unreadable-state`.
+**Quarantine.** When the brake quarantines memory, the adapter refuses the writes and deletes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence, so deleting one is refused too. Each refused write, delete or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write`, `delete` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's or delete's parent is the write it came from. The adapter fails closed: while it holds no current rules from the proxy, or can't check them, it refuses every write and serves no entry, with `wake.brake.halt_id` `stale-rules` or `quarantine-check-failed`. It does the same when the proxy doesn't know what it quarantined, because its state can't be read or was never initialized: its rules then carry `hidden_by` (`unreadable-state` or `uninitialized-state`).
 
 ## How the SDK finds parents
 

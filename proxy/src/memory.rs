@@ -8,7 +8,9 @@
 //!
 //! Each fetch is noted, and the brake reads the notes from the control API to confirm an
 //! agent's adapter has the quarantine. The agent names itself, so that confirmation trusts
-//! the agent's process, as the adapter's enforcement does; the proxy deny doesn't.
+//! the agent's process, as the adapter's enforcement does; the proxy deny doesn't. Agents
+//! can reach this port, so it caps its connections and how long each stays open
+//! (listen::MEMORY), and the notes are bounded (halts.rs).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,12 +18,11 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use hyper_util::rt::TokioIo;
-use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 use crate::halts::{Halts, MemoryRules};
-use crate::listen;
+use crate::listen::{self, Limits};
 
 async fn rules(State(halts): State<Arc<Halts>>, Query(query): Query<HashMap<String, String>>) -> Json<MemoryRules> {
     let agent = query.get("agent").map(String::as_str).unwrap_or("");
@@ -36,18 +37,38 @@ pub fn router(halts: Arc<Halts>) -> Router {
 
 /// Serves the memory rules on listener until shutdown resolves.
 pub async fn serve(listener: TcpListener, halts: Arc<Halts>, shutdown: impl std::future::Future<Output = ()> + Send) {
+    serve_with(listener, halts, listen::MEMORY, shutdown).await
+}
+
+/// Serves the memory rules with these limits.
+pub async fn serve_with(
+    listener: TcpListener,
+    halts: Arc<Halts>,
+    limits: Limits,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) {
     let app = router(halts);
-    let limit = listen::limit();
+    let open = Arc::new(Semaphore::new(limits.connections));
     tokio::pin!(shutdown);
     loop {
-        let (stream, _, permit) = tokio::select! {
-            accepted = listen::accept(&listener, &limit, "memory") => accepted,
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    tracing::warn!(error = %e, "memory rules: accept failed");
+                    continue;
+                }
+            },
             _ = &mut shutdown => return,
         };
-        let service = TowerToHyperService::new(app.clone());
+        let Ok(slot) = open.clone().try_acquire_owned() else {
+            tracing::warn!("memory rules: too many connections; closed one");
+            continue;
+        };
+        let app = app.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            let _ = listen::http().serve_connection(TokioIo::new(stream), service).await;
+            let _slot = slot;
+            listen::serve_for(stream, app, limits).await;
         });
     }
 }
