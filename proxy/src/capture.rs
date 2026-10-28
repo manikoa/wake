@@ -5,7 +5,10 @@
 //! after the result comes back, with no id tying the two together. The request hook hands
 //! agentgateway the event's id as metadata, and the gateway config passes it back to the
 //! response hook (see agentgateway.yaml). When it doesn't come back, responses are paired
-//! with requests in order within the same session, method and server.
+//! with requests in order within the same session, agent, method and server. When it comes
+//! back for a request that's no longer waiting, because it timed out or was pushed out, the
+//! response is recorded on its own: pairing it in order would give it another call's input,
+//! and maybe another agent's.
 //!
 //! JSON-RPC errors skip the response hook, so a request with no response within the
 //! timeout becomes an event with no output.
@@ -53,7 +56,19 @@ struct Pending {
     at: SystemTime,
 }
 
-type Key = (String, String, String); // session, method, server
+type Key = (String, String, String, String); // session, agent, method, server
+
+fn key(session: &str, agent: &str, method: &str, server: &str) -> Key {
+    (session.into(), agent.into(), method.into(), server.into())
+}
+
+fn agent_of(metadata: &HashMap<String, String>) -> String {
+    metadata
+        .get(META_AGENT)
+        .filter(|a| !a.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "unknown".into())
+}
 
 pub struct Capture {
     /// Responses paired by the event id the gateway passed back, and by order. If only the
@@ -101,13 +116,9 @@ impl Capture {
                 // Pairing uses the session from metadata, the only place the response hook
                 // can carry it too.
                 let session = metadata.get(META_SESSION).cloned().unwrap_or_default();
-                let agent = metadata
-                    .get(META_AGENT)
-                    .filter(|a| !a.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".into());
+                let agent = agent_of(&metadata);
                 self.queues
-                    .entry((session.clone(), method.clone(), server.clone()))
+                    .entry(key(&session, &agent, &method, &server))
                     .or_default()
                     .push_back(event_id.clone());
                 self.order.push_back(event_id.clone());
@@ -145,20 +156,19 @@ impl Capture {
                 result,
                 at,
             } => {
-                let by_id = metadata
-                    .get(META_EVENT_ID)
-                    .filter(|id| self.pending.contains_key(*id))
-                    .cloned();
-                let id = match by_id {
-                    Some(id) => {
+                let id = match metadata.get(META_EVENT_ID).filter(|id| !id.is_empty()) {
+                    // The gateway named the call. If it's no longer waiting, the response
+                    // is recorded on its own rather than given to another call.
+                    Some(id) if self.pending.contains_key(id) => {
                         self.paired_by_id += 1;
-                        Some(id)
+                        Some(id.clone())
                     }
+                    Some(_) => None,
                     None => {
                         let session = metadata.get(META_SESSION).cloned().unwrap_or_default();
                         let next = self
                             .queues
-                            .get_mut(&(session, method.clone(), server.clone()))
+                            .get_mut(&key(&session, &agent_of(&metadata), &method, &server))
                             .and_then(|q| q.pop_front());
                         if next.is_some() {
                             self.paired_in_order += 1;
@@ -201,14 +211,11 @@ impl Capture {
 
     fn finish(&mut self, id: &str, result: Option<&[u8]>, at: SystemTime, error: Option<&str>) -> Option<Event> {
         let p = self.pending.remove(id)?;
-        if let Some(q) = self
-            .queues
-            .get_mut(&(p.session.clone(), p.method.clone(), p.server.clone()))
-        {
+        let k = key(&p.session, &p.agent, &p.method, &p.server);
+        if let Some(q) = self.queues.get_mut(&k) {
             q.retain(|x| x != id);
             if q.is_empty() {
-                self.queues
-                    .remove(&(p.session.clone(), p.method.clone(), p.server.clone()));
+                self.queues.remove(&k);
             }
         }
         Some(build(id, &p, result, at, error))
@@ -280,11 +287,7 @@ fn orphan(method: &str, server: &str, metadata: &HashMap<String, String>, result
     let p = Pending {
         method: method.into(),
         server: server.into(),
-        agent: metadata
-            .get(META_AGENT)
-            .filter(|a| !a.is_empty())
-            .cloned()
-            .unwrap_or_else(|| "unknown".into()),
+        agent: agent_of(metadata),
         session: metadata.get(META_SESSION).cloned().unwrap_or_default(),
         params: None,
         request: mcp::Request::default(),
@@ -323,8 +326,9 @@ mod tests {
         }
     }
 
+    // The gateway config computes the same metadata in both phases.
     fn response(session: &str, event_id: Option<&str>, result: &str, at: SystemTime) -> Hook {
-        let mut m = meta(&[(META_SESSION, session)]);
+        let mut m = meta(&[(META_AGENT, "spiffe://wake.local/agent/email"), (META_SESSION, session)]);
         if let Some(id) = event_id {
             m.insert(META_EVENT_ID.into(), id.into());
         }
@@ -397,6 +401,52 @@ mod tests {
         assert_eq!(late.len(), 1);
         assert_ne!(late[0].str("wake.event.id"), Some("a"));
         assert_eq!(c.waiting(), 0);
+    }
+
+    #[test]
+    fn a_late_response_is_never_given_to_another_call() {
+        let mut c = Capture::new(Duration::from_secs(60), 100);
+        c.handle(request("a", "s1", "read_email", t(0)));
+        assert_eq!(c.expire(t(60)).len(), 1, "a is recorded with no output");
+        c.handle(request("b", "s1", "wire_money", t(61)));
+        // a's result comes back late, named by its id. b keeps waiting for its own.
+        let late = c.handle(response("s1", Some("a"), r#"{"content":"inbox"}"#, t(62)));
+        assert_eq!(late.len(), 1);
+        assert_ne!(late[0].str("wake.event.id"), Some("b"));
+        assert!(late[0].str("wake.payload").unwrap().contains("no request seen"));
+        assert_eq!(c.waiting(), 1);
+        let own = c.handle(response("s1", Some("b"), "{}", t(63)));
+        assert_eq!(own[0].str("wake.event.id"), Some("b"));
+        assert_eq!((c.paired_by_id, c.paired_in_order), (1, 0));
+    }
+
+    #[test]
+    fn pairs_in_order_only_within_one_agent() {
+        let call = |id: &str, agent: &str, tool: &str| Hook::Request {
+            event_id: id.into(),
+            method: "tools/call".into(),
+            server: "bank".into(),
+            metadata: meta(&[(META_AGENT, agent)]),
+            params: Some(format!(r#"{{"name":"{tool}","arguments":{{}}}}"#).into_bytes()),
+            headers: vec![],
+            at: t(0),
+        };
+        let reply = |agent: &str| Hook::Response {
+            method: "tools/call".into(),
+            server: "bank".into(),
+            metadata: meta(&[(META_AGENT, agent)]),
+            result: b"{}".to_vec(),
+            at: t(1),
+        };
+        let mut c = Capture::new(Duration::from_secs(60), 100);
+        c.handle(call("x", "support", "read_email"));
+        c.handle(call("y", "billing", "wire_money"));
+        // Neither call has a session; billing's response still can't take support's call.
+        let out = c.handle(reply("billing"));
+        assert_eq!(out[0].str("wake.event.id"), Some("y"));
+        assert_eq!(out[0].str("wake.agent.id"), Some("billing"));
+        let out = c.handle(reply("support"));
+        assert_eq!(out[0].str("wake.event.id"), Some("x"));
     }
 
     #[test]

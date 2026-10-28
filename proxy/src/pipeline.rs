@@ -3,12 +3,14 @@
 //! and the exporter. Each stage hands work on
 //! through a bounded queue, so a slow stage drops and counts rather than slow the call.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 
 use crate::authz::Authorizer;
 use crate::canonical::Event;
@@ -101,7 +103,21 @@ pub async fn serve(
         emit(capture.expire(SystemTime::now() + timeout));
     });
 
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    // Only agentgateway may call the hooks, from beside the processor: the same pod or
+    // network namespace, over loopback. Anything else could get events signed as the
+    // proxy's, so it's turned away before a byte is read.
+    let refused = counters.clone();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).filter(move |conn| match conn {
+        Ok(stream) => match stream.peer_addr() {
+            Ok(peer) if from_beside(peer) => true,
+            peer => {
+                refused.hooks_refused.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(?peer, "refused a hook connection from off the processor's host");
+                false
+            }
+        },
+        Err(_) => true,
+    });
     let result = tonic::transport::Server::builder()
         .add_service(Processor::new(hooks_tx, counters.clone()).server())
         .add_service(extproc::Processor::new(unsigned_tx.clone(), counters.clone()).server())
@@ -113,4 +129,39 @@ pub async fn serve(
     let _ = signed.await;
     let _ = exported.await;
     result
+}
+
+/// Whether a hook connection comes from beside the processor: a loopback address, IPv4
+/// mapped into IPv6 included.
+pub fn from_beside(peer: SocketAddr) -> bool {
+    match peer.ip() {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hooks_are_served_only_over_loopback() {
+        for peer in [
+            "127.0.0.1:5000",
+            "127.8.9.10:5000",
+            "[::1]:5000",
+            "[::ffff:127.0.0.1]:5000",
+        ] {
+            assert!(from_beside(peer.parse().unwrap()), "{peer}");
+        }
+        for peer in [
+            "172.18.0.5:5000",
+            "10.0.0.1:5000",
+            "0.0.0.0:5000",
+            "[::ffff:10.0.0.1]:5000",
+            "[fe80::1]:5000",
+        ] {
+            assert!(!from_beside(peer.parse().unwrap()), "{peer}");
+        }
+    }
 }

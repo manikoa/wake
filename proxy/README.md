@@ -5,7 +5,7 @@ Records every MCP call and every A2A message between agents that goes through [a
 agentgateway calls wake-proxy through its MCP guardrails hook (ExtMCP), before each `tools/call`, `resources/read` and `prompts/get` reaches its MCP server and again when the result comes back. wake-proxy:
 
 - **Never holds up a call.** It answers "pass" at once and queues the hook. A full queue drops the hook and counts it. With `failOpen`, calls go through unrecorded if wake-proxy is down.
-- **Pairs each request with its response.** The request hook hands agentgateway the event's id, and the config passes it back to the response hook. When it doesn't come back, responses are paired in order within a session. A request with no response after `--response-timeout` (JSON-RPC errors skip the response hook) is recorded with no output.
+- **Pairs each request with its response.** The request hook hands agentgateway the event's id, and the config passes it back to the response hook. When it doesn't come back, responses are paired in order within the same session and caller; one whose id comes back late is recorded on its own, never given to another call. A request with no response after `--response-timeout` (JSON-RPC errors skip the response hook) is recorded with no output.
 - **Signs each event.** It uses its own ECDSA P-256 key and X.509-SVID, and the certificate travels with the event. agentgateway never holds the key.
 - **Sends events to the collector** over OTLP/HTTP, in batches. If the collector can't take them, they're retried, then dropped and counted.
 
@@ -38,7 +38,7 @@ agentgateway -f agentgateway.yaml    # in another terminal; agentgateway v1.6.0
 
 `dev-identity` writes a stand-in trust bundle and a certificate signed by it, for local development only. In production SPIRE issues short-lived SVIDs. Add the bundle to the collector's `trust_bundles`, and the proxy's SPIFFE ID to its `trusted_signers` under `proxy`, so it accepts the proxy's signatures.
 
-wake-proxy must be reachable only by agentgateway, over loopback or a pod-local socket. Anything that can call it can get events signed.
+wake-proxy must be reachable only by agentgateway, from beside it in the same pod or network namespace: anything that can call it can get events signed. It refuses hook connections from anything but loopback, and counts them (`hooks_refused`).
 
 ## Development
 

@@ -139,8 +139,15 @@ func (s *signer) process(span ptrace.Span) {
 		return
 	}
 	attrs := span.Attributes()
+	repeated, isRepeated := event.DropRepeatedKeys(span)
 	attrs.Remove(event.SignatureError)
 	attrs.PutInt(event.Received, s.now().UnixNano())
+	if isRepeated {
+		// What it said under the repeated key is ambiguous, so it's neither signed nor
+		// trusted. It's kept, as the first copy of each key, as evidence.
+		mark(span, fmt.Errorf("attribute %s appears more than once", repeated))
+		return
+	}
 	if _, signed := attrs.Get(event.Signature); signed {
 		// Keep events whose signatures fail: they're evidence too.
 		mark(span, event.Verify(span, s.trust))

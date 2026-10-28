@@ -45,6 +45,9 @@ x-fleet: &fleet
 x-standin: &standin
   <<: *image
   user: "0"
+  # The agents reach them, as they'd reach Okta or E2B, and so does the brake, which stays
+  # off the agents' network (deploy/compose.yaml).
+  networks: [default, control]
   healthcheck:
     <<: *listening
     test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8080))"]

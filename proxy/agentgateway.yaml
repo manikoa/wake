@@ -61,6 +61,8 @@ routes:
           # The event id wake-proxy handed back from the request hook, so the response
           # hook can say which call it belongs to.
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
+          # The MCP session, so a response whose event id didn't come back pairs only within it.
+          session: '"mcp-session-id" in request.headers ? request.headers["mcp-session-id"] : ""'
   backends:
   - mcp:
       targets:

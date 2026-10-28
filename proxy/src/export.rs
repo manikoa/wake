@@ -30,6 +30,8 @@ pub struct Counters {
     pub paired_in_order: AtomicU64,
     /// Calls the deny lever denied.
     pub denied: AtomicU64,
+    /// Hook connections refused because they came from off the processor's host.
+    pub hooks_refused: AtomicU64,
 }
 
 impl Counters {
