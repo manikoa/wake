@@ -15,11 +15,13 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
 | `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it |
-| `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload`'s UTF-8 bytes. Set by the signer from the payload it received, replacing any value the sender gave |
+| `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload`'s UTF-8 bytes. Set by the signer from the payload it received, replacing any value the sender gave. An event with no payload has none: the signer removes one the sender gave |
 | `wake.signature` | string | Base64 signature, added by the signer: Ed25519 from the collector, ECDSA P-256 from the proxy (see [signing.md](signing.md)) |
 | `wake.signer` | string | SPIFFE id of the signer |
 | `wake.signature.certificate` | string | Set by a signer that signs with an X.509-SVID, such as the proxy: base64 of the DER SVID followed by any intermediates. Not signed; the CA's signature vouches for it |
 | `wake.signature.valid` | bool | Set by the collector: whether the signature checked out. Always overwritten, so a sender can't claim it. |
+| `wake.signature.error` | string | Set by the collector when `wake.signature.valid` is false: why. Not in the log entry; checking the entry again gives the reason |
+| `wake.received_unix_nano` | int | Set by the collector: when it received the event, in Unix nanoseconds. Always overwritten. Not signed by the event's signer, since the proxy signs before the collector receives; the log entry holds it, under the log's signed checkpoint |
 
 Framework specific context goes under the framework's name, for example `wake.langgraph.node`.
 
@@ -73,7 +75,9 @@ The memory adapter records each write to a memory store or memory file as a `mem
 
 The label is a pointer, not evidence: anything that can write the store can forge one. The signed `memory_write` it names, and the digest, are what make it checkable.
 
-**Quarantine.** When the brake quarantines memory, the adapter refuses the writes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence. Each refused write or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's parent is the write it came from.
+- **A delete** is a `memory_write` with `wake.memory.deleted` true and no label. Its parents are the tool call making it.
+
+**Quarantine.** When the brake quarantines memory, the adapter refuses the writes and deletes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence, so deleting one is refused too. Each refused write, delete or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write`, `delete` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's or delete's parent is the write it came from. The adapter fails closed: while it holds no current rules from the proxy, or can't check them, it refuses every write and serves no entry, with `wake.brake.halt_id` `stale-rules` or `quarantine-check-failed`.
 
 ## How the SDK finds parents
 
@@ -87,25 +91,27 @@ The signer signs the UTF-8 bytes of this JSON object, serialized with keys sorte
 {"attributes":{...},"end_time_unix_nano":0,"span_id":"<hex>","start_time_unix_nano":0,"trace_id":"<hex>"}
 ```
 
-`attributes` holds every `wake.*` and `gen_ai.*` attribute except `wake.signer`, any attribute starting with `wake.signature`, and `wake.payload`. Encode without HTML escaping, so `<`, `>` and `&` stay as they are.
+`attributes` holds every `wake.*` and `gen_ai.*` attribute except `wake.signer`, any attribute starting with `wake.signature`, `wake.payload` and `wake.received_unix_nano`. Encode without HTML escaping, so `<`, `>` and `&` stay as they are.
+
+A double that is NaN or infinite has no JSON form, so an event holding one in a signed attribute has no signed bytes. The collector marks it invalid with the reason and goes on with the rest of the request. It can't be logged, so it's counted in `wake_log_dropped_events` with reason `unloggable`. The shared vectors in `collector/event/testdata/canonical.json` include these cases, marked `invalid`.
 
 The payload is signed through its digest. Before signing an event that has a payload, the signer sets `wake.payload.sha256` from the payload's bytes, so the signature commits to exactly that payload, however large it is and wherever it's stored. A component that signs its own events, such as the proxy, does the same and still sends `wake.payload` on the span. The collector marks an event invalid when its payload doesn't match the signed digest, the same as a bad signature. Why the payload stays out of the signed bytes is in [large-payloads.md](large-payloads.md).
 
 ## What goes in the log
 
-Each event becomes one log entry: a JSON object holding the exact signed bytes, the payload when it fits, the signature, the signer and the collector's check.
+Each event becomes one log entry: a JSON object holding the exact signed bytes, the payload when it fits, the signature, the signer, when the collector received it and the collector's check.
 
 ```json
-{"event":{...signed bytes...},"payload":"<the payload>","signature":"<base64>","signer":"<name>","certificate":"<base64>","valid":true}
+{"event":{...signed bytes...},"payload":"<the payload>","signature":"<base64>","signer":"<name>","certificate":"<base64>","received_unix_nano":0,"valid":true}
 ```
 
 A log entry holds at most 65,535 bytes. `payload` is a JSON string holding the payload's exact bytes, and it's left out when the entry would be larger with it, or when the payload isn't valid UTF-8. The payload is then stored next to the log's tiles, at `payload/sha256/<wake.payload.sha256>`, in the same bucket or directory. It's written before the entry is appended. An event with no payload has neither `payload` nor a digest.
 
-`certificate` is there for a signer that signs with an X.509-SVID, such as the proxy, and left out otherwise.
+`certificate` is there for a signer that signs with an X.509-SVID, such as the proxy, and left out otherwise. `received_unix_nano` is the collector's `wake.received_unix_nano`. It's outside the signed bytes, but the log's signed checkpoint covers it like the rest of the entry, so read entries through a check of the log (`wakelog.Verify`).
 
 Anyone with the signer's public key, or for an SVID signer the SPIRE trust bundle, can check an entry on its own:
 
-1. Check `signature` over `event`. For the collector, use its public key. For an SVID signer, `certificate` must chain to the trust bundle as of the event's start time, have exactly one `spiffe://` URI SAN equal to `signer`, and hold a P-256 key, and the signature is ASN.1 DER ECDSA over the SHA-256 of `event`.
+1. Check `signature` over `event`. For the collector, use its public key. For an SVID signer, `signer` must be listed for the event's `wake.capture` among the signers you trust, since a bundle vouches for every workload in its trust domain, agents included. `certificate` must chain to the trust bundle as of `received_unix_nano`, give or take 5 minutes, have exactly one `spiffe://` URI SAN equal to `signer`, and hold a P-256 key, and the signature is ASN.1 DER ECDSA over the SHA-256 of `event`. The event must start no more than 24 hours before `received_unix_nano`, and no more than 5 minutes after it. A note format signer listed for no capture may sign any; once a capture lists signers, only they count for it.
 2. Take the payload from `payload`, or from `payload/sha256/<wake.payload.sha256>` next to the log.
 3. Check that its SHA-256 is the signed `wake.payload.sha256`.
 

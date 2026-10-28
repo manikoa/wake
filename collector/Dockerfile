@@ -23,6 +23,7 @@ COPY --from=build --chown=65532:65532 /out/var/lib/wake /var/lib/wake
 COPY --from=build --chown=65532:65532 /out/etc/wake /etc/wake
 COPY collector/config.docker.yaml /etc/wake/collector.yaml
 USER nonroot
-EXPOSE 4318
+# OTLP, the health check, and the collector's own metrics for Prometheus.
+EXPOSE 4318 13133 8888
 ENTRYPOINT ["/wake-collector"]
 CMD ["--config", "/etc/wake/collector.yaml"]

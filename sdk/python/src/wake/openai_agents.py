@@ -18,20 +18,16 @@ on, as it is by default; without them, events are recorded with empty payloads.
 """
 
 import hashlib
-import json
-import logging
 import uuid
-from functools import wraps
 from typing import Any
 
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
 from wake import events, links
-from wake._graph import EventGraph, _Recent
+from wake._graph import EventGraph, _Recent, never_raise
 from wake.recorder import Recorder
 
-log = logging.getLogger("wake")
 
 
 def install(recorder: Recorder) -> "WakeTracingProcessor":
@@ -41,17 +37,6 @@ def install(recorder: Recorder) -> "WakeTracingProcessor":
     processor = WakeTracingProcessor(recorder)
     add_trace_processor(processor)
     return processor
-
-
-def _never_raise(callback):
-    @wraps(callback)
-    def wrapper(self, *args, **kwargs):
-        try:
-            return callback(self, *args, **kwargs)
-        except Exception:
-            log.warning("wake: failed to record %s", callback.__name__, exc_info=True)
-
-    return wrapper
 
 
 def _plain(value: Any) -> Any:
@@ -107,10 +92,11 @@ class WakeTracingProcessor(EventGraph):
         self._roots = _Recent(limit=1024)  # sdk trace id -> the workflow's root span
         self._linked = _Recent(limit=1024)  # sdk trace id -> what started it, feeding its first response
         self._spans = _Recent(limit=10_000)  # sdk span id -> its open span
+        self._tool_agents = _Recent()  # tool call event id -> the agent making it
 
     # TracingProcessor.
 
-    @_never_raise
+    @never_raise
     def on_trace_start(self, trace_obj) -> None:
         # One root per workflow, so every agent in it, handoffs included, shares a trace. A
         # workflow run inside a recorded tool call, or for a message from another agent,
@@ -126,14 +112,14 @@ class WakeTracingProcessor(EventGraph):
             if link is not None:
                 self._linked[trace_obj.trace_id] = list(link.parents)
 
-    @_never_raise
+    @never_raise
     def on_trace_end(self, trace_obj) -> None:
         with self._lock:
             root = self._roots.pop(trace_obj.trace_id, None)
         if root is not None:
             root.end()
 
-    @_never_raise
+    @never_raise
     def on_span_start(self, span) -> None:
         with self._lock:
             self._parent[span.span_id] = span.parent_id
@@ -157,12 +143,14 @@ class WakeTracingProcessor(EventGraph):
             link = links._enter(links.Link(event_id, ctx.trace_id, ctx.span_id))
             # Its arguments aren't set yet, so the responses that asked for a tool of this
             # name stand in as its parents until it ends, for a memory write it makes.
+            agent = self._agent_for(span)
             with self._lock:
                 self._pending[span.span_id] = {"event_id": event_id, "link": link}
+                self._tool_agents[event_id] = agent
                 requested_by = [r for (t, n, _), (_, r) in self._call.items() if t == span.trace_id and n == data.name]
             self._remember_lineage(event_id, list(dict.fromkeys(requested_by)), [f"tool:{data.name}"])
 
-    @_never_raise
+    @never_raise
     def on_span_end(self, span) -> None:
         data = span.span_data
         handler = {
@@ -324,6 +312,16 @@ class WakeTracingProcessor(EventGraph):
                 sid = self._parent.get(sid)
         return self._recorder.agent
 
+    def _current_agent(self) -> str:
+        """The agent whose tool call is running, for a memory write it makes."""
+        link = links.current()
+        if link is not None:
+            with self._lock:
+                agent = self._tool_agents.get(link.event_id)
+            if agent:
+                return agent
+        return self._recorder.agent
+
     def _context(self, span):
         """Under the closest enclosing span Wake opened, else the workflow's root."""
         with self._lock:
@@ -355,6 +353,6 @@ class WakeTracingProcessor(EventGraph):
         if span.error:
             payload = {**payload, "error": _plain(span.error)}
             otel.set_status(Status(StatusCode.ERROR, str(_field(span.error, "message") or "error")))
-        otel.set_attributes(events.payload_attributes(json.loads(json.dumps(payload, default=str))))
+        otel.set_attributes(events.payload_attributes(payload))
         ctx = otel.get_span_context()
         links._note(links.Link(event_id, ctx.trace_id, ctx.span_id))

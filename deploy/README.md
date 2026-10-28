@@ -2,7 +2,7 @@
 
 `compose.yaml` runs the open source recorder in one place, such as a staging environment:
 
-- **collector:** receives events over OTLP/HTTP with TLS on port 4318, signs the SDK's events, checks the proxy's, and keeps the signed log in the `data` volume.
+- **collector:** receives events over OTLP/HTTP with TLS on port 4318, signs the SDK's events, checks the proxy's, and keeps the signed log in the `data` volume. Only `spiffe://wake.local/proxy` may sign proxy events (`WAKE_PROXY_ID` changes it). Its health check is on port 13133 and its own metrics, for Prometheus, on port 8888 at `/metrics`, both published on this host's loopback; alert on `wake_log_dropped_events`.
 - **wake-proxy:** records MCP calls and A2A messages for agentgateway, which reaches its hooks on a Unix socket in the `proxy-socket` volume. No other service mounts it, since anything that can call the hooks can get events signed.
 - **agentgateway:** your agents call MCP servers and A2A agents through it on port 3000, over mTLS, each presenting its own SVID. Point its backends at yours in `agentgateway.yaml`.
 - **First start:** one-shot containers create the collector's signing key, the log's checkpoint key, a development identity and the halts state, kept in volumes. The identity is a CA standing in for SPIRE, the proxy's SVID, the collector's and agentgateway's TLS certificates, the brake's SVID, and an SVID for each agent in `WAKE_DEV_AGENTS` (default `research,smoke-test`). agentgateway gets only its own certificate and the trust bundle, in the `gateway-identity` volume. A restart reuses them all.
@@ -17,7 +17,7 @@ docker compose -f deploy/compose.yaml up --build
 
 ```bash
 docker compose -f deploy/compose.yaml cp collector:/etc/wake/identity/bundle.pem ./wake-ca.pem
-export WAKE_ENDPOINT=https://localhost:4318 OTEL_EXPORTER_OTLP_CERTIFICATE=$PWD/wake-ca.pem
+export WAKE_ENDPOINT=https://localhost:4318 WAKE_CA_FILE=$PWD/wake-ca.pem
 ```
 
 **MCP and A2A:** agents call through agentgateway at `https://localhost:3000`, presenting their SVIDs. The A2A example route is at `/agents/research`. Each agent's development SVID is in the `identity` volume:
@@ -52,7 +52,8 @@ The signed log is in the `data` volume at `/var/lib/wake/log`, with checkpoints 
 
 ```bash
 docker compose run --rm --no-deps --entrypoint /wake-log collector verify -log /var/lib/wake/log \
-  -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem
+  -log-key /etc/wake/keys/log.pub -key /etc/wake/keys/collector.pub -bundle /etc/wake/identity/bundle.pem \
+  -signer proxy=spiffe://wake.local/proxy
 ```
 
 The provenance view and its ingester run on top of this in `manikoa/wake-platform`.

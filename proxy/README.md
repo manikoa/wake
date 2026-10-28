@@ -41,7 +41,7 @@ cargo run -- serve --key keys/proxy.key --cert keys/proxy.pem --state-dir "$PWD/
 agentgateway -f agentgateway.yaml    # in another terminal; agentgateway v1.6.0
 ```
 
-Agents then call `https://localhost:3000` with their SVIDs. `dev-identity` writes a stand-in trust bundle and certificates signed by it, for local development only. In production SPIRE issues short-lived SVIDs. Add the bundle to the collector's `trust_bundles` so it accepts the proxy's signatures.
+Agents then call `https://localhost:3000` with their SVIDs. `dev-identity` writes a stand-in trust bundle and certificates signed by it, for local development only. In production SPIRE issues short-lived SVIDs. Add the bundle to the collector's `trust_bundles`, and the proxy's SPIFFE ID to its `trusted_signers` under `proxy`, so it accepts the proxy's signatures.
 
 wake-proxy must be reachable only by agentgateway: anything that can call its hooks can get events signed. `--listen` takes a Unix socket (`unix:/run/wake/proxy.sock`, in a directory only agentgateway shares) or a loopback address, and refuses anything else. `deploy/compose.yaml` uses the socket.
 

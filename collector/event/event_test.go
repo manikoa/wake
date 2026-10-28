@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"strings"
 	"testing"
 
@@ -89,34 +90,79 @@ func TestSignThenVerify(t *testing.T) {
 		t.Fatal(err)
 	}
 	trusted := map[string]note.Verifier{"collector": verifier}
-	if !Verify(span, wakelog.Trust{Keys: trusted}) {
-		t.Fatal("signature doesn't verify")
+	if err := Verify(span, wakelog.Trust{Keys: trusted}); err != nil {
+		t.Fatalf("signature doesn't verify: %v", err)
 	}
 
-	// Signature fields aren't part of the signed bytes, so recording validity doesn't break it.
+	// Signature fields and the time it was received aren't part of the signed bytes, so
+	// the collector recording them doesn't break it.
 	span.Attributes().PutBool(SignatureValid, true)
-	if !Verify(span, wakelog.Trust{Keys: trusted}) {
-		t.Fatal("adding wake.signature.valid broke the signature")
+	span.Attributes().PutStr(SignatureError, "a reason")
+	span.Attributes().PutInt(Received, 12345)
+	if err := Verify(span, wakelog.Trust{Keys: trusted}); err != nil {
+		t.Fatalf("recording the collector's check broke the signature: %v", err)
 	}
 
 	tampered := ptrace.NewSpan()
 	span.CopyTo(tampered)
 	tampered.Attributes().PutStr(Payload, `{"output":"pay $1"}`)
-	if Verify(tampered, wakelog.Trust{Keys: trusted}) {
-		t.Fatal("event with a tampered payload still verifies")
+	if err := Verify(tampered, wakelog.Trust{Keys: trusted}); err != wakelog.ErrPayloadMismatch {
+		t.Fatalf("event with a tampered payload: %v", err)
 	}
 
 	span.CopyTo(tampered)
 	tampered.Attributes().PutStr(PayloadSHA256, sha256Hex(`{"output":"pay $1"}`))
 	tampered.Attributes().PutStr(Payload, `{"output":"pay $1"}`)
-	if Verify(tampered, wakelog.Trust{Keys: trusted}) {
+	if Verify(tampered, wakelog.Trust{Keys: trusted}) == nil {
 		t.Fatal("event with a tampered payload and digest still verifies")
 	}
 
 	span.CopyTo(tampered)
 	tampered.Attributes().Remove(PayloadSHA256)
-	if Verify(tampered, wakelog.Trust{Keys: trusted}) {
+	if Verify(tampered, wakelog.Trust{Keys: trusted}) == nil {
 		t.Fatal("event with a payload but no signed digest verifies")
+	}
+
+	// A signer committed to a payload it didn't send.
+	span.CopyTo(tampered)
+	tampered.Attributes().Remove(Payload)
+	if err := Verify(tampered, wakelog.Trust{Keys: trusted}); err == nil || !strings.Contains(err.Error(), "no payload") {
+		t.Fatalf("event with a signed digest but no payload: %v", err)
+	}
+}
+
+// docs/events.md: the signer sets wake.payload.sha256 from the payload it received,
+// replacing the sender's. With no payload received, there's nothing for a digest to
+// commit to, and the collector mustn't sign one the sender made up.
+func TestSignDropsADigestWithNoPayload(t *testing.T) {
+	signer, verifier := newKey(t, "collector")
+	span := newEvent()
+	span.Attributes().Remove(Payload)
+	span.Attributes().PutStr(PayloadSHA256, sha256Hex(`{"output":"a payload the agent never sent"}`))
+	if err := Sign(span, signer); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := span.Attributes().Get(PayloadSHA256); ok {
+		t.Fatalf("signed the sender's digest %s for an event with no payload", got.Str())
+	}
+	canonical, _ := Canonical(span)
+	if bytes.Contains(canonical, []byte(PayloadSHA256)) {
+		t.Fatalf("signed bytes hold a digest: %s", canonical)
+	}
+	if err := Verify(span, wakelog.Trust{Keys: map[string]note.Verifier{"collector": verifier}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSignRefusesADoubleThatIsntFinite(t *testing.T) {
+	signer, _ := newKey(t, "collector")
+	span := newEvent()
+	span.Attributes().PutDouble("gen_ai.request.temperature", math.NaN())
+	if err := Sign(span, signer); err == nil {
+		t.Fatal("signed an event JSON can't hold")
+	}
+	if _, ok := span.Attributes().Get(Signature); ok {
+		t.Fatal("left a signature on it")
 	}
 }
 
@@ -127,8 +173,8 @@ func TestVerifyRejectsUnknownSigner(t *testing.T) {
 	if err := Sign(span, signer); err != nil {
 		t.Fatal(err)
 	}
-	if Verify(span, wakelog.Trust{Keys: map[string]note.Verifier{"collector": otherVerifier}}) {
-		t.Fatal("event from an untrusted signer verifies")
+	if err := Verify(span, wakelog.Trust{Keys: map[string]note.Verifier{"collector": otherVerifier}}); err == nil || !strings.Contains(err.Error(), "isn't a trusted signer") {
+		t.Fatalf("event from an untrusted signer: %v", err)
 	}
 }
 
@@ -139,6 +185,7 @@ func TestEntryKeepsTheExactSignedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	span.Attributes().PutBool(SignatureValid, true)
+	span.Attributes().PutInt(Received, 300)
 	entry, external, err := Entry(span)
 	if err != nil {
 		t.Fatal(err)
@@ -155,14 +202,14 @@ func TestEntryKeepsTheExactSignedBytes(t *testing.T) {
 	if !bytes.Equal(decoded.Event, canonical) {
 		t.Fatalf("entry rewrote the signed bytes:\n%s\nwant\n%s", decoded.Event, canonical)
 	}
-	if decoded.Signer != "collector" || !decoded.Valid {
+	if decoded.Signer != "collector" || !decoded.Valid || decoded.Received != 300 {
 		t.Fatalf("entry = %+v", decoded)
 	}
 	if !decoded.Verify(map[string]note.Verifier{"collector": verifier}) {
 		t.Fatal("entry doesn't verify on its own")
 	}
-	if !Verify(span, wakelog.Trust{Keys: map[string]note.Verifier{"collector": verifier}}) {
-		t.Fatal("entry's event doesn't verify")
+	if err := Verify(span, wakelog.Trust{Keys: map[string]note.Verifier{"collector": verifier}}); err != nil {
+		t.Fatalf("entry's event doesn't verify: %v", err)
 	}
 	payload, err := decoded.ReadPayload(nil)
 	if err != nil || string(payload) != testPayload {

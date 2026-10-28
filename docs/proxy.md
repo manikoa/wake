@@ -121,11 +121,14 @@ Decided October 27, 2026. Anyone must be able to check a proxy event from the lo
 - The proxy sets `wake.signature.certificate`: base64 of the DER X.509-SVID, followed by any intermediates. Like every `wake.signature*` attribute, it's outside the signed bytes; the CA's signature is what vouches for it.
 - The log entry keeps it in an optional `certificate` field (`log/v0.3.0`).
 - Checking an entry, which `wakelog.Entry.Check` does:
-  - The certificate chains to a trusted SPIRE trust bundle as of the event's start time.
+  - The signer is listed for the event's `wake.capture` in the trusted signers (the collector's `trusted_signers`, `wake-log verify -signer`). Agents get SVIDs from the same SPIRE, so a bundle alone would let any of them sign as the proxy.
+  - The certificate chains to a trusted SPIRE trust bundle as of when the collector received the event (`received_unix_nano` in the entry), give or take 5 minutes. The event's start time is the signer's to choose, so it isn't used; it must fall no more than 24 hours before that receipt.
   - It isn't a CA.
   - Its one `spiffe://` URI SAN equals `signer`.
   - Its key is P-256.
   - The ECDSA signature, ASN.1 DER over SHA-256, checks out over `event`.
-- The collector (`trust_bundles`) and the ingester are configured with the trust bundles to accept. Publishing bundles next to the log is left until a design partner needs it.
+- The collector (`trust_bundles` and `trusted_signers`) and the ingester are configured with the trust bundles and signers to accept. Publishing bundles next to the log is left until a design partner needs it.
+
+Updated October 27, 2026: the signer allowlist and the receipt time were added after an audit showed an agent's SVID could sign events as the proxy, and that a key from an expired SVID could still sign events dated while it was valid. The collector checks the SVID when the event arrives, so a proxy event that reaches it more than 5 minutes after its SVID expired is logged invalid. SPIRE rotates SVIDs at half their lifetime, which leaves the proxy at least that long to deliver.
 
 The cost is about 600 bytes per proxy event. Storing each certificate once next to the log and referring to it by digest would save the bytes, but it adds a second lookup to every check, so it waits until the size matters.

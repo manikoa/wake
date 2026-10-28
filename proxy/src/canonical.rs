@@ -42,9 +42,14 @@ impl Event {
 }
 
 /// Whether an attribute is covered by the signature: every wake.* and gen_ai.* attribute
-/// except the signer, the signature fields and the payload, which its digest covers.
+/// except the signer, the signature fields, the payload, which its digest covers, and
+/// the time the collector received the event, which it adds after the proxy signs.
 pub fn signed(key: &str) -> bool {
-    if key == "wake.signer" || key == "wake.payload" || key.starts_with("wake.signature") {
+    if key == "wake.signer"
+        || key == "wake.payload"
+        || key == "wake.received_unix_nano"
+        || key.starts_with("wake.signature")
+    {
         return false;
     }
     key.starts_with("wake.") || key.starts_with("gen_ai.")
@@ -130,7 +135,10 @@ mod tests {
         start_time_unix_nano: u64,
         end_time_unix_nano: u64,
         attributes: Vec<Attr>,
+        #[serde(default)]
         canonical: String,
+        /// Why the span has no canonical bytes, so no signer may sign it.
+        invalid: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -140,6 +148,7 @@ mod tests {
         int: Option<i64>,
         bool: Option<bool>,
         strings: Option<Vec<String>>,
+        double: Option<String>,
     }
 
     proptest::proptest! {
@@ -162,6 +171,16 @@ mod tests {
         let vectors: Vec<Vector> = serde_json::from_str(data).unwrap();
         assert!(!vectors.is_empty());
         for v in vectors {
+            if let Some(why) = &v.invalid {
+                // The proxy has no floating point values, so it can never be asked to sign
+                // one of these. If Value gains them, canonical must refuse these as Go does.
+                assert!(
+                    v.attributes.iter().any(|a| a.double.is_some()),
+                    "vector {:?} is invalid ({why}) for a reason the proxy's Value can hold",
+                    v.name
+                );
+                continue;
+            }
             let mut event = Event {
                 start_time_unix_nano: v.start_time_unix_nano,
                 end_time_unix_nano: v.end_time_unix_nano,

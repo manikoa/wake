@@ -68,6 +68,26 @@ def path_to(events, start, found):
     return None
 
 
+def rooted(events, event_id):
+    """Whether every chain of parents behind an event ends where content entered from a
+    user. Every other origin enters at an event with parents (docs/events.md): a tool
+    result at the call the model asked for, a message at the step that sent it, a memory
+    entry at the write its label names. So an event with no parents and no user origin is
+    where a chain broke, such as an action linked to nothing or a memory entry no label
+    vouches for, and nothing that follows from it is complete. That includes the action
+    itself: its own origin doesn't make it a root."""
+    seen, queue = {event_id}, [event_id]
+    while queue:
+        event = events[queue.pop()]
+        if not event["parents"] and "user" not in event["origins"]:
+            return False
+        for parent in event["parents"]:
+            if parent in events and parent not in seen:
+                seen.add(parent)
+                queue.append(parent)
+    return True
+
+
 def main(path):
     events = load(path)
     print(f"{len(events)} events in the signed log")
@@ -92,20 +112,18 @@ def main(path):
         fail(f"{len(dangling)} parents aren't in the log, such as {dangling[0]}")
 
     # The gate metric: actions with an unbroken chain back to where their content came from.
-    def rooted(event_id):
-        return path_to(events, event_id, lambda e: not e["parents"] and e["origins"]) is not None
-
     actions = [e for e in events.values() if e["kind"] in ACTIONS]
-    complete = [e for e in actions if rooted(e["id"])]
+    complete = [e for e in actions if rooted(events, e["id"])]
     share = len(complete) / len(actions)
     print(f"complete provenance: {len(complete)} of {len(actions)} actions ({share:.0%})")
     if share < 1:
         fail("some actions don't trace back to an origin")
 
-    (payment,) = [e for e in events.values()
-                  if e["capture"] == "proxy" and e["tool"] == "refund" and POISONED_ACCOUNT in e["payload"]] or [None]
-    if payment is None:
-        fail(f"no recorded payment to account {POISONED_ACCOUNT}")
+    payments = [e for e in events.values()
+                if e["capture"] == "proxy" and e["tool"] == "refund" and POISONED_ACCOUNT in e["payload"]]
+    if len(payments) != 1:
+        fail(f"{len(payments)} recorded payments to account {POISONED_ACCOUNT}, not one")
+    payment = payments[0]
     chain = path_to(events, payment["id"], lambda e: "tool:fetch_page" in e["origins"])
     if chain is None:
         fail("the payment to the poisoned page's account doesn't trace back to the page")
@@ -113,6 +131,8 @@ def main(path):
     for event_id in chain:
         print("  " + describe(events[event_id]))
     user = path_to(events, payment["id"], lambda e: "user" in e["origins"])
+    if user is None:
+        fail("the payment doesn't trace back to the customer's request")
     print(f"\nIt also descends from the customer's request ({len(user) - 1} hops), so the view shows both: what the")
     print("customer asked for, and the page that added a payment nobody asked for.")
 

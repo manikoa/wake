@@ -126,12 +126,14 @@ func (l *Log) PutPayload(_ context.Context, payload []byte) error {
 		return err
 	}
 	path := filepath.Join(l.dir, filepath.FromSlash(rel))
+	dir := filepath.Dir(path)
 	if _, err := os.Stat(path); err == nil {
-		return nil
+		// An earlier call may have linked it and crashed before syncing the directory,
+		// so sync it before the caller appends an entry that points to it.
+		return syncDir(dir)
 	}
 	// As Tessera writes tiles: a synced temporary file, linked into place so a reader
 	// never sees half a payload, then the directory synced so the link survives a crash.
-	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-")
 	if err != nil {
 		return fmt.Errorf("store payload: %w", err)
@@ -174,7 +176,9 @@ func makePayloadDir(root string) error {
 	return nil
 }
 
-func syncDir(dir string) error {
+// syncDir syncs a directory, so the names linked into it survive a crash. A variable so
+// tests can see it called.
+var syncDir = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("sync %s: %w", dir, err)

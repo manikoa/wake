@@ -23,7 +23,7 @@ x-fleet: &fleet
   <<: *image
   environment:
     WAKE_ENDPOINT: https://collector:4318
-    OTEL_EXPORTER_OTLP_CERTIFICATE: /etc/wake/ca/bundle.pem
+    WAKE_CA_FILE: /etc/wake/ca/bundle.pem
     FLEET_GATEWAY: http://agentgateway:3000
     FLEET_IDP: http://idp:8080/oauth2/v1
     FLEET_E2B: http://e2b:8080
