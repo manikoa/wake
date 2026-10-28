@@ -168,6 +168,7 @@ fn origin_matches(pattern: &str, origin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::HashMap;
 
     fn call(caller: &str, receiver: &str, path: &str, origins: &str) -> Call {
@@ -255,5 +256,43 @@ mod tests {
             .deciding(&call("support", "research", "/agents/research", "user"))
             .unwrap();
         assert_eq!(denied.id, "policy:unreadable-policy");
+    }
+
+    proptest! {
+        #[test]
+        fn fuzz_origins_header_never_panics_and_enforces_bounds(raw in ".*") {
+            let c = call("caller", "receiver", "/mcp", &raw);
+            let parsed = FlowPolicy::origins_of(&c);
+            prop_assert!(parsed.len() <= 64);
+            for o in &parsed {
+                prop_assert!(!o.is_empty() && o.len() <= 256);
+            }
+        }
+
+        #[test]
+        fn fuzz_forbid_prefix_always_denies_matching_origin(
+            prefix in "[a-z]{1,12}:",
+            suffix in "[a-z0-9_-]{1,20}",
+            caller in "[a-z]{1,10}",
+            receiver in "[a-z]{1,10}",
+            path in "/[a-z/]{1,20}",
+        ) {
+            let rule = FlowRule {
+                id: "fuzz-forbid".into(),
+                callers: vec![caller.clone()],
+                receivers: vec![receiver.clone()],
+                path_prefixes: vec!["/".into()],
+                forbid_origins: vec![format!("{prefix}*")],
+                require_origins: vec![],
+            };
+            let policy = FlowPolicy {
+                rules: vec![rule],
+                unreadable: None,
+            };
+            let matching_origin = format!("user,{prefix}{suffix}");
+            let denied = policy.deciding(&call(&caller, &receiver, &path, &matching_origin));
+            prop_assert!(denied.is_some());
+            prop_assert_eq!(denied.unwrap().id, "policy:fuzz-forbid");
+        }
     }
 }
