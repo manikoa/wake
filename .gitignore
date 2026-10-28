@@ -7,3 +7,5 @@ collector/keys/
 collector/data/
 proxy/target/
 proxy/keys/
+node_modules/
+sdk/typescript/dist/
