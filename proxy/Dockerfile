@@ -19,8 +19,9 @@ COPY --from=build --chown=65532:65532 /out/run/wake /run/wake
 USER nonroot
 # The hooks are a Unix socket in /run/wake, for a volume only agentgateway shares: anything
 # that can call them can get events signed. 9002 is the brake's control API, mTLS with the
-# brake's SVID. 9003 serves memory adapters their quarantine rules, read only.
-EXPOSE 9002 9003
+# brake's SVID. 9003 serves memory adapters their quarantine rules, read only, and 9464
+# Prometheus its metrics, with --metrics-listen.
+EXPOSE 9002 9003 9464
 ENTRYPOINT ["/wake-proxy"]
 # The halts state must be initialized once (wake-proxy init --state-dir /var/lib/wake-proxy);
 # until it is, every call is denied.

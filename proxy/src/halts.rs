@@ -20,6 +20,9 @@
 //!
 //! The same state holds memory quarantines, which the SDKs' memory adapters fetch
 //! (memory.rs): agents whose memory writes are refused, and entries no longer served.
+//!
+//! Each change is announced (changes()), so a call already under way when a halt lands can
+//! be cut: an A2A exchange on an ext_proc stream, or an MCP result on its way back.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -27,6 +30,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::agents::Agents;
 
@@ -176,6 +180,8 @@ pub struct Halts {
     agents: Arc<Agents>,
     // Kept in memory only: after a restart, adapters fetch again within seconds.
     seen: Mutex<Notes>,
+    // The version in force, sent on each change.
+    changed: watch::Sender<u64>,
 }
 
 /// The most agents whose fetches are noted. Agents name themselves, so past it the oldest
@@ -236,6 +242,7 @@ impl Halts {
 
     fn new(state: State, path: Option<PathBuf>, unreadable: bool) -> Self {
         Halts {
+            changed: watch::Sender::new(state.version),
             current: RwLock::new(Arc::new(state)),
             disk: Mutex::new(Disk { path, unreadable }),
             agents: Arc::new(Agents::none()),
@@ -281,6 +288,11 @@ impl Halts {
 
     pub fn state(&self) -> State {
         (*self.current()).clone()
+    }
+
+    /// Says when the state changes: the version in force, from the next change on.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// Puts a halt in force, or replaces one with the same id, and returns the new state.
@@ -391,6 +403,7 @@ impl Halts {
         }
         // In force from here on, before the disk write.
         self.swap(next.clone());
+        self.changed.send_replace(next.version);
         // Stamped after the swap, so no call in scope is allowed after applied_at.
         let at = now();
         for h in next.halts.iter_mut().filter(|h| h.applied_at == STAMP) {
@@ -514,6 +527,22 @@ pub fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_change_is_announced_once_in_force() {
+        let halts = Halts::in_memory();
+        let mut changes = halts.changes();
+        assert!(!changes.has_changed().unwrap(), "nothing has changed yet");
+        halts.put("h1", fleet(), 1).unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(*changes.borrow_and_update(), 1);
+        assert!(
+            !halts.deciding(Some("anyone"), None).is_empty(),
+            "in force by the time it's announced"
+        );
+        halts.lift("h1").unwrap();
+        assert_eq!(*changes.borrow_and_update(), 2);
+    }
 
     fn agents(names: &[&str]) -> Scope {
         Scope {

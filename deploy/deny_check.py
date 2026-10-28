@@ -1,6 +1,7 @@
 """The deny lever end to end, for smoke_test.sh: the brake halts one agent, by name, and
 that agent's own outbound MCP call through agentgateway is denied, naming the halt, while
-another agent's isn't. A caller with no SVID never gets past the gateway's handshake.
+another agent's isn't. A caller with no SVID never gets past the gateway's handshake. Then
+a call already under way, a streamed A2A reply, is cut when a halt lands.
 
     python deny_check.py <dir with ca.pem, brake.pem/.key, agents/<name>.pem/.key>
 
@@ -11,6 +12,7 @@ import http.client
 import json
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -88,3 +90,53 @@ finally:
 status, headers, body = call(context("agents/smoke-test"), "POST", GATEWAY, INITIALIZE)
 assert headers.get("wake-halt") is None, (status, dict(headers), body)
 print("lifted: smoke-test's MCP call isn't halted")
+
+# A call under way when a halt lands: smoke-test asks research, behind the A2A route, for a
+# reply its stand-in streams for a minute (a2a_standin.py). The halt cuts it at the gateway.
+CUT = "smoke-cut"
+MESSAGE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "message/stream",
+    "params": {"message": {"role": "user", "messageId": "m1", "parts": [{"kind": "text", "text": "Stream a long answer"}]}},
+}
+gateway = http.client.HTTPSConnection("localhost", 3000, context=context("agents/smoke-test"), timeout=15)
+gateway.request("POST", "/agents/research", body=json.dumps(MESSAGE),
+                headers={"content-type": "application/json", "accept": "text/event-stream"})
+stream = gateway.getresponse()
+assert stream.status == 200 and (stream.getheader("content-type") or "").startswith("text/event-stream"), (
+    stream.status, stream.getheaders())
+
+
+def next_event() -> bool:
+    """Reads the stream's next event. False when the stream ends, cut or not."""
+    try:
+        while True:
+            line = stream.readline()
+            if not line:
+                return False
+            if line.startswith(b"data:"):
+                return True
+    except TimeoutError:
+        raise AssertionError("the stream stalled, rather than ending") from None
+    except (OSError, http.client.HTTPException):
+        return False
+
+
+for _ in range(2):
+    assert next_event(), "the stream started"
+status, _, body = call(brake, "PUT", f"{CONTROL}/v1/halts/{CUT}", {"scope": {"agents": ["smoke-test"]}})
+assert status == 200, (status, body)
+halted = time.monotonic()
+try:
+    after = 0
+    while next_event():
+        after += 1
+        assert time.monotonic() - halted < 10, f"the stream ran on, {after} events after the halt"
+    print(f"the streamed reply under way was cut {time.monotonic() - halted:.2f}s after the halt, "
+          f"{after} events after it")
+    assert after <= 2, f"{after} events arrived after the halt"
+finally:
+    gateway.close()
+    status, _, body = call(brake, "DELETE", f"{CONTROL}/v1/halts/{CUT}")
+    assert status == 200, (status, body)

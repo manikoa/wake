@@ -15,6 +15,10 @@ use crate::export::Counters;
 /// payload. Beyond it, the payload keeps a prefix, marked truncated.
 pub const MAX_CAPTURE: usize = 1 << 20;
 
+/// How every payload marked truncated ends: MCP's (mcp::capped_payload) and A2A's
+/// (extproc), whose last key it is.
+const TRUNCATED: &str = r#","truncated":true}"#;
+
 /// Bytes that queues and pending calls may hold at once.
 pub struct Budget {
     used: AtomicUsize,
@@ -120,6 +124,9 @@ impl Events {
     }
 
     pub fn send(&self, event: Event) {
+        if matches!(event.attributes.get("wake.payload"), Some(Value::Str(p)) if p.ends_with(TRUNCATED)) {
+            self.counters.truncated.fetch_add(1, Ordering::Relaxed);
+        }
         let sent = self
             .budget
             .take(weight(&event))

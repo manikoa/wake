@@ -14,7 +14,13 @@ For A2A, agentgateway calls wake-proxy's ext_proc service on each A2A route, wit
 
 An agent with a Wake SDK links its MCP calls into its own trace and provenance with two HTTP headers on the call: `traceparent`, and `wake-parents` (the comma-separated ids of the events that led to the call). agentgateway v1.6.0 drops `params._meta` before calling the processor, so headers are the way through it. The config forwards only those headers and `mcp-session-id`, never credentials.
 
-It's also the brake's deny lever. agentgateway asks wake-proxy before every request whether it may go ahead, through the gateway's `extAuthz` policy, and on A2A routes once more for the agent the route reaches. wake-proxy denies a call, with a 403 and a signed `denied` event, when the brake has halted the fleet, the agent making the call, or the agent it's sent to, and, while any agent is halted, when it can't tell who's calling. The 403's `wake-halts` header names every halt that covers the call, and `wake-halt` the first. `--agents` maps each agent's SPIFFE IDs and JWT subjects to the name the brake halts it by. The brake puts and lifts halts over the control API, which serves only the brake's SVID. Halts are kept on disk, and the deny fails closed: until the state is initialized with `wake-proxy init`, every call is denied. See "The deny lever" in [docs/proxy.md](../docs/proxy.md).
+It's also the brake's deny lever. agentgateway asks wake-proxy before every request whether it may go ahead, through the gateway's `extAuthz` policy, and on A2A routes once more for the agent the route reaches. wake-proxy denies a call, with a 403 and a signed `denied` event, when the brake has halted the fleet, the agent making the call, or the agent it's sent to, and, while any agent is halted, when it can't tell who's calling. The 403's `wake-halts` header names every halt that covers the call, and `wake-halt` the first.
+
+A call already under way when a halt lands is cut, and recorded as a `denied` event marked `cut`:
+- **A2A:** an exchange the proxy is carrying, such as a streamed reply, ends with an error, and agentgateway fails it.
+- **MCP:** a result on its way back is kept from the caller, which gets the gateway's error. The tool already ran.
+
+`--agents` maps each agent's SPIFFE IDs and JWT subjects to the name the brake halts it by. The brake puts and lifts halts over the control API, which serves only the brake's SVID. Halts are kept on disk, and the deny fails closed: until the state is initialized with `wake-proxy init`, every call is denied. See "The deny lever" in [docs/proxy.md](../docs/proxy.md).
 
 ```bash
 # The brake's side, with its SVID (dev-identity --brake-id writes keys/brake.pem and .key):
@@ -26,6 +32,8 @@ DELETE https://wake-proxy:9002/v1/quarantines/{id}
 GET    https://wake-proxy:9002/v1/memory/seen
 # Memory adapters, read only, with --memory-listen:
 GET    http://wake-proxy:9003/v1/memory?agent=billing
+# Prometheus, with --metrics-listen:
+GET    http://wake-proxy:9464/metrics
 ```
 
 ## Run it locally
@@ -53,6 +61,12 @@ cargo test    # also checks the shipped agentgateway configs keep the deny lever
 cargo +nightly fuzz run mcp_request   # also capture_hooks, canonical, a2a_exchange and authz_check
 ```
 
-It logs counters every minute: events sent, hooks and events dropped, and responses paired by id or by order. If responses are only ever paired by order, the gateway config isn't passing the event id back.
+With `--metrics-listen`, it serves counters for Prometheus at `/metrics`, and it logs them every minute too:
+- **Traffic:** MCP calls and A2A exchanges seen, and events sent.
+- **Losses:** calls seen but not recorded (`wake_proxy_hooks_dropped_total`), events dropped on their way to the collector (`wake_proxy_events_dropped_total`), and events truncated.
+- **Pairing:** responses paired by id or by order. If responses are only ever paired by order, the gateway config isn't passing the event id back.
+- **The brake:** calls denied and calls cut, the halts in force, and whether the halts state is ok.
+
+Recording fails open, so alert on the two drop counters, and on `wake_proxy_state_ok` going to 0, which means every call is being denied. A batch the collector refuses as bad, with a 4xx other than 408 or 429, isn't sent again: it's dropped and counted at once.
 
 Building needs `protoc`. `proto/ext_mcp.proto` is vendored from agentgateway v1.6.0. The signed bytes must match the collector's byte for byte, so `src/canonical.rs` is tested against `../collector/event/testdata/canonical.json`, which the collector's tests generate.

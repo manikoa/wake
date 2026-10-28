@@ -1,8 +1,9 @@
 # Fuzzes everything the proxy parses from agents and MCP servers (docs/proxy.md): every
 # night for five minutes a target, and for a minute on any pull request that changes the
-# fuzz targets. Each target starts from the corpus earlier runs built. A crash fails the
-# job and keeps the input that caused it. cargo-fuzz needs a nightly toolchain, pinned
-# here to a date so a nightly regression can't fail the job; move it forward now and then.
+# fuzz targets or the code they reach in proxy/src. Each target starts from the corpus
+# earlier runs built. A crash fails the job and keeps the input that caused it. cargo-fuzz
+# needs a nightly toolchain, pinned here to a date so a nightly regression can't fail the
+# job; move it forward now and then.
 name: Fuzz
 
 on:
@@ -16,6 +17,8 @@ on:
   pull_request:
     paths:
       - proxy/fuzz/**
+      - proxy/src/**
+      - proxy/Cargo.lock
       - .github/workflows/fuzz.yml
 
 permissions:

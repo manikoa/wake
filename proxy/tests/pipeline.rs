@@ -624,3 +624,342 @@ async fn serves_the_hooks_on_a_unix_socket() {
     let _ = done.await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// An ext_proc message: request headers on a route from sender to research.
+fn a2a_start(sender: &str) -> wake_proxy::extproc::pb::ext_proc::ProcessingRequest {
+    use wake_proxy::extproc::pb::ext_proc::{
+        ProcessingRequest, ProtocolConfiguration, processing_mode::BodySendMode, processing_request::Request as Phase,
+    };
+    let route = metadata(&[("sender", sender), ("receiver", "research")]).unwrap();
+    ProcessingRequest {
+        request: Some(Phase::RequestHeaders(a2a_headers(&[
+            (":method", "POST"),
+            (":path", "/agents/research"),
+            ("content-type", "application/json"),
+        ]))),
+        attributes: [("envoy.filters.http.ext_proc".to_string(), route)].into(),
+        protocol_config: Some(ProtocolConfiguration {
+            request_body_mode: BodySendMode::BufferedPartial as i32,
+            response_body_mode: BodySendMode::BufferedPartial as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn a2a_headers(pairs: &[(&str, &str)]) -> wake_proxy::extproc::pb::ext_proc::HttpHeaders {
+    use wake_proxy::extproc::pb::common::HeaderValue;
+    use wake_proxy::extproc::pb::ext_proc::{HeaderMap, HttpHeaders};
+    HttpHeaders {
+        headers: Some(HeaderMap {
+            headers: pairs
+                .iter()
+                .map(|(k, v)| HeaderValue {
+                    key: k.to_string(),
+                    raw_value: v.as_bytes().to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
+        }),
+        ..Default::default()
+    }
+}
+
+fn a2a_body(body: &[u8], response: bool, end: bool) -> wake_proxy::extproc::pb::ext_proc::ProcessingRequest {
+    use wake_proxy::extproc::pb::ext_proc::{HttpBody, ProcessingRequest, processing_request::Request as Phase};
+    let body = HttpBody {
+        body: body.to_vec(),
+        end_of_stream: end,
+    };
+    ProcessingRequest {
+        request: Some(if response {
+            Phase::ResponseBody(body)
+        } else {
+            Phase::RequestBody(body)
+        }),
+        ..Default::default()
+    }
+}
+
+/// The rest of a streamed exchange, up to its first chunk: the message, the reply's
+/// headers, and one event of the stream, which doesn't end.
+fn a2a_streaming() -> Vec<wake_proxy::extproc::pb::ext_proc::ProcessingRequest> {
+    use wake_proxy::extproc::pb::ext_proc::{ProcessingRequest, processing_request::Request as Phase};
+    vec![
+        a2a_body(
+            br#"{"jsonrpc":"2.0","id":1,"method":"message/stream","params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"Pay account 999-1234"}]}}}"#,
+            false,
+            true,
+        ),
+        ProcessingRequest {
+            request: Some(Phase::ResponseHeaders(a2a_headers(&[
+                (":status", "200"),
+                ("content-type", "text/event-stream"),
+            ]))),
+            ..Default::default()
+        },
+        a2a_body(b"data: {\"kind\":\"status-update\"}\n\n", true, false),
+    ]
+}
+
+/// Spans until none arrives for a while.
+async fn drain(spans: &mut mpsc::UnboundedReceiver<Span>) -> Vec<Span> {
+    let mut got = vec![];
+    while let Ok(Some(span)) = tokio::time::timeout(Duration::from_millis(1500), spans.recv()).await {
+        got.push(span);
+    }
+    got
+}
+
+#[tokio::test]
+async fn a_halt_cuts_a_streamed_a2a_reply_under_way_and_only_that() {
+    use wake_proxy::extproc::pb::ext_proc::external_processor_client::ExternalProcessorClient;
+    use wake_proxy::halts::{Halts, Scope};
+
+    let (url, mut spans) = collector().await;
+    let halts = Arc::new(Halts::in_memory());
+    let p = proxy_with(Options {
+        collector: url,
+        halts: halts.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut client = ExternalProcessorClient::connect(p.addr.clone()).await.unwrap();
+
+    // Two exchanges under way, each mid-stream: billing's, and support's.
+    let mut open = vec![];
+    for sender in ["spiffe://wake.local/agent/billing", "spiffe://wake.local/agent/support"] {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(a2a_start(sender)).await.unwrap();
+        for m in a2a_streaming() {
+            tx.send(m).await.unwrap();
+        }
+        let mut answers = client
+            .process(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        for _ in 0..4 {
+            assert!(answers.message().await.unwrap().is_some(), "answered while not halted");
+        }
+        open.push((tx, answers));
+    }
+
+    halts
+        .put(
+            "halt-billing",
+            Scope {
+                fleet: false,
+                agents: vec!["spiffe://wake.local/agent/billing".into()],
+            },
+            1,
+        )
+        .unwrap();
+
+    // Billing's stream ends at once, with the halt named; support's carries on.
+    let (billing_tx, mut billing) = open.remove(0);
+    let ended = tokio::time::timeout(Duration::from_secs(5), billing.message())
+        .await
+        .expect("cut, not left open");
+    let status = ended.expect_err("the stream ends with an error");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert!(status.message().contains("halt-billing"), "{}", status.message());
+    let (support_tx, mut support) = open.remove(0);
+    support_tx
+        .send(a2a_body(b"data: {\"kind\":\"message\"}\n\n", true, true))
+        .await
+        .unwrap();
+    assert!(
+        support.message().await.unwrap().is_some(),
+        "another agent's exchange isn't cut"
+    );
+    assert_eq!(Counters::get(&p.counters.cut), 1);
+    drop((billing_tx, support_tx));
+
+    let got: Vec<_> = drain(&mut spans).await.iter().map(attrs).collect();
+    let cut: Vec<_> = got.iter().filter(|a| s(a, "wake.event.kind") == "denied").collect();
+    assert_eq!(cut.len(), 1, "one cut");
+    let payload: serde_json::Value = serde_json::from_str(&s(cut[0], "wake.payload")).unwrap();
+    assert_eq!(payload["cut"], true);
+    assert_eq!(payload["halt"], "halt-billing");
+    assert_eq!(payload["receiver"], "research");
+    assert_eq!(s(cut[0], "wake.agent.id"), "spiffe://wake.local/agent/billing");
+    // It names the message billing's exchange recorded, and what the reply carried before
+    // the cut is recorded too.
+    let message = got
+        .iter()
+        .find(|a| s(a, "wake.event.id") == payload["recorded_as"].as_str().unwrap_or_default())
+        .expect("the message the cut names was recorded");
+    assert_eq!(s(message, "wake.event.kind"), "agent_message");
+    let replies = got
+        .iter()
+        .filter(|a| s(a, "wake.event.kind") == "agent_message" && s(a, "wake.payload").contains("status-update"))
+        .count();
+    assert_eq!(replies, 2, "both replies so far are recorded, the cut one included");
+    p.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_halt_keeps_an_mcp_result_from_its_caller_and_refuses_a_late_request() {
+    use wake_proxy::extmcp::pb::authorization_error::Code;
+    use wake_proxy::halts::{Halts, Scope};
+
+    let (url, mut spans) = collector().await;
+    let halts = Arc::new(Halts::in_memory());
+    let mut p = proxy_with(Options {
+        collector: url,
+        halts: halts.clone(),
+        ..Default::default()
+    })
+    .await;
+    let caller = "spiffe://wake.local/agent/billing";
+    let request = || McpRequest {
+        service_names: vec!["payments".into()],
+        method: "tools/call".into(),
+        metadata_context: metadata(&[("agent", caller), ("session", "s1")]),
+        mcp_request: Some(br#"{"name":"refund","arguments":{"amount":500}}"#.to_vec()),
+        headers: vec![],
+    };
+    let req = p.client.check_request(request()).await.unwrap().into_inner();
+    let event_id = match req.metadata.unwrap().fields["wake_event_id"].kind.clone() {
+        Some(Kind::StringValue(id)) => id,
+        other => panic!("{other:?}"),
+    };
+
+    // The fleet is halted while the payment runs.
+    halts
+        .put(
+            "fleet-halt",
+            Scope {
+                fleet: true,
+                agents: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    let resp = p
+        .client
+        .check_response(McpResponse {
+            service_names: vec!["payments".into()],
+            method: "tools/call".into(),
+            metadata_context: metadata(&[("agent", caller), ("wake_event_id", &event_id), ("session", "s1")]),
+            mcp_response: br#"{"content":[{"type":"text","text":"paid $500"}]}"#.to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    match resp.result {
+        Some(mcp_response_result::Result::Error(e)) => {
+            assert_eq!(e.code, Code::PermissionDenied as i32);
+            assert!(e.reason.contains("fleet-halt"), "{}", e.reason);
+        }
+        other => panic!("the result went back to the caller: {other:?}"),
+    }
+    // A call that reaches the hook after the halt isn't forwarded.
+    let late = p.client.check_request(request()).await.unwrap().into_inner();
+    assert!(
+        matches!(late.result, Some(mcp_request_result::Result::Error(_))),
+        "{late:?}"
+    );
+    assert_eq!(
+        (Counters::get(&p.counters.cut), Counters::get(&p.counters.denied)),
+        (1, 1)
+    );
+
+    let got: Vec<_> = drain(&mut spans).await.iter().map(attrs).collect();
+    let call = got
+        .iter()
+        .find(|a| s(a, "wake.event.id") == event_id)
+        .expect("the call is recorded");
+    assert!(
+        s(call, "wake.payload").contains("paid $500"),
+        "with what the tool returned"
+    );
+    let denied: Vec<(&BTreeMap<String, Value>, serde_json::Value)> = got
+        .iter()
+        .filter(|a| s(a, "wake.event.kind") == "denied")
+        .map(|a| (a, serde_json::from_str(&s(a, "wake.payload")).unwrap()))
+        .collect();
+    let (cut_event, cut) = denied
+        .iter()
+        .find(|(_, d)| d["cut"] == true)
+        .expect("the cut is recorded");
+    assert_eq!(cut["recorded_as"], event_id.as_str());
+    assert_eq!(cut["method"], "tools/call");
+    assert_eq!(
+        cut_event["wake.parents"],
+        Value::Strs(vec![event_id.clone()]),
+        "it follows the call it cut"
+    );
+    assert!(
+        denied
+            .iter()
+            .any(|(_, d)| d["cut"].is_null() && d["halt"] == "fleet-halt"),
+        "and the late call's denial"
+    );
+    p.shutdown().await;
+}
+
+/// A stand-in collector that answers every request with this status, and counts them.
+async fn refusing_collector(status: u16) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 65536];
+                loop {
+                    let n = conn.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map(|v| v.trim().parse().unwrap())
+                        .unwrap_or(0);
+                    if buf.len() < end + 4 + len {
+                        continue;
+                    }
+                    buf.drain(..end + 4 + len);
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    let answer = format!("HTTP/1.1 {status} Refused\r\ncontent-length: 0\r\n\r\n");
+                    let _ = conn.write_all(answer.as_bytes()).await;
+                }
+            });
+        }
+    });
+    (url, requests)
+}
+
+#[tokio::test]
+async fn a_request_the_collector_refuses_as_bad_isnt_sent_again() {
+    for (status, attempts) in [(400, 1), (413, 1), (429, 3), (503, 3)] {
+        let (url, requests) = refusing_collector(status).await;
+        let mut p = proxy(&url, Duration::from_millis(50)).await;
+        call(&mut p, "read_email", br#"{"content":[]}"#.to_vec()).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Counters::get(&p.counters.export_dropped) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            Counters::get(&p.counters.export_dropped),
+            1,
+            "HTTP {status}: dropped and counted"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), attempts, "HTTP {status}: requests");
+        p.shutdown().await;
+    }
+}

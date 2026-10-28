@@ -198,6 +198,24 @@ pub fn denied_event(call: &Call, halts: &[Halt], agents: &Agents, at: u64) -> Ev
     e
 }
 
+/// The signed record of a call that was under way when a halt landed, and was cut: a
+/// denied event, as for a call refused at the start, whose payload says it was cut, and
+/// names the event recording what the call carried, if there is one.
+pub fn cut_event(call: &Call, halts: &[Halt], agents: &Agents, at: u64, recorded_as: Option<&str>) -> Event {
+    let mut e = denied_event(call, halts, agents, at);
+    e.name = format!("cut {} {}", call.method, call.path).trim().to_string();
+    if let Some(Value::Str(payload)) = e.attributes.get("wake.payload")
+        && let Ok(serde_json::Value::Object(mut p)) = serde_json::from_str::<serde_json::Value>(payload)
+    {
+        p.insert("cut".into(), true.into());
+        if let Some(id) = recorded_as {
+            p.insert("recorded_as".into(), id.into());
+        }
+        e.set("wake.payload", Value::Str(serde_json::Value::Object(p).to_string()));
+    }
+    e
+}
+
 fn ids() -> ([u8; 16], [u8; 8]) {
     let mut span = [0u8; 8];
     span.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);

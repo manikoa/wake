@@ -73,7 +73,7 @@ services:
               "--collector", "https://collector:4318", "--collector-ca", "/etc/wake/identity/bundle.pem",
               "--state-dir", "/var/lib/wake-proxy", "--agents", "/etc/wake/agents.json",
               "--control-listen", "0.0.0.0:9002", "--trust-bundle", "/etc/wake/identity/bundle.pem",
-              "--memory-listen", "0.0.0.0:9003"]
+              "--memory-listen", "0.0.0.0:9003", "--metrics-listen", "0.0.0.0:9464"]
     environment:
       RUST_LOG: info
     volumes:
@@ -86,8 +86,11 @@ services:
       # The hooks agentgateway calls, as a Unix socket. Only agentgateway mounts this too:
       # anything that can reach the hooks can get events signed in the proxy's name.
       - proxy-socket:/run/wake
-    # Not published. Only the brake, which alone has the SVID the control API checks, may
-    # use 9002. Memory adapters read their quarantine rules from 9003.
+    # Only the brake, which alone has the SVID the control API checks, may use 9002, and it's
+    # not published. Memory adapters read their quarantine rules from 9003. Prometheus
+    # scrapes wake-proxy:9464/metrics on this network, or this host's loopback; alert on
+    # wake_proxy_hooks_dropped_total, wake_proxy_events_dropped_total and wake_proxy_state_ok.
+    ports: ["127.0.0.1:9464:9464"]
     restart: unless-stopped
 
   agentgateway:

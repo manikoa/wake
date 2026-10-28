@@ -16,5 +16,6 @@ pub mod halts;
 pub mod listen;
 pub mod mcp;
 pub mod memory;
+pub mod metrics;
 pub mod pipeline;
 pub mod signer;

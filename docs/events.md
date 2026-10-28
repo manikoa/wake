@@ -60,6 +60,11 @@ The proxy's deny lever records each call it denies as a `denied` event, captured
 - `wake.brake.halt_id` names the first halt that denied it, and `wake.brake.receiver` the agent the call was sent to, when there is one.
 - `wake.payload` is `{"caller", "identity", "receiver", "method", "host", "path", "halt", "halts"}`: `identity` is what the caller authenticated as, when its name differs, and `halts` every halt that covered the call.
 
+A call already under way when a halt lands is **cut**, and recorded the same way: an A2A exchange the proxy is carrying, such as a streamed reply, or an MCP call whose result was on its way back to the caller.
+- **Payload:** it adds `"cut": true`, and `recorded_as`, the id of the event that recorded the call, when there is one.
+- **Its MCP form:** the `method` is the MCP method and the `host` the MCP server. The event's parent is the call's own `tool_call`, which records what the tool returned, though the caller never got it.
+- **What the exchange carried before the cut** is recorded as usual.
+
 ## Memory
 
 The memory adapter records each write to a memory store or memory file as a `memory_write` event, and each read as a `memory_read`. Both have `wake.capture` `memory_adapter`, `wake.memory.store` and `wake.memory.entry`.

@@ -1,5 +1,6 @@
 //! An ext_authz check with any attributes: what the deny lever reads from agent traffic.
-//! Deciding and recording must never panic, and a denied call's payload is always JSON.
+//! Deciding and recording must never panic, and a denied or cut call's payload is always
+//! JSON.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use prost::Message;
@@ -24,6 +25,9 @@ fuzz_target!(|data: &[u8]| {
     if !deciding.is_empty() {
         let event = authz::denied_event(&call, &deciding, &Agents::none(), 1);
         assert!(serde_json::from_str::<serde_json::Value>(event.str("wake.payload").unwrap()).is_ok());
+        let cut = authz::cut_event(&call, &deciding, &Agents::none(), 1, call.caller.as_deref());
+        let payload: serde_json::Value = serde_json::from_str(cut.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["cut"], true);
         let _ = authz::deny(&deciding);
     }
 });
