@@ -10,7 +10,10 @@ test("what JSON holds comes out as Python's json.dumps(sort_keys=True) writes it
   assert.equal(dumps(payload), '{"a": {"text": "caf\\u00e9"}, "b": [1, 2.5, null, true]}');
   assert.equal(dumps(payload, { ensureAscii: false }), '{"a": {"text": "café"}, "b": [1, 2.5, null, true]}');
   assert.equal(dumps("tab\there \u0001   😀"), '"tab\\there \\u0001 \\u2028 \\ud83d\\ude00"');
-  assert.equal(dumps([1e-5, 1.5e16, 0.0001, 123.456, 1e100, -2.5e-7]), "[1e-05, 1.5e+16, 0.0001, 123.456, 1e+100, -2.5e-07]");
+  assert.equal(dumps([1e-5, 0.0001, 123.456, -2.5e-7, 0.1 + 0.2]), "[1e-05, 0.0001, 123.456, -2.5e-07, 0.30000000000000004]");
+  // A whole number is an integer, every digit of it, as the Python SDK writes memory content:
+  // JavaScript can't tell 500 from Python's 500.0.
+  assert.equal(dumps([500, -0, 1.5e16, 1e21, 1761600000000000000]), "[500, 0, 15000000000000000, 1000000000000000000000, 1761600000000000000]");
   assert.equal(dumps([NaN, Infinity, -Infinity]), "[NaN, Infinity, -Infinity]");
   // Keys in code point order, as Python sorts them, not UTF-16's.
   assert.equal(dumps({ "😀": 4, "￿": 5, é: 3, b: 1, a: 2 }, { ensureAscii: false }), '{"a": 2, "b": 1, "é": 3, "￿": 5, "😀": 4}');
