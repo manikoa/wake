@@ -9,6 +9,7 @@ use p256::pkcs8::DecodePrivateKey;
 use sha2::{Digest, Sha256};
 
 use crate::canonical::{Event, Value, canonical};
+use crate::redact::{self, REDACTED};
 
 pub struct Signer {
     key: SigningKey,
@@ -43,13 +44,30 @@ impl Signer {
         &self.id
     }
 
-    /// Signs an event. It sets the payload's digest first, from the payload itself, so the
-    /// signature commits to exactly what was captured. The certificate travels with the
-    /// event so anyone holding the trust bundle can check it later.
+    /// Signs an event. Its payload's secrets are replaced first (redact.rs), so they never
+    /// reach the log, and wake.payload.redacted lists their kinds. Then it sets the payload's
+    /// digest, from the payload itself, so the signature commits to exactly what's kept. The
+    /// certificate travels with the event so anyone holding the trust bundle can check it
+    /// later.
     pub fn sign(&self, event: &mut Event) {
-        if let Some(Value::Str(payload)) = event.attributes.get("wake.payload") {
+        event.attributes.remove(REDACTED);
+        let redacted = match event.attributes.get("wake.payload") {
+            Some(Value::Str(payload)) => {
+                let (text, kinds) = redact::redact(payload);
+                let changed = text != *payload;
+                Some((text, kinds, changed))
+            }
+            _ => None,
+        };
+        if let Some((payload, kinds, changed)) = redacted {
+            if !kinds.is_empty() {
+                event.set(REDACTED, Value::Strs(kinds));
+            }
             let digest = hex::encode(Sha256::digest(payload.as_bytes()));
             event.set("wake.payload.sha256", Value::Str(digest));
+            if changed {
+                event.set("wake.payload", Value::Str(payload));
+            }
         }
         let signature: DerSignature = self.key.sign(&canonical(event));
         event.set("wake.signature", Value::Str(STANDARD.encode(signature.as_bytes())));
@@ -278,6 +296,44 @@ mod tests {
         let mut other_payload = event.clone();
         other_payload.set("wake.payload", Value::Str("{}".into()));
         key.verify(&canonical(&other_payload), &sig).unwrap();
+        assert!(!event.attributes.contains_key(REDACTED), "nothing was redacted");
+    }
+
+    #[test]
+    fn redacts_the_payload_before_signing_it() {
+        let s = signer();
+        let token = format!("ghp_{}", "a".repeat(36));
+        let mut event = Event::default();
+        event.set("wake.event.id", Value::Str("e1".into()));
+        event.set(
+            "wake.payload",
+            Value::Str(format!(r#"{{"input":{{"token":"{token}"}}}}"#)),
+        );
+        // A sender's list of what was redacted is never kept.
+        event.set(REDACTED, Value::Strs(vec!["nothing".into()]));
+        s.sign(&mut event);
+
+        let payload = event.str("wake.payload").unwrap().to_string();
+        assert!(!payload.contains(&token), "{payload}");
+        assert!(payload.contains("[redacted github_token sha256:"), "{payload}");
+        assert_eq!(event.attributes[REDACTED], Value::Strs(vec!["github_token".into()]));
+        assert_eq!(
+            event.str("wake.payload.sha256"),
+            Some(hex::encode(Sha256::digest(payload.as_bytes())).as_str()),
+            "the digest is the redacted payload's"
+        );
+
+        // The signature covers the list of what was redacted.
+        let der = STANDARD
+            .decode(event.str("wake.signature.certificate").unwrap())
+            .unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+        let key = VerifyingKey::from_sec1_bytes(cert.public_key().subject_public_key.as_ref()).unwrap();
+        let sig = Signature::from_der(&STANDARD.decode(event.str("wake.signature").unwrap()).unwrap()).unwrap();
+        key.verify(&canonical(&event), &sig).unwrap();
+        let mut forged = event.clone();
+        forged.attributes.remove(REDACTED);
+        assert!(key.verify(&canonical(&forged), &sig).is_err());
     }
 
     #[test]

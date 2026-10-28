@@ -118,13 +118,25 @@ func digest(payload []byte) string {
 // payload's digest first, from the bytes received, so the signature commits to the
 // payload that arrived and not to a digest the sender claimed. An event with no payload
 // gets no digest. Any signature fields the sender set, such as a certificate, are dropped
-// first, so the entry carries only what this signer adds.
+// first, so the entry carries only what this signer adds. Before any of that, the payload's
+// secrets are replaced (redact.go), so they never reach the log, and wake.payload.redacted
+// lists their kinds; a list the sender set is dropped.
 func Sign(span ptrace.Span, signer note.Signer) error {
 	span.Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
-		return key == Signer || strings.HasPrefix(key, Signature)
+		return key == Signer || strings.HasPrefix(key, Signature) || key == Redacted
 	})
 	if payload, ok := PayloadOf(span); ok {
-		span.Attributes().PutStr(PayloadSHA256, digest(payload))
+		redacted, kinds := Redact(string(payload))
+		if redacted != string(payload) {
+			span.Attributes().PutStr(Payload, redacted)
+		}
+		if len(kinds) > 0 {
+			list := span.Attributes().PutEmptySlice(Redacted)
+			for _, k := range kinds {
+				list.AppendEmpty().SetStr(k)
+			}
+		}
+		span.Attributes().PutStr(PayloadSHA256, digest([]byte(redacted)))
 	} else {
 		span.Attributes().Remove(PayloadSHA256)
 	}

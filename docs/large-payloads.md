@@ -29,7 +29,7 @@ The signed event always carries `wake.payload.sha256`. A payload that fits goes 
 - An entry is no longer checkable on its own. The signature covers the whole event, so a verifier has to find every chunk and put the event back together first.
 - The exporter's 10 consumers append at the same time, so chunks of different events interleave. Every reader needs reassembly state.
 - A failure halfway leaves stray chunks in an append only log forever, and a retry appends them again.
-- Payloads stay inside the hash tree for good, so a payload can never be erased without breaking the log.
+- Payloads stay inside the hash tree for good, so a payload can never be erased without breaking the log. (Whichever way they're stored, that's why credentials are redacted before an event is signed: see Secrets in [events.md](events.md).)
 
 ## Recommendation: (a), with the payload always outside the signed bytes
 
