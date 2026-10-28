@@ -46,6 +46,7 @@ use crate::halts::{Halt, Halts};
 use crate::mcp::{self, TraceParent};
 use crate::origins::{Observed, Who};
 use crate::policy::{FlowPolicy, Policy};
+use crate::token::Token;
 
 // Generated from Envoy's protos, doc comments and all.
 #[allow(clippy::all)]
@@ -83,6 +84,8 @@ pub const ATTRIBUTES: &str = "envoy.filters.http.ext_proc";
 /// requestAttributes keys the gateway config fills from CEL.
 pub const ATTR_SENDER: &str = "sender";
 pub const ATTR_RECEIVER: &str = "receiver";
+/// What the gateway says about the token the sender presented, if a JWT (token.rs).
+pub const ATTR_SENDER_TOKEN: &str = "sender_token";
 
 /// How much of each body is kept for the event's payload.
 pub use crate::budget::MAX_CAPTURE;
@@ -219,6 +222,11 @@ impl Exchange {
             let raw = |key: &str| attrs.get(key).filter(|s| !s.is_empty()).cloned();
             self.call.caller = raw(ATTR_SENDER);
             self.call.receiver = raw(ATTR_RECEIVER);
+            self.call.token = request
+                .attributes
+                .get(ATTRIBUTES)
+                .and_then(|s| s.fields.get(ATTR_SENDER_TOKEN))
+                .and_then(Token::from_value);
         }
         let mut events = Vec::new();
         let answer = match request.request {
@@ -439,6 +447,10 @@ impl Exchange {
         e.set("wake.event.id", Value::Str(id.into()));
         e.set("wake.event.kind", Value::Str("agent_message".into()));
         e.set("wake.capture", Value::Str("proxy".into()));
+        // The token the sender presented, on the message and on the reply alike.
+        if let Some(token) = &self.call.token {
+            token.record(&mut e);
+        }
         if let Some(r) = &self.request {
             for (key, value) in [
                 ("wake.a2a.method", &r.method),
@@ -857,6 +869,42 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_message_and_the_reply_record_the_senders_token() {
+        use crate::token::{facts, text};
+        let mut request = first(&[(":method", "POST")]);
+        let chain = facts(&[
+            ("sub", text("planner/scout#toolu_3")),
+            ("act", facts(&[("sub", text("planner"))])),
+        ]);
+        request.attributes.get_mut(ATTRIBUTES).unwrap().fields.insert(
+            ATTR_SENDER_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("jti", text("tok-9")), ("act", chain)]),
+        );
+        let mut x = Exchange::default();
+        x.handle(request, t(0));
+        let (_, mut events) = x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        x.handle(phase(Phase::ResponseHeaders(headers(&[(":status", "200")]))), t(2));
+        let (_, reply) = x.handle(phase(Phase::ResponseBody(body(REPLY, true))), t(3));
+        events.extend(reply);
+        let [message, reply] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        for e in [message, reply] {
+            assert_eq!(s(e, "wake.token.subject"), "user-42");
+            assert_eq!(s(e, "wake.token.id"), "tok-9");
+            assert_eq!(
+                e.attributes["wake.token.actors"],
+                Value::Strs(vec!["planner/scout#toolu_3".into(), "planner".into()])
+            );
+        }
+        // Without a sender_token, as with an SVID, nothing is recorded.
+        let mut x = Exchange::default();
+        x.handle(first(&[(":method", "POST")]), t(0));
+        let (_, events) = x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        assert!(events.iter().all(|e| !e.attributes.contains_key("wake.token.subject")));
     }
 
     #[test]

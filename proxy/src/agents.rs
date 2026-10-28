@@ -1,5 +1,6 @@
 //! Which agent each identity belongs to: the one place where an identity the gateway
-//! authenticated, an X.509-SVID's SPIFFE ID or a JWT subject, becomes the short name the
+//! authenticated, an X.509-SVID's SPIFFE ID or a JWT's (the act.sub of the agent a delegated
+//! token names as acting, else its subject), becomes the short name the
 //! brake halts by and the SDKs record under (`--agents`, see docs/proxy.md).
 //!
 //! ```json

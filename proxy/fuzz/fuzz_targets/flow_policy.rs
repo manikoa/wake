@@ -24,6 +24,7 @@ fuzz_target!(|data: &[u8]| {
         host: "agentgateway:3000".into(),
         path: "/a2a/payments".into(),
         headers: HashMap::new(),
+        token: None,
     };
     for (at, receiver, path, tool) in [
         (At::Authz, Some("payments"), Some("/a2a/payments"), None),

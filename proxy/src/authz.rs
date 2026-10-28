@@ -3,7 +3,8 @@
 //! force and docs/proxy.md for the gateway config.
 //!
 //! A call is identified by what the gateway config computes: the caller from the `wake`
-//! metadata's `agent` (the same CEL as capture: SPIFFE ID, else JWT subject), falling back
+//! metadata's `agent` (the same CEL as capture: SPIFFE ID, else a delegated JWT's actor,
+//! act.sub, else its subject), falling back
 //! to the mTLS peer's principal, and the agent a route reaches from its static `receiver`
 //! context. The identity map (agents.rs) names both. A denied call gets a 403 whose
 //! `wake-halts` header names every halt that covers it, and `wake-halt` the first, and is
@@ -23,6 +24,7 @@ use crate::halts::{Halt, Halts};
 use crate::mcp;
 use crate::origins::{Observed, Who};
 use crate::policy::{At, Denial, FlowPolicy, Policy, Target};
+use crate::token::{self, Token};
 
 // Generated from Envoy's protos, doc comments and all.
 #[allow(clippy::all)]
@@ -71,21 +73,27 @@ pub struct Call {
     pub host: String,
     pub path: String,
     pub headers: HashMap<String, String>,
+    /// What the gateway says about the token the caller presented, if it presented a JWT.
+    pub token: Option<Token>,
 }
 
 pub fn read_call(request: &CheckRequest) -> Call {
     let Some(attributes) = &request.attributes else {
         return Call::default();
     };
-    let from_metadata = attributes
+    let wake = attributes
         .metadata_context
         .as_ref()
-        .and_then(|m| m.filter_metadata.get(METADATA))
+        .and_then(|m| m.filter_metadata.get(METADATA));
+    let from_metadata = wake
         .and_then(|s| s.fields.get(METADATA_AGENT))
         .and_then(|v| match &v.kind {
             Some(prost_types::value::Kind::StringValue(s)) => Some(s.clone()),
             _ => None,
         });
+    let token = wake
+        .and_then(|s| s.fields.get(token::META_TOKEN))
+        .and_then(Token::from_value);
     let principal = attributes.source.as_ref().map(|s| s.principal.clone());
     let caller = from_metadata
         .filter(|s| !s.is_empty())
@@ -104,6 +112,7 @@ pub fn read_call(request: &CheckRequest) -> Call {
         host: http.map(|h| h.host.clone()).unwrap_or_default(),
         path: http.map(|h| h.path.clone()).unwrap_or_default(),
         headers: http.map(|h| h.headers.clone()).unwrap_or_default(),
+        token,
     }
 }
 
@@ -179,6 +188,9 @@ pub fn denied_event(call: &Call, halts: &[Halt], agents: &Agents, at: u64) -> Ev
     e.set("wake.brake.halt_id", Value::Str(first.clone()));
     if let Some(receiver) = &call.receiver {
         e.set("wake.brake.receiver", Value::Str(receiver.clone()));
+    }
+    if let Some(token) = &call.token {
+        token.record(&mut e);
     }
     e.set(
         "wake.payload",
@@ -382,6 +394,72 @@ mod tests {
         assert_eq!(call.caller.as_deref(), Some("spiffe://x/peer"));
         assert_eq!(read_call(&check(None, "", None, &[])).caller, None);
         assert_eq!(read_call(&CheckRequest::default()), Call::default());
+    }
+
+    /// A sub-agent calling with a token from token exchange: the gateway names it by the
+    /// agent acting, and passes what the token says beside it.
+    fn delegated(agent: &str) -> CheckRequest {
+        use crate::token::{facts, text};
+        let mut request = check(Some(agent), "", Some("billing"), &[]);
+        let wake = request
+            .attributes
+            .as_mut()
+            .and_then(|a| a.metadata_context.as_mut())
+            .and_then(|m| m.filter_metadata.get_mut(METADATA))
+            .unwrap();
+        let chain = facts(&[("sub", text(agent)), ("act", facts(&[("sub", text("support"))]))]);
+        wake.fields.insert(
+            token::META_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("jti", text("tok-7")), ("act", chain)]),
+        );
+        request
+    }
+
+    #[test]
+    fn reads_the_token_the_caller_presented() {
+        let call = read_call(&delegated("support/researcher#toolu_1"));
+        assert_eq!(call.caller.as_deref(), Some("support/researcher#toolu_1"));
+        let token = call.token.unwrap();
+        assert_eq!(token.subject, "user-42");
+        assert_eq!(token.actors, ["support/researcher#toolu_1", "support"]);
+        assert_eq!(token.id.as_deref(), Some("tok-7"));
+        // An SVID caller has no token.
+        assert_eq!(read_call(&check(Some("support"), "", None, &[])).token, None);
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_records_the_token_it_came_with() {
+        let halts = Arc::new(Halts::in_memory());
+        let counters = Arc::new(Counters::default());
+        let (tx, mut rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let authz = Authorizer::new(halts.clone(), tx, counters);
+        halts
+            .put(
+                "halt-sub",
+                Scope {
+                    fleet: false,
+                    agents: vec!["support/researcher#toolu_1".into()],
+                },
+                1,
+            )
+            .unwrap();
+        let denied = authz
+            .check(Request::new(delegated("support/researcher#toolu_1")))
+            .await
+            .unwrap();
+        assert_eq!(denied.get_ref().status.as_ref().unwrap().code, PERMISSION_DENIED);
+        let event = rx.try_recv().unwrap().event;
+        assert_eq!(event.str("wake.agent.id"), Some("support/researcher#toolu_1"));
+        assert_eq!(event.str("wake.token.subject"), Some("user-42"));
+        assert_eq!(event.str("wake.token.id"), Some("tok-7"));
+        assert_eq!(
+            event.attributes["wake.token.actors"],
+            Value::Strs(vec!["support/researcher#toolu_1".into(), "support".into()])
+        );
+        assert_eq!(event.attributes["wake.token.bound"], Value::Bool(false));
+        // Its parent isn't halted: the same delegation, acting as support, goes on.
+        let allowed = authz.check(Request::new(delegated("support"))).await.unwrap();
+        assert_eq!(allowed.get_ref().status.as_ref().unwrap().code, 0);
     }
 
     #[tokio::test]

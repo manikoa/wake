@@ -50,7 +50,7 @@ gateways:
         url: https://example.okta.com/oauth2/default/v1/keys
 ```
 
-and list each agent's JWT subject in `agents.json`. `proxy/tests/gateway_configs.rs` checks the shipped configs authenticate one of these two ways.
+and list each agent's JWT subject in `agents.json`. When an agent calls with a token from token exchange (RFC 8693), acting for a user or for the agent that started it, the gateway names the caller by the token's `act.sub`, the agent acting, rather than its `sub`; list that in `agents.json`. `proxy/tests/gateway_configs.rs` checks the shipped configs authenticate one of these two ways.
 
 **The deny lever:** agentgateway asks wake-proxy whether the brake has halted each call, once for the gateway, for every route, and once more on each A2A route, for the agent it reaches. It fails closed: while wake-proxy is down, calls through the gateway are denied. The brake reaches wake-proxy's control API at `https://wake-proxy:9002` on this network, with the SVID in `identity/brake.pem` and `.key`, the only identity the API serves. Its probe through the gateway presents the same SVID. Halts are kept in the `proxy-state` volume, which the `proxy-state` one-shot initializes when it's new. A wake-proxy that starts without it denies every call until it's initialized again (`docker compose run --rm wake-proxy init --state-dir /var/lib/wake-proxy`). See "The deny lever" in `docs/proxy.md`.
 

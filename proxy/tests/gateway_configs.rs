@@ -135,6 +135,62 @@ fn mcp_capture_can_pair_each_response_with_its_request() {
     }
 }
 
+/// What one hook is told about its caller: who it is, and what its JWT says.
+struct Hook {
+    at: String,
+    caller: String,
+    token: String,
+}
+
+/// Splits the deny lever's `wake` metadata, `{"agent": <caller>, "token": <token>}`.
+fn wake_metadata(path: &str, at: &str, w: &str) -> (String, String) {
+    w.trim()
+        .strip_prefix(r#"{"agent":"#)
+        .and_then(|w| w.strip_suffix('}'))
+        .and_then(|w| w.split_once(r#", "token":"#))
+        .map(|(caller, token)| (caller.trim().to_string(), token.trim().to_string()))
+        .unwrap_or_else(|| panic!("{path}: {at}: extAuthz must send {{\"agent\": <caller>, \"token\": <token>}}"))
+}
+
+/// Every hook a config gives wake-proxy, with the caller and token expressions it gets: the
+/// deny lever's, at the gateway and on each route, ext_proc's sender and ExtMCP's agent.
+fn hooks(path: &str, config: &Yaml) -> Vec<Hook> {
+    let mut out = vec![];
+    let mut wake = |at: String, authz: &Yaml| {
+        if let Some(w) = authz["protocol"]["grpc"]["metadata"]["wake"].as_str() {
+            let (caller, token) = wake_metadata(path, &at, w);
+            out.push(Hook { at, caller, token });
+        }
+    };
+    for (name, gateway) in entries(&config["gateways"]) {
+        wake(format!("gateway {name}"), &gateway["extAuthz"]);
+    }
+    let routes = config["routes"].as_vec().unwrap();
+    for (i, route) in routes.iter().enumerate() {
+        wake(format!("route #{i} extAuthz"), &route["policies"]["extAuthz"]);
+    }
+    let text = |y: &Yaml| y.as_str().unwrap_or_default().trim().to_string();
+    for (i, route) in routes.iter().enumerate() {
+        let policies = &route["policies"];
+        let attributes = &policies["extProc"]["requestAttributes"];
+        if !attributes["sender"].is_badvalue() {
+            out.push(Hook {
+                at: format!("route #{i} extProc"),
+                caller: text(&attributes["sender"]),
+                token: text(&attributes["sender_token"]),
+            });
+        }
+        for processor in policies["mcpGuardrails"]["processors"].as_vec().into_iter().flatten() {
+            out.push(Hook {
+                at: format!("route #{i} mcpGuardrails"),
+                caller: text(&processor["metadata"]["agent"]),
+                token: text(&processor["metadata"]["token"]),
+            });
+        }
+    }
+    out
+}
+
 /// A halt that lands during a call is enforced by the capture hooks: ext_proc cuts an A2A
 /// exchange, and ExtMCP keeps a result from its caller. So they must see the caller as the
 /// deny lever does, or a halt would cut other agents' calls, or miss the halted one's.
@@ -143,21 +199,54 @@ fn the_capture_hooks_see_the_caller_the_deny_lever_does() {
     for (path, _) in CONFIGS {
         let config = load(path);
         let gateway = &config["gateways"]["default"]["extAuthz"]["protocol"]["grpc"]["metadata"]["wake"];
-        let caller = gateway
-            .as_str()
-            .and_then(|w| w.trim().strip_prefix(r#"{"agent":"#))
-            .and_then(|w| w.strip_suffix('}'))
-            .map(str::trim)
-            .unwrap_or_else(|| panic!("{path}: the gateway's extAuthz must send {{\"agent\": <caller>}}"));
-        for (i, route) in config["routes"].as_vec().unwrap().iter().enumerate() {
-            let policies = &route["policies"];
-            if let Some(sender) = policies["extProc"]["requestAttributes"]["sender"].as_str() {
-                assert_eq!(sender.trim(), caller, "{path}: route #{i}: extProc's sender");
-            }
-            for processor in policies["mcpGuardrails"]["processors"].as_vec().into_iter().flatten() {
-                let agent = processor["metadata"]["agent"].as_str().unwrap_or_default();
-                assert_eq!(agent.trim(), caller, "{path}: route #{i}: mcpGuardrails' agent");
-            }
+        let (caller, _) = wake_metadata(path, "the gateway", gateway.as_str().unwrap_or_default());
+        for hook in hooks(path, &config) {
+            assert_eq!(hook.caller, caller, "{path}: {}'s caller", hook.at);
+        }
+    }
+}
+
+/// A token from OAuth token exchange (RFC 8693) names whoever it acts for in `sub`, often
+/// a user or the agent that delegated, and the agent acting now in `act.sub`. Every hook must
+/// name the caller by the agent acting, or a halt on a sub-agent holding a delegated token
+/// would never match its calls, and its calls would be recorded as its user's.
+#[test]
+fn a_delegated_token_names_the_agent_acting() {
+    const ACTOR: &str = "has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub :";
+    for (path, _) in CONFIGS {
+        let all = hooks(path, &load(path));
+        assert!(!all.is_empty(), "{path}: no hooks");
+        for hook in &all {
+            assert!(
+                hook.caller.starts_with("has(source.spiffeId) ? source.spiffeId :"),
+                "{path}: {}: an SVID comes first: {}",
+                hook.at,
+                hook.caller
+            );
+            assert!(
+                hook.caller.contains(ACTOR),
+                "{path}: {}: a delegated token's act.sub must come before its sub: {}",
+                hook.at,
+                hook.caller
+            );
+        }
+    }
+}
+
+/// Every hook is told what the caller's JWT says, the same way, so a call's record and its
+/// denial carry the same facts. Only these claims, never the token: wake-proxy records what
+/// it's given (proxy/src/token.rs), and a bearer token in the record could be used by anyone
+/// who can read the log.
+#[test]
+fn every_hook_is_told_what_the_token_says_and_never_the_token() {
+    const TOKEN: &str = r#"{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}"#;
+    for (path, _) in CONFIGS {
+        for hook in hooks(path, &load(path)) {
+            assert_eq!(hook.token, TOKEN, "{path}: {}'s token", hook.at);
+        }
+        let text = std::fs::read_to_string(format!("{}/../{path}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        for credential in ["authorization", "Authorization", "jwt.raw", "jwt.token"] {
+            assert!(!text.contains(credential), "{path} passes {credential} to wake-proxy");
         }
     }
 }

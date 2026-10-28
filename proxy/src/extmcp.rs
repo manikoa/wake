@@ -32,6 +32,7 @@ use crate::halts::{Halt, Halts, now};
 use crate::mcp;
 use crate::origins::{Observed, Who};
 use crate::policy::{At, FlowPolicy, Policy, Target};
+use crate::token::{self, Token};
 
 pub mod pb {
     tonic::include_proto!("agentgateway.dev.ext_mcp");
@@ -91,15 +92,19 @@ impl Processor {
     }
 
     /// The string values in the metadata, with the caller named through the identity map,
-    /// and the identity the caller authenticated as.
-    fn metadata(&self, s: Option<Struct>) -> (HashMap<String, String>, Option<String>) {
+    /// the identity the caller authenticated as, and the token it presented, if a JWT.
+    fn metadata(&self, s: Option<Struct>) -> (HashMap<String, String>, Option<String>, Option<Token>) {
+        let token = s
+            .as_ref()
+            .and_then(|s| s.fields.get(token::META_TOKEN))
+            .and_then(Token::from_value);
         let mut metadata = strings(s);
         let identity = metadata.get(META_AGENT).filter(|a| !a.is_empty()).cloned();
         if let Some(agent) = &identity {
             let named = self.agents().record(agent).to_string();
             metadata.insert(META_AGENT.into(), named);
         }
-        (metadata, identity)
+        (metadata, identity, token)
     }
 
     /// The halts that cover a call from this caller now.
@@ -175,7 +180,7 @@ fn strings(s: Option<Struct>) -> HashMap<String, String> {
 impl ExtMcp for Processor {
     async fn check_request(&self, request: Request<McpRequest>) -> Result<Response<McpRequestResult>, Status> {
         let r = request.into_inner();
-        let (metadata, caller) = self.metadata(r.metadata_context);
+        let (metadata, caller, token) = self.metadata(r.metadata_context);
         let server = r.service_names.into_iter().next().unwrap_or_default();
         let headers: Vec<(String, Vec<u8>)> = r.headers.into_iter().map(|h| (h.key, h.value)).collect();
         // A halt that landed after ext_authz let the call in: it isn't forwarded.
@@ -188,6 +193,7 @@ impl ExtMcp for Processor {
                 host: server,
                 path: String::new(),
                 headers: link_headers(&headers),
+                token: token.clone(),
             };
             self.counters.denied.fetch_add(1, Ordering::Relaxed);
             self.events
@@ -223,6 +229,7 @@ impl ExtMcp for Processor {
                     host: server,
                     path: String::new(),
                     headers: link_headers(&headers),
+                    token: token.clone(),
                 };
                 self.counters.denied.fetch_add(1, Ordering::Relaxed);
                 self.events
@@ -244,6 +251,7 @@ impl ExtMcp for Processor {
             method: r.method,
             server,
             metadata,
+            token,
             params: r.mcp_request,
             headers,
             at: SystemTime::now(),
@@ -263,7 +271,7 @@ impl ExtMcp for Processor {
 
     async fn check_response(&self, request: Request<McpResponse>) -> Result<Response<McpResponseResult>, Status> {
         let r = request.into_inner();
-        let (metadata, caller) = self.metadata(r.metadata_context);
+        let (metadata, caller, token) = self.metadata(r.metadata_context);
         let server = r.service_names.into_iter().next().unwrap_or_default();
         let event_id = metadata.get(META_EVENT_ID).filter(|id| !id.is_empty()).cloned();
         let covering = self.covering(caller.as_deref());
@@ -292,6 +300,7 @@ impl ExtMcp for Processor {
                 .iter()
                 .map(|id| (mcp::HEADER_PARENTS.to_string(), id.clone()))
                 .collect(),
+            token,
         };
         self.counters.cut.fetch_add(1, Ordering::Relaxed);
         self.events.send(authz::cut_event(
@@ -395,5 +404,54 @@ mod tests {
         let r = p.check_request(call("billing", "fetch_page")).await.unwrap();
         assert_eq!(refused(r.get_ref()), None);
         assert_eq!(observed.seen(Who::Agent("billing"), now(), 900), Seen::These(vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_captured_call_records_the_token_it_came_with() {
+        use crate::canonical::Value;
+        use crate::capture::Capture;
+        use crate::token::{facts, text};
+        use std::time::Duration;
+
+        let counters = Arc::new(Counters::default());
+        let (hooks, mut hooks_rx) = mpsc::channel(16);
+        let (events, _events_rx) = Events::channel(16, Budget::new(1 << 20), counters.clone());
+        let p = Processor::new(
+            hooks,
+            Budget::new(1 << 20),
+            counters,
+            Arc::new(Halts::in_memory()),
+            events,
+        );
+        let mut request = call("support/researcher#toolu_1", "lookup_order");
+        let chain = facts(&[("sub", text("support/researcher#toolu_1"))]);
+        request.get_mut().metadata_context.as_mut().unwrap().fields.insert(
+            token::META_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("jti", text("tok-7")), ("act", chain)]),
+        );
+        assert_eq!(refused(p.check_request(request).await.unwrap().get_ref()), None);
+
+        let (hook, _permit) = hooks_rx.try_recv().unwrap();
+        let mut capture = Capture::new(Duration::from_secs(30), 16);
+        assert!(capture.handle(hook).is_empty(), "it waits for its response");
+        let events = capture.expire(SystemTime::now() + Duration::from_secs(60));
+        let [event] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        assert_eq!(event.str("wake.event.kind"), Some("tool_call"));
+        assert_eq!(event.str("wake.agent.id"), Some("support/researcher#toolu_1"));
+        assert_eq!(event.str("wake.token.subject"), Some("user-42"));
+        assert_eq!(event.str("wake.token.id"), Some("tok-7"));
+        assert_eq!(
+            event.attributes["wake.token.actors"],
+            Value::Strs(vec!["support/researcher#toolu_1".into()])
+        );
+
+        // A caller with an SVID presented no token, and none is recorded.
+        p.check_request(call("support", "lookup_order")).await.unwrap();
+        let (hook, _permit) = hooks_rx.try_recv().unwrap();
+        capture.handle(hook);
+        let events = capture.expire(SystemTime::now() + Duration::from_secs(60));
+        assert!(events.iter().all(|e| !e.attributes.contains_key("wake.token.subject")));
     }
 }

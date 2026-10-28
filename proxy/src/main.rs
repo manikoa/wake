@@ -53,10 +53,10 @@ enum Command {
         #[arg(long)]
         state_dir: PathBuf,
         /// A JSON file naming each agent and the identities it authenticates with, its SPIFFE
-        /// IDs and JWT subjects: {"billing": ["spiffe://example.org/agent/billing"]}. With it,
-        /// the brake halts agents by name, proxy events name agents the same way, and a caller
-        /// it doesn't list is denied while any agent is halted. Without it, identities are
-        /// names.
+        /// IDs and JWT subjects (for a delegated token, its act.sub):
+        /// {"billing": ["spiffe://example.org/agent/billing"]}. With it, the brake halts agents
+        /// by name, proxy events name agents the same way, and a caller it doesn't list is
+        /// denied while any agent is halted. Without it, identities are names.
         #[arg(long)]
         agents: Option<PathBuf>,
         /// Where the brake reaches the control API (mTLS). Only the brake may reach it.

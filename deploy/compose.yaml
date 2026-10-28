@@ -80,7 +80,7 @@ services:
       - identity:/etc/wake/identity:ro
       # The halts in force, kept so a restart doesn't lift one.
       - proxy-state:/var/lib/wake-proxy
-      # Which agent each SPIFFE ID or JWT subject is: the names the brake halts by.
+      # Which agent each SPIFFE ID or JWT subject (a delegated token's act.sub) is: the names the brake halts by.
       # WAKE_AGENTS swaps in another map, as the reference fleet does.
       - ${WAKE_AGENTS:-./agents.json}:/etc/wake/agents.json:ro
       # The hooks agentgateway calls, as a Unix socket. Only agentgateway mounts this too:

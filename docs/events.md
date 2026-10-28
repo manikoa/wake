@@ -12,6 +12,11 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.event.kind` | string | `model_call`, `tool_call`, `agent_message`, `memory_read`, `memory_write`, or `denied` for a call the brake stopped |
 | `wake.agent.id` | string | The agent that did it |
 | `wake.capture` | string | What recorded it: `sdk`, `proxy` or `memory_adapter` |
+| `wake.token.subject` | string | Set by the proxy when the caller presented a JWT: whom the token acts for, its `sub`. For a delegated token, often a user or the agent that delegated, while `wake.agent.id` names the agent acting. See Tokens |
+| `wake.token.actors` | string[] | With a delegated token: the agents acting under it, the one acting now first, then each before it (its nested `act` claims) |
+| `wake.token.id` | string | The token's `jti`, when it has one |
+| `wake.token.expires_unix` | int | The token's `exp`, in Unix seconds |
+| `wake.token.bound` | bool | Whether the token is bound to its holder's key (it has a `cnf` claim, as DPoP and mTLS-bound tokens do), rather than usable by whoever holds a copy |
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
 | `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it. A payload too large to send whole is cut short and says so: the proxy keeps 1 MiB of each body, as a string, and adds `"truncated": true`. The SDKs send `{"truncated": true, "bytes", "sha256", "prefix"}` in place of one over 4 MiB, with the whole payload's size and hex SHA-256, and its first 2 MiB as a string |
@@ -39,6 +44,12 @@ A span without `wake.event.kind` isn't an event. It only groups events, for exam
 ## Origins and parents
 
 An event's `wake.origins` names only the content that **entered** at that event: a tool result, a user's message seen for the first time, a message from another agent, or a memory entry. Everything else an event saw arrives through `wake.parents`. The full set of origins behind an event is the union over its ancestors, computed in the provenance graph.
+
+## Tokens
+
+When a caller presents a JWT at the gateway, the proxy records what the token says on the events it captures for that call: its `tool_call`, both `agent_message`s of an A2A exchange (the sender's token, on the message and on the reply), and any `denied` event, cut calls included. It never records the token itself: the gateway computes these facts from the claims of the token it verified and passes only them (see "Who's calling" in [proxy.md](proxy.md)). A caller that authenticates with an X.509-SVID presents no token, and its events have none of these attributes.
+
+A token from OAuth token exchange ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)) acts for its `sub` and is held by the agent its `act.sub` names, with earlier actors nested deeper in `act`. The gateway names the caller, `wake.agent.id`, by the agent acting; `wake.token.subject` and `wake.token.actors` keep whom it acts for and the chain the delegation passed through, so the record shows which user a sub-agent acted for, and through which agents. A chain is kept to its first 8 actors, and a claim too long to be an identifier (over 1,024 bytes) is left out rather than cut.
 
 ## Messages between agents
 
