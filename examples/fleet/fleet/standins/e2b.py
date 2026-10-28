@@ -1,11 +1,13 @@
 """A stand-in for the E2B API: just enough for a fleet agent to keep a sandbox and the brake to
 freeze it, with the fields the brake reads (wake-platform's brake/sandbox):
 
-    POST /sandboxes              create one, with metadata and lifecycle.autoResume
-    GET  /v2/sandboxes           list them, by metadata ("k=v&k2=v2") and state
-    GET  /sandboxes/{id}         read one: state, pauseMode, lifecycle.autoResume
-    POST /sandboxes/{id}/pause   pause one with its memory, or with its filesystem only
-                                 ({"memory": false}); 409 if it isn't running
+    POST /sandboxes                   create one, with metadata and lifecycle.autoResume
+    GET  /v2/sandboxes                list them, by metadata ("k=v&k2=v2") and state ("running,paused"),
+                                      a page at a time (limit, nextToken; X-Next-Token)
+    GET  /sandboxes/{id}              read one: state, pauseMode, lifecycle.autoResume
+    POST /sandboxes/{id}/pause        pause one with its memory, or with its filesystem only
+                                      ({"memory": false}); 409 if it isn't running
+    POST /v2/sandboxes/{id}/connect   resume a paused one (201), or find it running (200)
 
 It runs nothing: a sandbox here is only its record, and nothing sends it traffic, so nothing
 auto-resumes one. There are two API keys on one team, as an E2B account would have: billing's,
@@ -102,10 +104,29 @@ def routes(a: Account) -> list[Route]:
 
     async def listed(request: Request, holder: str) -> Response:
         want = dict(urllib.parse.parse_qsl(request.query_params.get("metadata", "")))
-        states = request.query_params.getlist("state") or ["running", "paused"]
-        found = [detail(s) for s in a.state["sandboxes"].values()
+        states = [s for v in request.query_params.getlist("state") for s in v.split(",")] or ["running", "paused"]
+        try:
+            limit = min(max(int(request.query_params.get("limit", "100")), 1), 100)
+            start = int(request.query_params.get("nextToken", "0"))
+        except ValueError:
+            return error(400, "invalid limit or nextToken")
+        found = [detail(s) for _, s in sorted(a.state["sandboxes"].items())
                  if s["state"] in states and all(s["metadata"].get(k) == v for k, v in want.items())]
-        return JSONResponse(found)
+        headers = {"X-Next-Token": str(start + limit)} if start + limit < len(found) else {}
+        return JSONResponse(found[start:start + limit], headers=headers)
+
+    async def connect(request: Request, holder: str) -> Response:
+        sid = request.path_params["id"]
+        with a.lock:
+            s = a.state["sandboxes"].get(sid)
+            if not s:
+                return error(404, f"sandbox {sid} not found")
+            if s["state"] == "running":
+                return JSONResponse(detail(s), status_code=200)
+            s["state"], s["pauseMode"] = "running", ""
+            a.save()
+        log.info("%s resumed sandbox %s", holder, sid)
+        return JSONResponse(detail(s), status_code=201)
 
     async def get(request: Request, holder: str) -> Response:
         s = a.state["sandboxes"].get(request.path_params["id"])
@@ -136,6 +157,7 @@ def routes(a: Account) -> list[Route]:
         Route("/v2/sandboxes", authed(listed), methods=["GET"]),
         Route("/sandboxes/{id}", authed(get), methods=["GET"]),
         Route("/sandboxes/{id}/pause", authed(pause), methods=["POST"]),
+        Route("/v2/sandboxes/{id}/connect", authed(connect), methods=["POST"]),
     ]
 
 

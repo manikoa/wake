@@ -48,7 +48,9 @@ The fleet holds something for each of the brake's levers, so a game day times th
 
 The stand-ins stand in for a design partner's identity provider, such as Okta, and E2B. Each implements what the agents and the brake call, and nothing more. Real ones come later, from a partner, or an Okta developer org and an E2B account.
 
-Each credential goes into a volume only its holder mounts. Each agent gets its own refresh token, billing also an E2B key, and the tools server a client for introspection. The brake gets the rest in `brake-secrets`, which no fleet service mounts: an OAuth client that may revoke and introspect, an API token for Okta's global token revocation, an E2B key, and its copy of each agent's refresh token. The brake's credentials never pass through the agents, and no agent can read another's.
+Each credential goes into a volume only its holder mounts. Each agent gets its own refresh token, billing also an E2B key, and the tools server a client for introspection. The brake gets the rest in `brake-secrets`, which no fleet service mounts: an API token for Okta's global token revocation and Users API, an E2B key, and its copy of each agent's refresh token. The brake's credentials never pass through the agents, and no agent can read another's.
+
+The identity provider is as strict as Okta's documentation allows: a client sees only the tokens issued to it. Introspecting another client's token answers inactive, and revoking it does nothing, with a 200. So the brake revokes and introspects each agent's token as the agent's own client, which is public, and the tools server, a resource server, may introspect only the access tokens it's the audience of. The provider also serves the part of Okta's Users API that lists a user's refresh tokens, which the brake confirms a sign-out with, and the E2B stand-in lists sandboxes a page at a time and resumes a paused one, as the brake needs to freeze it again.
 
 ## Identity
 

@@ -3,19 +3,31 @@ authorization server for the fleet's agents to hold tokens the brake can revoke.
 /oauth2/v1, as Okta's org authorization server has them:
 
     POST /token                      an agent swaps its refresh token for an access token
-    POST /revoke                     RFC 7009, for the brake's client
-    POST /introspect                 RFC 7662, for the brake's client and the tools server's
+    POST /revoke                     RFC 7009, for the client a token was issued to
+    POST /introspect                 RFC 7662, for the client a token was issued to, and the
+                                     tools server, for the access tokens it's the audience of
     POST /global-token-revocation    Okta's: signs a user out of everything, for an API token
 
+and Okta's Users API, under /api/v1, for the same API token:
+
+    GET /users/{user}/clients                    the clients the user holds tokens at
+    GET /users/{user}/clients/{client}/tokens    the user's refresh tokens at one of them
+
 At first start it issues each agent a refresh token, as if the agent had signed in as its own
-user. The agent's copy goes to the agent's volume. The customer's copy, which the brake
-revokes and introspects, goes to the brake's volume, with the brake's client secret and an
-API token for global token revocation. The tools server gets a client of its own, which may
-only introspect. No agent can read another's token or anything the brake holds.
+user, through the agent's own public client. The agent's copy goes to the agent's volume. The
+customer's copy, which the brake revokes and introspects as the agent's client, goes to the
+brake's volume, with an API token for global token revocation and the Users API. The tools
+server gets a client of its own, which may only introspect. No agent can read another's token
+or anything the brake holds.
+
+It's as strict as Okta's documentation says a server may be: a client sees only its own
+tokens. Introspecting another client's token answers inactive, and revoking it does nothing,
+with a 200, so a brake that asks as the wrong client would see a live token as revoked.
 
 Revoking a refresh token also revokes the access tokens swapped for it (RFC 7009, section
-2.1), and global token revocation revokes every token of the user. Client secrets go in
-HTTP Basic, form-encoded first (RFC 6749, section 2.3.1).
+2.1), and global token revocation revokes every token of the user. A confidential client's
+secret goes in HTTP Basic, form-encoded first (RFC 6749, section 2.3.1); a public client
+sends only its client_id, in the form.
 
     python -m fleet.standins.oauth
 """
@@ -39,7 +51,6 @@ log = logging.getLogger("idp")
 
 ISSUER = os.environ.get("STANDIN_ISSUER", "http://idp:8080")
 AGENTS = os.environ.get("STANDIN_AGENTS", "support research billing notify").split()
-BRAKE = "wake-brake"
 TOOLS = "fleet-tools"
 # The audience and scope of the access tokens: the fleet's tools server.
 AUDIENCE = "fleet-tools"
@@ -65,18 +76,17 @@ class Provider:
     def first_start(cls) -> "Provider":
         """Registers the clients and issues the agents' refresh tokens, handing each credential
         to its holder."""
-        brake_secret, tools_secret, api_token = new_secret("brake_"), new_secret("tools_"), new_secret("okta_")
+        tools_secret, api_token = new_secret("tools_"), new_secret("okta_")
         p = cls(persist=False, state={
             "clients": {
-                BRAKE: {"secret": digest(brake_secret), "may": ["revoke", "introspect"]},
-                TOOLS: {"secret": digest(tools_secret), "may": ["introspect"]},
+                # A resource server: it may introspect the access tokens it's the audience of.
+                TOOLS: {"secret": digest(tools_secret), "may": ["introspect"], "audience": AUDIENCE},
                 **{agent: {"public": True} for agent in AGENTS},
             },
             "api_tokens": [digest(api_token)],
             "users": [user(agent) for agent in AGENTS],
             "tokens": {},
         })
-        hand_out("brake", "oauth-client-secret", brake_secret)
         hand_out("brake", "okta-api-token", api_token)
         hand_out("tools", "oauth-client-secret", tools_secret)
         for agent in AGENTS:
@@ -125,11 +135,14 @@ class Provider:
             self.save()
         return count
 
-    def client(self, request: Request, may: str) -> str | None:
-        """The confidential client authenticating the request, if it may do this."""
+    def client(self, request: Request, form, may: str) -> str | None:
+        """The client authenticating the request, if it may do this: a confidential one with
+        its secret in Basic, or a public one, which may revoke and introspect its own tokens,
+        with its client_id in the form."""
         scheme, _, credentials = request.headers.get("authorization", "").partition(" ")
         if scheme.lower() != "basic":
-            return None
+            name = str(form.get("client_id", ""))
+            return name if self.state["clients"].get(name, {}).get("public") else None
         try:
             name, _, secret = base64.b64decode(credentials, validate=True).decode().partition(":")
         except ValueError:
@@ -140,9 +153,25 @@ class Provider:
             return None
         return name
 
+    def sees(self, client: str, t: dict) -> bool:
+        """Whether this client may know about the token: it was issued to the client, or it's
+        an access token for the client's audience."""
+        if t["client_id"] == client:
+            return True
+        audience = self.state["clients"].get(client, {}).get("audience")
+        return t["kind"] == "access_token" and audience == AUDIENCE
+
+    def api(self, request: Request) -> bool:
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        return scheme.lower() == "bearer" and any(matches(token, d) for d in self.state["api_tokens"])
+
 
 def invalid_client() -> JSONResponse:
     return JSONResponse({"error": "invalid_client"}, status_code=401, headers={"WWW-Authenticate": 'Basic realm="idp"'})
+
+
+def invalid_token() -> JSONResponse:
+    return JSONResponse({"errorCode": "E0000011", "errorSummary": "Invalid token provided"}, status_code=401)
 
 
 def routes(p: Provider) -> list[Route]:
@@ -161,25 +190,28 @@ def routes(p: Provider) -> list[Route]:
         return JSONResponse({"token_type": "Bearer", "access_token": access, "expires_in": ACCESS_TTL, "scope": SCOPE})
 
     async def revoke(request: Request) -> Response:
-        client = p.client(request, "revoke")
+        form = await request.form()
+        client = p.client(request, form, "revoke")
         if not client:
             return invalid_client()
-        form = await request.form()
         if not form.get("token"):
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         key, t = p.find(str(form["token"]))
-        if t:
+        if t and t["client_id"] == client:
             count = p.revoke([key])
             log.info("%s revoked a %s of %s: %d tokens revoked", client, t["kind"], t["sub"], count)
-        # 200 whether or not the token was valid (RFC 7009, section 2.2).
+        elif t:
+            log.warning("%s tried to revoke a token issued to %s: ignored", client, t["client_id"])
+        # 200 whether or not the token was valid, or the client's (RFC 7009, section 2.2).
         return Response(status_code=200)
 
     async def introspect(request: Request) -> Response:
-        if not p.client(request, "introspect"):
-            return invalid_client()
         form = await request.form()
+        client = p.client(request, form, "introspect")
+        if not client:
+            return invalid_client()
         _, t = p.find(str(form.get("token", "")))
-        if not p.active(t):
+        if not p.active(t) or not p.sees(client, t):
             return JSONResponse({"active": False})
         out = {"active": True, "iss": ISSUER, "client_id": t["client_id"], "sub": t["sub"], "username": t["sub"],
                "scope": t["scope"], "iat": t["iat"], "exp": t["exp"]}
@@ -188,9 +220,8 @@ def routes(p: Provider) -> list[Route]:
         return JSONResponse(out)
 
     async def global_token_revocation(request: Request) -> Response:
-        scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not any(matches(token, d) for d in p.state["api_tokens"]):
-            return JSONResponse({"errorCode": "E0000011", "errorSummary": "Invalid token provided"}, status_code=401)
+        if not p.api(request):
+            return invalid_token()
         try:
             sub_id = (await request.json())["sub_id"]
             fmt, sub = sub_id["format"], sub_id["id"]
@@ -204,11 +235,42 @@ def routes(p: Provider) -> list[Route]:
         log.info("signed %s out everywhere: %d tokens revoked", sub, count)
         return Response(status_code=204)
 
+    def user_tokens(request: Request) -> list[dict] | JSONResponse:
+        sub = request.path_params["user"]
+        if sub not in p.state["users"]:
+            return JSONResponse({"errorCode": "E0000007", "errorSummary": f"Not found: Resource not found: {sub} (User)"}, status_code=404)
+        return [t for t in p.state["tokens"].values() if t["sub"] == sub]
+
+    async def user_clients(request: Request) -> Response:
+        if not p.api(request):
+            return invalid_token()
+        tokens = user_tokens(request)
+        if isinstance(tokens, Response):
+            return tokens
+        clients = sorted({t["client_id"] for t in tokens})
+        return JSONResponse([{"client_id": c, "client_name": c} for c in clients])
+
+    async def user_client_tokens(request: Request) -> Response:
+        if not p.api(request):
+            return invalid_token()
+        tokens = user_tokens(request)
+        if isinstance(tokens, Response):
+            return tokens
+        client = request.path_params["client"]
+        return JSONResponse([
+            {"id": "oar" + k[:16], "status": "ACTIVE", "clientId": t["client_id"], "userId": t["sub"], "issuer": ISSUER,
+             "expiresAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t["exp"]))}
+            for k, t in p.state["tokens"].items()
+            if t["sub"] == request.path_params["user"] and t["client_id"] == client and t["kind"] == "refresh_token" and p.active(t)
+        ])
+
     return [
         Route("/oauth2/v1/token", token, methods=["POST"]),
         Route("/oauth2/v1/revoke", revoke, methods=["POST"]),
         Route("/oauth2/v1/introspect", introspect, methods=["POST"]),
         Route("/oauth2/v1/global-token-revocation", global_token_revocation, methods=["POST"]),
+        Route("/api/v1/users/{user}/clients", user_clients, methods=["GET"]),
+        Route("/api/v1/users/{user}/clients/{client}/tokens", user_client_tokens, methods=["GET"]),
     ]
 
 
