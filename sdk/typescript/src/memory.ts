@@ -3,7 +3,7 @@
  * its content came from before it lands.
  *
  *     const memory = new Memory(handler);
- *     const label = memory.write("facts", "fact-17", text); // save the label with the entry
+ *     const label = await memory.write("facts", "fact-17", text); // save the label with the entry
  *     ...
  *     memory.read("facts", "fact-17", text, label);         // links the read to the write
  *
@@ -25,11 +25,12 @@
  * write or read still happens, unlabeled, and the failure is counted in the recorder's health.
  *
  * With a Quarantine (wake-sdk/quarantine), the adapter also enforces the brake's memory
- * quarantine: a locked agent's writes and deletes throw MemoryLocked and don't happen, a
- * quarantined entry isn't served (read returns the quarantine's id, the store wrapper drops
- * the entry, readFile throws MemoryQuarantined), and deleting one throws MemoryLocked: it's
- * kept, as evidence. Each refusal is recorded as a denied event. If checking the quarantine
- * fails, the write or delete is refused and the entry isn't served.
+ * quarantine: a locked agent's writes and deletes reject with MemoryLocked and don't happen,
+ * a quarantined entry isn't served (read returns the quarantine's id, the store wrapper drops
+ * the entry, readFile rejects with MemoryQuarantined), and overwriting or deleting one
+ * rejects with MemoryLocked: it's kept, as evidence. Each refusal is recorded as a denied event. If
+ * checking the quarantine fails, the write or delete is refused and the entry isn't served.
+ * In a process that names its agents' runs, each run's writes are locked by its own name.
  */
 
 import { randomBytes, randomUUID } from "node:crypto";
@@ -124,16 +125,14 @@ export class Memory {
   }
 
   /**
-   * Records a write and returns the label to store with the entry, or null if recording
-   * failed. Throws MemoryLocked, before anything is written, when the brake's quarantine
-   * locks this agent's writes.
+   * Records a write and resolves to the label to store with the entry, or null if recording
+   * failed. current and label are what the entry holds now (undefined if nothing) and the
+   * label stored with it. Rejects with MemoryLocked, before anything is written, when the
+   * brake's quarantine locks this agent's writes, or hides the entry: a quarantined entry is
+   * kept, as evidence, not overwritten.
    */
-  write(store: string, entry: string, content: unknown): WriteLabel | null {
-    const locked = this.#locked();
-    if (locked) {
-      this.#refused("write", store, entry, locked, this.#linked());
-      throw new MemoryLocked(locked, store, entry);
-    }
+  async write(store: string, entry: string, content: unknown, current?: unknown, label?: Label | null): Promise<WriteLabel | null> {
+    await this.#check("write", store, entry, current, label);
     try {
       return this.#write(store, entry, contentOf(content));
     } catch (error) {
@@ -144,22 +143,30 @@ export class Memory {
 
   /**
    * Records the delete of an entry, given what it holds now (undefined if nothing) and the
-   * label stored with it. Throws MemoryLocked, before anything is deleted, when the brake's
-   * quarantine locks this agent's writes, or hides the entry: a quarantined entry is kept,
-   * as evidence.
+   * label stored with it. Rejects with MemoryLocked, before anything is deleted, when the
+   * brake's quarantine locks this agent's writes, or hides the entry: a quarantined entry is
+   * kept, as evidence.
    */
-  delete(store: string, entry: string, current?: unknown, label?: Label | null): void {
-    let refused = this.#locked();
-    const write = isLabel(label) ? eventId(label.event) : null;
-    if (!refused && current !== undefined && current !== null) refused = this.#hidden(store, entry, contentOf(current), label);
-    if (refused) {
-      this.#refused("delete", store, entry, refused, [...this.#linked(), ...(write ? [write] : [])]);
-      throw new MemoryLocked(refused, store, entry);
-    }
+  async delete(store: string, entry: string, current?: unknown, label?: Label | null): Promise<void> {
+    await this.#check("delete", store, entry, current, label);
     try {
       this.#delete(store, entry);
     } catch (error) {
       this._failed("a memory delete", error);
+    }
+  }
+
+  /**
+   * Throws MemoryLocked, and records the refusal, when the quarantine locks this agent's
+   * writes or hides the entry as it is now.
+   */
+  async #check(action: string, store: string, entry: string, current: unknown, label: Label | null | undefined): Promise<void> {
+    let refused = await this.#locked();
+    if (!refused && current !== undefined && current !== null) refused = this.#hidden(store, entry, contentOf(current), label);
+    if (refused) {
+      const write = isLabel(label) ? eventId(label.event) : null;
+      this.#refused(action, store, entry, refused, [...this.#linked(), ...(write ? [write] : [])]);
+      throw new MemoryLocked(refused, store, entry);
     }
   }
 
@@ -186,11 +193,18 @@ export class Memory {
   /**
    * Writes a memory file and its label, next to it as <file>.wake.json. The label lands
    * first and each file is replaced whole, so the new content is never found with a label
-   * that doesn't vouch for it, only the other way round, which reads as changed.
+   * that doesn't vouch for it, only the other way round, which reads as changed. Rejects with
+   * MemoryLocked when the quarantine locks this agent's writes or hides the file as it is now.
    */
   async writeFile(path: string, text: string): Promise<void> {
     const file = await resolved(path);
-    const label = this.write("file", file, text); // throws MemoryLocked when locked
+    let current: string | undefined;
+    let currentLabel: Label | null = null;
+    if (this.#quarantine !== undefined) {
+      current = await readFile(path, "utf8").catch(() => undefined);
+      if (current !== undefined) currentLabel = await this.#labelOf(path);
+    }
+    const label = await this.write("file", file, text, current, currentLabel);
     if (label !== null) {
       try {
         await writeAtomically(path + LABEL_SUFFIX, JSON.stringify(label));
@@ -204,25 +218,44 @@ export class Memory {
   /** Reads a memory file and records the read, with its label if it has one. */
   async readFile(path: string): Promise<string> {
     const text = await readFile(path, "utf8");
-    let label: unknown = null;
-    try {
-      label = JSON.parse(await readFile(path + LABEL_SUFFIX, "utf8"));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") log.warn("failed to read a memory file's label", error);
-    }
     const entry = await resolved(path);
-    const hidden = this.read("file", entry, text, isLabel(label) ? label : null);
+    const hidden = this.read("file", entry, text, await this.#labelOf(path));
     if (hidden) throw new MemoryQuarantined(hidden, "file", entry);
     return text;
   }
 
-  #locked(): string | null {
+  /** The label next to a memory file, if it has one that reads. */
+  async #labelOf(path: string): Promise<Label | null> {
     try {
-      return this.#quarantine ? this.#quarantine.lockedBy() : null;
+      const label: unknown = JSON.parse(await readFile(path + LABEL_SUFFIX, "utf8"));
+      return isLabel(label) ? label : null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") log.warn("failed to read a memory file's label", error);
+      return null;
+    }
+  }
+
+  async #locked(): Promise<string | null> {
+    if (!this.#quarantine) return null;
+    try {
+      const agent = this.#runAgent();
+      // A named run's rules are fetched from its first write, which waits for them.
+      if (agent !== undefined) await this.#quarantine.track(agent);
+      return this.#quarantine.lockedBy(agent);
     } catch (error) {
       log.warn("failed to check the memory quarantine", error);
       return UNCHECKED;
     }
+  }
+
+  /**
+   * The named run writing, such as handler.agent("email"), when it isn't the agent the
+   * recorder records for: one process can host several agents, and the brake locks each by
+   * its own name.
+   */
+  #runAgent(): string | undefined {
+    const agent = this.#handler._currentAgent();
+    return agent === this.#handler._recorder.agent ? undefined : agent;
   }
 
   #hidden(store: string, entry: string, text: string, label: Label | null | undefined): string | null {

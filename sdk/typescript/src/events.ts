@@ -21,6 +21,11 @@ export const DENIED = "denied";
 
 export const ORIGIN_USER = "user";
 
+// The largest payload sent whole. A larger one, such as a model's context late in a long
+// run, is cut to a prefix and marked truncated (docs/events.md), so one event always fits a
+// batch the collector takes. wake-proxy keeps 1 MiB of each body it records.
+export const MAX_PAYLOAD_BYTES = 4 << 20;
+
 /**
  * JSON for any value, with keys sorted. Never throws.
  *
@@ -46,8 +51,17 @@ export function dumps(value: unknown, { ensureAscii = true }: { ensureAscii?: bo
 
 /** The payload and its digest as span attributes. Never throws. */
 export function payloadAttributes(payload: unknown): Record<string, string> {
-  const body = dumps(payload);
+  let body = dumps(payload);
+  if (body.length > MAX_PAYLOAD_BYTES) body = truncated(body); // ASCII, so its length is its size in bytes
   return { [PAYLOAD]: body, [PAYLOAD_SHA256]: sha256(body) };
+}
+
+/**
+ * A payload too large to send whole: its size and digest, and as much of its start as fits,
+ * as a string. Escaping at most doubles the prefix, so half the limit always fits.
+ */
+function truncated(body: string): string {
+  return dumps({ truncated: true, bytes: body.length, sha256: sha256(body), prefix: body.slice(0, MAX_PAYLOAD_BYTES / 2 - 256) });
 }
 
 /** Hex SHA-256 of a string's UTF-8 bytes. */

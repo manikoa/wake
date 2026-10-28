@@ -11,8 +11,9 @@ import { AlwaysOffSampler, type ReadableSpan, type SpanExporter } from "@opentel
 import { z } from "zod";
 
 import { Recorder } from "../src/index.ts";
+import { MAX_BATCH_BYTES } from "../src/recorder.ts";
 import { WakeCallbackHandler } from "../src/langgraph.ts";
-import { attr, payload, recorded, tick, wakeEvents } from "./helpers.ts";
+import { attr, payload, recorded, sdk, tick, wakeEvents, withAppProxy } from "./helpers.ts";
 import { ANSWER, ask, emailAgentGraph } from "./email-agent.ts";
 
 class FailingExporter implements SpanExporter {
@@ -80,13 +81,13 @@ test("counts failed exports and calls onDrop", async () => {
   assert.equal(recorder.health().dropped, 4);
 });
 
-test("counts events pushed out of a full queue, and reports them only after the export", async () => {
+test("counts events a full queue turns away, and reports them only after the export", async () => {
   const reported: [number, string][] = [];
   const exporter = new BlockedExporter();
   const recorder = new Recorder({ agent: "email-agent", exporter, maxQueueSize: 8, onDrop: (n, why) => reported.push([n, why]) });
   emit(recorder, 8); // a full batch starts an export, which blocks
   await tick(20);
-  // Eight more fill the queue and the next twelve push spans out.
+  // Eight more fill the queue and the next twelve are turned away.
   emit(recorder, 20);
   assert.equal(recorder.health().dropped, 12);
   await tick(20);
@@ -328,4 +329,62 @@ test("a payload JSON can't hold is still recorded", async () => {
   assert.equal((output.loop as Record<string, unknown>).name, "loop");
   assert.equal(typeof (output.loop as Record<string, unknown>).self, "string");
   assert.equal(recorder.health().failed, 0);
+});
+
+/** Notes how many spans, and how many payload bytes, each export carries. */
+class SizedExporter implements SpanExporter {
+  readonly batches: [number, number][] = [];
+
+  export(spans: ReadableSpan[], done: (result: ExportResult) => void): void {
+    this.batches.push([spans.length, spans.reduce((total, s) => total + String(s.attributes["wake.payload"] ?? "").length, 0)]);
+    done({ code: ExportResultCode.SUCCESS });
+  }
+
+  async shutdown(): Promise<void> {}
+}
+
+function emitPayloads(recorder: Recorder, count: number, size: number): void {
+  for (let i = 0; i < count; i++) {
+    const span = recorder.tracer.startSpan(`event ${i}`);
+    span.setAttribute("wake.payload", "x".repeat(size));
+    span.end();
+  }
+}
+
+test("batches stay under the collector's request limit", async () => {
+  const exporter = new SizedExporter();
+  const recorder = new Recorder({ agent: "email-agent", exporter });
+  // Five 3 MiB contexts: together past the collector's 20 MiB limit, so never one batch.
+  emitPayloads(recorder, 5, 3 << 20);
+  assert.ok(await recorder.flush(10_000));
+  assert.equal(recorder.health().sent, 5);
+  assert.equal(exporter.batches.reduce((total, [n]) => total + n, 0), 5);
+  assert.ok(exporter.batches.every(([, bytes]) => bytes <= MAX_BATCH_BYTES), JSON.stringify(exporter.batches));
+});
+
+test("the queue is bounded by bytes too", async () => {
+  const { recorder } = recorded("email-agent", { maxQueueBytes: 1 << 20 });
+  emitPayloads(recorder, 5, 300_000); // the export waits for more before sending
+  assert.equal(recorder.health().dropped, 2);
+  assert.equal(await recorder.flush(), false);
+  assert.equal(recorder.health().sent, 3);
+});
+
+test("the app's proxy settings never reach the collector", async () => {
+  // The app sends its own traffic through a proxy that isn't there; Wake's goes direct.
+  const stand = await collector();
+  try {
+    const printed = await withAppProxy(`
+      const { Recorder } = await import(${sdk("index")});
+      const recorder = new Recorder({ agent: "email-agent", endpoint: ${JSON.stringify(stand.endpoint)} });
+      for (let i = 0; i < 3; i++) recorder.tracer.startSpan("event").end();
+      console.log(JSON.stringify({ flushed: await recorder.flush(), health: recorder.health() }));
+    `);
+    const { flushed, health } = JSON.parse(printed);
+    assert.ok(flushed);
+    assert.equal(health.sent, 3);
+    assert.equal(stand.seen.length, 1);
+  } finally {
+    await stand.kill();
+  }
 });
