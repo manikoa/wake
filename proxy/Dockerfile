@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # wake-proxy. Build from the repo root:
 #   docker build -f proxy/Dockerfile -t wake-proxy .
-FROM rust:1.90-bookworm AS build
+FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS build
 # libprotobuf-dev has the well-known types (google/protobuf/*.proto) the protos import.
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -11,7 +11,7 @@ RUN cargo build --release --locked --bin wake-proxy
 # Directories volumes mount over, owned by the user the proxy runs as.
 RUN mkdir -p /out/etc/wake/identity /out/etc/wake/gateway /out/var/lib/wake-proxy /out/run/wake
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build /src/target/release/wake-proxy /wake-proxy
 COPY --from=build --chown=65532:65532 /out/etc/wake /etc/wake
 COPY --from=build --chown=65532:65532 /out/var/lib/wake-proxy /var/lib/wake-proxy
