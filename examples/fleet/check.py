@@ -4,8 +4,8 @@
     python check.py entries.jsonl
 
 It checks what the Record gate asks for: every agent and every hop recorded, one trace
-across the agents, every parent in the log, and every action traced back to where its
-content came from. Then it traces the payment the poisoned page caused back to the page,
+across the agents, every parent in the log, the customer's request entering only where it
+came in, and every action traced back to where its content came from. Then it traces the payment the poisoned page caused back to the page,
 and prints the chain: the issue the game day catches. Exits 1 if anything is missing.
 """
 
@@ -31,6 +31,7 @@ def load(path):
             events[event_id] = {
                 "id": event_id,
                 "trace": event.get("trace_id"),
+                "start": int(event.get("start_time_unix_nano") or 0),
                 "kind": attributes.get("wake.event.kind"),
                 "agent": attributes.get("wake.agent.id"),
                 "capture": attributes.get("wake.capture"),
@@ -75,17 +76,30 @@ def rooted(events, event_id):
     entry at the write its label names. So an event with no parents and no user origin is
     where a chain broke, such as an action linked to nothing or a memory entry no label
     vouches for, and nothing that follows from it is complete. That includes the action
-    itself: its own origin doesn't make it a root."""
+    itself: its own origin doesn't make it a root. So is a parent that never reached the
+    log: nothing shows where its content came from."""
     seen, queue = {event_id}, [event_id]
     while queue:
         event = events[queue.pop()]
         if not event["parents"] and "user" not in event["origins"]:
             return False
         for parent in event["parents"]:
-            if parent in events and parent not in seen:
+            if parent not in events:
+                return False
+            if parent not in seen:
                 seen.add(parent)
                 queue.append(parent)
     return True
+
+
+def stray_user_origins(events):
+    """Events labeled with a user's request other than support's first step, where the
+    customer's request comes in. A receiver that loses the link to the message it got
+    takes the message for a plain request and labels it user, which looks complete, so in
+    this run any other user origin is a hop whose link broke."""
+    support = [e for e in events.values() if e["agent"] == "support" and e["capture"] == "sdk"]
+    first = min(support, key=lambda e: e["start"])["id"] if support else None
+    return [e for e in events.values() if "user" in e["origins"] and e["id"] != first]
 
 
 def main(path):
@@ -110,6 +124,13 @@ def main(path):
     dangling = [(e["id"], p) for e in events.values() for p in e["parents"] if p not in events]
     if dangling:
         fail(f"{len(dangling)} parents aren't in the log, such as {dangling[0]}")
+
+    stray = stray_user_origins(events)
+    if stray:
+        first = stray[0]
+        fail(f"{len(stray)} {'event' if len(stray) == 1 else 'events'} besides support's first step took in a user's"
+             f" request, such as {first['agent']}'s {first['kind']} {first['id']}: a hop lost its link")
+    print("the customer's request entered once, at support's first step")
 
     # The gate metric: actions with an unbroken chain back to where their content came from.
     actions = [e for e in events.values() if e["kind"] in ACTIONS]
