@@ -177,3 +177,67 @@ def test_agent_keeps_working_when_recording_fails(recorded, monkeypatch):
     monkeypatch.setattr(handler._recorder.tracer, "start_span", fail)
     result = ask(email_agent_graph(), handler)
     assert result["messages"][-1].content == "The email asks for a $10,000 wire."
+
+
+def test_a_graph_run_inside_a_tool_descends_from_the_tool_call(recorded):
+    handler, spans = recorded
+    summarizer = email_agent_graph()
+
+    @tool
+    def summarize(subject: str) -> str:
+        """Summarize the latest email with this subject."""
+        # The tool's own prompt: LangChain passes its callbacks on to the nested run.
+        result = summarizer.invoke({"messages": [HumanMessage(f"Summarize the {subject} email")]})
+        return result["messages"][-1].content
+
+    model = GenericFakeChatModel(messages=iter([
+        AIMessage(content="", tool_calls=[{"name": "summarize", "args": {"subject": "invoice"}, "id": "call_s"}]),
+        AIMessage(content="It asks for a $10,000 wire."),
+    ]))
+
+    def agent(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("agent", agent)
+    graph.add_node("tools", ToolNode([summarize]))
+    graph.add_edge(START, "agent")
+    graph.add_conditional_edges("agent", tools_condition)
+    graph.add_edge("tools", "agent")
+    ask(graph.compile(), handler)
+
+    events = wake_events(spans())
+    kinds = [e.attributes["wake.event.kind"] for e in events]
+    assert kinds == ["model_call", "tool_call", "model_call", "tool_call", "model_call", "model_call"]
+    outer, summarize_call, nested_first = events[:3]
+    assert summarize_call.attributes["gen_ai.tool.name"] == "summarize"
+    # The nested run's first step descends from the tool call that ran it, and its input
+    # is the tool's prompt, not the user's.
+    assert summarize_call.attributes["wake.event.id"] in nested_first.attributes["wake.parents"]
+    assert "user" not in nested_first.attributes["wake.origins"]
+    assert outer.attributes["wake.origins"] == ("user",)
+    assert len({e.context.trace_id for e in events}) == 1
+
+
+def test_a_user_message_with_no_id_is_new_only_once_in_a_trace(recorded):
+    from langchain_core.runnables import RunnableLambda
+
+    handler, spans = recorded
+    model = GenericFakeChatModel(messages=iter([AIMessage(content=f"Draft {n}.") for n in ("one", "two", "three")]))
+    question = HumanMessage("Write a reply to the invoice email")  # no id, as plain LangChain apps send
+
+    def twice(_):
+        first = model.invoke([question])
+        return model.invoke([question, first])
+
+    RunnableLambda(twice).invoke({}, config={"callbacks": [handler]})
+    first, second = wake_events(spans())
+    assert first.attributes["wake.origins"] == ("user",)
+    # Asked again in the same run, it isn't new: the second call descends from the first.
+    assert second.attributes["wake.origins"] == ()
+    assert first.attributes["wake.event.id"] in second.attributes["wake.parents"]
+
+    # A run of its own sees it for the first time.
+    RunnableLambda(lambda _: model.invoke([question])).invoke({}, config={"callbacks": [handler]})
+    third = wake_events(spans())[-1]
+    assert third.attributes["wake.origins"] == ("user",)

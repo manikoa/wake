@@ -47,8 +47,10 @@ class FakeModel(Model):
         output = next(self.turns)
         response_id = f"resp_{uuid.uuid4().hex[:8]}"
         with response_span(disabled=tracing.is_disabled()) as span:
-            span.span_data.response = Response.model_construct(id=response_id, model="fake-model", output=output, object="response")
-            span.span_data.input = input
+            # As the SDK's own model does, nothing of the exchange without sensitive data.
+            if tracing.include_data():
+                span.span_data.response = Response.model_construct(id=response_id, model="fake-model", output=output, object="response")
+                span.span_data.input = input
         return ModelResponse(output=output, usage=Usage(), response_id=response_id)
 
     def stream_response(self, *args, **kwargs):
@@ -203,3 +205,95 @@ def test_a_memory_write_in_a_tool_is_labeled_with_its_origins(tmp_path):
     # In the name of the agent whose tool wrote it, not the recorder's.
     assert attrs(write)["wake.agent.id"] == "billing"
     assert json.loads((tmp_path / "notes.md.wake.json").read_text())["agent"] == "billing"
+
+
+class FakeChatModel(FakeModel):
+    """Answers from a script, and reports each turn as the SDK's Chat Completions models
+    do, LiteLLM's included: a generation with chat messages in and out."""
+
+    async def get_response(self, system_instructions, input, model_settings, tools, output_schema, handoffs, tracing,
+                           previous_response_id=None, conversation_id=None, prompt=None, **kwargs):
+        from agents.models.chatcmpl_converter import Converter
+        from agents.tracing import generation_span
+
+        output = next(self.turns)
+        message = {"role": "assistant", "content": None}
+        for item in output:
+            if item.type == "function_call":
+                message.setdefault("tool_calls", []).append(
+                    {"id": item.call_id, "type": "function", "function": {"name": item.name, "arguments": item.arguments}})
+            else:
+                message["content"] = item.content[0].text
+        with generation_span(model="fake-chat", disabled=tracing.is_disabled()) as span:
+            if tracing.include_data():
+                span.span_data.input = Converter.items_to_messages(input)
+                span.span_data.output = [message]
+        return ModelResponse(output=output, usage=Usage(), response_id=None)
+
+
+def run(agent, **run_config):
+    from agents import RunConfig
+
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    set_trace_processors([WakeTracingProcessor(recorder)])
+    try:
+        asyncio.run(Runner.run(agent, "Is the Acme invoice legit?", run_config=RunConfig(**run_config)))
+    finally:
+        set_trace_processors([])
+    recorder.flush()
+    return wake_events(exporter.get_finished_spans())
+
+
+def billing_with(model_class):
+    return Agent(name="billing", tools=[read_email], model=model_class([
+        [call("read_email", json.dumps({"subject": "invoice"}), "call_read")],
+        [say("The email asks for a $10,000 wire to account 123.")],
+    ]))
+
+
+def test_chat_completions_messages_link_as_responses_do():
+    first, read, last = run(billing_with(FakeChatModel))
+    ids = lambda *es: {attrs(e)["wake.event.id"] for e in es}
+    assert attrs(first)["wake.origins"] == ("user",)
+    # The assistant message's tool call names the response that requested the tool...
+    assert set(attrs(read)["wake.parents"]) == ids(first)
+    # ...and the tool message in the next input names the tool call.
+    assert ids(read) <= set(attrs(last)["wake.parents"])
+
+
+def test_without_sensitive_data_the_loop_links_events():
+    seen_links.clear()
+    triage_call, handoff, first, read, last = run(agents_for_test(), trace_include_sensitive_data=False)
+    ids = lambda *es: {attrs(e)["wake.event.id"] for e in es}
+    # Nothing of the exchange is in the trace, but the run's shape is: the workflow's input
+    # enters at the first response, a tool runs from its agent's latest response, and the
+    # next response reads that response and the tool's result.
+    assert attrs(triage_call)["wake.origins"] == ("user",)
+    assert set(attrs(handoff)["wake.parents"]) == ids(triage_call)
+    assert ids(handoff) <= set(attrs(first)["wake.parents"])
+    assert set(attrs(read)["wake.parents"]) == ids(first)
+    assert set(attrs(last)["wake.parents"]) == ids(first, read)
+    assert "user" not in attrs(last)["wake.origins"]
+
+
+def test_an_agent_run_inside_a_tool_descends_from_the_tool_call():
+    summarizer = Agent(name="summarizer", model=FakeModel([[say("A request to wire $10,000.")]]))
+
+    @function_tool
+    async def summarize(subject: str) -> str:
+        """Summarize the latest email with a subject."""
+        result = await Runner.run(summarizer, f"Summarize this email: {EMAIL}")
+        return result.final_output
+
+    support = Agent(name="support", tools=[summarize], model=FakeModel([
+        [call("summarize", json.dumps({"subject": "invoice"}), "call_summary")],
+        [say("It asks for a wire.")],
+    ]))
+    first, tool, nested, last = run(support)
+    assert attrs(tool)["wake.event.kind"] == "tool_call"
+    assert (attrs(nested)["wake.agent.id"], attrs(nested)["wake.event.kind"]) == ("summarizer", "model_call")
+    # The summarizer's input came from the tool call, not from the user.
+    assert attrs(tool)["wake.event.id"] in attrs(nested)["wake.parents"]
+    assert "user" not in attrs(nested)["wake.origins"]
+    assert attrs(first)["wake.origins"] == ("user",)
