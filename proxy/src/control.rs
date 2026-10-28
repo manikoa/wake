@@ -9,7 +9,8 @@
 //! DELETE /v1/quarantines/{id}
 //! GET    /v1/memory/seen        each agent's memory adapter: the version it last fetched, and when
 //! GET    /v1/callers            each identity the deny lever has seen calling: its agent, the
-//!                               delegation chain and token ids it came with, and when
+//!                               delegation chain and token ids it came with, and when;
+//!                               ?identity=<id> only that one, and the callers whose chain names it
 //! ```
 //!
 //! Each answers with the state now in force and its version, and a change answers 200 only
@@ -227,8 +228,19 @@ async fn release_quarantine(State(halts): State<Arc<Halts>>, Path(id): Path<Stri
     stored(tokio::task::spawn_blocking(move || halts.release(&id)).await)
 }
 
-async fn callers(State(halts): State<Arc<Halts>>) -> Json<std::collections::HashMap<String, halts::Caller>> {
-    Json(halts.callers())
+#[derive(Deserialize)]
+struct CallersQuery {
+    identity: Option<String>,
+}
+
+async fn callers(
+    State(halts): State<Arc<Halts>>,
+    axum::extract::Query(q): axum::extract::Query<CallersQuery>,
+) -> Json<std::collections::HashMap<String, halts::Caller>> {
+    Json(match q.identity {
+        Some(identity) => halts.callers_naming(&identity),
+        None => halts.callers(),
+    })
 }
 
 async fn memory_seen(State(halts): State<Arc<Halts>>) -> Json<std::collections::HashMap<String, halts::Seen>> {

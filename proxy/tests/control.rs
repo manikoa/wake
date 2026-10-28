@@ -239,6 +239,21 @@ async fn the_brake_halts_a_token_and_sees_who_has_called() {
     assert_eq!(seen["calls"], 1);
     assert!(seen["first_seen"].as_u64().unwrap() > 0);
     assert_eq!(callers.as_object().unwrap().len(), 1);
+    // Or just one identity's.
+    for (identity, n) in [
+        ("spiffe://wake.local/agent/billing", 1),
+        ("spiffe://wake.local/agent/support", 0),
+    ] {
+        let named: serde_json::Value = brake
+            .get(reqwest::Url::parse_with_params(&format!("{}/v1/callers", c.url), [("identity", identity)]).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(named.as_object().unwrap().len(), n, "{identity}");
+    }
 
     // A halt may name tokens alone.
     let put = brake

@@ -497,6 +497,18 @@ impl Halts {
             .clone()
     }
 
+    /// The callers that are identity, or whose latest token's chain names it: what the
+    /// brake reads to tell whether one sub-agent calls under credentials of its own.
+    pub fn callers_naming(&self, identity: &str) -> HashMap<String, Caller> {
+        let callers = self.callers.lock().unwrap_or_else(|p| p.into_inner());
+        callers
+            .by_identity
+            .iter()
+            .filter(|(id, c)| *id == identity || c.actors.iter().any(|a| a == identity))
+            .map(|(id, c)| (id.clone(), c.clone()))
+            .collect()
+    }
+
     fn change(&self, f: impl FnOnce(&mut State)) -> Changed {
         let mut disk = self.disk.lock().unwrap_or_else(|p| p.into_inner());
         let mut next = (*self.current()).clone();
@@ -1004,6 +1016,29 @@ mod tests {
         let tokens = &halts.callers()[CHILD_1].tokens;
         assert_eq!(tokens.len(), CALLER_TOKENS);
         assert_eq!(tokens.last().map(String::as_str), Some("n19"), "newest last");
+    }
+
+    #[test]
+    fn the_callers_naming_an_identity_are_it_and_those_acting_under_it() {
+        let halts = Halts::in_memory();
+        halts.note_caller(Some(CHILD_1), Some(&token("support", &[CHILD_1], "tok-1")), 1);
+        let grandchild = "support/researcher/fetch#toolu_9";
+        halts.note_caller(
+            Some(grandchild),
+            Some(&token("support", &[grandchild, CHILD_1], "tok-9")),
+            2,
+        );
+        halts.note_caller(Some(CHILD_2), Some(&token("support", &[CHILD_2], "tok-2")), 3);
+        halts.note_caller(Some("support"), None, 4);
+        let mut named: Vec<String> = halts.callers_naming(CHILD_1).into_keys().collect();
+        named.sort();
+        assert_eq!(named, [CHILD_1, grandchild]);
+        assert!(halts.callers_naming("support/researcher#toolu_7").is_empty());
+        assert_eq!(
+            halts.callers_naming("support").len(),
+            1,
+            "the subject isn't a chain's actor"
+        );
     }
 
     #[test]
