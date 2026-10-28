@@ -39,7 +39,7 @@ The processor is a new parsing surface for attacker-controlled MCP and A2A bodie
 - Server-initiated MCP messages (progress, sampling, elicitation) aren't hooked.
 - ExtMCP is synchronous: every call waits on the processor, and it fails closed by default. Recording mustn't block, so for capture the processor answers at once and does its work after replying. Capture fails open (see the decisions below).
 - agentgateway's ext_proc is marked "very experimental" in its source. SSE with body rewriting needs testing early.
-- Per-call deny doesn't stop calls already forwarded or long-lived streams. ext_proc can cut an open stream; the Brake phase has to verify that.
+- Per-call deny doesn't stop calls already forwarded or long-lived streams. ext_proc can cut an open stream; the Brake phase has to verify that. Built, and verified against agentgateway: see "Calls under way" below.
 - There's no built-in "deny in force" acknowledgement. Verification would combine `/config_dump`, the processor's deny-list version, signed events for denied attempts, and a probe call with a test identity.
 
 Upstream proposals that would help, none blocking: a request id and the params in `McpResponse`, calling `CheckResponse` on JSON-RPC errors, an observe-only async mode, and an A2A hook like ExtMCP.
@@ -47,7 +47,7 @@ Upstream proposals that would help, none blocking: a request id and the params i
 ## Decisions
 
 1. **Proxy events are signed with ECDSA P-256, using the processor's X.509-SVID key.** SPIRE issues P-256, P-384 or RSA-2048 keys, not Ed25519, and signing with the SVID key keeps one identity per component. The collector keeps signing SDK and memory adapter events with Ed25519, so it checks two algorithms. It checks a proxy signature against the signer's SVID, and the SVID against the SPIRE trust bundle, instead of a fixed key file. How the SVID travels with each event, so anyone can check a log entry later on its own, is settled when the proxy is built.
-2. **Capture fails open.** If the processor is down or slow, agentgateway lets the call through unrecorded, because recording never blocks. The gap must not be silent: agentgateway's own spans for the call still reach the collector, and calls the proxy saw but didn't record raise a health signal. Deny, in the Brake phase, fails closed, so it goes in a separate guardrail entry with its own failure mode.
+2. **Capture fails open.** If the processor is down or slow, agentgateway lets the call through unrecorded, because recording never blocks. The gap must not be silent: agentgateway's own spans for the call still reach the collector, and calls the proxy saw but didn't record raise a health signal (its metrics, below). Deny, in the Brake phase, fails closed, so it goes in a separate guardrail entry with its own failure mode.
 
 ## Built so far
 
@@ -112,7 +112,23 @@ The brake's first lever (October 27, 2026). agentgateway calls the processor's e
   - With the processor stopped, the gateway denied calls.
   - Both denied calls were recorded and signed.
 - **Checked in CI** against `deploy/`'s mTLS gateway, by `deploy/smoke_test.sh`: halting the `smoke-test` agent by name denies its own MCP call, naming the halt, and not another agent's; a caller with no SVID is refused at the handshake; lifting the halt lets the call through; and the denial is signed into the log in the agent's name. agentgateway v1.6.0 accepts all three shipped configs (`--validate-only`).
-- **Not yet.** The lever stops new requests, not ones already under way: an open SSE stream, or an MCP call already forwarded, runs to its end. Cutting those needs the ext_proc stream (A2A) and is open work. In the example fleet, the caller's name comes from a header any caller can set, so an agent-scoped halt there trusts it; in `deploy/` it comes from SPIFFE IDs.
+- **Calls under way** (October 28, 2026). ext_authz stops a call before it starts. A call already under way when a halt lands is cut by the hook carrying it, which hears of each change to the halts at once and checks every call it holds, with the same rule as ext_authz.
+  - **A2A:** an exchange the halt covers, from its sender or to its receiver, is cut by ending its ext_proc stream with an error. agentgateway fails a call whose processor errs once its body is under way, so a streamed reply stops where it is, and a request still waiting for its reply never gets one. A halt that lands between ext_authz and the first ext_proc message is caught there, and the call isn't forwarded.
+  - **MCP:** the MCP hook keeps a result coming back to a caller the halt covers from it: the caller gets the gateway's error instead. The tool already ran; what it returned is still recorded, on the call's `tool_call` event. A request that reaches the hook after a halt is refused there, as ext_authz would have.
+  - **What's recorded:** each cut is a signed `denied` event whose payload says `"cut": true` and names the event that recorded the call (`recorded_as`). What the exchange carried before the cut is recorded as usual.
+  - **What it can't cut:** the MCP hook fails open, as capture does, so it cuts only while wake-proxy answers; ext_authz still fails closed for every call after. An MCP server's own stream to the agent (a `GET` for server-initiated messages) goes through neither hook. The gateway configs must give the hooks the caller the same way they give it to ext_authz, which `proxy/tests/gateway_configs.rs` checks.
+  - **Checked in CI** against `deploy/`'s mTLS gateway (agentgateway v1.6.0), by `deploy/smoke_test.sh`. The `smoke-test` agent starts a streamed A2A call to a stand-in that streams for a minute, and is halted after two events. The stream ended by the time the halt was acknowledged, with no event after it, and the cut was signed into the log and counted in the metrics.
+- **Not yet.** In the example fleet, the caller's name comes from a header any caller can set, so an agent-scoped halt there trusts it; in `deploy/` it comes from SPIFFE IDs.
+
+### Metrics
+
+With `--metrics-listen`, wake-proxy serves its counters for Prometheus at `/metrics` (`deploy/compose.yaml` publishes it on the host's loopback, at 9464):
+- **Traffic:** MCP calls and A2A exchanges seen, and events sent.
+- **Losses:** calls seen but not recorded (`wake_proxy_hooks_dropped_total`), events dropped on their way to the collector (`wake_proxy_events_dropped_total`), and events whose payload was truncated.
+- **Pairing:** MCP responses paired by id or by order.
+- **The brake:** calls denied and cut, the halts in force, the state's version, and `wake_proxy_state_ok`, which is 0 while every call is denied because the state is lost or unreadable.
+
+Recording fails open, so the two drop counters are the health signal for what wasn't recorded. A batch the collector refuses as bad, with a 4xx other than 408 or 429, isn't sent again: it's dropped and counted at once.
 
 ## How the certificate travels
 

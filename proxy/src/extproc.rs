@@ -16,9 +16,15 @@
 //! naming the reply's event, so the sender's next step descends from the reply. A reply to
 //! tasks/get or GetTask links to the message that started the task, which an earlier
 //! exchange recorded.
+//!
+//! An exchange under way when a halt that covers it lands, from its sender or to its
+//! receiver, is cut: the processor ends the stream with an error, and agentgateway fails
+//! the call, a streamed reply included. The cut is recorded as a signed denied event, and
+//! what the exchange carried before it as usual.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost_types::value::Kind;
@@ -29,8 +35,11 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::a2a;
 use crate::agents::Agents;
+use crate::authz::{self, Call};
 use crate::budget::{Budget, Events, Permit};
 use crate::canonical::{Event, Value};
+use crate::export::Counters;
+use crate::halts::{Halt, Halts};
 use crate::mcp::{self, TraceParent};
 
 // Generated from Envoy's protos, doc comments and all.
@@ -77,11 +86,15 @@ pub use crate::budget::MAX_CAPTURE;
 #[derive(Default)]
 pub struct Exchange {
     started: bool,
+    ended: bool, // the reply has all arrived
     request_mode: i32,
     response_mode: i32,
     recorded: bool, // a POST: request and reply are recorded
     sender: String,
     receiver: String,
+    // The call as the deny lever sees it: the sender's identity, the receiver the route
+    // names, and the request line and link headers, for checking halts that land during it.
+    call: Call,
     header_trace: Option<TraceParent>,
     header_parents: Vec<String>,
     // The receiver's link headers wait for the body: the sender's trace is only in the
@@ -173,6 +186,9 @@ impl Exchange {
             };
             self.sender = named(ATTR_SENDER);
             self.receiver = named(ATTR_RECEIVER);
+            let raw = |key: &str| attrs.get(key).filter(|s| !s.is_empty()).cloned();
+            self.call.caller = raw(ATTR_SENDER);
+            self.call.receiver = raw(ATTR_RECEIVER);
         }
         let mut events = Vec::new();
         let answer = match request.request {
@@ -205,6 +221,7 @@ impl Exchange {
                 // A buffered-partial request body over the gateway's limit sends only its
                 // prefix, with no end of stream.
                 events.extend(self.finish_request(now));
+                self.ended |= h.end_of_stream;
                 let (answer, mode) = self.response_headers(&h);
                 return (
                     ProcessingResponse {
@@ -217,6 +234,7 @@ impl Exchange {
             }
             Some(Phase::ResponseBody(b)) => {
                 let full_duplex = self.response_mode == BodySendMode::FullDuplexStreamed as i32;
+                self.ended |= b.end_of_stream;
                 if self.recorded {
                     self.capture(true, &b.body);
                     if b.end_of_stream {
@@ -227,6 +245,7 @@ impl Exchange {
             }
             Some(Phase::RequestTrailers(_)) => Answer::RequestTrailers(TrailersResponse::default()),
             Some(Phase::ResponseTrailers(_)) => {
+                self.ended = true;
                 events.extend(self.finish(now));
                 Answer::ResponseTrailers(TrailersResponse::default())
             }
@@ -253,8 +272,31 @@ impl Exchange {
         out
     }
 
+    /// The halts that cover this exchange now, from its sender or to its receiver: empty
+    /// unless it's under way, from its request to the end of its reply.
+    pub fn halted_by(&self, halts: &Halts) -> Vec<Halt> {
+        if !self.started || self.ended {
+            return vec![];
+        }
+        halts.deciding(self.call.caller.as_deref(), self.call.receiver.as_deref())
+    }
+
+    /// The signed record of cutting this exchange under these halts, which names the
+    /// exchange's message event when it's recorded one.
+    pub fn cut_event(&self, halts: &[Halt], now: SystemTime) -> Event {
+        let recorded_as = self.message_emitted.then_some(self.message_id.as_str());
+        authz::cut_event(&self.call, halts, &self.agents, nanos(now), recorded_as)
+    }
+
     fn request_headers(&mut self, h: &HttpHeaders, now: SystemTime) -> HeadersResponse {
         let headers = header_map(h);
+        self.call.method = headers.get(":method").cloned().unwrap_or_default();
+        self.call.host = headers.get(":authority").cloned().unwrap_or_default();
+        self.call.path = headers.get(":path").cloned().unwrap_or_default();
+        self.call.headers = [mcp::HEADER_TRACEPARENT, mcp::HEADER_PARENTS]
+            .into_iter()
+            .filter_map(|k| headers.get(k).map(|v| (k.to_string(), v.clone())))
+            .collect();
         self.started_at = nanos(now);
         if headers.get(":method").map(String::as_str) != Some("POST") {
             // Agent cards and other reads aren't messages.
@@ -579,21 +621,24 @@ fn random_ids() -> ([u8; 16], [u8; 8]) {
 pub struct Processor {
     events: Events,
     tasks: Arc<a2a::Tasks>,
-    agents: Arc<Agents>,
+    halts: Arc<Halts>,
     bodies: Arc<Budget>,
+    counters: Arc<Counters>,
 }
 
 /// How many tasks the processor remembers the starting message of.
 pub const TASKS_REMEMBERED: usize = 10_000;
 
 impl Processor {
-    /// bodies bounds what every exchange's captured bodies hold together.
-    pub fn new(events: Events, agents: Arc<Agents>, bodies: Arc<Budget>) -> Self {
+    /// bodies bounds what every exchange's captured bodies hold together. An exchange a halt
+    /// covers is cut, and senders and receivers are named through the halts' identity map.
+    pub fn new(events: Events, halts: Arc<Halts>, bodies: Arc<Budget>, counters: Arc<Counters>) -> Self {
         Processor {
             events,
             tasks: Arc::new(a2a::Tasks::new(TASKS_REMEMBERED)),
-            agents,
+            halts,
             bodies,
+            counters,
         }
     }
 
@@ -615,23 +660,60 @@ impl ExternalProcessor for Processor {
         let (tx, rx) = mpsc::channel(16);
         let events = self.events.clone();
         let tasks = self.tasks.clone();
-        let agents = self.agents.clone();
+        let halts = self.halts.clone();
         let bodies = self.bodies.clone();
+        let counters = self.counters.clone();
+        counters.a2a_exchanges.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            let mut exchange = Exchange::with_tasks(tasks).with_agents(agents).with_budget(bodies);
+            let mut exchange = Exchange::with_tasks(tasks)
+                .with_agents(halts.agents().clone())
+                .with_budget(bodies);
+            let mut changes = halts.changes();
+            let mut watching = true;
             let emit = |list: Vec<Event>| {
                 for e in list {
                     events.send(e);
                 }
             };
-            while let Some(message) = incoming.next().await {
-                let Ok(message) = message else { break };
-                let (answer, done) = exchange.handle(message, SystemTime::now());
-                // Answer first: the gateway is waiting on it.
-                if tx.send(Ok(answer)).await.is_err() {
-                    break;
+            // Ends the exchange: agentgateway fails a call whose processor errs once the
+            // body is under way, and doesn't forward one that errs before.
+            let cut = |exchange: &Exchange, covering: &[Halt]| {
+                counters.cut.fetch_add(1, Ordering::Relaxed);
+                events.send(exchange.cut_event(covering, SystemTime::now()));
+                let ids: Vec<&str> = covering.iter().map(|h| h.id.as_str()).collect();
+                Status::permission_denied(format!("halted by Wake ({})", ids.join(", ")))
+            };
+            loop {
+                tokio::select! {
+                    message = incoming.next() => {
+                        let Some(Ok(message)) = message else { break };
+                        let (answer, done) = exchange.handle(message, SystemTime::now());
+                        // A halt can land between ext_authz letting the call in and this.
+                        let covering = exchange.halted_by(&halts);
+                        if !covering.is_empty() {
+                            emit(done);
+                            let _ = tx.send(Err(cut(&exchange, &covering))).await;
+                            break;
+                        }
+                        // Answer first: the gateway is waiting on it.
+                        if tx.send(Ok(answer)).await.is_err() {
+                            break;
+                        }
+                        emit(done);
+                    }
+                    // A halt landed while the exchange is under way, such as a streamed reply.
+                    changed = changes.changed(), if watching => {
+                        if changed.is_err() {
+                            watching = false;
+                            continue;
+                        }
+                        let covering = exchange.halted_by(&halts);
+                        if !covering.is_empty() {
+                            let _ = tx.send(Err(cut(&exchange, &covering))).await;
+                            break;
+                        }
+                    }
                 }
-                emit(done);
             }
             emit(exchange.finish(SystemTime::now()));
         });

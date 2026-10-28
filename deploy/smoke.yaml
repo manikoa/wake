@@ -4,3 +4,10 @@
 services:
   wake-proxy:
     ports: ["127.0.0.1:9002:9002"]
+  # A stand-in for research behind the A2A route, which streams a slow reply, so the test
+  # can halt a call under way. The route reaches it on this machine's port 9999.
+  a2a-standin:
+    image: python:3.13-alpine@sha256:8bcfa47b04b853a17aaf909362b847b2112fd6ec4105ea553ef9a43bafbb5916
+    command: ["python", "/standin.py"]
+    volumes: ["./a2a_standin.py:/standin.py:ro"]
+    ports: ["9999:9999"]

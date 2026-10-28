@@ -2,7 +2,8 @@
 //! A batch holds at most MAX_BATCH_BYTES, well under the collector's 20 MiB request limit,
 //! so a run of large events goes out in several requests rather than one it refuses. When
 //! the collector is down, events are retried a few times and then dropped and counted; the
-//! processor and agentgateway never wait on it.
+//! processor and agentgateway never wait on it. A request the collector refuses as bad, a
+//! 4xx other than 408 or 429, would be refused again, so it's dropped and counted at once.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,21 +22,32 @@ use crate::canonical::{Event, Value};
 /// The most a batch holds, by the events' weight. An event over it goes out on its own.
 pub const MAX_BATCH_BYTES: usize = 4 << 20;
 
-/// What the processor has done since it started. Logged, and checked by tests.
+/// What the processor has done since it started. Served for Prometheus (metrics.rs),
+/// logged, and checked by tests.
 #[derive(Default)]
 pub struct Counters {
-    /// Hook calls dropped because the capture queue was full.
+    /// MCP calls the processor saw: tools/call, resources/read and prompts/get.
+    pub mcp_calls: AtomicU64,
+    /// A2A exchanges the processor saw.
+    pub a2a_exchanges: AtomicU64,
+    /// Hook calls dropped because the capture queue was full: calls seen and not recorded.
     pub hooks_dropped: AtomicU64,
     /// Events sent to the collector.
     pub sent: AtomicU64,
-    /// Events dropped because the collector couldn't take them.
+    /// Events dropped on their way to the collector: a full queue, or the collector
+    /// couldn't take them.
     pub export_dropped: AtomicU64,
+    /// Events recorded with their payload cut to a prefix, marked truncated.
+    pub truncated: AtomicU64,
     /// Responses paired with their request by the event id the gateway passed back.
     pub paired_by_id: AtomicU64,
     /// Responses paired by order within a session, because the id didn't come back.
     pub paired_in_order: AtomicU64,
     /// Calls the deny lever denied.
     pub denied: AtomicU64,
+    /// Calls under way when a halt landed, and cut: an A2A exchange, or an MCP result kept
+    /// from the caller.
+    pub cut: AtomicU64,
 }
 
 impl Counters {
@@ -133,6 +145,12 @@ impl Exporter {
             match result {
                 Ok(r) if r.status().is_success() => {
                     self.counters.sent.fetch_add(n, Ordering::Relaxed);
+                    return;
+                }
+                // The same request would be refused again; a timeout or a rate limit may pass.
+                Ok(r) if r.status().is_client_error() && !matches!(r.status().as_u16(), 408 | 429) => {
+                    self.counters.export_dropped.fetch_add(n, Ordering::Relaxed);
+                    tracing::error!(status = %r.status(), events = n, "the collector refused events; dropped them");
                     return;
                 }
                 Ok(r) => tracing::warn!(status = %r.status(), attempt, "collector refused events"),

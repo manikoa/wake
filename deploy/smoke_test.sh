@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Starts the recorder from compose.yaml, sends events from the Python SDK over TLS, and
 # checks they're signed into the log. Then it checks the deny lever: a halted agent's own
-# MCP call through agentgateway is denied, and the denial is signed into the log too. CI
-# runs it; it needs Docker, uv and python3.
+# MCP call through agentgateway is denied, a streamed A2A reply under way is cut when a halt
+# lands, and both are signed into the log and counted in wake-proxy's metrics. CI runs it;
+# it needs Docker, uv and python3.
 set -euo pipefail
 cd "$(dirname "$0")"
 # smoke.yaml publishes wake-proxy's control API on loopback, for the test only.
@@ -15,13 +16,16 @@ fail() {
   exit 1
 }
 
-compose up -d --build --wait collector wake-proxy agentgateway
+compose up -d --build --wait collector wake-proxy agentgateway a2a-standin
 compose cp collector:/etc/wake/identity/bundle.pem "$work/ca.pem"
 
-# The health check answers, and Prometheus can scrape the collector's own metrics.
+# The health check answers, and Prometheus can scrape the collector's and wake-proxy's
+# metrics.
 for _ in $(seq 1 20); do curl -fsS http://localhost:13133/ >/dev/null 2>&1 && break; sleep 1; done
 curl -fsS http://localhost:13133/ >/dev/null
 curl -fsS http://localhost:8888/metrics | grep -q '^otelcol_'
+for _ in $(seq 1 20); do curl -fsS http://localhost:9464/metrics >/dev/null 2>&1 && break; sleep 1; done
+curl -fsS http://localhost:9464/metrics | grep -q '^wake_proxy_state_ok 1$'
 
 
 # Python 3.13 checks certificates strictly by default, so the development identity must pass.
@@ -74,20 +78,33 @@ mkdir -p "$work/agents"
 for f in brake.pem brake.key agents/smoke-test.pem agents/smoke-test.key agents/research.pem agents/research.key; do
   compose cp "collector:/etc/wake/identity/$f" "$work/$f"
 done
-python3 deny_check.py "$work" || fail "the deny lever didn't deny the halted agent's call"
+python3 deny_check.py "$work" || fail "the deny lever didn't deny the halted agent's call, or cut the one under way"
 
-# The denied call is a signed event in the log, in the agent's name.
+# wake-proxy counted both.
+curl -fsS http://localhost:9464/metrics > "$work/metrics.txt"
+grep -Eq '^wake_proxy_denied_total [1-9]' "$work/metrics.txt" || fail "wake_proxy_denied_total didn't count the denial"
+grep -Eq '^wake_proxy_cut_total [1-9]' "$work/metrics.txt" || fail "wake_proxy_cut_total didn't count the cut"
+
+# The denied call and the cut one are signed events in the log, in the agent's name.
 for _ in $(seq 1 30); do
   verify -entries > "$work/entries.jsonl" 2>/dev/null || true
   if python3 - "$work/entries.jsonl" <<'PY'
 import json, sys
+found = {}
 for line in open(sys.argv[1]):
     entry = json.loads(line)
     a = (entry.get("event") or {}).get("attributes") or {}
-    if (entry.get("signed") and a.get("wake.event.kind") == "denied" and a.get("wake.agent.id") == "smoke-test"
-            and a.get("wake.brake.halt_id") == "smoke-halt" and a.get("wake.capture") == "proxy"):
-        print(f"the denial is entry {entry.get('index')}, signed by {entry.get('signer')}")
-        sys.exit(0)
+    if not (entry.get("signed") and a.get("wake.event.kind") == "denied" and a.get("wake.agent.id") == "smoke-test"
+            and a.get("wake.capture") == "proxy"):
+        continue
+    payload = entry.get("payload")
+    payload = json.loads(payload) if isinstance(payload, str) else payload or {}
+    halt = a.get("wake.brake.halt_id")
+    if halt == "smoke-halt" or (halt == "smoke-cut" and payload.get("cut") is True and payload.get("receiver") == "research"):
+        found[halt] = f"entry {entry.get('index')}, signed by {entry.get('signer')}"
+if len(found) == 2:
+    print(f"the denial is {found['smoke-halt']}, and the cut {found['smoke-cut']}")
+    sys.exit(0)
 sys.exit(1)
 PY
   then
@@ -95,4 +112,4 @@ PY
   fi
   sleep 1
 done
-fail "the denied call isn't in the signed log"
+fail "the denied call or the cut one isn't in the signed log"

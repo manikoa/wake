@@ -70,6 +70,10 @@ enum Command {
         /// Where the SDKs' memory adapters fetch the memory quarantines (read only).
         #[arg(long)]
         memory_listen: Option<String>,
+        /// Where Prometheus scrapes the processor's metrics, at /metrics: calls seen,
+        /// dropped and cut, events sent, and the halts in force.
+        #[arg(long)]
+        metrics_listen: Option<String>,
     },
     /// Initialize the halts state: a new, empty state with a new epoch. The deny lever
     /// denies every call until this has been done once, so a proxy that loses its state
@@ -215,6 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             trust_bundle,
             brake_id,
             memory_listen,
+            metrics_listen,
         } => {
             let key_pem = std::fs::read_to_string(key)?;
             let cert_pem = std::fs::read_to_string(cert)?;
@@ -257,6 +262,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(memory_listen, "serving memory rules to memory adapters");
                 tokio::spawn(wake_proxy::memory::serve(listener, halts.clone(), stopping()));
             }
+            if let Some(metrics_listen) = metrics_listen {
+                let listener = tokio::net::TcpListener::bind(&metrics_listen).await?;
+                tracing::info!(metrics_listen, "serving metrics at /metrics");
+                tokio::spawn(wake_proxy::metrics::serve(
+                    listener,
+                    counters.clone(),
+                    halts.clone(),
+                    stopping(),
+                ));
+            }
             if let Some(control_listen) = control_listen {
                 let bundle = trust_bundle.ok_or("--control-listen needs --trust-bundle")?;
                 let tls = control::Tls {
@@ -286,9 +301,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sent = Counters::get(&stats.sent),
                         hooks_dropped = Counters::get(&stats.hooks_dropped),
                         export_dropped = Counters::get(&stats.export_dropped),
+                        truncated = Counters::get(&stats.truncated),
                         paired_by_id = Counters::get(&stats.paired_by_id),
                         paired_in_order = Counters::get(&stats.paired_in_order),
                         denied = Counters::get(&stats.denied),
+                        cut = Counters::get(&stats.cut),
                         "recording"
                     );
                 }
@@ -310,6 +327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 paired_by_id = Counters::get(&counters.paired_by_id),
                 paired_in_order = Counters::get(&counters.paired_in_order),
                 denied = Counters::get(&counters.denied),
+                cut = Counters::get(&counters.cut),
                 "stopped"
             );
         }

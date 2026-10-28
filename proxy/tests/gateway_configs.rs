@@ -135,6 +135,33 @@ fn mcp_capture_can_pair_each_response_with_its_request() {
     }
 }
 
+/// A halt that lands during a call is enforced by the capture hooks: ext_proc cuts an A2A
+/// exchange, and ExtMCP keeps a result from its caller. So they must see the caller as the
+/// deny lever does, or a halt would cut other agents' calls, or miss the halted one's.
+#[test]
+fn the_capture_hooks_see_the_caller_the_deny_lever_does() {
+    for (path, _) in CONFIGS {
+        let config = load(path);
+        let gateway = &config["gateways"]["default"]["extAuthz"]["protocol"]["grpc"]["metadata"]["wake"];
+        let caller = gateway
+            .as_str()
+            .and_then(|w| w.trim().strip_prefix(r#"{"agent":"#))
+            .and_then(|w| w.strip_suffix('}'))
+            .map(str::trim)
+            .unwrap_or_else(|| panic!("{path}: the gateway's extAuthz must send {{\"agent\": <caller>}}"));
+        for (i, route) in config["routes"].as_vec().unwrap().iter().enumerate() {
+            let policies = &route["policies"];
+            if let Some(sender) = policies["extProc"]["requestAttributes"]["sender"].as_str() {
+                assert_eq!(sender.trim(), caller, "{path}: route #{i}: extProc's sender");
+            }
+            for processor in policies["mcpGuardrails"]["processors"].as_vec().into_iter().flatten() {
+                let agent = processor["metadata"]["agent"].as_str().unwrap_or_default();
+                assert_eq!(agent.trim(), caller, "{path}: route #{i}: mcpGuardrails' agent");
+            }
+        }
+    }
+}
+
 /// Every host a config calls wake-proxy's hooks on.
 fn hook_hosts(config: &Yaml) -> Vec<String> {
     let mut hosts = vec![];

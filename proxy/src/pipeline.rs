@@ -35,7 +35,8 @@ pub struct Options {
     /// requests waiting for their responses, A2A bodies being captured, and events on
     /// their way to the collector.
     pub queue_bytes: usize,
-    /// The halts in force, which the ext_authz service enforces.
+    /// The halts in force, which the ext_authz service enforces, and ext_proc and ExtMCP
+    /// enforce on calls already under way.
     pub halts: Arc<Halts>,
 }
 
@@ -142,11 +143,19 @@ where
         emit(capture.expire(SystemTime::now() + timeout));
     });
 
-    let agents = options.halts.agents().clone();
     let bodies = Budget::new(options.queue_bytes);
     let result = tonic::transport::Server::builder()
-        .add_service(Processor::new(hooks_tx, hooks_budget, counters.clone(), agents.clone()).server())
-        .add_service(extproc::Processor::new(events.clone(), agents, bodies).server())
+        .add_service(
+            Processor::new(
+                hooks_tx,
+                hooks_budget,
+                counters.clone(),
+                options.halts.clone(),
+                events.clone(),
+            )
+            .server(),
+        )
+        .add_service(extproc::Processor::new(events.clone(), options.halts.clone(), bodies, counters.clone()).server())
         .add_service(Authorizer::new(options.halts.clone(), events, counters).server())
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
