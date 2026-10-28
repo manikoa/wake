@@ -6,8 +6,11 @@ FROM node:24-bookworm-slim AS build
 RUN npm install --global pnpm@12.15.0
 WORKDIR /src
 # The SDK first, built from source, then the agent, which takes it as a file: dependency.
+# Building the SDK needs its development dependencies but none of their optional ones, such
+# as the Claude Agent SDK's native Claude Code, nearly 300 MB nothing here runs. Every
+# image the game day builds has to fit one CI runner's disk.
 COPY sdk/typescript/package.json sdk/typescript/pnpm-lock.yaml sdk/typescript/tsconfig.json sdk/typescript/tsconfig.build.json sdk/typescript/
-RUN cd sdk/typescript && pnpm install --frozen-lockfile
+RUN cd sdk/typescript && pnpm install --frozen-lockfile --no-optional
 COPY sdk/typescript/src sdk/typescript/src
 RUN cd sdk/typescript && pnpm build
 COPY examples/fleet/notify/package.json examples/fleet/notify/pnpm-lock.yaml examples/fleet/notify/tsconfig.json examples/fleet/notify/
