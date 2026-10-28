@@ -9,3 +9,8 @@ proxy/target/
 proxy/keys/
 node_modules/
 sdk/typescript/dist/
+# Copied in from the repository's root when the TypeScript SDK is packed.
+sdk/typescript/LICENSE
+sdk/typescript/NOTICE
+sdk/typescript/pack/
+sdk/typescript/*.tgz
