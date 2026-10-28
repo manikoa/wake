@@ -542,8 +542,8 @@ impl Halts {
 
     /// The same, for a caller that may have presented a token (token.rs). A halt covers the
     /// call when it names the caller, the receiver, an agent the call is made under, or the
-    /// token itself. A delegated token's call is made under every actor in its chain and
-    /// whom they act for, its subject: halting an agent halts the sub-agents acting for it.
+    /// token itself. A call is made under every actor in its token's chain and whom they act
+    /// for, its subject (Token::under): halting an agent halts the sub-agents acting for it.
     ///
     /// A caller the identity map doesn't list could be a halted agent, so every agent halt
     /// denies it. But one whose own token's chain passes through an agent the map lists is
@@ -557,18 +557,11 @@ impl Halts {
         let state = self.current();
         let identity = caller.filter(|c| !c.is_empty());
         let receiver = receiver.filter(|r| !r.is_empty()).map(|r| self.agents.named(r));
-        let delegated = token.filter(|t| !t.actors.is_empty());
-        let chain: Vec<&str> = delegated
-            .map(|t| {
-                t.actors
-                    .iter()
-                    .chain([&t.subject])
-                    .map(|a| self.agents.named(a))
-                    .collect()
-            })
+        let chain: Vec<&str> = token
+            .map(|t| t.under().map(|a| self.agents.named(a)).collect())
             .unwrap_or_default();
-        let own = delegated.filter(|t| identity.is_some_and(|i| t.actors[0] == i));
-        let placed = own.is_some_and(|t| !t.cut && t.actors.iter().chain([&t.subject]).any(|a| self.agents.knows(a)));
+        let own = token.filter(|t| identity.is_some_and(|i| t.actors.first().is_some_and(|a| a == i)));
+        let placed = own.is_some_and(|t| !t.cut && t.under().any(|a| self.agents.knows(a)));
         let unknown = (self.agents.caller(identity).is_none() && !placed) || token.is_some_and(|t| t.cut);
         let token_id = token.and_then(|t| t.id.as_deref());
         let names = |agent: &str, halt: &Halt| halt.scope.agents.iter().any(|h| self.agents.named(h) == agent);
@@ -822,6 +815,12 @@ mod tests {
         );
         assert_eq!(
             ids(halts.deciding_with(Some("support/researcher/fetch#toolu_9"), None, Some(&grandchild))),
+            ["h1"]
+        );
+        // Over mTLS, a caller presenting a token issued to support acts as support.
+        let supports_own = token("support", &[], "tok-5");
+        assert_eq!(
+            ids(halts.deciding_with(Some("spiffe://wake.local/agent/other"), None, Some(&supports_own))),
             ["h1"]
         );
         // An agent outside support's chain goes on, with or without a token.

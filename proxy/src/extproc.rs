@@ -44,7 +44,7 @@ use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp::{self, TraceParent};
-use crate::origins::{Observed, Who};
+use crate::origins::{self, Observed, Who};
 use crate::policy::{FlowPolicy, Policy};
 use crate::token::Token;
 
@@ -173,8 +173,12 @@ impl Exchange {
             let who = receiver.map(Who::Agent).unwrap_or(Who::Nobody);
             observed.note(who, &format!("agent:{}", self.sender), at);
         } else {
-            let who = Who::of(&self.agents, self.call.caller.as_deref());
-            observed.note(who, &format!("agent:{}", self.receiver), at);
+            // The reply reaches the agents the sender acts under too.
+            let origin = format!("agent:{}", self.receiver);
+            observed.note(Who::of(&self.agents, self.call.caller.as_deref()), &origin, at);
+            for under in origins::under(&self.agents, self.call.token.as_ref()) {
+                observed.note(under, &origin, at);
+            }
         }
     }
 
@@ -929,6 +933,37 @@ mod tests {
         // So does the reply reach planner.
         x.handle(phase(Phase::ResponseHeaders(headers(&[(":status", "200")]))), t(2));
         assert_eq!(seen("planner"), Seen::These(vec!["agent:research".into()]));
+    }
+
+    #[test]
+    fn a_reply_reaches_the_agents_the_sender_acts_under() {
+        use crate::origins::Seen;
+        use crate::token::{facts, text};
+        let observed = Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS));
+        let mut x = Exchange::default().with_observed(Some(observed.clone()));
+        let seen = |agent: &str| observed.seen(Who::Agent(agent), nanos(t(10)), 900);
+        // Planner's scout, acting under planner, asks research.
+        let mut request = first(&[(":method", "POST")]);
+        let chain = facts(&[
+            ("sub", text("planner/scout#toolu_3")),
+            ("act", facts(&[("sub", text("planner"))])),
+        ]);
+        request.attributes.get_mut(ATTRIBUTES).unwrap().fields.insert(
+            ATTR_SENDER_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("act", chain)]),
+        );
+        x.handle(request, t(0));
+        x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        x.handle(phase(Phase::ResponseHeaders(headers(&[(":status", "200")]))), t(2));
+        let reply = Seen::These(vec!["agent:research".into()]);
+        assert_eq!(seen("spiffe://wake.local/agent/planner"), reply, "the sender");
+        assert_eq!(seen("planner/scout#toolu_3"), reply);
+        assert_eq!(seen("planner"), reply, "what the scout heard goes back to planner");
+        // The message reaches research alone: its route says nothing of a chain.
+        assert_eq!(
+            seen("research"),
+            Seen::These(vec!["agent:spiffe://wake.local/agent/planner".into()])
+        );
     }
 
     #[test]

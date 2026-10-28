@@ -30,7 +30,7 @@ use crate::capture::{Hook, META_AGENT, META_EVENT_ID};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts, now};
 use crate::mcp;
-use crate::origins::{Observed, Who};
+use crate::origins::{self, Observed, Who};
 use crate::policy::{At, FlowPolicy, Policy, Target};
 use crate::token::{self, Token};
 
@@ -217,6 +217,7 @@ impl ExtMcp for Processor {
             let policy = self.policy.current();
             let checked = Target {
                 caller: who,
+                token: token.as_ref(),
                 receiver: None,
                 path: None,
                 tool: Some(&tool),
@@ -242,7 +243,12 @@ impl ExtMcp for Processor {
                     metadata: None,
                 }));
             }
-            self.observed.note(who, &format!("tool:{tool}"), at);
+            // What the tool returns reaches the agents the caller acts under too.
+            let origin = format!("tool:{tool}");
+            self.observed.note(who, &origin, at);
+            for under in origins::under(self.agents(), token.as_ref()) {
+                self.observed.note(under, &origin, at);
+            }
         }
         self.counters.mcp_calls.fetch_add(1, Ordering::Relaxed);
         let event_id = uuid::Uuid::new_v4().to_string();
@@ -385,6 +391,100 @@ mod tests {
         // Support fetched nothing, and the rule isn't about support anyway.
         let r = p.check_request(call("support", "pay")).await.unwrap();
         assert_eq!(refused(r.get_ref()), None);
+    }
+
+    /// A call from a sub-agent with a token support delegated to it for a user. A cut one's
+    /// chain goes on past an actor that can't be read.
+    fn delegated(child: &str, tool: &str, cut: bool) -> Request<McpRequest> {
+        use crate::token::{facts, text};
+        let mut request = call(child, tool);
+        let support = if cut {
+            facts(&[("sub", text("support")), ("act", facts(&[("iss", text("idp"))]))])
+        } else {
+            facts(&[("sub", text("support"))])
+        };
+        let chain = facts(&[("sub", text(child)), ("act", support)]);
+        request.get_mut().metadata_context.as_mut().unwrap().fields.insert(
+            token::META_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("jti", text("tok-1")), ("act", chain)]),
+        );
+        request
+    }
+
+    fn no_pay_after_web() -> (Processor, Arc<Observed>, mpsc::Receiver<crate::budget::Queued>) {
+        let counters = Arc::new(Counters::default());
+        let (hooks, _hooks_rx) = mpsc::channel(16);
+        let (events, events_rx) = Events::channel(16, Budget::new(1 << 20), counters.clone());
+        let policy = FlowPolicy::parse(
+            br#"{"rules": [{"id": "no-pay-after-web", "callers": ["support"], "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}]}"#,
+        )
+        .unwrap();
+        let observed = Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS));
+        let p = Processor::new(
+            hooks,
+            Budget::new(1 << 20),
+            counters,
+            Arc::new(Halts::in_memory()),
+            events,
+        )
+        .with_policy(Arc::new(Policy::fixed(policy)), observed.clone());
+        (p, observed, events_rx)
+    }
+
+    const CHILD: &str = "support/researcher#toolu_1";
+
+    #[tokio::test]
+    async fn a_sub_agent_cant_act_on_what_entered_its_parent() {
+        let (p, _observed, mut events_rx) = no_pay_after_web();
+        let r = p.check_request(delegated(CHILD, "pay", false)).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None, "nothing has entered either yet");
+        // Support fetches a page, and hands the job to a sub-agent: it can't pay either.
+        p.check_request(call("support", "fetch_page")).await.unwrap();
+        let r = p.check_request(delegated(CHILD, "pay", false)).await.unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+        let event = events_rx.try_recv().unwrap().event;
+        assert_eq!(event.str("wake.agent.id"), Some(CHILD));
+        assert_eq!(event.str("wake.token.id"), Some("tok-1"));
+        let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["origins"], serde_json::json!(["tool:fetch_page"]));
+        // Without the token, it's a caller of its own: the token is what puts it under support.
+        let r = p.check_request(call(CHILD, "pay")).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None);
+    }
+
+    #[tokio::test]
+    async fn a_parent_cant_act_on_what_entered_its_sub_agent() {
+        let (p, observed, _events_rx) = no_pay_after_web();
+        // A sub-agent fetches a page; what it found goes back to support.
+        p.check_request(delegated(CHILD, "fetch_page", false)).await.unwrap();
+        for agent in [CHILD, "support"] {
+            assert!(
+                matches!(observed.seen(Who::Agent(agent), now(), 900), Seen::These(o) if o == ["tool:fetch_page"]),
+                "{agent}"
+            );
+        }
+        let r = p.check_request(call("support", "pay")).await.unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+        // A sibling under support acts on what support has now.
+        let r = p
+            .check_request(delegated("support/researcher#toolu_2", "pay", false))
+            .await
+            .unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+    }
+
+    #[tokio::test]
+    async fn a_cut_chain_counts_as_every_origin() {
+        let (p, _observed, mut events_rx) = no_pay_after_web();
+        let r = p.check_request(delegated(CHILD, "pay", true)).await.unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+        let event = events_rx.try_recv().unwrap().event;
+        let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["every_origin"], origins::CUT_CHAIN);
+        assert_eq!(
+            event.attributes["wake.token.actors_cut"],
+            crate::canonical::Value::Bool(true)
+        );
     }
 
     #[tokio::test]

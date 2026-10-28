@@ -91,6 +91,13 @@ impl Token {
         })
     }
 
+    /// Whom a call made with it is made under, besides its caller: each actor in its chain,
+    /// the one acting now first, then whom they act for, its subject. Without a chain the
+    /// subject is the agent the token was issued to.
+    pub fn under(&self) -> impl Iterator<Item = &str> {
+        self.actors.iter().chain([&self.subject]).map(String::as_str)
+    }
+
     /// Records the token on an event: `wake.token.subject`, `wake.token.actors`,
     /// `wake.token.actors_cut`, `wake.token.id`, `wake.token.expires_unix` and
     /// `wake.token.bound` (docs/events.md).

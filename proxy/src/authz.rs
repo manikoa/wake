@@ -22,7 +22,7 @@ use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp;
-use crate::origins::{Observed, Who};
+use crate::origins::{self, Observed, Seen, Who};
 use crate::policy::{At, Denial, FlowPolicy, Policy, Target};
 use crate::token::{self, Token};
 
@@ -246,7 +246,8 @@ pub fn policy_denied_event(call: &Call, denial: &Denial, agents: &Agents, at: u6
     e
 }
 
-/// What a policy decides on for a call from caller: what entered it within the window.
+/// What a policy decides on for a call from caller: what entered it, or any agent the call
+/// is made under, within the window.
 pub fn check_policy(
     policy: &FlowPolicy,
     observed: &Observed,
@@ -255,7 +256,13 @@ pub fn check_policy(
     target: &Target<'_>,
     now: u64,
 ) -> Option<Denial> {
-    let seen = observed.seen(target.caller, now, policy.window_seconds);
+    let seen = if target.token.is_some_and(|t| t.cut) {
+        Seen::Every(origins::CUT_CHAIN)
+    } else {
+        let mut whos = origins::under(agents, target.token);
+        whos.insert(0, target.caller);
+        observed.seen_by(&whos, now, policy.window_seconds)
+    };
     policy.deciding(at_hook, target, &seen, agents)
 }
 
@@ -324,6 +331,7 @@ impl Authorization for Authorizer {
         }
         let target = Target {
             caller: Who::of(agents, call.caller.as_deref()),
+            token: call.token.as_ref(),
             receiver: call.receiver.as_deref(),
             path: Some(&call.path),
             tool: None,
