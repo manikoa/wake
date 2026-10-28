@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
 
@@ -38,6 +39,27 @@ const (
 func IsEvent(span ptrace.Span) bool {
 	_, ok := span.Attributes().Get(Kind)
 	return ok
+}
+
+// DropRepeatedKeys keeps only the first attribute with each key and returns the first key
+// that was repeated, if any. OTLP says keys are unique, but nothing on the wire enforces
+// it, and a lookup (the first wins) and Canonical (the last wins) would read two
+// different events from one span: a sender could get a capture or a payload digest signed
+// that the collector never checked.
+func DropRepeatedKeys(span ptrace.Span) (string, bool) {
+	seen := map[string]bool{}
+	repeated := ""
+	span.Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
+		if seen[key] {
+			if repeated == "" {
+				repeated = key
+			}
+			return true
+		}
+		seen[key] = true
+		return false
+	})
+	return repeated, repeated != ""
 }
 
 // Canonical returns the exact bytes a signer signs for span: a JSON object with
@@ -95,8 +117,12 @@ func digest(payload []byte) string {
 // Sign signs span and records the signature and the signer's name on it. It sets the
 // payload's digest first, from the bytes received, so the signature commits to the
 // payload that arrived and not to a digest the sender claimed. An event with no payload
-// gets no digest.
+// gets no digest. Any signature fields the sender set, such as a certificate, are dropped
+// first, so the entry carries only what this signer adds.
 func Sign(span ptrace.Span, signer note.Signer) error {
+	span.Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
+		return key == Signer || strings.HasPrefix(key, Signature)
+	})
 	if payload, ok := PayloadOf(span); ok {
 		span.Attributes().PutStr(PayloadSHA256, digest(payload))
 	} else {
