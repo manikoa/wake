@@ -52,6 +52,15 @@ export const LABEL_KEY = "__wake__";
 export const LABEL_SUFFIX = ".wake.json";
 /** The id a write is refused under, and an entry not served, when checking the quarantine fails. */
 export const UNCHECKED = "quarantine-check-failed";
+export const GATE_DENIED = "write-gate-denied";
+
+export type WriteSnapshot = {
+  event: string;
+  origins: string[];
+  sha256: string;
+  agent: string;
+  content: string;
+};
 
 /** What write() hands back, to keep with the entry. */
 export type WriteLabel = {
@@ -59,7 +68,10 @@ export type WriteLabel = {
   origins: string[];
   sha256: string;
   agent: string;
+  previous?: WriteSnapshot[];
 };
+
+export type WriteGate = (store: string, entry: string, content: string, origins: string[]) => boolean | Promise<boolean>;
 
 export function digest(content: string): string {
   return events.sha256(content);
@@ -114,10 +126,12 @@ async function resolved(path: string): Promise<string> {
 export class Memory {
   readonly #handler: Recording;
   readonly #quarantine?: Quarantine;
+  readonly #gate?: WriteGate;
 
-  constructor(handler: Recording, options: { quarantine?: Quarantine } = {}) {
+  constructor(handler: Recording, options: { quarantine?: Quarantine; gate?: WriteGate } = {}) {
     this.#handler = handler;
     this.#quarantine = options.quarantine;
+    this.#gate = options.gate;
   }
 
   get quarantine(): Quarantine | undefined {
@@ -133,8 +147,17 @@ export class Memory {
    */
   async write(store: string, entry: string, content: unknown, current?: unknown, label?: Label | null): Promise<WriteLabel | null> {
     await this.#check("write", store, entry, current, label);
+    const text = contentOf(content);
+    if (this.#gate) {
+      const { parents, origins } = this.#parentsAndOrigins(text);
+      const allowed = await this.#gate(store, entry, text, origins);
+      if (!allowed) {
+        this.#refused("write", store, entry, GATE_DENIED, parents);
+        throw new MemoryLocked(GATE_DENIED, store, entry);
+      }
+    }
     try {
-      return this.#write(store, entry, contentOf(content));
+      return this.#write(store, entry, text);
     } catch (error) {
       this._failed("a memory write", error);
       return null;
@@ -198,21 +221,78 @@ export class Memory {
    */
   async writeFile(path: string, text: string): Promise<void> {
     const file = await resolved(path);
-    let current: string | undefined;
-    let currentLabel: Label | null = null;
-    if (this.#quarantine !== undefined) {
-      current = await readFile(path, "utf8").catch(() => undefined);
-      if (current !== undefined) currentLabel = await this.#labelOf(path);
+    const current = await readFile(path, "utf8").catch(() => undefined);
+    const currentLabel = current !== undefined ? await this.#labelOf(path) : null;
+    let previous: WriteSnapshot[] = [];
+    if (current !== undefined && currentLabel !== null && eventId(currentLabel.event)) {
+      const prior = Array.isArray((currentLabel as WriteLabel).previous)
+        ? ((currentLabel as WriteLabel).previous ?? [])
+        : [];
+      previous = [
+        {
+          event: String(currentLabel.event),
+          origins: Array.isArray(currentLabel.origins)
+            ? currentLabel.origins.filter((o): o is string => typeof o === "string")
+            : [],
+          sha256: typeof currentLabel.sha256 === "string" ? currentLabel.sha256 : digest(current),
+          agent: typeof currentLabel.agent === "string" ? currentLabel.agent : "",
+          content: current,
+        },
+        ...prior,
+      ].slice(0, 16);
     }
     const label = await this.write("file", file, text, current, currentLabel);
     if (label !== null) {
+      const fullLabel: WriteLabel = previous.length > 0 ? { ...label, previous } : label;
       try {
-        await writeAtomically(path + LABEL_SUFFIX, JSON.stringify(label));
+        await writeAtomically(path + LABEL_SUFFIX, JSON.stringify(fullLabel));
       } catch (error) {
         this._failed("a memory file's label", error);
       }
     }
     await writeAtomically(file, text);
+  }
+
+  /**
+   * Rolls a memory file and its .wake.json label back to a prior versioned snapshot (or the
+   * immediately preceding snapshot when targetEventId is omitted), recording a memory_write
+   * event.
+   */
+  async rollbackFile(path: string, targetEventId?: string): Promise<WriteLabel> {
+    const file = await resolved(path);
+    const currentLabel = await this.#labelOf(path);
+    const history = currentLabel && Array.isArray((currentLabel as WriteLabel).previous)
+      ? ((currentLabel as WriteLabel).previous ?? [])
+      : [];
+    if (history.length === 0) {
+      throw new Error(`no rollback history in ${path}${LABEL_SUFFIX}`);
+    }
+    const idx = targetEventId ? history.findIndex((h) => h.event === targetEventId) : 0;
+    if (idx < 0) {
+      throw new Error(`rollback target ${targetEventId} not found in ${path}${LABEL_SUFFIX}`);
+    }
+    const snapshot = history[idx];
+    const remaining = history.slice(idx + 1);
+    const restoredLabel: WriteLabel = {
+      event: snapshot.event,
+      origins: snapshot.origins,
+      sha256: snapshot.sha256,
+      agent: snapshot.agent,
+      ...(remaining.length > 0 ? { previous: remaining } : {}),
+    };
+    try {
+      this.#emit(randomUUID(), events.MEMORY_WRITE, this.#handler._eventContext(), [snapshot.event], [], {
+        "wake.memory.store": "file",
+        "wake.memory.entry": file,
+        "wake.memory.rollback_to": snapshot.event,
+        "wake.memory.origins": snapshot.origins,
+      }, { store: "file", entry: file, content: snapshot.content, rollback_to: snapshot.event });
+    } catch (error) {
+      this._failed("a memory rollback", error);
+    }
+    await writeAtomically(path + LABEL_SUFFIX, JSON.stringify(restoredLabel));
+    await writeAtomically(file, snapshot.content);
+    return restoredLabel;
   }
 
   /** Reads a memory file and records the read, with its label if it has one. */
@@ -292,7 +372,7 @@ export class Memory {
     failed(this.#handler._recorder, what);
   }
 
-  #write(store: string, entry: string, content: string): WriteLabel {
+  #parentsAndOrigins(content: string): { parents: string[]; origins: string[]; context: Context | undefined } {
     const h = this.#handler;
     const context = h._eventContext();
     const traceId = traceIdOf(context);
@@ -300,6 +380,12 @@ export class Memory {
     if (traceId) parents.push(...h._matchingOutputs(traceId, content));
     parents = unique(parents);
     const origins = h._originsUpstream(parents);
+    return { parents, origins, context };
+  }
+
+  #write(store: string, entry: string, content: string): WriteLabel {
+    const h = this.#handler;
+    const { parents, origins, context } = this.#parentsAndOrigins(content);
     const id = randomUUID();
     const label = { event: id, origins, sha256: digest(content), agent: h._currentAgent() };
     this.#emit(id, events.MEMORY_WRITE, context, parents, [], {

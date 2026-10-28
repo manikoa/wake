@@ -18,4 +18,5 @@ pub mod mcp;
 pub mod memory;
 pub mod metrics;
 pub mod pipeline;
+pub mod policy;
 pub mod signer;

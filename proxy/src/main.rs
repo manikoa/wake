@@ -12,6 +12,7 @@ use wake_proxy::export::Counters;
 use wake_proxy::halts::Halts;
 use wake_proxy::listen::Hooks;
 use wake_proxy::pipeline::{self, Options};
+use wake_proxy::policy::FlowPolicy;
 use wake_proxy::signer::{DevExtras, Signer, dev_identity_with};
 
 #[derive(Parser)]
@@ -74,6 +75,9 @@ enum Command {
         /// dropped and cut, events sent, and the halts in force.
         #[arg(long)]
         metrics_listen: Option<String>,
+        /// Optional JSON flow policy file enforced at ext_authz (fails closed if unreadable).
+        #[arg(long)]
+        policy_file: Option<PathBuf>,
     },
     /// Initialize the halts state: a new, empty state with a new epoch. The deny lever
     /// denies every call until this has been done once, so a proxy that loses its state
@@ -220,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             brake_id,
             memory_listen,
             metrics_listen,
+            policy_file,
         } => {
             let key_pem = std::fs::read_to_string(key)?;
             let cert_pem = std::fs::read_to_string(cert)?;
@@ -232,6 +237,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => Agents::none(),
             };
             let halts = Arc::new(Halts::load(&state_dir).with_agents(Arc::new(agents)));
+            let policy = Arc::new(
+                policy_file
+                    .as_deref()
+                    .map(FlowPolicy::load)
+                    .unwrap_or_else(FlowPolicy::empty),
+            );
             let in_force = halts.state();
             tracing::info!(
                 version = in_force.version,
@@ -255,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 collector_ca,
                 response_timeout: Duration::from_secs(response_timeout),
                 halts: halts.clone(),
+                policy,
                 ..Default::default()
             };
             if let Some(memory_listen) = memory_listen {

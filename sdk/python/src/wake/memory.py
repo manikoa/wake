@@ -39,7 +39,7 @@ import logging
 import os
 import shutil
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,7 @@ LABEL_KEY = "__wake__"
 LABEL_SUFFIX = ".wake.json"
 # The id a write is refused under, and an entry not served, when checking the quarantine fails.
 UNCHECKED = "quarantine-check-failed"
+GATE_DENIED = "write-gate-denied"
 
 
 def digest(content: str) -> str:
@@ -92,9 +93,16 @@ class Memory:
     """Records memory writes and reads alongside the events an SDK integration records, such as a
     WakeCallbackHandler or a WakeClaudeAgent."""
 
-    def __init__(self, handler, quarantine: Quarantine | None = None) -> None:
+    def __init__(
+        self,
+        handler,
+        quarantine: Quarantine | None = None,
+        *,
+        gate: Callable[[str, str, str, list[str]], bool] | None = None,
+    ) -> None:
         self._handler = handler
         self._quarantine = quarantine
+        self._gate = gate
 
     @property
     def quarantine(self) -> Quarantine | None:
@@ -109,8 +117,14 @@ class Memory:
         the brake's quarantine locks this agent's writes, or hides the entry: a quarantined
         entry is kept, as evidence, not overwritten."""
         self._check("write", store, entry, current, label)
+        text = content_of(content)
+        if self._gate is not None:
+            parents, origins = self._parents_and_origins(text)
+            if not self._gate(store, entry, text, origins):
+                self._refused("write", store, entry, GATE_DENIED, parents=parents)
+                raise MemoryLocked(GATE_DENIED, store, entry)
         try:
-            return self._write(store, entry, content_of(content))
+            return self._write(store, entry, text)
         except Exception:
             self._failed("a memory write")
             return None
@@ -157,18 +171,87 @@ class Memory:
         lands first and each file is replaced whole, so the new content is never found
         with a label that doesn't vouch for it, only the other way round, which reads as
         changed. Raises MemoryLocked when the quarantine locks this agent's writes or hides
-        the file as it is now."""
+        the file as it is now. Preserves up to 16 versioned snapshots in `previous` for
+        rollback."""
         path = Path(path)
         current = current_label = None
         if self._quarantine is not None and path.exists():
             current, current_label = path.read_text(), self._label_of(path)
+        previous: list[dict[str, Any]] = []
+        try:
+            if path.exists():
+                old_text = current if current is not None else path.read_text()
+                old_label = current_label if current_label is not None else self._label_of(path)
+                if isinstance(old_label, Mapping) and _event_id(old_label.get("event")):
+                    prior = [p for p in old_label.get("previous", []) if isinstance(p, dict)]
+                    previous = [
+                        {
+                            "event": old_label["event"],
+                            "origins": list(old_label.get("origins", [])),
+                            "sha256": old_label.get("sha256", digest(old_text)),
+                            "agent": old_label.get("agent", ""),
+                            "content": old_text,
+                        },
+                        *prior,
+                    ][:16]
+        except OSError:
+            previous = []
         label = self.write("file", str(path.resolve()), text, current, current_label)
         if label is not None:
+            if previous:
+                label = {**label, "previous": previous}
             try:
                 _write_atomically(Path(str(path) + LABEL_SUFFIX), json.dumps(label))
             except OSError:
                 self._failed("a memory file's label")
         _write_atomically(path.resolve(), text)
+
+    def rollback_file(self, path: str | Path, target_event_id: str | None = None) -> dict[str, Any]:
+        """Rolls a memory file and its .wake.json label back to a prior versioned snapshot
+        (or the immediately preceding snapshot when target_event_id is None), recording a
+        memory_write event."""
+        path = Path(path)
+        label_path = Path(str(path) + LABEL_SUFFIX)
+        current_label = self._label_of(path)
+        history = current_label.get("previous") if isinstance(current_label, Mapping) else None
+        if not isinstance(history, list) or not history:
+            raise ValueError(f"no rollback history in {label_path}")
+        idx = 0
+        if target_event_id is not None:
+            idx = next((i for i, h in enumerate(history) if isinstance(h, Mapping) and h.get("event") == target_event_id), -1)
+            if idx < 0:
+                raise ValueError(f"rollback target {target_event_id} not found in {label_path}")
+        snapshot = history[idx]
+        remaining = history[idx + 1 :]
+        restored_label: dict[str, Any] = {
+            "event": snapshot["event"],
+            "origins": list(snapshot.get("origins", [])),
+            "sha256": snapshot["sha256"],
+            "agent": snapshot.get("agent", ""),
+        }
+        if remaining:
+            restored_label["previous"] = remaining
+        entry = str(path.resolve())
+        try:
+            self._emit(
+                str(uuid.uuid4()),
+                events.MEMORY_WRITE,
+                self._handler._event_context(),
+                parents=[snapshot["event"]],
+                origins=[],
+                attributes={
+                    "wake.memory.store": "file",
+                    "wake.memory.entry": entry,
+                    "wake.memory.rollback_to": snapshot["event"],
+                    "wake.memory.origins": restored_label["origins"],
+                },
+                payload={"store": "file", "entry": entry, "content": snapshot["content"], "rollback_to": snapshot["event"]},
+            )
+        except Exception:
+            self._failed("a memory rollback")
+        _write_atomically(label_path, json.dumps(restored_label))
+        _write_atomically(path.resolve(), snapshot["content"])
+        return restored_label
 
     def read_file(self, path: str | Path) -> str:
         """Reads a memory file and records the read, with its label if it has one."""
@@ -243,7 +326,7 @@ class Memory:
         log.warning("wake: failed to record %s", what, exc_info=True)
         failed(self._handler._recorder, what)
 
-    def _write(self, store: str, entry: str, content: str) -> dict[str, Any]:
+    def _parents_and_origins(self, content: str) -> tuple[list[str], list[str]]:
         h = self._handler
         context = h._event_context()
         trace_id = trace.get_current_span(context).get_span_context().trace_id if context else 0
@@ -255,6 +338,12 @@ class Memory:
             parents += h._matching_outputs(trace_id, content)
         parents = list(dict.fromkeys(parents))
         origins = h._origins_upstream(parents)
+        return parents, origins
+
+    def _write(self, store: str, entry: str, content: str) -> dict[str, Any]:
+        h = self._handler
+        context = h._event_context()
+        parents, origins = self._parents_and_origins(content)
         event_id = str(uuid.uuid4())
         label = {"event": event_id, "origins": origins, "sha256": digest(content), "agent": h._current_agent()}
         self._emit(
