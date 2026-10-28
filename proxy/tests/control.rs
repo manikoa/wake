@@ -362,3 +362,59 @@ async fn clients_that_connect_and_stall_cant_keep_the_brake_out() {
         .unwrap();
     assert_eq!(listed.status(), 200);
 }
+
+#[tokio::test]
+async fn a_rotated_svid_and_bundle_serve_the_next_connection() {
+    let dir = std::env::temp_dir().join(format!("wake-control-svid-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |id: &wake_proxy::signer::DevIdentity| {
+        std::fs::write(dir.join("proxy.pem"), &id.cert_pem).unwrap();
+        std::fs::write(dir.join("proxy.key"), &id.key_pem).unwrap();
+        std::fs::write(dir.join("bundle.pem"), &id.ca_pem).unwrap();
+    };
+    let first = dev_identity_with_tls("spiffe://wake.local/proxy", &[], Some(BRAKE)).unwrap();
+    write(&first);
+    let svid = Arc::new(
+        wake_proxy::svid::Svid::from_files(
+            &dir.join("proxy.pem"),
+            &dir.join("proxy.key"),
+            Some(&dir.join("bundle.pem")),
+        )
+        .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}/v1/halts", listener.local_addr().unwrap());
+    let (_stop, stopped) = oneshot::channel::<()>();
+    let source = control::TlsSource::Svid {
+        svid: svid.clone(),
+        brake_id: BRAKE.into(),
+    };
+    tokio::spawn(async move {
+        control::serve(listener, Arc::new(Halts::in_memory()), source, async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
+    });
+    // A new client each time, so no connection made before a rotation is reused after it.
+    let brake = |id: &wake_proxy::signer::DevIdentity| {
+        let (cert, key) = id.brake.clone().unwrap();
+        reqwest::Client::builder()
+            .tls_certs_only([reqwest::Certificate::from_pem(id.ca_pem.as_bytes()).unwrap()])
+            .identity(reqwest::Identity::from_pem(format!("{cert}{key}").as_bytes()).unwrap())
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .unwrap()
+    };
+    assert_eq!(brake(&first).get(&url).send().await.unwrap().status(), 200);
+
+    // SPIRE rotates the proxy's SVID, and with a new CA, the bundle and the brake's SVID.
+    let second = dev_identity_with_tls("spiffe://wake.local/proxy", &[], Some(BRAKE)).unwrap();
+    write(&second);
+    assert_eq!(svid.reload(), Ok(true));
+    assert_eq!(brake(&second).get(&url).send().await.unwrap().status(), 200);
+    // The old ones no longer chain: the proxy's new SVID isn't under the old CA, and the
+    // brake's old SVID isn't under the new bundle.
+    assert!(brake(&first).get(&url).send().await.is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

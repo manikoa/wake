@@ -27,7 +27,7 @@ agentgateway's own OpenTelemetry spans carry MCP and A2A attributes but no bodie
 
 - It implements the ExtMCP, ext_proc and ext_authz servers (tonic, with vendored Apache 2.0 protos).
 - It builds each `wake.*` event, signs it and exports it over OTLP to the collector. agentgateway can't sign, so "the proxy signs its own events" in `docs/signing.md` means this processor does.
-- It gets its own SVID from the SPIRE Workload API. agentgateway never holds the key.
+- It reads its own SVID from the files SPIRE writes (`--cert`, `--key`, and `--trust-bundle` for the control API). It checks them every 5 seconds, and uses a rotated SVID once its key and certificate match. Until then, and if a file is broken, it keeps the SVID in use. agentgateway never holds the key. Reading it from the SPIRE Workload API instead waits for SPIRE.
 - It accepts calls only from agentgateway. Otherwise an agent could send it fake calls and get them signed. `--listen` takes a Unix socket (`unix:/run/wake/proxy.sock`), in a directory only agentgateway shares, or a loopback address, for agentgateway in the same pod; it refuses any other address. `deploy/compose.yaml` puts the socket in a volume only wake-proxy and agentgateway mount. mTLS checked against agentgateway's SVID, for the two on different hosts, isn't built yet.
 
 The processor is a new parsing surface for attacker-controlled MCP and A2A bodies, so it gets fuzz targets from the first commit.
@@ -188,6 +188,6 @@ Decided October 27, 2026. Anyone must be able to check a proxy event from the lo
   - The ECDSA signature, ASN.1 DER over SHA-256, checks out over `event`.
 - The collector (`trust_bundles` and `trusted_signers`) and the ingester are configured with the trust bundles and signers to accept. Publishing bundles next to the log is left until a design partner needs it.
 
-Updated October 27, 2026: the signer allowlist and the receipt time were added after an audit showed an agent's SVID could sign events as the proxy, and that a key from an expired SVID could still sign events dated while it was valid. The collector checks the SVID when the event arrives, so a proxy event that reaches it more than 5 minutes after its SVID expired is logged invalid. SPIRE rotates SVIDs at half their lifetime, which leaves the proxy at least that long to deliver.
+Updated October 27, 2026: the signer allowlist and the receipt time were added after an audit showed an agent's SVID could sign events as the proxy, and that a key from an expired SVID could still sign events dated while it was valid. The collector checks the SVID when the event arrives, so a proxy event that reaches it more than 5 minutes after its SVID expired is logged invalid. SPIRE rotates SVIDs at half their lifetime, which leaves the proxy at least that long to deliver. The proxy signs with the rotated SVID within 5 seconds of SPIRE writing it, so it never signs with an expired one while a new one is on disk.
 
 The cost is about 600 bytes per proxy event. Storing each certificate once next to the log and referring to it by digest would save the bytes, but it adds a second lookup to every check, so it waits until the size matters.

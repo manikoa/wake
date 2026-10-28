@@ -21,3 +21,4 @@ pub mod origins;
 pub mod pipeline;
 pub mod policy;
 pub mod signer;
+pub mod svid;

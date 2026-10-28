@@ -22,7 +22,7 @@ use crate::extproc;
 use crate::halts::Halts;
 use crate::origins::Observed;
 use crate::policy::{DEFAULT_WINDOW_SECS, FlowPolicy, Policy};
-use crate::signer::Signer;
+use crate::svid::Svid;
 
 pub struct Options {
     /// The collector's OTLP/HTTP base URL.
@@ -68,31 +68,31 @@ impl Default for Options {
 /// listen.rs.
 pub async fn serve(
     listener: TcpListener,
-    signer: Signer,
+    signer: impl Into<Arc<Svid>>,
     options: Options,
     counters: Arc<Counters>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    serve_incoming(incoming, signer, options, counters, shutdown).await
+    serve_incoming(incoming, signer.into(), options, counters, shutdown).await
 }
 
 /// The same, on a Unix socket shared only with agentgateway.
 #[cfg(unix)]
 pub async fn serve_unix(
     listener: tokio::net::UnixListener,
-    signer: Signer,
+    signer: impl Into<Arc<Svid>>,
     options: Options,
     counters: Arc<Counters>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
-    serve_incoming(incoming, signer, options, counters, shutdown).await
+    serve_incoming(incoming, signer.into(), options, counters, shutdown).await
 }
 
 async fn serve_incoming<I, IO, IE>(
     incoming: I,
-    signer: Signer,
+    signer: Arc<Svid>,
     options: Options,
     counters: Arc<Counters>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -114,7 +114,8 @@ where
     let sign_counters = counters.clone();
     let signed = tokio::spawn(async move {
         while let Some(mut queued) = unsigned_rx.recv().await {
-            signer.sign(&mut queued.event);
+            // The SVID in use now: SPIRE rotates it, and svid.rs reads the new one.
+            signer.current().signer.sign(&mut queued.event);
             if signed_tx.try_send(queued).is_err() {
                 sign_counters.export_dropped.fetch_add(1, Ordering::Relaxed);
             }
