@@ -53,3 +53,10 @@ path = "fuzz_targets/authz_check.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "flow_policy"
+path = "fuzz_targets/flow_policy.rs"
+test = false
+doc = false
+bench = false
