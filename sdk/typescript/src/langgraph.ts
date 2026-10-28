@@ -17,7 +17,7 @@ import {
   type SearchOperation,
 } from "@langchain/langgraph";
 
-import { LABEL_KEY, type Label, type Memory } from "./memory.ts";
+import { LABEL_KEY, type Label, type Memory, type WriteLabel } from "./memory.ts";
 
 type SearchItem = Item & { score?: number };
 
@@ -37,10 +37,12 @@ function isSearch(op: Operation): op is SearchOperation {
 
 /**
  * Wraps a LangGraph store so each put or delete is a memory write, each put labeled, and each
- * get or search a memory read. The label is kept in the stored value under __wake__ and taken
- * out of what the app gets back. With a quarantine on the Memory, a locked put or delete
+ * get or search a memory read. The label is kept in the stored value under __wake__, with the
+ * versions the entry held before it, and taken out of what the app gets back; rollback()
+ * restores one of those versions. With a quarantine on the Memory, a locked put or delete
  * throws MemoryLocked, a quarantined entry reads as absent and drops out of searches, and
- * overwriting or deleting one throws MemoryLocked: it's kept, as evidence.
+ * overwriting or deleting one throws MemoryLocked: it's kept, as evidence. A batch is checked
+ * whole before any of it is recorded: if one put or delete is refused, none is recorded or run.
  */
 export class WakeStore extends BaseStore {
   readonly #store: BaseStore;
@@ -60,6 +62,26 @@ export class WakeStore extends BaseStore {
     return this.#after(ops, results as unknown[]) as OperationResults<Op>;
   }
 
+  /**
+   * Rolls an entry back to a version its label keeps, as Memory.rollbackFile does a memory
+   * file: the newest, or the one targetEventId names. A rollback is a write: it rejects with
+   * MemoryLocked when a put would, when the quarantine wouldn't serve the version, or when the
+   * gate refuses it, and with an Error, restoring nothing, when there's no such version or it
+   * doesn't match its digest. Resolves to the new label, which names the rollback and keeps
+   * the version it replaced; null if recording failed.
+   */
+  async rollback(namespace: string[], key: string, targetEventId?: string): Promise<WriteLabel | null> {
+    const item = await this.#store.get(namespace, key);
+    const [current, currentLabel] = item ? split(item.value) : [undefined, null];
+    const store = namespace.join("/");
+    const [content, record] = await this.#memory._admitRollback(
+      store, key, current, currentLabel, targetEventId, restorable, `${store}/${key}`,
+    );
+    const label = record();
+    await this.#store.put(namespace, key, label === null ? { ...content } : { ...content, [LABEL_KEY]: label });
+    return label;
+  }
+
   override start(): void {
     this.#store.start();
   }
@@ -69,36 +91,42 @@ export class WakeStore extends BaseStore {
   }
 
   /**
-   * What each put or delete would replace or remove, so the quarantine can refuse to
-   * overwrite or delete an entry it hides. Without a quarantine, there's nothing to look up.
+   * What each put or delete would replace or remove: the quarantine refuses to overwrite or
+   * delete an entry it hides, and a put keeps the version it replaces.
    */
   #lookups(ops: Operation[]): GetOperation[] {
-    if (this.#memory.quarantine === undefined) return [];
     return ops.filter(isPut).map((op) => ({ namespace: op.namespace, key: op.key }));
   }
 
+  /**
+   * The ops to run, each put labeled. Every put and delete is checked before any is recorded,
+   * so the log never says a write happened in a batch that didn't run.
+   */
   async #before(ops: Operation[], found: Map<string, Item | null>): Promise<Operation[]> {
-    const out: Operation[] = [];
+    const checked: [Operation, (() => WriteLabel | null | void) | null][] = [];
     for (const op of ops) {
       if (!isPut(op)) {
-        out.push(op);
+        checked.push([op, null]);
         continue;
       }
       const store = op.namespace.join("/");
       const item = found.get(keyOf(op.namespace, op.key));
       const [current, currentLabel] = item ? split(item.value) : [undefined, null];
       if (op.value === null) {
-        await this.#memory.delete(store, op.key, current, currentLabel); // throws MemoryLocked
-        out.push(op);
+        // Throws MemoryLocked when the quarantine or the gate refuses it.
+        checked.push([op, await this.#memory._admitDelete(store, op.key, current, currentLabel)]);
         continue;
       }
       const value: Record<string, unknown> = Object.fromEntries(Object.entries(op.value).filter(([k]) => k !== LABEL_KEY));
-      // Throws MemoryLocked when the entry it replaces is quarantined.
-      const label = await this.#memory.write(store, op.key, value, current, currentLabel);
-      if (label !== null) value[LABEL_KEY] = label;
-      out.push({ ...op, value });
+      // Throws MemoryLocked when the entry it replaces is quarantined, or the gate refuses it.
+      const record = await this.#memory._admitWrite(store, op.key, value, current, currentLabel, { history: true });
+      checked.push([{ ...op, value }, record]);
     }
-    return out;
+    return checked.map(([op, record]) => {
+      const label = record?.();
+      if (label && isPut(op) && op.value !== null) op.value[LABEL_KEY] = label;
+      return op;
+    });
   }
 
   #after(ops: Operation[], results: unknown[]): unknown[] {
@@ -134,11 +162,16 @@ export class WakeStore extends BaseStore {
   }
 }
 
-/** A stored value as the app sees it, without its label, and the label. */
+/** A stored value as the app sees it, without its label and the history in it, and the label. */
 function split(value: unknown): [Record<string, unknown>, Label | null] {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return [value as Record<string, unknown>, null];
   const { [LABEL_KEY]: label, ...rest } = value as Record<string, unknown>;
   return [rest, label !== null && typeof label === "object" && !Array.isArray(label) ? (label as Label) : null];
+}
+
+/** A version a rollback can put back: a value, as a store holds, with no label of its own. */
+function restorable(content: unknown): content is Record<string, unknown> {
+  return content !== null && typeof content === "object" && !Array.isArray(content) && !(LABEL_KEY in content);
 }
 
 function keyOf(namespace: string[], key: string): string {

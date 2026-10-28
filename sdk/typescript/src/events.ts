@@ -34,7 +34,8 @@ export const MAX_PAYLOAD_BYTES = 4 << 20;
  * items, keys in code point order, and non-ASCII escaped unless ensureAscii is false. Past
  * that, a value with toJSON() is what it returns, a Map an object, a Set an array, a value
  * inside itself its inspect(), and anything else its String(). JavaScript keeps no
- * difference between 1 and 1.0, so a whole float Python wrote as 1.0 comes out as 1.
+ * difference between 1 and 1.0, so a whole number comes out as an integer, every digit of it:
+ * a float Python wrote as 500.0 is 500, as the Python SDK writes a memory entry's content too.
  */
 export function dumps(value: unknown, { ensureAscii = true }: { ensureAscii?: boolean } = {}): string {
   try {
@@ -113,13 +114,12 @@ function encode(value: unknown, ascii: boolean, inside: Set<object>): string {
 function number(value: number): string {
   if (Number.isNaN(value)) return "NaN";
   if (!Number.isFinite(value)) return value > 0 ? "Infinity" : "-Infinity";
-  if (Number.isInteger(value) && Math.abs(value) < 1e16) return Object.is(value, -0) ? "-0.0" : value.toFixed(0);
-  // Python's float repr: the same shortest digits, in exponent form below 1e-4 and from 1e16.
+  if (Number.isInteger(value)) return BigInt(value).toString();
+  // Python's float repr: the same shortest digits, in exponent form below 1e-4. Every number
+  // from 2^53 up is whole, so none reaches here.
   const [digits, power] = value.toExponential().split("e");
   const exponent = Number(power);
-  if (exponent < -4 || exponent >= 16) {
-    return `${digits}e${exponent < 0 ? "-" : "+"}${String(Math.abs(exponent)).padStart(2, "0")}`;
-  }
+  if (exponent < -4) return `${digits}e-${String(-exponent).padStart(2, "0")}`;
   return String(value);
 }
 

@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readFile, writeFile, access } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, writeFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -15,7 +15,7 @@ import { InMemoryStore } from "@langchain/langgraph";
 
 import { log } from "../src/log.ts";
 import { WakeStore } from "../src/langgraph.ts";
-import { contentOf, digest, LABEL_KEY, Memory } from "../src/memory.ts";
+import { contentOf, digest, LABEL_KEY, LABEL_SUFFIX, Memory } from "../src/memory.ts";
 import { MemoryLocked, MemoryQuarantined, Quarantine, STALE } from "../src/quarantine.ts";
 import { attr, id, parents, sdk, tick, withAppProxy } from "./helpers.ts";
 import { EMAIL, rememberFromEmail, Session } from "./sessions.ts";
@@ -401,4 +401,87 @@ test("a slow first fetch doesn't hold up the agent", async () => {
   } finally {
     q.close();
   }
+});
+
+test("a locked agent can't roll back", async () => {
+  const r = await rules();
+  const session = new Session("billing");
+  const plain = new Memory(session.handler);
+  const dir = await mkdtemp(join(tmpdir(), "wake-quarantine-"));
+  const path = join(dir, "ledger.md");
+  await plain.writeFile(path, "v1: pay Acme's account 123");
+  await plain.writeFile(path, "v2: pay Acme's account 666");
+  const inner = new InMemoryStore();
+  await new WakeStore(inner, plain).put(["facts"], "acme", { text: "account 123" });
+  await new WakeStore(inner, plain).put(["facts"], "acme", { text: "account 666" });
+
+  r.quarantine({ locked_by: "q1", lock: { agents: ["billing"] } });
+  const memory = await quarantined(session, r, "billing");
+  await assert.rejects(memory.rollbackFile(path), (e: unknown) => e instanceof MemoryLocked && e.quarantine === "q1");
+  await assert.rejects(new WakeStore(inner, memory).rollback(["facts"], "acme"), MemoryLocked);
+  assert.equal(await readFile(path, "utf8"), "v2: pay Acme's account 666");
+  assert.equal((await inner.get(["facts"], "acme"))!.value.text, "account 666");
+  assert.deepEqual(await refused(session), ["write", "write"], "refused as writes");
+  assert.ok(!(await session.events("memory_write")).some((w) => attr(w, "wake.memory.rollback_to")));
+});
+
+test("a quarantined version isn't restored", async () => {
+  // Restoring it would give quarantined content a fresh label the quarantine no longer matches.
+  const r = await rules();
+  const inner = new InMemoryStore();
+  const writer = new Session("email");
+  await rememberFromEmail(writer, new WakeStore(inner, writer.memory)); // from tool:read_and_remember
+  const [poisoned] = await writer.events("memory_write");
+  await new WakeStore(inner, writer.memory).put(["facts", "user-1"], "acme-bank", { text: "Acme's account is unchanged." });
+
+  // By its origins.
+  r.quarantine({ origins: ["tool:read_and_remember"] });
+  const session = new Session("email");
+  const store = new WakeStore(inner, await quarantined(session, r, "email"));
+  await assert.rejects(store.rollback(["facts", "user-1"], "acme-bank"), (e: unknown) => e instanceof MemoryLocked && e.quarantine === "q1");
+  assert.deepEqual((await store.get(["facts", "user-1"], "acme-bank"))!.value, { text: "Acme's account is unchanged." }, "still served");
+  const [denied] = await session.events("denied");
+  assert.equal(attr(denied, "wake.memory.refused"), "write");
+  assert.ok(parents(denied).includes(id(poisoned)), "linked to the write it would have restored");
+
+  // By the write that made it, for a memory file too.
+  const dir = await mkdtemp(join(tmpdir(), "wake-quarantine-"));
+  const path = join(dir, "notes.md");
+  const plain = new Memory(writer.handler);
+  await plain.writeFile(path, "v1: wire to account 666");
+  await plain.writeFile(path, "v2: wire to account 123");
+  const [v1] = JSON.parse(await readFile(path + LABEL_SUFFIX, "utf8")).previous;
+  r.quarantine({ writes: [v1.event] });
+  let memory = await quarantined(new Session("email"), r, "email");
+  await assert.rejects(memory.rollbackFile(path), MemoryLocked);
+  assert.equal(await memory.readFile(path), "v2: wire to account 123");
+
+  // And the entry as it is now is evidence too, when the quarantine covers it.
+  r.quarantine({ entries: [`file/${await realpath(path)}`] });
+  memory = await quarantined(new Session("email"), r, "email");
+  await assert.rejects(memory.rollbackFile(path), MemoryLocked);
+  assert.equal(await readFile(path, "utf8"), "v2: wire to account 123");
+});
+
+test("a batch with a quarantined put records and runs none of it", async () => {
+  const r = await rules();
+  const inner = new InMemoryStore();
+  const writer = new Session("email");
+  await rememberFromEmail(writer, new WakeStore(inner, writer.memory));
+  const poisoned = (await inner.get(["facts", "user-1"], "acme-bank"))!.value;
+
+  r.quarantine({ origins: ["tool:read_and_remember"] });
+  const session = new Session("email");
+  const store = new WakeStore(inner, await quarantined(session, r, "email"));
+  await assert.rejects(
+    store.batch([
+      { namespace: ["facts", "user-1"], key: "fresh", value: { text: "a new entry" } },
+      { namespace: ["facts", "user-1"], key: "acme-bank", value: { text: "corrected" } },
+    ]),
+    MemoryLocked,
+  );
+  assert.equal(await inner.get(["facts", "user-1"], "fresh"), null, "the first put didn't run");
+  assert.deepEqual(await session.events("memory_write"), [], "nor does the log say it did");
+  assert.deepEqual(await refused(session), ["write"]);
+  assert.deepEqual((await inner.get(["facts", "user-1"], "acme-bank"))!.value, poisoned);
 });

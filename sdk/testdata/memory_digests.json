@@ -1,0 +1,122 @@
+{
+  "description": "Memory digests both SDKs must agree on. files: a memory file's text, whose digest is the SHA-256 of its UTF-8, which is also what lands on disk. values: a store value, the text its digest covers (JSON with keys sorted in code point order, \", \" and \": \" between items, non-ASCII as it is, and each whole number an integer), and that text's SHA-256.",
+  "files": [
+    {
+      "name": "ascii",
+      "content": "Deploy with make release.\n",
+      "sha256": "0a3f5ee84ec33d1235d31c51594ad9aa7fda312d143fbc77c35bc816f2f5d876"
+    },
+    {
+      "name": "non-ascii",
+      "content": "Caf\u00e9 notes: \u6771\u4eac \u2192 Z\u00fcrich, \ud83d\ude00 ok.\n",
+      "sha256": "170764ce98c97ffa13922cbe07b6ce01e814f8138bfca7bc182a2cd44034601b"
+    },
+    {
+      "name": "line endings",
+      "content": "first line\nsecond line\r\nthird line\rend",
+      "sha256": "a23e36c55737bf540300a35cb472ebe0a82b9121a2db57a39bb05fc66f80f34c"
+    },
+    {
+      "name": "empty",
+      "content": "",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "byte order mark",
+      "content": "\ufeffnotes after a byte order mark\n",
+      "sha256": "83cb001a2ad351d966bae13706eef6714556e9eccf5d45cb5fe4d635c5fe942d"
+    }
+  ],
+  "values": [
+    {
+      "name": "text",
+      "value": {
+        "text": "Acme's new bank account for invoices is 987654."
+      },
+      "content": "{\"text\": \"Acme's new bank account for invoices is 987654.\"}",
+      "sha256": "ba139a95ab14955b0a3ab3cb39fc59825f308a25e7b1c90878bf304e6d1e3802"
+    },
+    {
+      "name": "whole float",
+      "value": {
+        "amount": 500.0,
+        "currency": "USD",
+        "fee": 1.5
+      },
+      "content": "{\"amount\": 500, \"currency\": \"USD\", \"fee\": 1.5}",
+      "sha256": "68b66c905c797d40a5fbd4228fbe44765767a5dd6325d020f942e6c9ef14948f"
+    },
+    {
+      "name": "numbers",
+      "value": {
+        "n": [
+          0,
+          -0.0,
+          2.0,
+          -3.0,
+          1.5,
+          0.1,
+          1e-07,
+          0.0001,
+          123456.789,
+          1e+21,
+          1761600000000000000,
+          1.7616e+18,
+          true,
+          null
+        ]
+      },
+      "content": "{\"n\": [0, 0, 2, -3, 1.5, 0.1, 1e-07, 0.0001, 123456.789, 1000000000000000000000, 1761600000000000000, 1761600000000000000, true, null]}",
+      "sha256": "7719891166e925b9278c0fed04ab303ba9865eb181fdb25471cde20cf4f35362"
+    },
+    {
+      "name": "nested",
+      "value": {
+        "user": {
+          "name": "Ana",
+          "accounts": [
+            {
+              "iban": "DE89 3704 0044 0532 0130 00",
+              "primary": true
+            },
+            {
+              "iban": null,
+              "primary": false
+            }
+          ],
+          "limits": {
+            "monthly": 25000,
+            "daily": 1000.0
+          }
+        },
+        "tags": [
+          "b",
+          "a"
+        ]
+      },
+      "content": "{\"tags\": [\"b\", \"a\"], \"user\": {\"accounts\": [{\"iban\": \"DE89 3704 0044 0532 0130 00\", \"primary\": true}, {\"iban\": null, \"primary\": false}], \"limits\": {\"daily\": 1000, \"monthly\": 25000}, \"name\": \"Ana\"}}",
+      "sha256": "cc8408bb456e91652c2eba76d8fca6df1c7c26621119e5c05fa41278efa8df53"
+    },
+    {
+      "name": "non-ascii",
+      "value": {
+        "note": "caf\u00e9 \u6771\u4eac \u2192 \ud83d\ude00",
+        "\u00e9": 1,
+        "z": 2,
+        "\ufb00": 3,
+        "\ud83d\ude00": 4,
+        "A": 5
+      },
+      "content": "{\"A\": 5, \"note\": \"caf\u00e9 \u6771\u4eac \u2192 \ud83d\ude00\", \"z\": 2, \"\u00e9\": 1, \"\ufb00\": 3, \"\ud83d\ude00\": 4}",
+      "sha256": "3de6b3ec5e0b43d151ec676ec6e6e11dd03bc53e3d130703a75c58322b031a83"
+    },
+    {
+      "name": "escapes",
+      "value": {
+        "s": "quote \" backslash \\ tab \t newline \n return \r control \u0001 delete \u007f separator \u2028"
+      },
+      "content": "{\"s\": \"quote \\\" backslash \\\\ tab \\t newline \\n return \\r control \\u0001 delete \u007f separator \u2028\"}",
+      "sha256": "51a5125586b5e9abc6aadd2b476fc7b3f60ebbff66af1028d9d447c3f70ccf1b"
+    }
+  ]
+}
