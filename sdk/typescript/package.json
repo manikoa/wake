@@ -62,12 +62,15 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test \"test/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\"",
+    "prepack": "pnpm run build && node -e \"for (const f of ['LICENSE', 'NOTICE']) require('node:fs').copyFileSync('../../' + f, f)\""
   },
   "dependencies": {
     "@opentelemetry/api": "1.10.0",
