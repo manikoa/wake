@@ -106,6 +106,10 @@ pub struct MemoryRules {
     /// The quarantine that refuses this agent's writes, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locked_by: Option<String>,
+    /// Set when no entry may be served at all, because the proxy doesn't know what it
+    /// quarantined: the id refused reads are recorded under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_by: Option<String>,
     pub quarantines: Vec<Quarantine>,
 }
 
@@ -325,24 +329,28 @@ impl Halts {
     }
 
     /// The rules for one agent's memory adapter, noting that the agent has them now. A
-    /// state that can't be read, or was never initialized, refuses every write.
+    /// state that can't be read, or was never initialized, refuses every write and serves
+    /// no entry: whatever it quarantined is unknown, so any entry might be.
     pub fn memory_rules(&self, agent: &str) -> MemoryRules {
         let state = self.current();
         let agent = self.agents.named(agent);
         let named = |scope: &Scope| {
             scope.fleet || (!agent.is_empty() && scope.agents.iter().any(|a| self.agents.named(a) == agent))
         };
-        let locked_by = if state.unreadable.is_some() {
+        let unknown = if state.unreadable.is_some() {
             Some(UNREADABLE.to_string())
         } else if state.uninitialized {
             Some(UNINITIALIZED.to_string())
         } else {
+            None
+        };
+        let locked_by = unknown.clone().or_else(|| {
             state
                 .quarantines
                 .iter()
                 .find(|q| named(&q.selection.lock))
                 .map(|q| q.id.clone())
-        };
+        });
         if !agent.is_empty() {
             let mut notes = self.seen.lock().unwrap_or_else(|p| p.into_inner());
             let seen = Seen {
@@ -361,6 +369,7 @@ impl Halts {
         MemoryRules {
             version: state.version,
             locked_by,
+            hidden_by: unknown,
             quarantines: state.quarantines.clone(),
         }
     }
@@ -706,7 +715,13 @@ mod tests {
         let halts = Halts::load(&dir);
         assert!(halts.state().uninitialized);
         assert_eq!(ids(halts.deciding(Some("anyone"), None)), [UNINITIALIZED]);
-        assert_eq!(halts.memory_rules("billing").locked_by.as_deref(), Some(UNINITIALIZED));
+        let rules = halts.memory_rules("billing");
+        assert_eq!(rules.locked_by.as_deref(), Some(UNINITIALIZED));
+        assert_eq!(
+            rules.hidden_by.as_deref(),
+            Some(UNINITIALIZED),
+            "no entry is served while what was quarantined is unknown"
+        );
         // A halt put meanwhile is kept, and the state stays uninitialized across a restart.
         halts.put("h1", agents(&["billing"]), 1).unwrap();
         let restarted = Halts::load(&dir);
@@ -715,6 +730,7 @@ mod tests {
         let state = restarted.lift(UNINITIALIZED).unwrap();
         assert!(!state.uninitialized && !state.epoch.is_empty());
         assert!(restarted.deciding(Some("support"), None).is_empty());
+        assert_eq!(restarted.memory_rules("billing").hidden_by, None);
         assert!(!Halts::load(&dir).state().uninitialized);
         // Init refuses to write over a state.
         let err = Halts::init(&dir).unwrap_err();
@@ -730,10 +746,12 @@ mod tests {
         let halts = Halts::load(&dir);
         assert_eq!(ids(halts.deciding(None, None)), [UNREADABLE]);
         assert!(halts.state().unreadable.is_some());
+        let rules = halts.memory_rules("billing");
+        assert_eq!(rules.locked_by.as_deref(), Some(UNREADABLE), "memory writes too");
         assert_eq!(
-            halts.memory_rules("billing").locked_by.as_deref(),
+            rules.hidden_by.as_deref(),
             Some(UNREADABLE),
-            "memory writes too"
+            "and no entry is served, since what was quarantined is unknown"
         );
         // A restart still can't read it.
         assert!(Halts::load(&dir).state().unreadable.is_some());

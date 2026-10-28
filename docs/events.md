@@ -73,7 +73,7 @@ The memory adapter records each write to a memory store or memory file as a `mem
 
 The label is a pointer, not evidence: anything that can write the store can forge one. The signed `memory_write` it names, and the digest, are what make it checkable.
 
-**Quarantine.** When the brake quarantines memory, the adapter refuses the writes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence. Each refused write or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's parent is the write it came from.
+**Quarantine.** When the brake quarantines memory, the adapter refuses the writes of agents it locks, and stops serving entries the quarantine selects: by the agent that wrote them, their origins, or the write that made them (all from the label), by key, or because no label vouches for them. Quarantined entries stay in the store, as evidence. Each refused write or read is a `denied` event from the memory adapter, with `wake.memory.refused` (`write` or `read`) and `wake.brake.halt_id` naming the quarantine. A refused read's parent is the write it came from. When the proxy doesn't know what it quarantined, because its state can't be read or was never initialized, its rules carry `hidden_by` (`unreadable-state` or `uninitialized-state`), and the adapter serves no entry.
 
 ## How the SDK finds parents
 
