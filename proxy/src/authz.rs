@@ -21,6 +21,7 @@ use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp;
+use crate::policy::FlowPolicy;
 
 // Generated from Envoy's protos, doc comments and all.
 #[allow(clippy::all)]
@@ -173,7 +174,7 @@ pub fn denied_event(call: &Call, halts: &[Halt], agents: &Agents, at: u64) -> Ev
     e.set("wake.capture", Value::Str("proxy".into()));
     e.set("wake.agent.id", Value::Str(caller.clone()));
     e.set("wake.parents", Value::Strs(parents));
-    e.set("wake.origins", Value::Strs(vec![]));
+    e.set("wake.origins", Value::Strs(FlowPolicy::origins_of(call)));
     let first = halts.first().map(|h| h.id.clone()).unwrap_or_default();
     e.set("wake.brake.halt_id", Value::Str(first.clone()));
     if let Some(receiver) = &call.receiver {
@@ -225,14 +226,25 @@ fn ids() -> ([u8; 16], [u8; 8]) {
 /// The gRPC service.
 pub struct Authorizer {
     halts: Arc<Halts>,
+    policy: Arc<FlowPolicy>,
     events: Events,
     counters: Arc<Counters>,
 }
 
 impl Authorizer {
     pub fn new(halts: Arc<Halts>, events: Events, counters: Arc<Counters>) -> Self {
+        Self::with_policy(halts, Arc::new(FlowPolicy::empty()), events, counters)
+    }
+
+    pub fn with_policy(
+        halts: Arc<Halts>,
+        policy: Arc<FlowPolicy>,
+        events: Events,
+        counters: Arc<Counters>,
+    ) -> Self {
         Authorizer {
             halts,
+            policy,
             events,
             counters,
         }
@@ -247,7 +259,12 @@ impl Authorizer {
 impl Authorization for Authorizer {
     async fn check(&self, request: Request<CheckRequest>) -> Result<Response<CheckResponse>, Status> {
         let call = read_call(request.get_ref());
-        let halts = self.halts.deciding(call.caller.as_deref(), call.receiver.as_deref());
+        let mut halts = self.halts.deciding(call.caller.as_deref(), call.receiver.as_deref());
+        if halts.is_empty()
+            && let Some(policy_halt) = self.policy.deciding(&call)
+        {
+            halts.push(policy_halt);
+        }
         if halts.is_empty() {
             return Ok(Response::new(allow()));
         }

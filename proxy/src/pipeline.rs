@@ -20,6 +20,7 @@ use crate::export::{Counters, Exporter};
 use crate::extmcp::Processor;
 use crate::extproc;
 use crate::halts::Halts;
+use crate::policy::FlowPolicy;
 use crate::signer::Signer;
 
 pub struct Options {
@@ -38,6 +39,8 @@ pub struct Options {
     /// The halts in force, which the ext_authz service enforces, and ext_proc and ExtMCP
     /// enforce on calls already under way.
     pub halts: Arc<Halts>,
+    /// Optional origin flow policies enforced at ext_authz.
+    pub policy: Arc<FlowPolicy>,
 }
 
 impl Default for Options {
@@ -49,6 +52,7 @@ impl Default for Options {
             queue: 10_000,
             queue_bytes: 64 << 20,
             halts: Arc::new(Halts::in_memory()),
+            policy: Arc::new(FlowPolicy::empty()),
         }
     }
 }
@@ -156,7 +160,7 @@ where
             .server(),
         )
         .add_service(extproc::Processor::new(events.clone(), options.halts.clone(), bodies, counters.clone()).server())
-        .add_service(Authorizer::new(options.halts.clone(), events, counters).server())
+        .add_service(Authorizer::with_policy(options.halts.clone(), options.policy.clone(), events, counters).server())
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
     // The server dropped its senders, so each stage drains and ends in turn.
