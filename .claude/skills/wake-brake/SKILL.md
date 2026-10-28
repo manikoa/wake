@@ -11,17 +11,18 @@ The brake, its Temporal workers and the downstream view are paid parts, so they'
 
 ## What ships, and what counts as done
 
-**Ships (months 3 to 6):** a brake with three levers (proxy deny, token revocation at the top providers, sandbox freeze on E2B or Modal), the downstream view, memory quarantine, and the first paid pilots.
+**Ships (months 3 to 6):** a brake with three levers (proxy deny, token revocation at the top providers, sandbox freeze on E2B or Modal), the downstream view, memory quarantine, and the first paid pilots; halting one sub-agent while its run goes on, saying so when it can't be stopped alone; an owner for every agent and a census of agents seen against the inventory.
 
 **Gate:** a partner's fleet stopped and verified in under a minute during a game day, and 2 to 5 paid pilots.
 
-**Metric:** time to stop a fleet, verified. Under 60 seconds by this gate, and under 10 seconds by Contain.
+**Metric:** time to stop a fleet, verified. Under 60 seconds by this gate, and under 10 seconds by Contain. Also: time to stop one sub-agent while its run goes on, under 10 seconds by this gate for sub-agents with credentials of their own; and every agent in a partner's inventory has a named owner.
 
 The promise is a stop that reaches every vendor, with proof that it worked. Reaching vendors comes from the levers; proof comes from verification. Speed is the number the gate measures.
 
 ## The shape of a halt
 
-- A halt has a scope: one agent, one workflow, or the whole fleet.
+- A halt has a scope: one sub-agent instance, one agent, one workflow, or the whole fleet. An instance (`wake.agent.instance`, see `docs/events.md`) is stopped alone only where something outside the agent can tell it apart: credentials of its own the gateway sees, or a delegated token naming it as the actor. One running inside its parent's process with the parent's credentials can only be stopped by the SDK in that process, which trusts the agent's code, as the memory quarantine does; the brake shows that path as such, never as a verified stop.
+- Halts and pages go to the agent's owner, from the inventory. A census compares the agents the signed log saw with the inventory: agents seen but unknown can't be halted by name, and agents known but never seen hold credentials to retire.
 - In this phase a human starts it: the on-call engineer, from the dashboard or an API call. Detection rules that trigger the brake arrive in Prove, and even then they brake automatically only when the customer's policy says stop.
 - Each halt is one Temporal workflow. It works out which lever applies to which target in scope, then fans out one activity per lever and target. Each activity pulls its lever and then verifies it. Go workers run the activities.
 - The result is per path: **confirmed stopped** or **live**. A path is confirmed only after positive verification. A timeout, an error or an unclear answer means live. The workflow keeps retrying live paths and shows them as live until they're confirmed or a human steps in. The brake never reports a fleet as stopped while any path is unconfirmed.
@@ -62,7 +63,7 @@ The roadmap says to test the pricing meter during this phase: per protected agen
 
 ## Not in Brake
 
-More than three levers, detection rules, evidence packs, the self serve Team plan, flow policies, memory rollback, blast radius replay and policy compilation all belong to later phases.
+More than three levers, detection rules, evidence packs, the self serve Team plan, flow policies, run charters, memory rollback, blast radius replay and policy compilation all belong to later phases.
 
 ## Gate checklist
 
