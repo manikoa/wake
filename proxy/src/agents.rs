@@ -9,7 +9,9 @@
 //!
 //! Without a map, an identity is its own name, as when the gateway already sends short
 //! names. With one, an identity the map doesn't list belongs to no agent: the deny treats
-//! its calls as a caller it doesn't know, which every agent halt denies.
+//! its calls as a caller it doesn't know, which every agent halt denies, unless its own
+//! token places it under an agent the map lists, as a sub-agent's does (halts.rs).
+//! Sub-agents needn't be listed.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -63,6 +65,11 @@ impl Agents {
     /// identities.
     pub fn named<'a>(&'a self, name: &'a str) -> &'a str {
         self.by_identity.get(name).map(String::as_str).unwrap_or(name)
+    }
+
+    /// Whether the map lists this identity, as one of an agent's.
+    pub fn knows(&self, identity: &str) -> bool {
+        self.by_identity.contains_key(identity)
     }
 
     /// The name to record an identity under: its agent's, when the map lists it, else the

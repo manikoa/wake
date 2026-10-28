@@ -108,8 +108,8 @@ impl Processor {
     }
 
     /// The halts that cover a call from this caller now.
-    fn covering(&self, caller: Option<&str>) -> Vec<Halt> {
-        self.halts.deciding(caller, None)
+    fn covering(&self, caller: Option<&str>, token: Option<&Token>) -> Vec<Halt> {
+        self.halts.deciding_with(caller, None, token)
     }
 
     pub fn server(self) -> pb::ext_mcp_server::ExtMcpServer<Self> {
@@ -184,7 +184,7 @@ impl ExtMcp for Processor {
         let server = r.service_names.into_iter().next().unwrap_or_default();
         let headers: Vec<(String, Vec<u8>)> = r.headers.into_iter().map(|h| (h.key, h.value)).collect();
         // A halt that landed after ext_authz let the call in: it isn't forwarded.
-        let covering = self.covering(caller.as_deref());
+        let covering = self.covering(caller.as_deref(), token.as_ref());
         if !covering.is_empty() {
             let call = Call {
                 caller,
@@ -274,7 +274,7 @@ impl ExtMcp for Processor {
         let (metadata, caller, token) = self.metadata(r.metadata_context);
         let server = r.service_names.into_iter().next().unwrap_or_default();
         let event_id = metadata.get(META_EVENT_ID).filter(|id| !id.is_empty()).cloned();
-        let covering = self.covering(caller.as_deref());
+        let covering = self.covering(caller.as_deref(), token.as_ref());
         let method = r.method.clone();
         // What came back is recorded either way: it's what the tool did.
         if mcp::captured(&r.method) {

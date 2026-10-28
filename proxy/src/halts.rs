@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::agents::Agents;
+use crate::token::Token;
 
 /// What a halt covers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -42,13 +43,19 @@ pub struct Scope {
     #[serde(default)]
     pub fleet: bool,
     /// Calls made by, or sent to, these agents: their names, or identities the map lists.
+    /// A call is made by an agent too when the agent is in the delegation chain of the token
+    /// it came with: halting an agent halts the sub-agents acting under it.
     #[serde(default)]
     pub agents: Vec<String>,
+    /// Calls made with these tokens, by their id (a JWT's jti, token.rs), whoever presents
+    /// them: one sub-agent's credential, stopped without its parent's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<String>,
 }
 
 impl Scope {
     pub fn is_empty(&self) -> bool {
-        !self.fleet && self.agents.is_empty()
+        !self.fleet && self.agents.is_empty() && self.tokens.is_empty()
     }
 }
 
@@ -180,6 +187,8 @@ pub struct Halts {
     agents: Arc<Agents>,
     // Kept in memory only: after a restart, adapters fetch again within seconds.
     seen: Mutex<Notes>,
+    // The callers the deny lever has seen, kept in memory only, like seen.
+    callers: Mutex<Callers>,
     // The version in force, sent on each change.
     changed: watch::Sender<u64>,
 }
@@ -191,6 +200,44 @@ pub const SEEN_LIMIT: usize = 10_000;
 #[derive(Default)]
 struct Notes {
     by_agent: HashMap<String, Seen>,
+    order: VecDeque<String>,
+}
+
+/// One identity the deny lever has seen calling, for the brake: under which agent the
+/// identity map names it, whom its latest token acted for and through which agents, the
+/// latest ids of the tokens it presented, and when. With it the brake can tell whether a
+/// sub-agent calls under credentials of its own, which a halt can stop alone, or only ever
+/// as its parent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Caller {
+    /// The agent the identity map names it as, if it lists it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Whom its latest token acted for, the token's `sub`; none without a token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The delegation chain of its latest token, the agent acting now first; empty without one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actors: Vec<String>,
+    /// Whether that chain went on past the actors kept (token.rs).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub actors_cut: bool,
+    /// The ids of the latest tokens it presented, newest last, at most CALLER_TOKENS.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<String>,
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub calls: u64,
+}
+
+/// The most identities the deny lever notes. Past it the one seen longest ago goes.
+pub const CALLERS_LIMIT: usize = 10_000;
+/// The most token ids kept for one identity.
+pub const CALLER_TOKENS: usize = 8;
+
+#[derive(Default)]
+struct Callers {
+    by_identity: HashMap<String, Caller>,
     order: VecDeque<String>,
 }
 
@@ -247,6 +294,7 @@ impl Halts {
             disk: Mutex::new(Disk { path, unreadable }),
             agents: Arc::new(Agents::none()),
             seen: Mutex::new(Notes::default()),
+            callers: Mutex::new(Callers::default()),
         }
     }
 
@@ -391,6 +439,64 @@ impl Halts {
         self.seen.lock().unwrap_or_else(|p| p.into_inner()).by_agent.clone()
     }
 
+    /// Notes a call from identity, the one the gateway authenticated, with the token it
+    /// presented, if any. Called for every call the deny lever checks, allowed or not.
+    pub fn note_caller(&self, identity: Option<&str>, token: Option<&Token>, at: u64) {
+        let Some(identity) = identity.filter(|i| !i.is_empty()) else {
+            return;
+        };
+        let agent = if self.agents.knows(identity) {
+            Some(self.agents.named(identity).to_string())
+        } else {
+            None
+        };
+        let mut callers = self.callers.lock().unwrap_or_else(|p| p.into_inner());
+        let Callers { by_identity, order } = &mut *callers;
+        let caller = by_identity.entry(identity.to_string()).or_insert_with(|| {
+            order.push_back(identity.to_string());
+            Caller {
+                agent: None,
+                subject: None,
+                actors: vec![],
+                actors_cut: false,
+                tokens: vec![],
+                first_seen: at,
+                last_seen: at,
+                calls: 0,
+            }
+        });
+        caller.agent = agent;
+        caller.last_seen = at;
+        caller.calls += 1;
+        if let Some(token) = token {
+            caller.subject = Some(token.subject.clone());
+            caller.actors = token.actors.clone();
+            caller.actors_cut = token.cut;
+            if let Some(id) = &token.id {
+                caller.tokens.retain(|t| t != id);
+                caller.tokens.push(id.clone());
+                if caller.tokens.len() > CALLER_TOKENS {
+                    caller.tokens.remove(0);
+                }
+            }
+        }
+        while order.len() > CALLERS_LIMIT {
+            if let Some(oldest) = order.pop_front() {
+                by_identity.remove(&oldest);
+            }
+        }
+    }
+
+    /// Every identity the deny lever has seen calling since the proxy started, at most
+    /// CALLERS_LIMIT of them.
+    pub fn callers(&self) -> HashMap<String, Caller> {
+        self.callers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_identity
+            .clone()
+    }
+
     fn change(&self, f: impl FnOnce(&mut State)) -> Changed {
         let mut disk = self.disk.lock().unwrap_or_else(|p| p.into_inner());
         let mut next = (*self.current()).clone();
@@ -431,21 +537,53 @@ impl Halts {
     /// receiver, the agent the route reaches: the brake's halts in the order they were put,
     /// then UNREADABLE or UNINITIALIZED. Empty when the call may go ahead.
     pub fn deciding(&self, caller: Option<&str>, receiver: Option<&str>) -> Vec<Halt> {
+        self.deciding_with(caller, receiver, None)
+    }
+
+    /// The same, for a caller that may have presented a token (token.rs). A halt covers the
+    /// call when it names the caller, the receiver, an agent the call is made under, or the
+    /// token itself. A delegated token's call is made under every actor in its chain and
+    /// whom they act for, its subject: halting an agent halts the sub-agents acting for it.
+    ///
+    /// A caller the identity map doesn't list could be a halted agent, so every agent halt
+    /// denies it. But one whose own token's chain passes through an agent the map lists is
+    /// a sub-agent acting under that agent, by the identity provider's word: it's covered
+    /// only by a halt that names it, its chain or its token, so halting one sub-agent leaves
+    /// its siblings be. The token is the caller's own when the agent it names as acting now
+    /// is the caller; to act under a chain it isn't part of, an agent would need another
+    /// actor's credentials, and with them it is that actor. A chain that was cut could hide
+    /// a halted agent in its unknown part, so every agent halt denies it too.
+    pub fn deciding_with(&self, caller: Option<&str>, receiver: Option<&str>, token: Option<&Token>) -> Vec<Halt> {
         let state = self.current();
-        let caller = self.agents.caller(caller);
+        let identity = caller.filter(|c| !c.is_empty());
         let receiver = receiver.filter(|r| !r.is_empty()).map(|r| self.agents.named(r));
-        let names = |agent: Option<&str>, halt: &Halt| {
-            agent.is_some_and(|a| halt.scope.agents.iter().any(|h| self.agents.named(h) == a))
-        };
+        let delegated = token.filter(|t| !t.actors.is_empty());
+        let chain: Vec<&str> = delegated
+            .map(|t| {
+                t.actors
+                    .iter()
+                    .chain([&t.subject])
+                    .map(|a| self.agents.named(a))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let own = delegated.filter(|t| identity.is_some_and(|i| t.actors[0] == i));
+        let placed = own.is_some_and(|t| !t.cut && t.actors.iter().chain([&t.subject]).any(|a| self.agents.knows(a)));
+        let unknown = (self.agents.caller(identity).is_none() && !placed) || token.is_some_and(|t| t.cut);
+        let token_id = token.and_then(|t| t.id.as_deref());
+        let names = |agent: &str, halt: &Halt| halt.scope.agents.iter().any(|h| self.agents.named(h) == agent);
         let mut out: Vec<Halt> = state
             .halts
             .iter()
             .filter(|h| {
                 h.scope.fleet
-                    || names(caller, h)
-                    || names(receiver, h)
-                    // A caller nobody can name could be the halted agent.
-                    || (caller.is_none() && !h.scope.agents.is_empty())
+                    // The caller, by its agent's name or, unlisted, its own identity.
+                    || identity.is_some_and(|i| names(self.agents.named(i), h))
+                    || receiver.is_some_and(|r| names(r, h))
+                    || chain.iter().any(|a| names(a, h))
+                    || token_id.is_some_and(|id| h.scope.tokens.iter().any(|t| t == id))
+                    // A caller nobody can name or place could be the halted agent.
+                    || (unknown && !h.scope.agents.is_empty())
             })
             .cloned()
             .collect();
@@ -459,6 +597,7 @@ impl Halts {
                     scope: Scope {
                         fleet: true,
                         agents: vec![],
+                        tokens: vec![],
                     },
                     issued_at: 0,
                     applied_at: 0,
@@ -548,6 +687,7 @@ mod tests {
         Scope {
             fleet: false,
             agents: names.iter().map(|s| s.to_string()).collect(),
+            tokens: vec![],
         }
     }
 
@@ -555,6 +695,7 @@ mod tests {
         Scope {
             fleet: true,
             agents: vec![],
+            tokens: vec![],
         }
     }
 
@@ -644,6 +785,238 @@ mod tests {
             ids(halts.deciding(Some("spiffe://wake.local/agent/billing"), Some("support"))),
             ["h2"]
         );
+    }
+
+    /// What the gateway says about a token: whom it acts for, and the agents acting, the
+    /// one acting now first.
+    fn token(subject: &str, actors: &[&str], id: &str) -> Token {
+        Token {
+            subject: subject.into(),
+            actors: actors.iter().map(|a| a.to_string()).collect(),
+            id: Some(id.into()),
+            ..Default::default()
+        }
+    }
+
+    const CHILD_1: &str = "support/researcher#toolu_1";
+    const CHILD_2: &str = "support/researcher#toolu_2";
+
+    #[test]
+    fn a_halt_on_an_agent_covers_the_sub_agents_acting_for_it() {
+        let halts = Halts::in_memory();
+        halts.put("h1", agents(&["support"]), 1).unwrap();
+        // Support delegated to the child for a user: support is in the chain.
+        let for_user = token("user-42", &[CHILD_1, "support"], "tok-1");
+        assert_eq!(ids(halts.deciding_with(Some(CHILD_1), None, Some(&for_user))), ["h1"]);
+        // Support delegated its own token: support is whom the child acts for.
+        let for_support = token("support", &[CHILD_2], "tok-2");
+        assert_eq!(
+            ids(halts.deciding_with(Some(CHILD_2), None, Some(&for_support))),
+            ["h1"]
+        );
+        // Further down, a grandchild acting under the child is covered too.
+        let grandchild = token(
+            "user-42",
+            &["support/researcher/fetch#toolu_9", CHILD_1, "support"],
+            "tok-3",
+        );
+        assert_eq!(
+            ids(halts.deciding_with(Some("support/researcher/fetch#toolu_9"), None, Some(&grandchild))),
+            ["h1"]
+        );
+        // An agent outside support's chain goes on, with or without a token.
+        let billing = token("user-42", &["billing"], "tok-4");
+        assert!(halts.deciding_with(Some("billing"), None, Some(&billing)).is_empty());
+        assert!(halts.deciding(Some("billing"), None).is_empty());
+        // Without the token, the child is just a caller of its own name: the token is what
+        // places it under support.
+        assert!(halts.deciding(Some(CHILD_1), None).is_empty());
+    }
+
+    #[test]
+    fn halting_one_sub_agent_leaves_its_siblings_and_its_parent_be() {
+        // The map lists the agents, by the subjects their own tokens carry; sub-agents
+        // aren't in it.
+        let map = br#"{"support": ["0oa1support"], "billing": ["0oa1billing"]}"#;
+        let halts = Halts::in_memory().with_agents(Arc::new(Agents::from_json(map).unwrap()));
+        let child_1 = token("0oa1support", &[CHILD_1], "tok-1");
+        let child_2 = token("0oa1support", &[CHILD_2], "tok-2");
+        let support = token("0oa1support", &[], "tok-0");
+        halts.put("h1", agents(&[CHILD_1]), 1).unwrap();
+        assert_eq!(ids(halts.deciding_with(Some(CHILD_1), None, Some(&child_1))), ["h1"]);
+        assert!(
+            halts.deciding_with(Some(CHILD_2), None, Some(&child_2)).is_empty(),
+            "its sibling acts under support, by the identity provider's word"
+        );
+        assert!(
+            halts
+                .deciding_with(Some("0oa1support"), None, Some(&support))
+                .is_empty()
+        );
+        assert!(halts.deciding(Some("0oa1billing"), Some("support")).is_empty());
+
+        // The rule for callers nobody can name still holds for anyone not placed.
+        assert_eq!(ids(halts.deciding(Some(CHILD_2), None)), ["h1"], "no token");
+        assert_eq!(ids(halts.deciding(None, None)), ["h1"], "no identity");
+        assert_eq!(
+            ids(halts.deciding_with(Some("intruder"), None, Some(&child_2))),
+            ["h1"],
+            "a token that names another as acting isn't the caller's own"
+        );
+        let unlisted = token("user-42", &["scraper#run_1", "scraper"], "tok-5");
+        assert_eq!(
+            ids(halts.deciding_with(Some("scraper#run_1"), None, Some(&unlisted))),
+            ["h1"],
+            "a chain through no listed agent places nobody"
+        );
+        let cut = Token {
+            cut: true,
+            ..child_2.clone()
+        };
+        assert_eq!(
+            ids(halts.deciding_with(Some(CHILD_2), None, Some(&cut))),
+            ["h1"],
+            "the halted agent could be in the part that was cut"
+        );
+        let listed_cut = Token {
+            cut: true,
+            ..token("0oa1support", &["0oa1billing"], "tok-6")
+        };
+        assert_eq!(
+            ids(halts.deciding_with(Some("0oa1billing"), None, Some(&listed_cut))),
+            ["h1"],
+            "even for a caller the map lists"
+        );
+
+        // Halting the parent, by its name, halts both children and leaves billing be.
+        halts.lift("h1").unwrap();
+        halts.put("h2", agents(&["support"]), 2).unwrap();
+        assert_eq!(ids(halts.deciding_with(Some(CHILD_1), None, Some(&child_1))), ["h2"]);
+        assert_eq!(ids(halts.deciding_with(Some(CHILD_2), None, Some(&child_2))), ["h2"]);
+        assert_eq!(
+            ids(halts.deciding_with(Some("0oa1support"), None, Some(&support))),
+            ["h2"]
+        );
+        let billing = token("0oa1billing", &[], "tok-7");
+        assert!(
+            halts
+                .deciding_with(Some("0oa1billing"), None, Some(&billing))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_halt_by_token_stops_that_token_alone() {
+        let map = br#"{"support": ["0oa1support"]}"#;
+        let halts = Halts::in_memory().with_agents(Arc::new(Agents::from_json(map).unwrap()));
+        let scope = Scope {
+            tokens: vec!["tok-1".into()],
+            ..Default::default()
+        };
+        assert!(!scope.is_empty());
+        halts.put("t1", scope, 1).unwrap();
+        let child_1 = token("0oa1support", &[CHILD_1], "tok-1");
+        assert_eq!(ids(halts.deciding_with(Some(CHILD_1), None, Some(&child_1))), ["t1"]);
+        assert_eq!(
+            ids(halts.deciding_with(Some("anyone"), None, Some(&child_1))),
+            ["t1"],
+            "whoever presents it"
+        );
+        let renewed = token("0oa1support", &[CHILD_1], "tok-2");
+        assert!(
+            halts.deciding_with(Some(CHILD_1), None, Some(&renewed)).is_empty(),
+            "another token for the same child isn't the one halted"
+        );
+        // A token halt names no agent, so a caller nobody can name isn't denied by it.
+        assert!(halts.deciding(None, None).is_empty());
+        assert!(halts.deciding(Some("intruder"), None).is_empty());
+        assert!(halts.deciding_with(Some(CHILD_1), None, None).is_empty());
+    }
+
+    #[test]
+    fn a_scope_with_tokens_reads_and_writes_them() {
+        let scope: Scope = serde_json::from_str(r#"{"tokens": ["tok-1"]}"#).unwrap();
+        assert_eq!(scope.tokens, ["tok-1"]);
+        assert!(!scope.fleet && scope.agents.is_empty() && !scope.is_empty());
+        assert_eq!(
+            serde_json::to_string(&scope).unwrap(),
+            r#"{"fleet":false,"agents":[],"tokens":["tok-1"]}"#
+        );
+        // A state written before tokens existed reads as it was, and writes as it was.
+        let scope: Scope = serde_json::from_str(r#"{"agents": ["billing"]}"#).unwrap();
+        assert!(scope.tokens.is_empty());
+        assert_eq!(
+            serde_json::to_string(&scope).unwrap(),
+            r#"{"fleet":false,"agents":["billing"]}"#
+        );
+        assert!(serde_json::from_str::<Scope>("{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn notes_each_caller_with_its_chain_and_latest_tokens() {
+        let map = br#"{"support": ["0oa1support"]}"#;
+        let halts = Halts::in_memory().with_agents(Arc::new(Agents::from_json(map).unwrap()));
+        halts.note_caller(None, None, 1);
+        halts.note_caller(Some(""), Some(&token("u", &[], "x")), 1);
+        assert!(halts.callers().is_empty(), "a call with no identity names nobody");
+
+        halts.note_caller(Some(CHILD_1), Some(&token("0oa1support", &[CHILD_1], "tok-1")), 10);
+        halts.note_caller(Some(CHILD_1), Some(&token("0oa1support", &[CHILD_1], "tok-2")), 20);
+        halts.note_caller(Some(CHILD_1), Some(&token("0oa1support", &[CHILD_1], "tok-1")), 30);
+        halts.note_caller(Some("0oa1support"), None, 40);
+        let callers = halts.callers();
+        assert_eq!(
+            callers[CHILD_1],
+            Caller {
+                agent: None,
+                subject: Some("0oa1support".into()),
+                actors: vec![CHILD_1.into()],
+                actors_cut: false,
+                tokens: vec!["tok-2".into(), "tok-1".into()],
+                first_seen: 10,
+                last_seen: 30,
+                calls: 3,
+            }
+        );
+        assert_eq!(callers["0oa1support"].agent.as_deref(), Some("support"));
+        assert_eq!(
+            serde_json::to_value(&callers["0oa1support"]).unwrap(),
+            serde_json::json!({"agent": "support", "first_seen": 40, "last_seen": 40, "calls": 1})
+        );
+
+        let cut = Token {
+            cut: true,
+            ..token("user-42", &["deep#9"], "tok-deep")
+        };
+        halts.note_caller(Some("deep#9"), Some(&cut), 45);
+        assert!(halts.callers()["deep#9"].actors_cut);
+        assert_eq!(
+            serde_json::to_value(&halts.callers()["deep#9"]).unwrap()["actors_cut"],
+            true
+        );
+
+        // A call without a token keeps what the last token said.
+        halts.note_caller(Some(CHILD_1), None, 50);
+        assert_eq!(halts.callers()[CHILD_1].tokens, ["tok-2", "tok-1"]);
+        for i in 0..20 {
+            let renewed = token("0oa1support", &[CHILD_1], &format!("n{i}"));
+            halts.note_caller(Some(CHILD_1), Some(&renewed), 60);
+        }
+        let tokens = &halts.callers()[CHILD_1].tokens;
+        assert_eq!(tokens.len(), CALLER_TOKENS);
+        assert_eq!(tokens.last().map(String::as_str), Some("n19"), "newest last");
+    }
+
+    #[test]
+    fn the_callers_noted_are_bounded() {
+        let halts = Halts::in_memory();
+        for i in 0..=CALLERS_LIMIT {
+            halts.note_caller(Some(&format!("agent-{i}")), None, i as u64);
+        }
+        let callers = halts.callers();
+        assert_eq!(callers.len(), CALLERS_LIMIT);
+        assert!(!callers.contains_key("agent-0"), "the one seen first goes first");
+        assert!(callers.contains_key(&format!("agent-{CALLERS_LIMIT}")));
     }
 
     #[test]

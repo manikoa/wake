@@ -10,7 +10,9 @@
 //!
 //! The claims come from a token the identity provider signed, but they're still bounded:
 //! a value too long to be an identifier is left out rather than cut, and a chain longer
-//! than MAX_ACTORS is cut there.
+//! than MAX_ACTORS is cut there. A chain that goes on past what's kept, past MAX_ACTORS or
+//! an actor that can't be read, is marked cut: its earliest actors are unknown, and a halt
+//! decides on it as on a caller it can't name (halts.rs).
 
 use prost_types::value::Kind;
 use prost_types::{Struct, Value as PbValue};
@@ -37,6 +39,8 @@ pub struct Token {
     pub expires: Option<i64>,
     /// Whether it's bound to its holder's key (it has a `cnf` claim), rather than a bearer token.
     pub bound: bool,
+    /// Whether the chain goes on past the actors kept.
+    pub cut: bool,
 }
 
 impl Token {
@@ -64,6 +68,9 @@ impl Token {
             actors.push(actor);
             act = a.fields.get("act");
         }
+        // Where the walk stopped, an actor with any claims at all is one it didn't keep. The
+        // gateway sends an empty object for a token without a chain.
+        let cut = matches!(act.and_then(|a| a.kind.as_ref()), Some(Kind::StructValue(a)) if !a.fields.is_empty());
         let expires = match s.fields.get("exp").and_then(|e| e.kind.as_ref()) {
             Some(Kind::NumberValue(n)) if n.is_finite() && *n > 0.0 && n.fract() == 0.0 && *n < i64::MAX as f64 => {
                 Some(*n as i64)
@@ -80,15 +87,20 @@ impl Token {
             id: identifier(s.fields.get("jti")),
             expires,
             bound,
+            cut,
         })
     }
 
     /// Records the token on an event: `wake.token.subject`, `wake.token.actors`,
-    /// `wake.token.id`, `wake.token.expires_unix` and `wake.token.bound` (docs/events.md).
+    /// `wake.token.actors_cut`, `wake.token.id`, `wake.token.expires_unix` and
+    /// `wake.token.bound` (docs/events.md).
     pub fn record(&self, e: &mut Event) {
         e.set("wake.token.subject", Value::Str(self.subject.clone()));
         if !self.actors.is_empty() {
             e.set("wake.token.actors", Value::Strs(self.actors.clone()));
+        }
+        if self.cut {
+            e.set("wake.token.actors_cut", Value::Bool(true));
         }
         if let Some(id) = &self.id {
             e.set("wake.token.id", Value::Str(id.clone()));
@@ -175,6 +187,7 @@ mod tests {
                 id: Some("tok-1".into()),
                 expires: Some(1_793_226_604),
                 bound: false,
+                cut: false,
             }
         );
     }
@@ -193,6 +206,7 @@ mod tests {
         .unwrap();
         assert_eq!(t.subject, "user-42");
         assert_eq!(t.actors, ["support/researcher#toolu_1", "support"]);
+        assert!(!t.cut, "the chain ends where it says");
         assert!(t.bound);
         assert_eq!(t.id, None);
         assert_eq!(t.expires, None);
@@ -204,9 +218,18 @@ mod tests {
         let gap = facts(&[("iss", text("idp")), ("act", facts(&[("sub", text("hidden"))]))]);
         let t = Token::from_value(&facts(&[("sub", text("u")), ("act", gap)])).unwrap();
         assert!(t.actors.is_empty());
+        assert!(t.cut, "an actor it couldn't read is one it didn't keep");
+        let long = facts(&[("sub", text(&"x".repeat(MAX_LEN + 1)))]);
+        let t = Token::from_value(&facts(&[
+            ("sub", text("u")),
+            ("act", facts(&[("sub", text("child")), ("act", long)])),
+        ]))
+        .unwrap();
+        assert_eq!((t.actors, t.cut), (vec!["child".to_string()], true));
         // An act that isn't an object is no chain.
         let t = Token::from_value(&facts(&[("sub", text("u")), ("act", text("support"))])).unwrap();
         assert!(t.actors.is_empty());
+        assert!(!t.cut);
         // A long chain is cut at MAX_ACTORS.
         let mut act = facts(&[("sub", text("a0"))]);
         for i in 1..20 {
@@ -215,6 +238,14 @@ mod tests {
         let t = Token::from_value(&facts(&[("sub", text("u")), ("act", act)])).unwrap();
         assert_eq!(t.actors.len(), MAX_ACTORS);
         assert_eq!(t.actors[0], "a19");
+        assert!(t.cut);
+        // A chain exactly MAX_ACTORS long is whole.
+        let mut act = facts(&[("sub", text("a0"))]);
+        for i in 1..MAX_ACTORS {
+            act = facts(&[("sub", text(&format!("a{i}"))), ("act", act)]);
+        }
+        let t = Token::from_value(&facts(&[("sub", text("u")), ("act", act)])).unwrap();
+        assert_eq!((t.actors.len(), t.cut), (MAX_ACTORS, false));
     }
 
     #[test]
@@ -244,6 +275,7 @@ mod tests {
             id: Some("tok-1".into()),
             expires: Some(1_793_226_604),
             bound: false,
+            cut: true,
         }
         .record(&mut e);
         assert_eq!(e.attributes["wake.token.subject"], Value::Str("user-42".into()));
@@ -254,6 +286,7 @@ mod tests {
         assert_eq!(e.attributes["wake.token.id"], Value::Str("tok-1".into()));
         assert_eq!(e.attributes["wake.token.expires_unix"], Value::Int(1_793_226_604));
         assert_eq!(e.attributes["wake.token.bound"], Value::Bool(false));
+        assert_eq!(e.attributes["wake.token.actors_cut"], Value::Bool(true));
         let mut e = Event::default();
         Token {
             subject: "support".into(),
@@ -261,6 +294,7 @@ mod tests {
         }
         .record(&mut e);
         assert!(!e.attributes.contains_key("wake.token.actors"));
+        assert!(!e.attributes.contains_key("wake.token.actors_cut"));
         assert!(!e.attributes.contains_key("wake.token.id"));
         assert!(!e.attributes.contains_key("wake.token.expires_unix"));
     }

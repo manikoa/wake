@@ -2,12 +2,14 @@
 //! force (halts.rs).
 //!
 //! ```text
-//! PUT    /v1/halts/{id}         {"scope": {"fleet": true} or {"agents": [...]}, "issued_at": <Unix ns>}
+//! PUT    /v1/halts/{id}         {"scope": {"fleet": true} or {"agents": [...], "tokens": [...]}, "issued_at": <Unix ns>}
 //! DELETE /v1/halts/{id}
 //! GET    /v1/halts              the halts and quarantines in force
 //! PUT    /v1/quarantines/{id}   {"selection": {"lock": {...}, "agents": [...], "origins": [...], ...}}
 //! DELETE /v1/quarantines/{id}
 //! GET    /v1/memory/seen        each agent's memory adapter: the version it last fetched, and when
+//! GET    /v1/callers            each identity the deny lever has seen calling: its agent, the
+//!                               delegation chain and token ids it came with, and when
 //! ```
 //!
 //! Each answers with the state now in force and its version, and a change answers 200 only
@@ -165,7 +167,21 @@ async fn put_halt(State(halts): State<Arc<Halts>>, Path(id): Path<String>, Json(
         return failure.into_response();
     }
     if body.scope.is_empty() {
-        return (StatusCode::BAD_REQUEST, "a halt needs a scope: the fleet, or agents").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "a halt needs a scope: the fleet, agents or tokens",
+        )
+            .into_response();
+    }
+    // A blank name matches no call: the halt would be acknowledged and stop nothing.
+    if body
+        .scope
+        .agents
+        .iter()
+        .chain(&body.scope.tokens)
+        .any(|n| n.trim().is_empty())
+    {
+        return (StatusCode::BAD_REQUEST, "a halt's agents and tokens can't be blank").into_response();
     }
     let issued_at = body.issued_at.unwrap_or_else(halts::now);
     stored(tokio::task::spawn_blocking(move || halts.put(&id, body.scope, issued_at)).await)
@@ -211,6 +227,10 @@ async fn release_quarantine(State(halts): State<Arc<Halts>>, Path(id): Path<Stri
     stored(tokio::task::spawn_blocking(move || halts.release(&id)).await)
 }
 
+async fn callers(State(halts): State<Arc<Halts>>) -> Json<std::collections::HashMap<String, halts::Caller>> {
+    Json(halts.callers())
+}
+
 async fn memory_seen(State(halts): State<Arc<Halts>>) -> Json<std::collections::HashMap<String, halts::Seen>> {
     Json(halts.seen())
 }
@@ -224,6 +244,7 @@ pub fn router(halts: Arc<Halts>) -> Router {
             axum::routing::put(put_quarantine).delete(release_quarantine),
         )
         .route("/v1/memory/seen", get(memory_seen))
+        .route("/v1/callers", get(callers))
         .with_state(halts)
 }
 

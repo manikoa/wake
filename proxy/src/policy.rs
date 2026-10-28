@@ -232,6 +232,7 @@ fn halt(id: String, fleet: bool, caller: Option<&str>) -> Halt {
         scope: Scope {
             fleet,
             agents: caller.iter().map(|c| c.to_string()).collect(),
+            tokens: vec![],
         },
         issued_at: 0,
         applied_at: 0,

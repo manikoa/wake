@@ -319,7 +319,11 @@ impl Exchange {
         if !self.started || self.ended {
             return vec![];
         }
-        halts.deciding(self.call.caller.as_deref(), self.call.receiver.as_deref())
+        halts.deciding_with(
+            self.call.caller.as_deref(),
+            self.call.receiver.as_deref(),
+            self.call.token.as_ref(),
+        )
     }
 
     /// The signed record of cutting this exchange under these halts, which names the
