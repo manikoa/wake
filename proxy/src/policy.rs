@@ -150,12 +150,7 @@ impl FlowRule {
                 return false;
             }
         }
-        if !self.path_prefixes.is_empty()
-            && !self
-                .path_prefixes
-                .iter()
-                .any(|p| call.path.starts_with(p.as_str()))
-        {
+        if !self.path_prefixes.is_empty() && !self.path_prefixes.iter().any(|p| call.path.starts_with(p.as_str())) {
             return false;
         }
         true
@@ -247,12 +242,7 @@ mod tests {
 
         assert!(
             policy
-                .deciding(&call(
-                    "billing",
-                    "tools",
-                    "/mcp/pay",
-                    "user,agent:researcher"
-                ))
+                .deciding(&call("billing", "tools", "/mcp/pay", "user,agent:researcher"))
                 .is_none()
         );
     }

@@ -236,12 +236,7 @@ impl Authorizer {
         Self::with_policy(halts, Arc::new(FlowPolicy::empty()), events, counters)
     }
 
-    pub fn with_policy(
-        halts: Arc<Halts>,
-        policy: Arc<FlowPolicy>,
-        events: Events,
-        counters: Arc<Counters>,
-    ) -> Self {
+    pub fn with_policy(halts: Arc<Halts>, policy: Arc<FlowPolicy>, events: Events, counters: Arc<Counters>) -> Self {
         Authorizer {
             halts,
             policy,
