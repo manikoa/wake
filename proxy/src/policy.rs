@@ -134,7 +134,9 @@ impl FlowPolicy {
         if !value.is_object() || rules.is_some_and(|r| r.iter().any(|rule| !rule.is_object())) {
             return Err("a policy and each of its rules must be a JSON object".into());
         }
-        let file: File = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        // Read from the bytes, not the value, which keeps only the last of a field given
+        // twice: which one the writer meant isn't known, so it's refused.
+        let file: File = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if !(1..=MAX_WINDOW_SECS).contains(&file.window_seconds) {
             return Err(format!(
                 "window_seconds must be from 1 to {MAX_WINDOW_SECS}, not {}",
@@ -604,6 +606,11 @@ mod tests {
             (r#"{"window_seconds": 0, "rules": []}"#, "window_seconds"),
             (r#"{"window_seconds": 86401, "rules": []}"#, "window_seconds"),
             ("[]", "must be a JSON object"),
+            (r#"{"window_seconds": 60, "window_seconds": 900}"#, "duplicate field"),
+            (
+                r#"{"rules": [{"id": "r", "forbid_origins": ["x"], "forbid_origins": []}]}"#,
+                "duplicate field",
+            ),
             (
                 r#"{"rules": [["r", [], [], [], [], ["x"], []]]}"#,
                 "must be a JSON object",
