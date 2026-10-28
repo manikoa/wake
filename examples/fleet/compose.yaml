@@ -1,11 +1,12 @@
 # The reference fleet on the staging recorder (deploy/compose.yaml): three agents on three
 # frameworks and the tools they call, all through agentgateway, all recorded by Wake, with
 # stand-ins for the identity provider and E2B the brake pulls levers on. run.sh brings it up
-# and sends one request through it. See README.md.
+# and sends one request through it. Each agent and the tools server reaches the rest of the
+# fleet only through agentgateway (networks.yaml). See README.md.
 name: wake-fleet
 
 include:
-  - path: ../../deploy/compose.yaml
+  - path: [../../deploy/compose.yaml, networks.yaml]
     env_file: fleet.env
 
 x-image: &image
@@ -27,7 +28,7 @@ x-fleet: &fleet
     FLEET_GATEWAY: http://agentgateway:3000
     FLEET_IDP: http://idp:8080/oauth2/v1
     FLEET_E2B: http://e2b:8080
-    WAKE_MEMORY_RULES: http://wake-proxy:9003
+    WAKE_MEMORY_RULES: http://memory-rules:9003
     FLEET_MODELS: ${FLEET_MODELS:-scripted}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -57,6 +58,7 @@ services:
     user: "0"
     entrypoint: ["sh", "-c", "cp /etc/wake/identity/bundle.pem /etc/wake/ca/bundle.pem && chmod 0444 /etc/wake/ca/bundle.pem"]
     volumes: [identity:/etc/wake/identity:ro, ca:/etc/wake/ca]
+    network_mode: none
     depends_on:
       identity: {condition: service_completed_successfully}
 
@@ -67,6 +69,9 @@ services:
   # each agent's refresh token.
   idp:
     <<: *standin
+    # Each agent signs in there and the tools server introspects tokens there, each from its
+    # own network. The brake reaches it on default.
+    networks: [default, support, research, billing, tools]
     command: ["python", "-m", "fleet.standins.oauth"]
     environment:
       STANDIN_ISSUER: http://idp:8080
@@ -82,6 +87,7 @@ services:
   # (fleet/standins/e2b.py). Billing keeps a sandbox there, and the brake can freeze it.
   e2b:
     <<: *standin
+    networks: [default, billing]
     command: ["python", "-m", "fleet.standins.e2b"]
     volumes:
       - e2b-state:/var/lib/standin
@@ -90,6 +96,7 @@ services:
 
   tools:
     <<: *fleet
+    networks: [tools]
     command: ["python", "-m", "fleet.tools"]
     volumes: [ca:/etc/wake/ca:ro, tools-secrets:/etc/fleet/secrets:ro]
     healthcheck:
@@ -98,22 +105,36 @@ services:
 
   research:
     <<: *fleet
+    networks: [research]
     command: ["python", "-m", "fleet.research"]
     volumes: [ca:/etc/wake/ca:ro, research-secrets:/etc/fleet/secrets:ro]
     healthcheck:
       <<: *listening
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9101))"]
 
-  # Billing's memory adapter fetches the brake's quarantines from wake-proxy, and it keeps
-  # a sandbox at E2B.
+  # wake-proxy's memory rules (9003) on billing's network, and nothing else of wake-proxy's:
+  # not the brake's control API (9002). See "Network" in README.md.
+  memory-rules:
+    <<: *image
+    networks: [default, billing]
+    command: ["python", "-m", "fleet.relay", "9003", "wake-proxy:9003"]
+    depends_on:
+      wake-proxy: {condition: service_started}
+    healthcheck:
+      <<: *listening
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9003))"]
+
+  # Billing's memory adapter fetches the brake's quarantines from wake-proxy, through
+  # memory-rules, and it keeps a sandbox at E2B.
   billing:
     <<: *fleet
+    networks: [billing]
     command: ["python", "-m", "fleet.billing"]
     volumes: [ca:/etc/wake/ca:ro, billing-secrets:/etc/fleet/secrets:ro]
     depends_on:
       fleet-ca: {condition: service_completed_successfully}
       collector: {condition: service_started}
-      wake-proxy: {condition: service_started}
+      memory-rules: {condition: service_healthy}
       idp: {condition: service_healthy}
       e2b: {condition: service_healthy}
     healthcheck:
@@ -123,6 +144,7 @@ services:
   # One request per run: docker compose run --rm support "<request>"
   support:
     <<: *fleet
+    networks: [support]
     command: ["python", "-m", "fleet.support"]
     profiles: [run]
     volumes: [ca:/etc/wake/ca:ro, support-secrets:/etc/fleet/secrets:ro]
