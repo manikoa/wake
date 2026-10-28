@@ -11,6 +11,10 @@ services:
   # agent could reach every other one.
   collector:
     networks: [default, support, research, billing]
+    # Docker takes a published port at the container's own address from every network, even
+    # one published on 127.0.0.1 only, so the tools server could reach these. The agents reach
+    # the collector on their own networks, and nothing on the host needs it.
+    ports: !reset []
 
 networks:
   support:
