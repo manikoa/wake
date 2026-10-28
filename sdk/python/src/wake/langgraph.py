@@ -32,7 +32,8 @@ class WakeStore(BaseStore):
     and each get or search a memory read. The label is kept in the stored value under
     __wake__ and taken out of what the app gets back. With a quarantine on the Memory, a
     locked put or delete raises MemoryLocked, a quarantined entry reads as absent and drops
-    out of searches, and deleting one raises MemoryLocked: it's kept, as evidence."""
+    out of searches, and overwriting or deleting one raises MemoryLocked: it's kept, as
+    evidence."""
 
     def __init__(self, store: BaseStore, memory: Memory) -> None:
         self._store = store
@@ -54,22 +55,25 @@ class WakeStore(BaseStore):
         return self._after(ops, await self._store.abatch(self._before(ops, _by_key(lookups, found))))
 
     def _lookups(self, ops: list[Op]) -> list[GetOp]:
-        """What each delete would remove, so the quarantine can refuse to delete an entry it
-        hides. Without a quarantine, there's nothing to look up."""
+        """What each put or delete would replace or remove, so the quarantine can refuse to
+        overwrite or delete an entry it hides. Without a quarantine, there's nothing to look
+        up."""
         if self._memory.quarantine is None:
             return []
-        return [GetOp(op.namespace, op.key, refresh_ttl=False) for op in ops if isinstance(op, PutOp) and op.value is None]
+        return [GetOp(op.namespace, op.key, refresh_ttl=False) for op in ops if isinstance(op, PutOp)]
 
     def _before(self, ops: list[Op], found: dict[tuple, Any]) -> list[Op]:
         out: list[Op] = []
         for op in ops:
-            if isinstance(op, PutOp) and op.value is None:
+            if isinstance(op, PutOp):
                 item = found.get((op.namespace, op.key))
-                value, label = _split(item.value) if isinstance(item, Item) else (None, None)
-                self._memory.delete("/".join(op.namespace), op.key, value, label)  # raises MemoryLocked
+                current, current_label = _split(item.value) if isinstance(item, Item) else (None, None)
+            if isinstance(op, PutOp) and op.value is None:
+                self._memory.delete("/".join(op.namespace), op.key, current, current_label)  # raises MemoryLocked
             elif isinstance(op, PutOp):
                 value = {k: v for k, v in op.value.items() if k != LABEL_KEY}
-                label = self._memory.write("/".join(op.namespace), op.key, value)
+                # Raises MemoryLocked when the entry it replaces is quarantined.
+                label = self._memory.write("/".join(op.namespace), op.key, value, current, current_label)
                 if label is not None:
                     value[LABEL_KEY] = label
                 op = PutOp(op.namespace, op.key, value, op.index, op.ttl)
