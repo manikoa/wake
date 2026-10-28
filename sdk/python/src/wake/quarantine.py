@@ -17,11 +17,17 @@ once they're older than ttl seconds, or if no fetch has succeeded yet, every wri
 refused and no entry is served, under the id STALE, until a fetch succeeds again. health()
 says whether the rules are fresh, and going stale is logged as a warning.
 
+One process can host several agents, as named runs (handler.agent("email")) or Claude
+subagents. The brake locks each by its name, so the rules are fetched for each name the
+adapter writes under, from its first write on, and a run's writes are refused when its own
+name or the process's agent is locked.
+
 The proxy notes each fetch, which is how the brake confirms an adapter has a quarantine.
 Each fetch names the agent and this process (a process parameter the proxy is free to
-ignore), and a forked process starts fetching on its own. All of this runs in the agent's
-own process, so it holds only as long as the agent's code does; the proxy deny doesn't
-depend on it.
+ignore), and a forked process starts fetching on its own. Fetches go straight to the URL
+given: the app's proxy settings, such as HTTP_PROXY, never apply. All of this runs in the
+agent's own process, so it holds only as long as the agent's code does; the proxy deny
+doesn't depend on it.
 """
 
 import json
@@ -43,6 +49,12 @@ log = logging.getLogger("wake")
 STALE = "stale-rules"
 # The largest rules accepted. A larger answer is a failed fetch.
 MAX_RULES_BYTES = 8 << 20
+# The most agent names one adapter fetches rules for. Writes under any further name are
+# refused, as stale, since there are no rules to check them against.
+MAX_AGENTS = 64
+
+# Fetches the rules with no proxy, whatever the app's environment says.
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class MemoryLocked(PermissionError):
@@ -88,8 +100,18 @@ def _valid(rules: Any) -> bool:
     )
 
 
+class _Fetched:
+    """The rules last fetched for one agent name."""
+
+    def __init__(self) -> None:
+        self.rules: dict[str, Any] | None = None
+        self.at: float | None = None  # time.monotonic() of the last fetch that succeeded
+        self.error: str | None = None
+
+
 class Quarantine:
-    """Fetches one agent's memory rules from wake-proxy, and fails closed when it can't."""
+    """Fetches the memory rules for an agent, and for each named run its process hosts,
+    from wake-proxy, and fails closed when it can't."""
 
     def __init__(
         self,
@@ -106,18 +128,18 @@ class Quarantine:
         self._agent = agent
         self._interval = interval
         self._timeout = timeout
+        self._first_timeout = first_timeout
         self._ttl = ttl
         self._process = _process_id()
         self._lock = threading.Lock()
-        self._rules: dict[str, Any] | None = None
-        self._fetched_at: float | None = None  # time.monotonic() of the last fetch that succeeded
-        self._error: str | None = None
+        self._fetched: dict[str, _Fetched] = {agent: _Fetched()}
         self._warned_stale = False
+        self._warned_full = False
         self._closed = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         if start:
-            self.fetch(timeout=first_timeout)
+            self._fetch_within(agent, first_timeout)
             self._start()
             if hasattr(os, "register_at_fork"):
                 ref = weakref.ref(self)
@@ -145,15 +167,28 @@ class Quarantine:
     def _run(self) -> None:
         stop = self._stop
         while not stop.is_set():
-            self.fetch()
+            with self._lock:
+                agents = list(self._fetched)
+            for agent in agents:
+                self.fetch(agent=agent)
             stop.wait(self._interval)
 
-    def fetch(self, timeout: float | None = None) -> bool:
-        """Fetches the rules now. Never raises: on failure the last rules stand until
-        they're stale."""
+    def _fetch_within(self, agent: str, timeout: float) -> None:
+        """Fetches an agent's rules, waiting at most timeout, name lookup included, which a
+        socket timeout doesn't bound. A fetch still going carries on in the background."""
+        fetching = threading.Thread(
+            target=self.fetch, kwargs={"timeout": timeout, "agent": agent}, name="wake-quarantine-first", daemon=True
+        )
+        fetching.start()
+        fetching.join(timeout)
+
+    def fetch(self, timeout: float | None = None, agent: str | None = None) -> bool:
+        """Fetches an agent's rules now, by default those of the agent the quarantine was
+        given. Never raises: on failure the last rules stand until they're stale."""
+        agent = agent or self._agent
         try:
-            query = urllib.parse.urlencode({"agent": self._agent, "process": self._process})
-            with urllib.request.urlopen(f"{self._url}?{query}", timeout=timeout or self._timeout) as response:
+            query = urllib.parse.urlencode({"agent": agent, "process": self._process})
+            with _opener.open(f"{self._url}?{query}", timeout=timeout or self._timeout) as response:
                 body = response.read(MAX_RULES_BYTES + 1)
             if len(body) > MAX_RULES_BYTES:
                 raise ValueError(f"memory rules over {MAX_RULES_BYTES} bytes")
@@ -163,17 +198,20 @@ class Quarantine:
         except Exception as e:  # noqa: BLE001 - fetching runs beside the agent and must never raise
             error = f"couldn't fetch memory rules: {e}"
             with self._lock:
-                repeated, self._error = error == self._error, error
+                fetched = self._fetched.get(agent)
+                repeated = fetched is None or error == fetched.error
+                if fetched is not None:
+                    fetched.error = error
             # Each new error is a warning; the same one again, every couple of seconds, isn't.
             log.log(logging.DEBUG if repeated else logging.WARNING, "wake: %s", error)
             self._note_staleness()
             return False
         with self._lock:
-            self._rules = rules
-            self._fetched_at = time.monotonic()
-            self._error = None
+            fetched = self._fetched.get(agent)
+            if fetched is not None:
+                fetched.rules, fetched.at, fetched.error = rules, time.monotonic(), None
         self._note_staleness()
-        return True
+        return fetched is not None
 
     def _note_staleness(self) -> None:
         stale = self._is_stale()
@@ -189,34 +227,62 @@ class Quarantine:
         self._stop.set()
 
     def health(self) -> QuarantineHealth:
+        """Whether the rules for the quarantine's agent are fresh."""
         with self._lock:
-            fetched, error = self._fetched_at, self._error
-        age = None if fetched is None else time.monotonic() - fetched
+            fetched = self._fetched[self._agent]
+            at, error = fetched.at, fetched.error
+        age = None if at is None else time.monotonic() - at
         return QuarantineHealth(ok=age is not None and age <= self._ttl, age=age, last_error=error)
 
-    def rules(self) -> dict[str, Any] | None:
+    def rules(self, agent: str | None = None) -> dict[str, Any] | None:
         with self._lock:
-            return self._rules
+            fetched = self._fetched.get(agent or self._agent)
+            return fetched.rules if fetched else None
 
-    def _is_stale(self) -> bool:
+    def _is_stale(self, agent: str | None = None) -> bool:
         with self._lock:
-            fetched = self._fetched_at
-        return fetched is None or time.monotonic() - fetched > self._ttl
+            fetched = self._fetched.get(agent or self._agent)
+            at = fetched.at if fetched else None
+        return at is None or time.monotonic() - at > self._ttl
 
-    def locked_by(self) -> str | None:
-        """The quarantine refusing this agent's memory writes, if any: STALE when the rules
-        are."""
-        rules = self.rules()
-        locked = rules.get("locked_by") if rules else None
-        if isinstance(locked, str) and locked:
-            return locked
-        return STALE if self._is_stale() else None
+    def locked_by(self, agent: str | None = None) -> str | None:
+        """The quarantine refusing memory writes, if any: by the quarantine's agent, or by
+        agent, a named run the same process hosts, when either is locked. STALE when the
+        rules for either are. A name not seen before has its rules fetched first, waiting at
+        most first_timeout."""
+        names = [self._agent] if agent in (None, self._agent) else [self._agent, agent]
+        for name in names:
+            if not self._tracking(name):
+                return STALE
+            rules = self.rules(name)
+            locked = rules.get("locked_by") if rules else None
+            if isinstance(locked, str) and locked:
+                return locked
+        return STALE if any(self._is_stale(name) for name in names) else None
+
+    def _tracking(self, agent: str) -> bool:
+        """Whether rules are fetched for agent, starting now if they weren't, unless there
+        are already MAX_AGENTS."""
+        with self._lock:
+            if agent in self._fetched:
+                return True
+            full = len(self._fetched) >= MAX_AGENTS
+            if not full:
+                self._fetched[agent] = _Fetched()
+            warn, self._warned_full = full and not self._warned_full, self._warned_full or full
+        if full:
+            if warn:
+                log.warning("wake: memory rules are fetched for %d agents at most; refusing writes under more", MAX_AGENTS)
+            return False
+        self._fetch_within(agent, self._first_timeout)
+        return True
 
     def hiding(self, store: str, entry: str, label: Mapping[str, Any] | None, vouched: bool) -> str | None:
         """The quarantine that stops this entry being served, if any: STALE when the rules
         are, and the proxy's hidden_by when it serves no entry at all, as when it can't read
         the quarantines it holds. vouched says whether the label's digest matches the
         content read."""
+        # Every agent's rules carry every quarantine, so the quarantine's agent's will do.
         rules = self.rules()
         hidden = rules.get("hidden_by") if rules else None
         if isinstance(hidden, str) and hidden:

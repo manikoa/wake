@@ -22,6 +22,11 @@ DENIED = "denied"
 
 ORIGIN_USER = "user"
 
+# The largest payload sent whole. A larger one, such as a model's context late in a long
+# run, is cut to a prefix and marked truncated (docs/events.md), so one event always fits a
+# batch the collector takes. wake-proxy keeps 1 MiB of each body it records.
+MAX_PAYLOAD_BYTES = 4 << 20
+
 
 def dumps(value: Any, *, ensure_ascii: bool = True) -> str:
     """JSON for any value, with keys sorted. Never raises.
@@ -75,7 +80,23 @@ def _repr(value: Any) -> str:
 def payload_attributes(payload: Any) -> dict[str, str]:
     """Serialize a payload and its digest as span attributes. Never raises."""
     body = dumps(payload)
+    if len(body) > MAX_PAYLOAD_BYTES:  # ASCII, so its length is its size in bytes
+        body = _truncated(body)
     return {
         PAYLOAD: body,
         PAYLOAD_SHA256: hashlib.sha256(body.encode()).hexdigest(),
     }
+
+
+def _truncated(body: str) -> str:
+    """A payload too large to send whole: its size and digest, and as much of its start as
+    fits, as a string. Escaping at most doubles the prefix, so half the limit always fits."""
+    return json.dumps(
+        {
+            "truncated": True,
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "prefix": body[: MAX_PAYLOAD_BYTES // 2 - 256],
+        },
+        sort_keys=True,
+    )

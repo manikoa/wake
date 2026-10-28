@@ -27,9 +27,10 @@ in the recorder's health.
 With a Quarantine (wake.quarantine), the adapter also enforces the brake's memory
 quarantine: a locked agent's writes and deletes raise MemoryLocked and don't happen, a
 quarantined entry isn't served (read returns the quarantine's id, the store wrapper drops
-the entry, read_file raises MemoryQuarantined), and deleting one raises MemoryLocked: it's
-kept, as evidence. Each refusal is recorded as a `denied` event. If checking the
-quarantine fails, the write or delete is refused and the entry isn't served.
+the entry, read_file raises MemoryQuarantined), and overwriting or deleting one raises
+MemoryLocked: it's kept, as evidence. Each refusal is recorded as a `denied` event. If
+checking the quarantine fails, the write or delete is refused and the entry isn't served.
+In a process that names its agents' runs, each run's writes are locked by its own name.
 """
 
 import hashlib
@@ -99,14 +100,15 @@ class Memory:
     def quarantine(self) -> Quarantine | None:
         return self._quarantine
 
-    def write(self, store: str, entry: str, content: Any) -> dict[str, Any] | None:
+    def write(
+        self, store: str, entry: str, content: Any, current: Any = None, label: Mapping[str, Any] | None = None
+    ) -> dict[str, Any] | None:
         """Records a write and returns the label to store with the entry, or None if
-        recording failed. Raises MemoryLocked, before anything is written, when the brake's
-        quarantine locks this agent's writes."""
-        locked = self._locked()
-        if locked:
-            self._refused("write", store, entry, locked, parents=self._linked())
-            raise MemoryLocked(locked, store, entry)
+        recording failed. current and label are what the entry holds now (None if nothing)
+        and the label stored with it. Raises MemoryLocked, before anything is written, when
+        the brake's quarantine locks this agent's writes, or hides the entry: a quarantined
+        entry is kept, as evidence, not overwritten."""
+        self._check("write", store, entry, current, label)
         try:
             return self._write(store, entry, content_of(content))
         except Exception:
@@ -118,17 +120,22 @@ class Memory:
         label stored with it. Raises MemoryLocked, before anything is deleted, when the
         brake's quarantine locks this agent's writes, or hides the entry: a quarantined
         entry is kept, as evidence."""
-        refused = self._locked()
-        write = _event_id(label.get("event")) if isinstance(label, Mapping) else None
-        if not refused and current is not None:
-            refused = self._hidden(store, entry, content_of(current), label)
-        if refused:
-            self._refused("delete", store, entry, refused, parents=self._linked() + ([write] if write else []))
-            raise MemoryLocked(refused, store, entry)
+        self._check("delete", store, entry, current, label)
         try:
             self._delete(store, entry)
         except Exception:
             self._failed("a memory delete")
+
+    def _check(self, action: str, store: str, entry: str, current: Any, label: Mapping[str, Any] | None) -> None:
+        """Raises MemoryLocked, and records the refusal, when the quarantine locks this
+        agent's writes or hides the entry as it is now."""
+        refused = self._locked()
+        if not refused and current is not None:
+            refused = self._hidden(store, entry, content_of(current), label)
+        if refused:
+            write = _event_id(label.get("event")) if isinstance(label, Mapping) else None
+            self._refused(action, store, entry, refused, parents=self._linked() + ([write] if write else []))
+            raise MemoryLocked(refused, store, entry)
 
     def read(self, store: str, entry: str, content: Any, label: Mapping[str, Any] | None) -> str | None:
         """Records a read of an entry, with the label it was stored with, if any. Returns the
@@ -149,9 +156,13 @@ class Memory:
         """Writes a memory file and its label, next to it as <file>.wake.json. The label
         lands first and each file is replaced whole, so the new content is never found
         with a label that doesn't vouch for it, only the other way round, which reads as
-        changed."""
+        changed. Raises MemoryLocked when the quarantine locks this agent's writes or hides
+        the file as it is now."""
         path = Path(path)
-        label = self.write("file", str(path.resolve()), text)  # raises MemoryLocked when locked
+        current = current_label = None
+        if self._quarantine is not None and path.exists():
+            current, current_label = path.read_text(), self._label_of(path)
+        label = self.write("file", str(path.resolve()), text, current, current_label)
         if label is not None:
             try:
                 _write_atomically(Path(str(path) + LABEL_SUFFIX), json.dumps(label))
@@ -163,25 +174,36 @@ class Memory:
         """Reads a memory file and records the read, with its label if it has one."""
         path = Path(path)
         text = path.read_text()
-        label = None
-        try:
-            label_path = Path(str(path) + LABEL_SUFFIX)
-            if label_path.exists():
-                label = json.loads(label_path.read_text())
-        except (OSError, ValueError):
-            log.warning("wake: failed to read a memory file's label", exc_info=True)
         entry = str(path.resolve())
-        hidden = self.read("file", entry, text, label if isinstance(label, Mapping) else None)
+        hidden = self.read("file", entry, text, self._label_of(path))
         if hidden:
             raise MemoryQuarantined(hidden, "file", entry)
         return text
 
+    def _label_of(self, path: Path) -> Mapping[str, Any] | None:
+        """The label next to a memory file, if it has one that reads."""
+        try:
+            label_path = Path(str(path) + LABEL_SUFFIX)
+            if label_path.exists():
+                label = json.loads(label_path.read_text())
+                return label if isinstance(label, Mapping) else None
+        except (OSError, ValueError):
+            log.warning("wake: failed to read a memory file's label", exc_info=True)
+        return None
+
     def _locked(self) -> str | None:
         try:
-            return self._quarantine.locked_by() if self._quarantine else None
+            return self._quarantine.locked_by(self._run_agent()) if self._quarantine else None
         except Exception:
             log.warning("wake: failed to check the memory quarantine", exc_info=True)
             return UNCHECKED
+
+    def _run_agent(self) -> str | None:
+        """The named run writing, such as handler.agent("email"), when it isn't the agent the
+        quarantine was given: one process can host several agents, and the brake locks each
+        by its own name."""
+        agent = self._handler._current_agent()
+        return None if agent == self._handler._recorder.agent else agent
 
     def _hidden(self, store: str, entry: str, text: str, label: Mapping[str, Any] | None) -> str | None:
         if not self._quarantine:
