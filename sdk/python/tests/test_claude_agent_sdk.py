@@ -38,6 +38,7 @@ class FakeClaudeCode(Transport):
         self._hooks: dict[str, list[str]] = {}
         self._requests = 0
         self._task = None
+        self.refused: list[str] = []  # tool uses a PreToolUse hook denied
 
     async def connect(self) -> None:
         pass
@@ -83,11 +84,14 @@ class FakeClaudeCode(Transport):
         assert response["subtype"] == "success", response
         return response["response"]
 
-    async def hook(self, event: str, tool_use_id: str, **fields) -> None:
+    async def hook(self, event: str, tool_use_id: str, **fields) -> list[dict]:
+        answers = []
         for callback_id in self._hooks.get(event, []):
-            await self.request({"subtype": "hook_callback", "callback_id": callback_id, "tool_use_id": tool_use_id,
-                                "input": {"hook_event_name": event, "session_id": "session-1", "transcript_path": "",
-                                          "cwd": "/", "tool_use_id": tool_use_id, **fields}})
+            answers.append(await self.request({
+                "subtype": "hook_callback", "callback_id": callback_id, "tool_use_id": tool_use_id,
+                "input": {"hook_event_name": event, "session_id": "session-1", "transcript_path": "",
+                          "cwd": "/", "tool_use_id": tool_use_id, **fields}}))
+        return answers
 
     async def mcp(self, server: str, method: str, params: dict, request_id: int | None = None) -> dict:
         message = {"jsonrpc": "2.0", "method": method, "params": params}
@@ -107,9 +111,18 @@ class FakeClaudeCode(Transport):
         await self.emit({"type": "user", "parent_tool_use_id": parent, "session_id": "session-1",
                          "message": {"role": "user", "content": list(blocks)}})
 
-    async def use_tool(self, tool_use_id: str, name: str, arguments: dict, run, *, parent=None, agent=None):
-        context = {"agent_id": f"agent-{agent}", "agent_type": agent} if agent else {}
-        await self.hook("PreToolUse", tool_use_id, tool_name=name, tool_input=arguments, **context)
+    async def use_tool(self, tool_use_id: str, name: str, arguments: dict, run, *, parent=None, agent=None,
+                       agent_id=None):
+        context = {"agent_id": agent_id or f"agent-{agent}", "agent_type": agent} if agent else {}
+        answers = await self.hook("PreToolUse", tool_use_id, tool_name=name, tool_input=arguments, **context)
+        refused = [(a.get("hookSpecificOutput") or {}) for a in answers]
+        refused = [r["permissionDecisionReason"] for r in refused if r.get("permissionDecision") == "deny"]
+        if refused:
+            # As Claude Code does: the tool doesn't run, and the model is told why.
+            self.refused.append(tool_use_id)
+            await self.user({"type": "tool_result", "tool_use_id": tool_use_id, "content": refused[0], "is_error": True},
+                            parent=parent)
+            return
         output = await run()
         await self.hook("PostToolUse", tool_use_id, tool_name=name, tool_input=arguments, tool_response=output, **context)
         await self.user({"type": "tool_result", "tool_use_id": tool_use_id, "content": output}, parent=parent)
@@ -309,6 +322,148 @@ def test_two_subagents_of_one_type_are_two_instances():
     }, "each started its own run, under one agent name"
     answers = [e for e in wake_events(spans) if e.name == "agent_message support/researcher -> support"]
     assert len(answers) == 2 and all(identity(a) == (None, None) for a in answers), "each answer reaches the main agent"
+
+
+class Halts:
+    """Stands in for the brake's rules (wake.quarantine.Quarantine): the halts in force."""
+
+    def __init__(self) -> None:
+        self.halts: list[dict] = []
+
+    def halted(self, names):
+        for h in self.halts:
+            if h.get("fleet") or set(names) & set(h.get("agents", [])):
+                return h["id"]
+        return None
+
+
+async def until(condition, what: str) -> None:
+    for _ in range(400):
+        if condition():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"never: {what}")
+
+
+WINDOW, SHIPPING = "support/researcher#toolu_window", "support/researcher#toolu_shipping"
+
+
+def two_researchers_working(claude: WakeClaudeAgent, halts: Halts):
+    """Two researcher copies each fetch a page, then run a command. One copy is halted once
+    both have fetched."""
+
+    async def script(cli: FakeClaudeCode) -> None:
+        await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
+        asks = {"toolu_window": "Check the refund window", "toolu_shipping": "Check who pays return shipping"}
+        await cli.assistant("msg_1", *[{"type": "tool_use", "id": use, "name": "Agent",
+                                        "input": {"description": ask, "prompt": ask, "subagent_type": "researcher"}}
+                                       for use, ask in asks.items()])
+        for use, ask in asks.items():
+            await cli.user({"type": "text", "text": ask}, parent=use)
+        run = lambda: claude._run_for("session-1")
+        await until(lambda: run() is not None and {"toolu_window", "toolu_shipping"} <= set(run().threads), "both copies started")
+
+        async def fetched():
+            return POLICY
+
+        for use in asks:
+            fetch = {"url": f"https://example.com/{use}", "prompt": "policy"}
+            await cli.assistant(f"msg_{use}_1", {"type": "tool_use", "id": f"{use}_fetch", "name": "WebFetch",
+                                                 "input": fetch}, parent=use)
+            await cli.use_tool(f"{use}_fetch", "WebFetch", fetch, fetched, parent=use, agent="researcher",
+                               agent_id=f"agent-{use}")
+        await until(lambda: len(claude._subagents) == 2, "each copy placed by its agent_id")
+        halts.halts = [{"id": "halt-window", "agents": [WINDOW]}]
+
+        async def ran():
+            return "ok"
+
+        for use in asks:
+            command = {"command": f"echo {use}"}
+            await cli.assistant(f"msg_{use}_2", {"type": "tool_use", "id": f"{use}_bash", "name": "Bash",
+                                                 "input": command}, parent=use)
+            await cli.use_tool(f"{use}_bash", "Bash", command, ran, parent=use, agent="researcher",
+                               agent_id=f"agent-{use}")
+        for use in asks:
+            await cli.user({"type": "tool_result", "tool_use_id": use, "content": [{"type": "text", "text": "done"}]})
+        # The main agent isn't halted: its own tool call runs.
+        await cli.assistant("msg_2", {"type": "tool_use", "id": "toolu_main_bash", "name": "Bash",
+                                      "input": {"command": "date"}})
+        await cli.use_tool("toolu_main_bash", "Bash", {"command": "date"}, ran)
+        await cli.assistant("msg_3", {"type": "text", "text": ANSWER})
+        await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
+                        "is_error": False, "num_turns": 3, "session_id": "session-1", "result": ANSWER})
+        cli_seen.append(cli)
+
+    return script
+
+
+cli_seen: list = []
+
+
+def test_a_halted_subagent_is_stopped_in_process_and_its_sibling_goes_on():
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    halts = Halts()
+    claude = WakeClaudeAgent(recorder, quarantine=halts)
+    cli_seen.clear()
+    asyncio.run(run_support(claude, script=two_researchers_working(claude, halts)))
+    recorder.flush()
+    assert cli_seen[0].refused == ["toolu_window_bash"], "only the halted copy's command was refused"
+    denied = [e for e in wake_events(exporter.get_finished_spans()) if e.attributes["wake.event.kind"] == "denied"]
+    assert len(denied) == 1
+    (d,) = denied
+    assert d.attributes["wake.brake.halt_id"] == "halt-window"
+    assert d.attributes["gen_ai.tool.name"] == "Bash"
+    assert identity(d) == (WINDOW, ("support",)), "recorded as the halted instance's attempt"
+    ran = [e for e in wake_events(exporter.get_finished_spans())
+           if e.attributes["wake.event.kind"] == "tool_call" and e.attributes.get("gen_ai.tool.name") == "Bash"]
+    assert sorted(identity(e)[0] or "main" for e in ran) == ["main", SHIPPING]
+
+
+def test_while_wake_cant_tell_which_copy_is_calling_a_halted_copy_stops_every_copy():
+    # A hook can come before the stream says which copy asked for its tool. Two copies of a
+    # type are running, neither yet placed by its agent_id, and one is halted.
+    halts = Halts()
+    halts.halts = [{"id": "halt-window", "agents": [WINDOW]}]
+    claude = WakeClaudeAgent(Recorder(agent="support", exporter=InMemorySpanExporter()), quarantine=halts)
+    run = claude._start_run(PROMPT)
+    main = run.threads[None]
+    for use in ("toolu_window", "toolu_shipping"):
+        run.threads[use] = main.started("support/researcher", f"support/researcher#{use}", run.root, [], [])
+
+    def ask(agent_id):
+        return claude._halting({"agent_id": agent_id, "agent_type": "researcher", "tool_name": "Bash"}, None)
+
+    halt, reason = ask("agent-1")
+    assert halt == "halt-window" and "can't yet tell which copy is calling" in reason
+    # Once one copy is placed, the other is the only one an unknown agent_id can be.
+    claude._subagents["agent-2"] = (SHIPPING, "support")
+    halt, reason = ask("agent-1")
+    assert halt == "halt-window" and reason.startswith(f"Wake halted {WINDOW}")
+    assert ask("agent-2") is None, "the sibling goes on"
+    claude._subagents["agent-1"] = (WINDOW, "support")
+    assert ask("agent-1")[0] == "halt-window"
+    halts.halts = []
+    assert ask("agent-1") is None
+    claude._end_run(run)
+
+
+def test_a_halt_of_the_agent_stops_it_and_its_subagents_and_no_halt_stops_nothing(recorded):
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    halts = Halts()
+    halts.halts = [{"id": "halt-support", "agents": ["support", "0oa1support"]}]
+    seen_links.clear()
+    asyncio.run(run_support(WakeClaudeAgent(recorder, quarantine=halts)))
+    recorder.flush()
+    denied = [e for e in wake_events(exporter.get_finished_spans()) if e.attributes["wake.event.kind"] == "denied"]
+    assert sorted(e.attributes["gen_ai.tool.name"] for e in denied) == ["WebFetch", "mcp__crm__lookup_order"]
+    assert {e.attributes["wake.brake.halt_id"] for e in denied} == {"halt-support"}
+    assert seen_links == [], "the in-process tool never ran"
+    # Without a halt, the same run records as before: nothing refused.
+    _, spans = recorded
+    assert not [e for e in wake_events(spans) if e.attributes["wake.event.kind"] == "denied"]
 
 
 def test_an_in_process_tool_runs_with_its_event_current(recorded):

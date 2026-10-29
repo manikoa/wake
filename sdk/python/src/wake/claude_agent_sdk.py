@@ -25,15 +25,23 @@ in-process tools so they run with their event current: an MCP or A2A call they m
 through the proxy, or a memory write, links back to the tool call. Tools Claude Code runs
 itself, such as Bash, WebFetch or an external MCP server, are recorded from the stream
 but can't carry the link.
+
+Given the brake's rules (WakeClaudeAgent(recorder, quarantine=Quarantine(...))), the
+hooks also stop the agent, or one subagent instance of it, in its own process: a tool
+call a halt covers is refused before it runs, and recorded as denied. That reaches what
+the proxy deny can't, such as Bash, and subagents that call with their parent's
+credentials, which the proxy can't tell from their parent. It's a cooperative stop: it
+holds only while the agent's code does, and a compromised agent can leave it out.
 """
 
 import dataclasses
+import logging
 import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterable, AsyncIterator
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -54,6 +62,10 @@ from wake import events, links
 from wake._graph import EventGraph, _Recent, never_raise
 from wake.recorder import Recorder
 
+if TYPE_CHECKING:
+    from wake.quarantine import Quarantine
+
+log = logging.getLogger("wake")
 
 # The tool Claude Code starts a subagent with; older versions call it Task.
 SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
@@ -140,6 +152,7 @@ class _Tool:
         self.error: str | None = None
         self.ended_at: int | None = None
         self.frame = None  # the in-process tool's link frame, once it runs
+        self.halted: str | None = None  # the halt its call was refused under
 
 
 class _Run:
@@ -156,12 +169,19 @@ class _Run:
 class WakeClaudeAgent(EventGraph):
     """Records one Claude agent's runs, and the subagents it starts."""
 
-    def __init__(self, recorder: Recorder) -> None:
+    def __init__(self, recorder: Recorder, quarantine: "Quarantine | None" = None) -> None:
+        """With quarantine, the brake's rules for this agent (wake.quarantine), a tool call by
+        the agent, or by a subagent instance of it, that a halt covers is refused before it
+        runs, and recorded as denied. It trusts the agent's code: see cooperative stops in
+        the README."""
         super().__init__(recorder)
+        self._quarantine = quarantine
         self._tools: dict[str, _Tool] = _Recent()  # tool use id -> its open tool call
         self._waiting = _Recent()  # (tool name, arguments) -> tool use ids an in-process tool may be
         self._tool_agents = _Recent()  # tool call event id -> the agent making it
         self._tool_instances = _Recent()  # tool call event id -> the subagent instance making it, and its lineage
+        self._agent_ids = _Recent()  # tool use id -> the agent_id its hook named, for a subagent's
+        self._subagents = _Recent()  # a hook's agent_id -> the names of the instance it is: itself, then its lineage
         self._sessions = _Recent(limit=1024)  # session id -> its run now
         self._last_calls = _Recent(limit=1024)  # session id -> its last model call, for the next turn
         self._active: list[_Run] = []
@@ -201,7 +221,11 @@ class WakeClaudeAgent(EventGraph):
 
     async def _pre_tool_use(self, hook_input, tool_use_id, context) -> dict:
         self._hook_opened(hook_input, tool_use_id)
-        return {}
+        halt = self._halting(hook_input, tool_use_id)
+        if halt is None:
+            return {}
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": halt[1]}}
 
     async def _post_tool_use(self, hook_input, tool_use_id, context) -> dict:
         self._hook_closed(hook_input, tool_use_id)
@@ -210,14 +234,70 @@ class WakeClaudeAgent(EventGraph):
     @never_raise
     def _hook_opened(self, hook_input, tool_use_id) -> None:
         name = hook_input.get("tool_name") or ""
+        agent_id = hook_input.get("agent_id")
+        if tool_use_id and agent_id:
+            with self._lock:
+                self._agent_ids[tool_use_id] = agent_id
         if not tool_use_id or name in SUBAGENT_TOOLS:
             return
         run = self._run_for(hook_input.get("session_id"))
         if run is None:
             return  # the stream opens it instead
-        agent_type = hook_input.get("agent_type") if hook_input.get("agent_id") else None
+        agent_type = hook_input.get("agent_type") if agent_id else None
         agent = f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
-        self._open_tool(run, tool_use_id, name, hook_input.get("tool_input"), agent, run.root)
+        tool = self._open_tool(run, tool_use_id, name, hook_input.get("tool_input"), agent, run.root)
+        if agent_id and tool.instance:
+            # The stream said first which instance asked for it.
+            with self._lock:
+                self._subagents[agent_id] = (tool.instance, *tool.lineage)
+
+    # Cooperative stops.
+
+    @never_raise
+    def _halting(self, hook_input, tool_use_id) -> "tuple[str, str] | None":
+        """The halt that stops this tool call, and why, if one covers who's making it: the
+        agent, the subagent type it runs as, and the instance it is and those that started it.
+        A subagent's instance is known from its earlier calls, by the agent_id its hooks name.
+        Before that, with one copy of its type running, it's that one; with several, it's
+        refused if any copy is halted, since Wake can't yet tell which is calling."""
+        if self._quarantine is None:
+            return None
+        agent_id = hook_input.get("agent_id")
+        agent_type = hook_input.get("agent_type") if agent_id else None
+        agent = f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
+        names = {self._recorder.agent, agent}
+        copies: list[tuple[str, ...]] = [()]
+        if agent_id:
+            with self._lock:
+                known = self._subagents.get(agent_id)
+            copies = [known] if known else (self._unplaced(hook_input.get("session_id"), agent) or [()])
+        for copy in copies:
+            halt = self._quarantine.halted(names | set(copy))
+            if halt is None:
+                continue
+            who = copy[0] if len(copies) == 1 and copy else agent
+            if len(copies) > 1:
+                reason = (f"Wake halted a copy of {agent} ({halt}) and can't yet tell which copy is calling, "
+                          f"so this tool call wasn't run.")
+            else:
+                reason = f"Wake halted {who} ({halt}), so this tool call wasn't run."
+            with self._lock:
+                tool = self._tools.get(tool_use_id) if tool_use_id else None
+            if tool is not None:
+                tool.halted = halt
+            log.warning("wake: refused %s's %s call: %s", who, hook_input.get("tool_name") or "tool", halt)
+            return halt, reason
+        return None
+
+    def _unplaced(self, session_id: str | None, agent: str) -> list[tuple[str, ...]]:
+        """The names of each running instance of agent that no hook's agent_id is known to be."""
+        run = self._run_for(session_id)
+        if run is None:
+            return []
+        with self._lock:
+            placed = {names[0] for names in self._subagents.values()}
+        return [(t.instance, *t.lineage) for t in list(run.threads.values())
+                if t.agent == agent and t.instance and t.instance not in placed]
 
     @never_raise
     def _hook_closed(self, hook_input, tool_use_id) -> None:
@@ -435,6 +515,10 @@ class WakeClaudeAgent(EventGraph):
             self._tool_agents[tool.event_id] = thread.agent
             if thread.instance:
                 self._tool_instances[tool.event_id] = (thread.instance, thread.lineage)
+                agent_id = self._agent_ids.get(tool_use_id)
+                if agent_id:
+                    # Its hook came first, naming the subagent by agent_id: now it's placed.
+                    self._subagents[agent_id] = (thread.instance, *thread.lineage)
         self._remember_lineage(tool.event_id, tool.parents, [f"tool:{name}"])
 
     def _open_tool(self, run, tool_use_id, name, arguments, agent, parent_span, *, server=False) -> _Tool:
@@ -472,7 +556,11 @@ class WakeClaudeAgent(EventGraph):
         payload: dict[str, Any] = {"input": tool.arguments, "output": output}
         if error:
             payload["error"] = tool.error or _text(output) or error
-        self._emit(tool.span, tool.event_id, events.TOOL_CALL, f"execute_tool {tool.name}", tool.agent,
+        kind = events.TOOL_CALL
+        if tool.halted:
+            # Refused in the agent's own process, under the halt: what the agent tried.
+            kind, attributes["wake.brake.halt_id"] = events.DENIED, tool.halted
+        self._emit(tool.span, tool.event_id, kind, f"execute_tool {tool.name}", tool.agent,
                    tool.parents, [f"tool:{tool.name}"], attributes, payload, error=error, who=tool)
         self._remember_output(tool.span.get_span_context().trace_id, tool.event_id, _text(output))
         tool.span.end(end_time=tool.ended_at)

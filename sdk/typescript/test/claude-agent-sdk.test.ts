@@ -204,6 +204,87 @@ test("two subagents of one type are two instances", async () => {
   assert.ok(answers.every((a) => identity(a).every((v) => v === undefined)), "each answer reaches the main agent");
 });
 
+/** Stands in for the brake's rules (Quarantine): the halts in force. */
+class Halts {
+  halts: { id: string; fleet?: boolean; agents?: string[] }[] = [];
+  halted(names: Iterable<string>): string | null {
+    const named = new Set(names);
+    return this.halts.find((h) => h.fleet || (h.agents ?? []).some((a) => named.has(a)))?.id ?? null;
+  }
+}
+
+async function until(condition: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 400; i++) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`never: ${what}`);
+}
+
+const WINDOW = "support/researcher#toolu_window";
+const SHIPPING = "support/researcher#toolu_shipping";
+
+/** Two researcher copies each fetch a page, then run a command; one is halted once both have fetched. */
+function twoResearchersWorking(claude: WakeClaudeAgent, halts: Halts, seen: FakeClaudeCode[]) {
+  return async (cli: FakeClaudeCode): Promise<void> => {
+    seen.push(cli);
+    cli.emit({ type: "system", subtype: "init", session_id: "session-1", uuid: "u0" });
+    const asks: [string, string][] = [
+      ["toolu_window", "Check the refund window"],
+      ["toolu_shipping", "Check who pays return shipping"],
+    ];
+    cli.assistant("msg_1", asks.map(([use, ask]) => ({ type: "tool_use", id: use, name: "Agent", input: { description: ask, prompt: ask, subagent_type: "researcher" } })));
+    for (const [use, ask] of asks) cli.user([{ type: "text", text: ask }], use);
+    for (const [use] of asks) {
+      const fetch = { url: `https://example.com/${use}`, prompt: "policy" };
+      cli.assistant(`msg_${use}_1`, [{ type: "tool_use", id: `${use}_fetch`, name: "WebFetch", input: fetch }], use);
+      await cli.useTool(`${use}_fetch`, "WebFetch", fetch, async () => POLICY, { parent: use, agent: "researcher", agentId: `agent-${use}` });
+    }
+    await until(() => claude._subagents.size === 2, "each copy placed by its agent_id");
+    halts.halts = [{ id: "halt-window", agents: [WINDOW] }];
+    for (const [use] of asks) {
+      const command = { command: `echo ${use}` };
+      cli.assistant(`msg_${use}_2`, [{ type: "tool_use", id: `${use}_bash`, name: "Bash", input: command }], use);
+      await cli.useTool(`${use}_bash`, "Bash", command, async () => "ok", { parent: use, agent: "researcher", agentId: `agent-${use}` });
+    }
+    for (const [use] of asks) cli.user([{ type: "tool_result", tool_use_id: use, content: [{ type: "text", text: "done" }] }]);
+    // The main agent isn't halted: its own tool call runs.
+    cli.assistant("msg_2", [{ type: "tool_use", id: "toolu_main_bash", name: "Bash", input: { command: "date" } }]);
+    await cli.useTool("toolu_main_bash", "Bash", { command: "date" }, async () => "ok");
+    cli.assistant("msg_3", [{ type: "text", text: ANSWER }]);
+    cli.emit({ type: "result", subtype: "success", duration_ms: 10, duration_api_ms: 8, is_error: false, num_turns: 3, session_id: "session-1", result: ANSWER });
+  };
+}
+
+test("a halted subagent is stopped in process, and its sibling goes on", async () => {
+  const { recorder, spans } = recorded("support");
+  const halts = new Halts();
+  const claude = new WakeClaudeAgent(recorder, { quarantine: halts });
+  const seen: FakeClaudeCode[] = [];
+  await runSupport(claude, twoResearchersWorking(claude, halts, seen));
+  assert.deepEqual(seen[0].refused, ["toolu_window_bash"], "only the halted copy's command was refused");
+  const events = wakeEvents(await spans());
+  const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "halt-window");
+  assert.equal(attr(denied[0], "gen_ai.tool.name"), "Bash");
+  assert.deepEqual(identity(denied[0]), [WINDOW, ["support"]], "recorded as the halted instance's attempt");
+  const ran = events.filter((e) => attr(e, "wake.event.kind") === "tool_call" && attr(e, "gen_ai.tool.name") === "Bash");
+  assert.deepEqual(ran.map((e) => (identity(e)[0] as string | undefined) ?? "main").sort(), ["main", SHIPPING]);
+});
+
+test("a halt of the agent stops it and its subagents", async () => {
+  const { recorder, spans } = recorded("support");
+  const halts = new Halts();
+  halts.halts = [{ id: "halt-support", agents: ["support", "0oa1support"] }];
+  const before = seenLinks.length;
+  await runSupport(new WakeClaudeAgent(recorder, { quarantine: halts }));
+  const denied = wakeEvents(await spans()).filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.deepEqual(denied.map((e) => attr(e, "gen_ai.tool.name")).sort(), ["WebFetch", "mcp__crm__lookup_order"]);
+  assert.deepEqual(new Set(denied.map((e) => attr(e, "wake.brake.halt_id"))), new Set(["halt-support"]));
+  assert.equal(seenLinks.length, before, "the in-process tool never ran");
+});
+
 test("an in-process tool runs with its event current", async () => {
   const { spans } = await support();
   const lookup = byName(spans, "execute_tool mcp__crm__lookup_order");

@@ -227,6 +227,35 @@ def test_stale_rules_fail_closed(rules, tmp_path, caplog):
     assert {attr(e, "wake.brake.halt_id") for e in refused} == {STALE}
 
 
+def test_the_rules_say_who_is_halted(rules):
+    q = Quarantine(rules.url, "support", start=False, ttl=60)
+    assert q.fetch()
+    assert q.halted({"support"}) is None, "a proxy that doesn't say what's halted halts nothing here"
+    rules.rules = {"version": 2, "quarantines": [], "halts": [{"id": "h-sub", "agents": ["support/researcher#toolu_1"]}]}
+    assert q.fetch()
+    copy = {"support", "support/researcher"}
+    assert q.halted(copy | {"support/researcher#toolu_1"}) == "h-sub"
+    assert q.halted(copy | {"support/researcher#toolu_2"}) is None, "its sibling goes on"
+    rules.rules["halts"].append({"id": "h-fleet", "fleet": True})
+    assert q.fetch()
+    assert q.halted({"billing"}) == "h-fleet"
+    # Halts that don't read as halts are a failed fetch: the last rules stand.
+    for bad in ([{"id": 3}], [{"id": "h", "agents": "support"}], [{"id": "h", "fleet": "yes"}], "h"):
+        rules.rules = {"version": 3, "quarantines": [], "halts": bad}
+        assert not q.fetch()
+        assert q.halted({"billing"}) == "h-fleet"
+
+
+def test_stale_rules_halt_everyone(rules):
+    q = Quarantine(rules.url, "support", start=False, ttl=0.2)
+    assert q.fetch()
+    assert q.halted({"support"}) is None
+    rules.server.shutdown()
+    rules.server.server_close()
+    time.sleep(0.3)
+    assert q.halted({"support"}) == STALE
+
+
 def test_rules_over_a_mebibyte_are_read_and_too_large_rules_are_a_warning(rules, caplog):
     rules.quarantine(locked_by="q1", lock={"fleet": True})
     rules.padding = 2 << 20

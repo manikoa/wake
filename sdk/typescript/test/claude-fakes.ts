@@ -15,6 +15,7 @@ export class FakeClaudeCode {
   readonly #hooks = new Map<string, string[]>();
   #requests = 0;
   readonly sessionId: string;
+  readonly refused: string[] = []; // tool uses a PreToolUse hook denied
 
   constructor(out: PassThrough, sessionId: string) {
     this.#out = out;
@@ -46,15 +47,17 @@ export class FakeClaudeCode {
     return (response.response as Json) ?? {};
   }
 
-  async hook(event: string, toolUseId: string, fields: Json): Promise<void> {
+  async hook(event: string, toolUseId: string, fields: Json): Promise<Json[]> {
+    const answers: Json[] = [];
     for (const callbackId of this.#hooks.get(event) ?? []) {
-      await this.request({
+      answers.push(await this.request({
         subtype: "hook_callback",
         callback_id: callbackId,
         tool_use_id: toolUseId,
         input: { hook_event_name: event, session_id: this.sessionId, transcript_path: "", cwd: "/", tool_use_id: toolUseId, ...fields },
-      });
+      }));
     }
+    return answers;
   }
 
   async mcp(server: string, method: string, params: Json, id?: number): Promise<Json> {
@@ -81,9 +84,25 @@ export class FakeClaudeCode {
     this.emit({ type: "user", parent_tool_use_id: parent, session_id: this.sessionId, message: { role: "user", content: blocks } });
   }
 
-  async useTool(toolUseId: string, name: string, args: Json, run: () => Promise<string>, options: { parent?: string; agent?: string } = {}): Promise<void> {
-    const context = options.agent ? { agent_id: `agent-${options.agent}`, agent_type: options.agent } : {};
-    await this.hook("PreToolUse", toolUseId, { tool_name: name, tool_input: args, ...context });
+  async useTool(
+    toolUseId: string,
+    name: string,
+    args: Json,
+    run: () => Promise<string>,
+    options: { parent?: string; agent?: string; agentId?: string } = {},
+  ): Promise<void> {
+    const context = options.agent ? { agent_id: options.agentId ?? `agent-${options.agent}`, agent_type: options.agent } : {};
+    const answers = await this.hook("PreToolUse", toolUseId, { tool_name: name, tool_input: args, ...context });
+    const refused = answers
+      .map((a) => (a.hookSpecificOutput ?? {}) as Json)
+      .filter((o) => o.permissionDecision === "deny")
+      .map((o) => o.permissionDecisionReason as string);
+    if (refused.length) {
+      // As Claude Code does: the tool doesn't run, and the model is told why.
+      this.refused.push(toolUseId);
+      this.user([{ type: "tool_result", tool_use_id: toolUseId, content: refused[0], is_error: true }], options.parent ?? null);
+      return;
+    }
     const output = await run();
     await this.hook("PostToolUse", toolUseId, { tool_name: name, tool_input: args, tool_response: output, ...context });
     this.user([{ type: "tool_result", tool_use_id: toolUseId, content: output }], options.parent ?? null);

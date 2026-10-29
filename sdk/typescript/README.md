@@ -55,6 +55,22 @@ Wake reads the messages the SDK streams back from Claude Code and passes them on
 
 `options()` adds hooks that open each tool call before it runs. `tools()` wraps in-process tools so they run with their event current, so an MCP or A2A call they make through the proxy, or a memory write, links back to the tool call. Tools Claude Code runs itself, such as Bash, WebFetch or an external MCP server, are recorded from the stream but can't carry the link.
 
+### Stopping one subagent in its process
+
+Give it the brake's rules, and its hooks also refuse the tool calls of a halted agent, or of one halted subagent instance, before they run:
+
+```ts
+import { Quarantine } from "wake-sdk/quarantine";
+
+const claude = new WakeClaudeAgent(recorder, { quarantine: new Quarantine("http://wake-proxy:9003", { agent: "support" }) });
+```
+
+Wake's brake halts a subagent by the identity it calls with. One that calls through the proxy with credentials of its own is stopped there. One that runs in its parent's process with its parent's credentials can't be told from its parent outside that process, so this stops it inside: the rules carry the halts in force, fetched from the proxy every couple of seconds, and a tool call whose agent, subagent type, instance or any instance that started it is halted is refused, and recorded as a `denied` event naming the halt (`wake.brake.halt_id`). That reaches Bash, file edits and anything else Claude Code runs itself, which never pass the proxy.
+
+- **Which copy is calling.** Claude Code names a subagent in its hooks by an `agent_id`, not by the Agent tool use Wake names the instance by. Wake learns which is which from the subagent's calls it has seen both ways. Before it has, with one copy of that type running it's that one; with several, a call is refused if any copy is halted, since Wake can't yet tell which is calling.
+- **It fails closed.** Rules older than the quarantine's ttl (30 seconds by default) refuse every tool call, as they refuse memory writes. A proxy that doesn't serve halts, being older than this, stops nothing here: the proxy deny still holds.
+- **It trusts the agent's code.** It runs in the agent's own process, so it holds only while that code does: a compromised agent can leave it out. The brake says so when it confirms a subagent stopped this way.
+
 ## LangChain agents written as plain TypeScript
 
 For agents built from LangChain models and tools without LangGraph, install the handler so every model and tool call made from there on is recorded, and name the agent behind each run. `handler.uninstall()` turns it off again.

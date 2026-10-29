@@ -22,6 +22,12 @@ subagents. The brake locks each by its name, so the rules are fetched for each n
 adapter writes under, from its first write on, and a run's writes are refused when its own
 name or the process's agent is locked.
 
+The rules carry the halts in force too, so an integration can stop its agent, or one
+instance of it such as an in-process subagent, in the agent's own process: the Claude
+Agent SDK integration refuses their tool calls (halted). That reaches what the proxy deny
+can't, such as built-in tools and subagents that call with their parent's credentials,
+but like the rest of this it holds only while the agent's code does.
+
 The proxy notes each fetch, which is how the brake confirms an adapter has a quarantine.
 Each fetch names the agent and this process (a process parameter the proxy is free to
 ignore), and a forked process starts fetching on its own. Fetches go straight to the URL
@@ -39,7 +45,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import weakref
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -91,12 +97,18 @@ def _valid(rules: Any) -> bool:
     if not isinstance(rules, dict):
         return False
     locked, hidden = rules.get("locked_by"), rules.get("hidden_by")
-    quarantines = rules.get("quarantines", [])
-    if any(v is not None and not isinstance(v, str) for v in (locked, hidden)) or not isinstance(quarantines, list):
+    quarantines, halts = rules.get("quarantines", []), rules.get("halts", [])
+    if any(v is not None and not isinstance(v, str) for v in (locked, hidden)):
+        return False
+    if not isinstance(quarantines, list) or not isinstance(halts, list):
         return False
     return all(
         isinstance(q, dict) and isinstance(q.get("id"), str) and q["id"] and isinstance(q.get("selection") or {}, dict)
         for q in quarantines
+    ) and all(
+        isinstance(h, dict) and isinstance(h.get("id"), str) and h["id"] and isinstance(h.get("fleet", False), bool)
+        and isinstance(h.get("agents", []), list) and all(isinstance(a, str) for a in h.get("agents", []))
+        for h in halts
     )
 
 
@@ -259,6 +271,23 @@ class Quarantine:
             if isinstance(locked, str) and locked:
                 return locked
         return STALE if any(self._is_stale(name) for name in names) else None
+
+    def halted(self, names: "Iterable[str]") -> str | None:
+        """The halt that stops whoever goes by these names, if any: an agent's name, the
+        subagent type it runs as, its instance and the instances that started it. STALE when
+        the rules are. None when the proxy doesn't say what's halted, being older than
+        cooperative stops: there's nothing to go on, and the proxy deny still holds."""
+        if self._is_stale():
+            return STALE
+        rules = self.rules()
+        halts = rules.get("halts") if rules else None
+        if not isinstance(halts, list):
+            return None
+        names = set(names)
+        for h in halts:
+            if h.get("fleet") or names.intersection(h.get("agents") or []):
+                return h["id"]
+        return None
 
     def _tracking(self, agent: str) -> bool:
         """Whether rules are fetched for agent, starting now if they weren't, unless there

@@ -26,6 +26,13 @@
  * proxy, or a memory write, links back to the tool call. Tools Claude Code runs itself, such
  * as Bash, WebFetch or an external MCP server, are recorded from the stream but can't carry
  * the link.
+ *
+ * Given the brake's rules (new WakeClaudeAgent(recorder, { quarantine })), the hooks also stop
+ * the agent, or one subagent instance of it, in its own process: a tool call a halt covers is
+ * refused before it runs, and recorded as denied. That reaches what the proxy deny can't, such
+ * as Bash, and subagents that call with their parent's credentials, which the proxy can't tell
+ * from their parent. It's a cooperative stop: it holds only while the agent's code does, and a
+ * compromised agent can leave it out.
  */
 
 import { randomUUID } from "node:crypto";
@@ -36,6 +43,7 @@ import * as events from "./events.ts";
 import { contextOf, EventGraph, failed, Recent, unique } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
+import type { Quarantine } from "./quarantine.ts";
 import { now, type Recorder } from "./recorder.ts";
 
 /** The tool Claude Code starts a subagent with; older versions call it Task. */
@@ -144,6 +152,7 @@ class Tool {
   error: string | undefined;
   endedAt: number | undefined;
   frame: links.Frame | undefined; // the in-process tool's link frame, once it runs
+  halted: string | undefined; // the halt its call was refused under
 
   constructor(eventId: string, span: Span, name: string, args: unknown, agent: string, run: Run | undefined) {
     this.eventId = eventId;
@@ -190,9 +199,19 @@ export class WakeClaudeAgent extends EventGraph {
   readonly #sessions = new Recent<string, Run>(1024); // session id -> its run now
   readonly #lastCalls = new Recent<string, string>(1024); // session id -> its last model call, for the next turn
   readonly #active: Run[] = [];
+  readonly #agentIds = new Recent<string, string>(); // tool use id -> the agent_id its hook named, for a subagent's
+  /** A hook's agent_id -> the names of the instance it is: itself, then its lineage. */
+  readonly _subagents = new Recent<string, readonly string[]>();
+  readonly #quarantine: Pick<Quarantine, "halted"> | undefined;
 
-  constructor(recorder: Recorder) {
+  /**
+   * With quarantine, the brake's rules for this agent, a tool call by the agent, or by a
+   * subagent instance of it, that a halt covers is refused before it runs, and recorded as
+   * denied. It trusts the agent's code: see cooperative stops in the README.
+   */
+  constructor(recorder: Recorder, { quarantine }: { quarantine?: Pick<Quarantine, "halted"> } = {}) {
     super(recorder);
+    this.#quarantine = quarantine;
   }
 
   // Setup.
@@ -236,7 +255,9 @@ export class WakeClaudeAgent extends EventGraph {
 
   readonly #preToolUse: HookCallback = async (input, toolUseId) => {
     this.#safely("hookOpened", () => this.#hookOpened(input, toolUseId));
-    return {};
+    const halt = this.#safely("halting", () => this._halting(input, toolUseId));
+    if (halt === undefined) return {};
+    return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: halt[1] } };
   };
 
   readonly #postToolUse: HookCallback = async (input, toolUseId) => {
@@ -246,12 +267,63 @@ export class WakeClaudeAgent extends EventGraph {
 
   #hookOpened(input: Json, toolUseId: string | undefined): void {
     const name = typeof input.tool_name === "string" ? input.tool_name : "";
+    const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : undefined;
+    if (toolUseId && agentId) this.#agentIds.set(toolUseId, agentId);
     if (!toolUseId || SUBAGENT_TOOLS.has(name)) return;
     const run = this.#runFor(input.session_id as string | undefined);
     if (run === undefined) return; // the stream opens it instead
-    const agentType = input.agent_id ? (input.agent_type as string | undefined) : undefined;
+    const agentType = agentId ? (input.agent_type as string | undefined) : undefined;
     const agent = agentType ? `${this._recorder.agent}/${agentType}` : this._recorder.agent;
-    this.#openTool(run, toolUseId, name, input.tool_input, agent, run.root);
+    const tool = this.#openTool(run, toolUseId, name, input.tool_input, agent, run.root);
+    // The stream said first which instance asked for it.
+    if (agentId && tool.instance) this._subagents.set(agentId, [tool.instance, ...tool.lineage]);
+  }
+
+  // Cooperative stops.
+
+  /**
+   * The halt that stops this tool call, and why, if one covers who's making it: the agent, the
+   * subagent type it runs as, and the instance it is and those that started it. A subagent's
+   * instance is known from its earlier calls, by the agent_id its hooks name. Before that, with
+   * one copy of its type running, it's that one; with several, it's refused if any copy is
+   * halted, since Wake can't yet tell which is calling.
+   */
+  _halting(input: Json, toolUseId: string | undefined): [string, string] | undefined {
+    if (this.#quarantine === undefined) return undefined;
+    const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : undefined;
+    const agentType = agentId ? (input.agent_type as string | undefined) : undefined;
+    const agent = agentType ? `${this._recorder.agent}/${agentType}` : this._recorder.agent;
+    const names = [this._recorder.agent, agent];
+    let copies: (readonly string[])[] = [[]];
+    if (agentId) {
+      const known = this._subagents.get(agentId);
+      const unplaced = known === undefined ? this.#unplaced(input.session_id as string | undefined, agent) : [];
+      copies = known !== undefined ? [known] : unplaced.length ? unplaced : [[]];
+    }
+    for (const copy of copies) {
+      const halt = this.#quarantine.halted([...names, ...copy]);
+      if (halt === null) continue;
+      const who = copies.length === 1 && copy.length ? copy[0] : agent;
+      const reason =
+        copies.length > 1
+          ? `Wake halted a copy of ${agent} (${halt}) and can't yet tell which copy is calling, so this tool call wasn't run.`
+          : `Wake halted ${who} (${halt}), so this tool call wasn't run.`;
+      const tool = toolUseId ? this.#tools.get(toolUseId) : undefined;
+      if (tool !== undefined) tool.halted = halt;
+      log.warn(`refused ${who}'s ${typeof input.tool_name === "string" ? input.tool_name : "tool"} call: ${halt}`);
+      return [halt, reason];
+    }
+    return undefined;
+  }
+
+  /** The names of each running instance of agent that no hook's agent_id is known to be. */
+  #unplaced(sessionId: string | undefined, agent: string): (readonly string[])[] {
+    const run = this.#runFor(sessionId);
+    if (run === undefined) return [];
+    const placed = new Set([...this._subagents.values()].map((names) => names[0]));
+    return [...run.threads.values()]
+      .filter((t) => t.agent === agent && t.instance && !placed.has(t.instance))
+      .map((t) => [t.instance as string, ...t.lineage]);
   }
 
   #hookClosed(input: Json, toolUseId: string | undefined): void {
@@ -466,7 +538,12 @@ export class WakeClaudeAgent extends EventGraph {
     tool.lineage = thread.lineage;
     tool.parents = unique([call.eventId, ...call.found]);
     this.#toolAgents.set(tool.eventId, thread.agent);
-    if (thread.instance) this.#toolInstances.set(tool.eventId, [thread.instance, thread.lineage]);
+    if (thread.instance) {
+      this.#toolInstances.set(tool.eventId, [thread.instance, thread.lineage]);
+      // Its hook came first, naming the subagent by agent_id: now it's placed.
+      const agentId = this.#agentIds.get(toolUseId);
+      if (agentId) this._subagents.set(agentId, [thread.instance, ...thread.lineage]);
+    }
     this._rememberLineage(tool.eventId, tool.parents, [`tool:${name}`]);
   }
 
@@ -502,7 +579,13 @@ export class WakeClaudeAgent extends EventGraph {
     if (parts[0] === "mcp" && parts.length >= 3) attributes["wake.mcp.server"] = parts[1];
     const payload: Json = { input: tool.args ?? null, output: output ?? null };
     if (error) payload.error = tool.error ?? (text(output) || error);
-    this.#emit(tool.span, tool.eventId, events.TOOL_CALL, `execute_tool ${tool.name}`, tool.agent, tool.parents, [`tool:${tool.name}`], attributes, payload, error, tool);
+    let kind = events.TOOL_CALL;
+    if (tool.halted) {
+      // Refused in the agent's own process, under the halt: what the agent tried.
+      kind = events.DENIED;
+      attributes["wake.brake.halt_id"] = tool.halted;
+    }
+    this.#emit(tool.span, tool.eventId, kind, `execute_tool ${tool.name}`, tool.agent, tool.parents, [`tool:${tool.name}`], attributes, payload, error, tool);
     this._rememberOutput(tool.span.spanContext().traceId, tool.eventId, text(output));
     tool.span.end(tool.endedAt ?? now());
     return tool;
