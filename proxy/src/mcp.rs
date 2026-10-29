@@ -139,6 +139,29 @@ pub fn parse_traceparent(s: &str) -> Option<TraceParent> {
     Some(TraceParent { trace_id, span_id })
 }
 
+/// Whether an MCP call went well, as `wake.call.ok` records it: a result came back that
+/// doesn't say `isError`. One with no response seen didn't, since agentgateway skips the
+/// response hook on a JSON-RPC error. None when the result was cut short or isn't a JSON
+/// object, so nothing can be read from it.
+pub fn call_ok(result: Option<(&[u8], bool)>) -> Option<bool> {
+    let Some((bytes, cut)) = result else {
+        return Some(false);
+    };
+    if cut {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    // The result alone, or a whole JSON-RPC response around it.
+    if v.get("error").is_some() && v.get("result").is_none() {
+        return Some(false);
+    }
+    let result = v.get("result").unwrap_or(&v);
+    Some(result.get("isError").and_then(serde_json::Value::as_bool) != Some(true))
+}
+
 /// The event's payload: what the call sent and what came back, kept byte for byte when
 /// they're JSON, and as a string when they aren't.
 pub fn payload(input: Option<&[u8]>, output: Option<&[u8]>, error: Option<&str>) -> String {

@@ -19,6 +19,7 @@ use tonic::{Request, Response, Status};
 use crate::agents::Agents;
 use crate::budget::Events;
 use crate::canonical::{Event, Value};
+use crate::charters::{self, Resource};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp;
@@ -246,6 +247,21 @@ pub fn policy_denied_event(call: &Call, denial: &Denial, agents: &Agents, at: u6
     e
 }
 
+/// The signed record of a call a run charter denied: a denied event whose payload also says
+/// which charter, why, and in words what it found.
+pub fn charter_denied_event(call: &Call, denial: &charters::Denial, agents: &Agents, at: u64) -> Event {
+    let mut e = denied_event(call, std::slice::from_ref(&denial.halt), agents, at);
+    if let Some(Value::Str(payload)) = e.attributes.get("wake.payload")
+        && let Ok(serde_json::Value::Object(mut p)) = serde_json::from_str::<serde_json::Value>(payload)
+    {
+        p.insert("charter".into(), denial.halt.id.trim_start_matches("charter:").into());
+        p.insert("why".into(), denial.why.into());
+        p.insert("detail".into(), denial.detail.clone().into());
+        e.set("wake.payload", Value::Str(serde_json::Value::Object(p).to_string()));
+    }
+    e
+}
+
 /// What a policy decides on for a call from caller: what entered it, or any agent the call
 /// is made under, within the window.
 pub fn check_policy(
@@ -337,12 +353,24 @@ impl Authorization for Authorizer {
             tool: None,
         };
         let policy = self.policy.current();
-        let Some(denial) = check_policy(&policy, &self.observed, agents, At::Authz, &target, now) else {
-            return Ok(Response::new(allow()));
-        };
-        self.counters.denied.fetch_add(1, Ordering::Relaxed);
-        self.events.send(policy_denied_event(&call, &denial, agents, now));
-        Ok(Response::new(deny(std::slice::from_ref(&denial.halt))))
+        if let Some(denial) = check_policy(&policy, &self.observed, agents, At::Authz, &target, now) {
+            self.counters.denied.fetch_add(1, Ordering::Relaxed);
+            self.events.send(policy_denied_event(&call, &denial, agents, now));
+            return Ok(Response::new(deny(std::slice::from_ref(&denial.halt))));
+        }
+        // A run's charter: past its expiry every call is denied here, and an A2A request is
+        // checked against never by the agent its route reaches. MCP calls are checked, and
+        // counted, at the MCP hook, which sees the tool.
+        let resource = call.receiver.as_deref().map(Resource::Agent);
+        if let Some(denial) = self
+            .halts
+            .charter_deciding(call.caller.as_deref(), call.token.as_ref(), resource, now)
+        {
+            self.counters.denied.fetch_add(1, Ordering::Relaxed);
+            self.events.send(charter_denied_event(&call, &denial, agents, now));
+            return Ok(Response::new(deny(std::slice::from_ref(&denial.halt))));
+        }
+        Ok(Response::new(allow()))
     }
 }
 
@@ -706,6 +734,60 @@ mod tests {
         // Planner's calls to other agents aren't covered.
         let r = authz
             .check(Request::new(check(Some("planner"), "", Some("research"), &[])))
+            .await
+            .unwrap();
+        assert_eq!(r.get_ref().status.as_ref().unwrap().code, 0);
+    }
+
+    #[tokio::test]
+    async fn a_runs_charter_is_enforced_at_the_gateway() {
+        use crate::charters::Charter;
+        let halts = Arc::new(Halts::in_memory());
+        let counters = Arc::new(Counters::default());
+        let (tx, mut rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let authz = Authorizer::new(halts.clone(), tx, counters);
+        let mut charter = Charter {
+            id: "run-1".into(),
+            scope: halted(&["planner"]),
+            expires_at: 4_000_000_000,
+            never: r#"@id("not-payments") forbid(principal, action, resource == Wake::Agent::"payments");"#.into(),
+            issued_at: 1,
+            ..Default::default()
+        };
+        halts.put_charter(charter.clone()).unwrap();
+        let from_planner = |receiver| check(Some("planner"), "", receiver, &[]);
+
+        // An A2A request to an agent the run must never reach is denied, and recorded.
+        let r = authz.check(Request::new(from_planner(Some("payments")))).await.unwrap();
+        let id = "charter:run-1";
+        assert_eq!(denied_by(r.get_ref()), Some((id.into(), id.into())));
+        let event = rx.try_recv().unwrap().event;
+        assert_eq!(event.str("wake.brake.halt_id"), Some(id));
+        let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(
+            (&payload["charter"], &payload["why"], &payload["detail"]),
+            (
+                &serde_json::json!("run-1"),
+                &serde_json::json!("never"),
+                &serde_json::json!("forbidden by not-payments")
+            )
+        );
+        // Another agent, and an MCP request, whose tool the MCP hook checks, go ahead.
+        for receiver in [Some("research"), None] {
+            let r = authz.check(Request::new(from_planner(receiver))).await.unwrap();
+            assert_eq!(r.get_ref().status.as_ref().unwrap().code, 0);
+        }
+
+        // Expired, the charter denies every call the run makes, and only the run's.
+        charter.expires_at = 1;
+        halts.put_charter(charter).unwrap();
+        let r = authz.check(Request::new(from_planner(None))).await.unwrap();
+        assert_eq!(denied_by(r.get_ref()), Some((id.into(), id.into())));
+        let payload: serde_json::Value =
+            serde_json::from_str(rx.try_recv().unwrap().event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["why"], "expired");
+        let r = authz
+            .check(Request::new(check(Some("billing"), "", Some("payments"), &[])))
             .await
             .unwrap();
         assert_eq!(r.get_ref().status.as_ref().unwrap().code, 0);

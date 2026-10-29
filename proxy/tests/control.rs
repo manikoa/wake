@@ -114,6 +114,107 @@ async fn the_brake_puts_lists_and_lifts_halts() {
 }
 
 #[tokio::test]
+async fn the_brake_puts_checks_lists_and_ends_charters() {
+    use wake_proxy::charters::Resource;
+    let c = control().await;
+    let brake = client(&c, &c.brake);
+    let body = serde_json::json!({
+        "scope": {"agents": ["support/refunder#toolu_1"]},
+        "expires_at": 4_000_000_000u64,
+        "never": r#"forbid(principal, action, resource == Wake::Tool::"delete_customer");"#,
+        "budget": [{"tools": ["refund"], "calls": 1}],
+        "issued_at": 42
+    });
+
+    // One that doesn't fit the Wake schema is refused by the check and by a put, which
+    // changes nothing.
+    let mut bad = body.clone();
+    bad["never"] = r#"forbid(principal, action, resource == Wake::Tol::"delete_customer");"#.into();
+    let checked = brake
+        .post(format!("{}/v1/charters/check", c.url))
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(checked.status(), 400);
+    assert!(checked.text().await.unwrap().contains("doesn't fit the Wake schema"));
+    let put = brake
+        .put(format!("{}/v1/charters/run-1", c.url))
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 400);
+    let mut unknown = body.clone();
+    unknown["done_when"] = serde_json::json!([]);
+    let put = brake
+        .put(format!("{}/v1/charters/run-1", c.url))
+        .json(&unknown)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        put.status().is_client_error(),
+        "a field the proxy doesn't know is refused"
+    );
+    assert_eq!(c.halts.state().version, 0);
+
+    let checked = brake
+        .post(format!("{}/v1/charters/check", c.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(checked.status(), 200);
+    let put = brake
+        .put(format!("{}/v1/charters/run-1", c.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200);
+    let state: serde_json::Value = put.json().await.unwrap();
+    assert_eq!(
+        (state["version"].as_u64(), &state["charters"][0]["id"]),
+        (Some(1), &serde_json::json!("run-1"))
+    );
+    assert_eq!(state["charters"][0]["issued_at"], 42);
+
+    let refund = || {
+        c.halts.charter_deciding(
+            Some("support/refunder#toolu_1"),
+            None,
+            Some(Resource::Tool("refund")),
+            wake_proxy::halts::now(),
+        )
+    };
+    assert!(refund().is_none());
+    assert!(refund().is_some());
+    let listed: serde_json::Value = brake
+        .get(format!("{}/v1/charters", c.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (&listed[0]["id"], &listed[0]["used"]),
+        (&serde_json::json!("run-1"), &serde_json::json!([1]))
+    );
+
+    let ended = brake
+        .delete(format!("{}/v1/charters/run-1", c.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ended.status(), 200);
+    let state: serde_json::Value = ended.json().await.unwrap();
+    assert_eq!((state["version"].as_u64(), state.get("charters")), (Some(2), None));
+    assert!(refund().is_none());
+}
+
+#[tokio::test]
 async fn bad_requests_change_nothing() {
     let c = control().await;
     let brake = client(&c, &c.brake);

@@ -27,6 +27,7 @@ use crate::agents::Agents;
 use crate::authz::{self, Call};
 use crate::budget::{Budget, Events, Permit};
 use crate::capture::{Hook, META_AGENT, META_EVENT_ID};
+use crate::charters::Resource;
 use crate::export::Counters;
 use crate::halts::{Halt, Halts, now};
 use crate::mcp;
@@ -207,12 +208,12 @@ impl ExtMcp for Processor {
         if !mcp::captured(&r.method) {
             return Ok(pass_request(None));
         }
+        let at = now();
+        let target = mcp::parse_request(&r.method, r.mcp_request.as_deref(), &[]).target;
+        let tool = target.filter(|t| !t.is_empty()).unwrap_or_else(|| server.clone());
         if self.policy.enforcing() {
             // What the tool returns enters the caller, so the call is checked against what
             // entered it already, and then noted, before it goes on.
-            let at = now();
-            let target = mcp::parse_request(&r.method, r.mcp_request.as_deref(), &[]).target;
-            let tool = target.filter(|t| !t.is_empty()).unwrap_or_else(|| server.clone());
             let who = Who::of(self.agents(), caller.as_deref());
             let policy = self.policy.current();
             let checked = Target {
@@ -243,7 +244,36 @@ impl ExtMcp for Processor {
                     metadata: None,
                 }));
             }
+        }
+        // The run's charter: what it must never call, and its budget, which counts the call
+        // only if it goes on.
+        if let Some(denial) =
+            self.halts
+                .charter_deciding(caller.as_deref(), token.as_ref(), Some(Resource::Tool(&tool)), at)
+        {
+            let call = Call {
+                caller,
+                receiver: None,
+                method: r.method,
+                host: server,
+                path: String::new(),
+                headers: link_headers(&headers),
+                token: token.clone(),
+            };
+            self.counters.denied.fetch_add(1, Ordering::Relaxed);
+            self.events
+                .send(authz::charter_denied_event(&call, &denial, self.agents(), at));
+            return Ok(Response::new(McpRequestResult {
+                result: Some(mcp_request_result::Result::Error(halted(std::slice::from_ref(
+                    &denial.halt,
+                )))),
+                header_mutation: None,
+                metadata: None,
+            }));
+        }
+        if self.policy.enforcing() {
             // What the tool returns reaches the agents the caller acts under too.
+            let who = Who::of(self.agents(), caller.as_deref());
             let origin = format!("tool:{tool}");
             self.observed.note(who, &origin, at);
             for under in origins::under(self.agents(), token.as_ref()) {
@@ -350,6 +380,62 @@ mod tests {
             Some(mcp_request_result::Result::Error(e)) => Some(&e.reason),
             _ => None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_runs_charter_holds_its_tool_calls_to_never_and_its_budget() {
+        use crate::charters::{Charter, Limit};
+        use crate::halts::Scope;
+        let counters = Arc::new(Counters::default());
+        let (hooks, mut hooks_rx) = mpsc::channel(16);
+        let (events, mut events_rx) = Events::channel(16, Budget::new(1 << 20), counters.clone());
+        let halts = Arc::new(Halts::in_memory());
+        halts
+            .put_charter(Charter {
+                id: "run-1".into(),
+                scope: Scope {
+                    agents: vec!["billing".into()],
+                    ..Default::default()
+                },
+                expires_at: 4_000_000_000,
+                never: r#"forbid(principal, action, resource == Wake::Tool::"delete_customer");"#.into(),
+                budget: vec![Limit {
+                    tools: vec!["refund".into()],
+                    calls: 1,
+                }],
+                issued_at: 1,
+                applied_at: 0,
+            })
+            .unwrap();
+        let p = Processor::new(hooks, Budget::new(1 << 20), counters, halts.clone(), events);
+
+        let r = p.check_request(call("billing", "delete_customer")).await.unwrap();
+        assert!(refused(r.get_ref()).is_some_and(|reason| reason.contains("charter:run-1")));
+        let payload: serde_json::Value =
+            serde_json::from_str(events_rx.try_recv().unwrap().event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(
+            (&payload["why"], &payload["method"]),
+            (&serde_json::json!("never"), &serde_json::json!("tools/call"))
+        );
+        assert!(
+            hooks_rx.try_recv().is_err(),
+            "a denied call isn't recorded as a tool call"
+        );
+
+        // The first refund goes ahead and is recorded; the second is past the budget.
+        let r = p.check_request(call("billing", "refund")).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None);
+        assert!(hooks_rx.try_recv().is_ok());
+        let r = p.check_request(call("billing", "refund")).await.unwrap();
+        assert!(refused(r.get_ref()).is_some());
+        let payload: serde_json::Value =
+            serde_json::from_str(events_rx.try_recv().unwrap().event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["why"], "budget");
+        assert_eq!(halts.charters()[0].1, vec![1]);
+
+        // Another agent's calls aren't the run's.
+        let r = p.check_request(call("support", "delete_customer")).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None);
     }
 
     #[tokio::test]

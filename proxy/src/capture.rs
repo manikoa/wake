@@ -343,6 +343,9 @@ fn build(id: &str, p: &Pending, result: Option<(&[u8], bool)>, end: SystemTime, 
     if let Some(token) = &p.token {
         token.record(&mut event);
     }
+    if let Some(ok) = mcp::call_ok(result) {
+        event.set("wake.call.ok", Value::Bool(ok));
+    }
     event.set(
         "wake.payload",
         Value::Str(mcp::capped_payload(
@@ -441,6 +444,7 @@ mod tests {
             e.attributes["wake.origins"],
             Value::Strs(vec!["tool:read_email".into()])
         );
+        assert_eq!(e.attributes["wake.call.ok"], Value::Bool(true));
         assert_eq!(
             e.str("wake.payload"),
             Some(r#"{"input":{"name":"read_email","arguments":{}},"output":{"content":"second"}}"#)
@@ -479,11 +483,55 @@ mod tests {
             payload.contains(r#""output":null"#) && payload.contains("no response seen"),
             "{payload}"
         );
+        // JSON-RPC errors skip the response hook, so a call with no response didn't go well.
+        assert_eq!(out[0].attributes["wake.call.ok"], Value::Bool(false));
         // A late response then has nothing to pair with and is recorded on its own.
         let late = c.handle(response("s1", Some("a"), "{}", t(61)));
         assert_eq!(late.len(), 1);
         assert_ne!(late[0].str("wake.event.id"), Some("a"));
         assert_eq!(c.waiting(), 0);
+    }
+
+    #[test]
+    fn whether_a_call_went_well_is_recorded_from_its_result() {
+        let mut c = Capture::new(Duration::from_secs(60), 100);
+        c.handle(request("a", "s1", "refund", t(0)));
+        let out = c.handle(response(
+            "s1",
+            Some("a"),
+            r#"{"content":[{"type":"text","text":"card declined"}],"isError":true}"#,
+            t(1),
+        ));
+        assert_eq!(out[0].attributes["wake.call.ok"], Value::Bool(false));
+
+        for (result, cut, ok) in [
+            (r#"{"content":[]}"#, false, Some(true)),
+            (r#"{"content":[],"isError":false}"#, false, Some(true)),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{"isError":true}}"#,
+                false,
+                Some(false),
+            ),
+            (r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#, false, Some(true)),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602}}"#,
+                false,
+                Some(false),
+            ),
+            // Cut short, or not an object: nothing can be read from it.
+            (r#"{"content":[],"isError":tr"#, true, None),
+            (r#"{"content":[]}"#, true, None),
+            ("not json", false, None),
+            ("[1]", false, None),
+        ] {
+            assert_eq!(mcp::call_ok(Some((result.as_bytes(), cut))), ok, "{result}");
+        }
+        assert_eq!(mcp::call_ok(None), Some(false));
+
+        // Unreadable, it isn't recorded at all, rather than as either.
+        c.handle(request("b", "s1", "refund", t(2)));
+        let out = c.handle(response("s1", Some("b"), "not json", t(3)));
+        assert!(!out[0].attributes.contains_key("wake.call.ok"));
     }
 
     #[test]
