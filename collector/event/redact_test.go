@@ -3,9 +3,11 @@ package event
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -71,8 +73,9 @@ func TestRedactionVectors(t *testing.T) {
 
 // Anything an agent sends, inside a JSON payload, as encoding/json writes it and as the SDKs
 // do, with non-ASCII escaped: it stays JSON, and so does the JSON in its string, redacting
-// twice changes nothing more, and every kind listed names a placeholder. go test runs the
-// seeds; go test -fuzz=FuzzRedact explores.
+// twice changes nothing more, and every kind listed names a placeholder. In JSON or not,
+// what's replaced is what the regexps alone would replace. go test runs the seeds; go test
+// -fuzz=FuzzRedact explores.
 func FuzzRedact(f *testing.F) {
 	data, err := os.ReadFile(filepath.Join("testdata", "redaction.json"))
 	if err != nil {
@@ -89,11 +92,12 @@ func FuzzRedact(f *testing.F) {
 	// Escaped, ® and « end in e and b, which start a JWT and a bearer token.
 	f.Add("®yJhbGciOiJFUzI1NiJ9.eyJqdGkiOiJ0b2stNyJ9.c2lnbmF0dXJlLW5vdC1yZWFs «earer abcdefghijklmnopqrstuvwxyz")
 	f.Fuzz(func(t *testing.T, text string) {
+		redactsAsRegexps(t, text)
 		inner, _ := json.Marshal(map[string]string{"text": text})
 		plain, _ := json.Marshal(map[string]string{"output": text, "nested": string(inner)})
 		escaped, _ := json.Marshal(map[string]string{"output": text, "nested": ascii(inner)})
 		for _, payload := range []string{string(plain), ascii(escaped)} {
-			out, kinds := Redact(payload)
+			out, kinds := redactsAsRegexps(t, payload)
 			var doc map[string]string
 			if err := json.Unmarshal([]byte(out), &doc); err != nil {
 				t.Fatalf("not JSON: %s", out)
@@ -129,19 +133,168 @@ func ascii(text []byte) string {
 	return out.String()
 }
 
+// The secrets matched by hand are the ones their regexps capture, and Redact replaces what
+// the regexps alone would, in payloads made to put literals, word starts, escapes and runs
+// wherever a matcher could slip.
+func TestSecretsMatchedByHandAreTheRegexps(t *testing.T) {
+	// The race detector slows the regexps tenfold, and there's nothing here to race.
+	n := 10000
+	if raceDetector {
+		n = 2000
+	}
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range n {
+		payload := randomPayload(rng)
+		for _, r := range redactions {
+			if r.secret == nil {
+				continue
+			}
+			var got, want [][2]int
+			for start, end := range r.secrets(payload) {
+				got = append(got, [2]int{start, end})
+			}
+			for _, m := range r.pattern.FindAllStringSubmatchIndex(payload, -1) {
+				want = append(want, [2]int{m[2], m[3]})
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s in %q: got %v, want %v", r.kind, payload, got, want)
+			}
+		}
+		redactsAsRegexps(t, payload)
+	}
+}
+
+// redactsAsRegexps fails t unless Redact replaces in payload just what the regexps alone
+// would, and returns what Redact made of it.
+func redactsAsRegexps(t *testing.T, payload string) (string, []string) {
+	t.Helper()
+	out, kinds := Redact(payload)
+	if want, wantKinds := redactByRegexp(payload); out != want || !reflect.DeepEqual(kinds, wantKinds) {
+		t.Fatalf("%q:\n got %q %v\nwant %q %v", payload, out, kinds, want, wantKinds)
+	}
+	return out, kinds
+}
+
+// redactByRegexp is Redact with every secret found by its pattern's regexp, as wake-proxy
+// finds them, and nothing skipped for want of a literal.
+func redactByRegexp(payload string) (string, []string) {
+	var kinds []string
+	for _, r := range redactions {
+		var out strings.Builder
+		last := 0
+		for _, m := range r.pattern.FindAllStringSubmatchIndex(payload, -1) {
+			secret := payload[m[2]:m[3]]
+			if r.kind == "basic_auth" && !basicCredentials(secret) {
+				continue
+			}
+			out.WriteString(payload[last:m[2]])
+			out.WriteString(placeholder(r.kind, secret))
+			last = m[3]
+		}
+		if last == 0 {
+			continue
+		}
+		out.WriteString(payload[last:])
+		payload = out.String()
+		kinds = append(kinds, r.kind)
+	}
+	sort.Strings(kinds)
+	return payload, kinds
+}
+
+// What a matcher could slip on: literals and near misses, what starts a word and what
+// doesn't, escapes whole and broken, characters of two to four bytes, bytes that aren't
+// UTF-8, and runs of the bytes secrets are made of, and of others.
+var (
+	pieces = []string{
+		"eyJ", ".eyJ", ".", "ghp_", "gho_", "ghx_", "github_pat_", "github_", "AIza", "ya29.", "ya29",
+		"xoxb-", "xoxs-", "xoxz-", "xox", "xapp-", "xapp", "sk-", "sk-ant-", "sk-admin", "sk_live_",
+		"rk_live_", "_live_", "Bearer", "bearer ", "BEARER", "BeArEr ", "Basic", "basic ", "BASIC",
+		" ", "  ", "=", "==", "===", "-", "_", "]", "[", "\\", `"`, ":", "/", "+", "~", "\t", "\n",
+		"\x00", "a", "Z", "9", `\n`, `\\n`, `\b`, `\\\t`, `\` + `u00ab`, `\\` + `u00e9`, `\` + `u12`,
+		`\` + `u00zz`, `\x`, "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80", "\xff", "\xe2\x82", "\x82",
+		"dXNlcjpwYXNz", "bm9jb2xvbg==", "Basic dXNlcjpwYXNz", "BASIC  bWU6eA==", "://u:p@h",
+		"secretAccessKey=", "-----BEGIN PRIVATE KEY-----",
+	}
+	alphabets = []string{
+		"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+		"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-",
+		"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._~+/-=",
+		"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+/=",
+		" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~",
+		"eyJ-.",
+	}
+)
+
+// randomPayload strings together pieces, runs, and secrets made from the steps of one
+// matched by hand, each of their runs a few bytes either side of its bounds, some of them
+// with bytes from out of their class.
+func randomPayload(rng *rand.Rand) string {
+	var byHand []redaction
+	for _, r := range redactions {
+		if r.secret != nil {
+			byHand = append(byHand, r)
+		}
+	}
+	var b strings.Builder
+	write := func(alphabet string, n int) {
+		for range n {
+			b.WriteByte(alphabet[rng.IntN(len(alphabet))])
+		}
+	}
+	for range 1 + rng.IntN(10) {
+		switch rng.IntN(3) {
+		case 0:
+			b.WriteString(pieces[rng.IntN(len(pieces))])
+		case 1:
+			write(alphabets[rng.IntN(len(alphabets))], rng.IntN(48))
+		default:
+			r := byHand[rng.IntN(len(byHand))]
+			for _, st := range r.secret[rng.IntN(len(r.secret))] {
+				if st.class == nil {
+					b.WriteString(st.literals[rng.IntN(len(st.literals))])
+					continue
+				}
+				var class []byte
+				for c := range 256 {
+					if st.class[c] {
+						class = append(class, byte(c))
+					}
+				}
+				n := max(0, st.min+rng.IntN(5)-2)
+				if rng.IntN(4) == 0 {
+					n += rng.IntN(30)
+				}
+				if rng.IntN(4) == 0 {
+					write(alphabets[rng.IntN(len(alphabets))], n)
+				} else {
+					write(string(class), n)
+				}
+			}
+		}
+	}
+	return b.String()
+}
+
 // An agent chooses what's in a payload. Inputs built to make a backtracking engine retry
-// at every position still take linear time.
+// at every position, or a matcher measure a run again from every start in it, still take
+// linear time.
 func TestRedactionTakesLinearTime(t *testing.T) {
 	for name, payload := range map[string]string{
 		"jwt prefixes":          strings.Repeat("eyJ", 1<<20),
 		"a key that never ends": "-----BEGIN PRIVATE KEY-----" + strings.Repeat("A-", 1<<20),
 		"many key starts":       strings.Repeat("-----BEGIN PRIVATE KEY-----", 1<<15),
 		"bearer runs":           strings.Repeat("Bearer ", 1<<19),
+		// Words that each start a secret, all in one run its first step takes.
+		"jwt starts in a run":   strings.Repeat("-eyJ", 1<<20),
+		"slack starts in a run": strings.Repeat("-xoxb-", 1<<19),
+		"llm starts in a run":   strings.Repeat("-sk-ant-", 1<<19),
 		// Every pattern's literals, so none is skipped.
-		"every pattern": strings.Repeat(` eyJ ghp_ AIza ya29. xoxb- sk- _live_ Bearer Basic \\u00ab ://a:b secretAccessKey=`, 1<<14),
+		"every pattern": strings.Repeat(` eyJ ghp_ AIza ya29. xoxb- sk- sk_live_ Bearer Basic \\u00ab ://a:b secretAccessKey=`, 1<<14),
 	} {
-		// The budget catches a pattern that backtracks, which would take hours on a payload this
-		// size, not a slow machine or the race detector.
+		// The budget catches a pattern that backtracks, or a run measured again from each start
+		// in it, which would take most of an hour or more on a payload this size, not a slow
+		// machine or the race detector.
 		budget := 5 * time.Second
 		if raceDetector {
 			budget = 60 * time.Second
