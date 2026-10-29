@@ -238,6 +238,37 @@ test("stale rules fail closed", async () => {
   assert.deepEqual(new Set(denied.map((e) => attr(e, "wake.brake.halt_id"))), new Set([STALE]));
 });
 
+test("the rules say who is halted", async () => {
+  const r = await rules();
+  const q = new Quarantine(r.url, { agent: "support", start: false, ttlMillis: 60_000 });
+  assert.ok(await q.fetch());
+  assert.equal(q.halted(["support"]), null, "a proxy that doesn't say what's halted halts nothing here");
+  r.rules = { version: 2, quarantines: [], halts: [{ id: "h-sub", agents: ["support/researcher#toolu_1"] }] };
+  assert.ok(await q.fetch());
+  const copy = ["support", "support/researcher"];
+  assert.equal(q.halted([...copy, "support/researcher#toolu_1"]), "h-sub");
+  assert.equal(q.halted([...copy, "support/researcher#toolu_2"]), null, "its sibling goes on");
+  r.rules = { version: 3, quarantines: [], halts: [{ id: "h-sub", agents: ["x"] }, { id: "h-fleet", fleet: true }] };
+  assert.ok(await q.fetch());
+  assert.equal(q.halted(["billing"]), "h-fleet");
+  // Halts that don't read as halts are a failed fetch: the last rules stand.
+  for (const bad of [[{ id: 3 }], [{ id: "h", agents: "support" }], [{ id: "h", fleet: "yes" }], "h"]) {
+    r.rules = { version: 4, quarantines: [], halts: bad };
+    assert.equal(await q.fetch(), false);
+    assert.equal(q.halted(["billing"]), "h-fleet");
+  }
+});
+
+test("stale rules halt everyone", async () => {
+  const r = await rules();
+  const q = new Quarantine(r.url, { agent: "support", start: false, ttlMillis: 200 });
+  assert.ok(await q.fetch());
+  assert.equal(q.halted(["support"]), null);
+  await r.stop();
+  await tick(300);
+  assert.equal(q.halted(["support"]), STALE);
+});
+
 test("rules over a mebibyte are read, and too large rules are a warning", async () => {
   const r = await rules();
   r.quarantine({ locked_by: "q1", lock: { fleet: true } });

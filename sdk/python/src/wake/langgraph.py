@@ -20,10 +20,10 @@ from langgraph.store.base import (
     SearchOp,
 )
 
-from wake.langchain import AgentRun, WakeCallbackHandler
+from wake.langchain import AgentHalted, AgentRun, WakeCallbackHandler
 from wake.memory import LABEL_KEY, Memory
 
-__all__ = ["AgentRun", "WakeCallbackHandler", "WakeStore"]
+__all__ = ["AgentHalted", "AgentRun", "WakeCallbackHandler", "WakeStore"]
 
 
 

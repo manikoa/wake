@@ -24,6 +24,13 @@ produced the AI and tool messages in its context, and a tool call's parent is
 the model call that requested it. When an app builds its prompts from strings,
 so no message ids link them, an event's parents are the earlier events in the
 same trace whose output appears in its input. See docs/events.md.
+
+Given the brake's rules (WakeCallbackHandler(recorder, quarantine=Quarantine(...))), the
+handler also stops an agent, or one run of it, in its own process: agent() refuses to
+start a run a halt covers, raising AgentHalted, and a LangGraph ToolNode given the
+handler's wrap_tool_call and awrap_tool_call refuses a tool call a halt covers before it
+runs, telling the model why. Both are recorded as denied. It's a cooperative stop: it
+holds only while the agent's code does.
 """
 
 import asyncio
@@ -34,7 +41,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -44,9 +51,15 @@ from langchain_core.tracers.context import register_configure_hook
 from opentelemetry import trace
 from opentelemetry.trace import Span, Status, StatusCode
 
-from wake import events, links
+from wake import events, links, stop
 from wake._graph import _MIN_MATCH, EventGraph, _Recent, failed, never_raise
 from wake.recorder import Recorder
+from wake.stop import AgentHalted
+
+if TYPE_CHECKING:
+    from wake.quarantine import Quarantine
+
+__all__ = ["AgentHalted", "AgentRun", "WakeCallbackHandler"]
 
 log = logging.getLogger("wake")
 
@@ -107,8 +120,12 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
     # never waits on the network.
     run_inline = True
 
-    def __init__(self, recorder: Recorder) -> None:
+    def __init__(self, recorder: Recorder, quarantine: "Quarantine | None" = None) -> None:
+        """With quarantine, the brake's rules for the agent (wake.quarantine), agent() and the
+        ToolNode wrappers stop what a halt covers."""
         EventGraph.__init__(self, recorder)
+        self._quarantine = quarantine
+        self._call_context = _Recent()  # tool call id -> the span context of the model call that requested it
         self._parent_run = _Recent()  # run id -> parent run id
         self._spans = _Recent()  # open spans by run id
         self._pending = _Recent()  # open events by run id
@@ -142,7 +159,11 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         recorded as an agent_message event that feeds this run's next event.
         At the top, `origin` labels where `input` came from, such as "user".
         Call reply() on the run to record the answer going back.
+
+        With the brake's rules, a run a halt covers, by its name or what starts it, isn't
+        started: this raises AgentHalted, and the attempt is recorded as denied.
         """
+        self._refuse_start(name, input)
         run = self._start_run(name, input, origin)
         token = _current_run.set(run)
         error: BaseException | None = None
@@ -270,11 +291,15 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                 outputs.append(_message(message))
                 texts.append(_text(message.content))
                 with self._lock:
+                    span = self._spans.get(run_id)
                     if message.id:
                         self._event_by_message[message.id] = pending["event_id"]
                     for call in getattr(message, "tool_calls", None) or []:
                         if call.get("id"):
                             self._event_by_tool_call[call["id"]] = pending["event_id"]
+                            if self._quarantine is not None and span is not None:
+                                # Where a refusal of the call is recorded, if it's refused.
+                                self._call_context[call["id"]] = span.get_span_context()
         self._end_event(run_id, outputs, text="\n".join(texts))
 
     @never_raise
@@ -355,6 +380,125 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs) -> None:
         self._remember_tool_result(run_id, None)
         self._end_event(run_id, None, error)
+
+    # Cooperative stops.
+
+    def wrap_tool_call(self, request, execute):
+        """For a LangGraph ToolNode (ToolNode(tools, wrap_tool_call=handler.wrap_tool_call,
+        awrap_tool_call=handler.awrap_tool_call)), or a create_agent middleware's hook of the
+        same name: refuses a tool call a halt covers before it runs, answering the model with
+        why, and records it as denied. Any other call runs."""
+        refused = self._tool_refusal(request)
+        return execute(request) if refused is None else refused
+
+    async def awrap_tool_call(self, request, execute):
+        """wrap_tool_call(), for a graph run asynchronously."""
+        refused = self._tool_refusal(request)
+        return await execute(request) if refused is None else refused
+
+    def _tool_refusal(self, request) -> ToolMessage | None:
+        """The answer to a tool call a halt covers, by the agent making it, the run it's in and
+        what started that run; None for a call to run."""
+        if self._quarantine is None:
+            return None
+        run, who, call = _current_run.get(), self._recorder.agent, {}
+        try:
+            call = request.tool_call if isinstance(request.tool_call, dict) else {}
+            names = {self._recorder.agent}
+            if run is not None:
+                names.update((run.agent, *run.lineage))
+                if run.instance:
+                    names.add(run.instance)
+                who = run.instance or run.agent
+            refused = stop.refusal(self._quarantine, who, names)
+        except Exception:
+            log.warning("wake: couldn't check the halts for a tool call; refusing it", exc_info=True)
+            refused = stop.unchecked()
+        if refused is None:
+            return None
+        name = call.get("name") or "tool"
+        self._refused_call(run, name, call, refused)
+        log.warning("wake: refused a %s call of %s: %s", name, who, refused.halt)
+        return ToolMessage(content=refused.reason, tool_call_id=call.get("id") or "", name=name, status="error")
+
+    def _refuse_start(self, name: str, input: Any) -> None:
+        """Raises AgentHalted, recording the attempt, if a halt covers the run of name about
+        to start here: by its name, or what starts it."""
+        if self._quarantine is None:
+            return
+        enclosing = _current_run.get()
+        try:
+            lineage = (*enclosing.lineage, enclosing.instance or enclosing.agent) if enclosing is not None else ()
+            refused = stop.refusal(self._quarantine, name, {self._recorder.agent, name, *lineage},
+                                   outcome=f"this run of {name} wasn't started")
+        except Exception:
+            log.warning("wake: couldn't check the halts for a run of %s; refusing it", name, exc_info=True)
+            refused = stop.unchecked(f"this run of {name} wasn't started")
+        if refused is None:
+            return
+        self._refused_start(enclosing, name, input, refused)
+        log.warning("wake: refused to start a run of %s: %s", name, refused.halt)
+        raise AgentHalted(refused)
+
+    @never_raise
+    def _refused_call(self, run: AgentRun | None, name: str, call: dict, refused: stop.Refusal) -> None:
+        """Records a tool call a halt refused before it ran: what the agent tried, under the
+        model call that asked for it. The tool never ran, so it has no origins. The model's
+        next call reads the refusal."""
+        call_id = call.get("id")
+        with self._lock:
+            requested_by = self._event_by_tool_call.get(call_id) if call_id else None
+            requester = self._call_context.get(call_id) if call_id else None
+        if requester is not None:
+            context = trace.set_span_in_context(trace.NonRecordingSpan(requester))
+        elif run is not None and run._span is not None:
+            context = trace.set_span_in_context(run._span)
+        else:
+            context = EventGraph._event_context(self)
+        attributes = {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name, "wake.brake.halt_id": refused.halt}
+        if call_id:
+            attributes["gen_ai.tool.call.id"] = call_id
+        event_id = self._denied(f"execute_tool {name}", run, [requested_by] if requested_by else [], [],
+                                attributes, {"input": call.get("args"), "output": refused.reason}, context)
+        if call_id:
+            with self._lock:
+                self._result_by_tool_call[call_id] = event_id
+
+    @never_raise
+    def _refused_start(self, sender: AgentRun | None, name: str, content: Any, refused: stop.Refusal) -> None:
+        """Records a run a halt refused to start: the attempt to hand it its task, in the name
+        of what tried. Nothing entered the run, so it has no origins."""
+        if sender is not None and sender._span is not None:
+            context = trace.set_span_in_context(sender._span)
+        else:
+            context = EventGraph._event_context(self)
+        trace_id = trace.get_current_span(context).get_span_context().trace_id if context is not None else 0
+        parents = self._matching_outputs(trace_id, _text(content)) if trace_id and content is not None else []
+        agent = sender.agent if sender is not None else self._recorder.agent
+        self._denied(f"agent_message {agent} -> {name}", sender, parents, [],
+                     {"gen_ai.agent.name": name, "wake.brake.halt_id": refused.halt, "wake.brake.receiver": name},
+                     {"from": agent, "to": name, "content": content}, context)
+
+    def _denied(self, span_name: str, run: AgentRun | None, parents: list[str], origins: list[str],
+                attributes: dict[str, Any], payload: Any, context) -> str:
+        """Records a denied event, ended as soon as it starts, and returns its id."""
+        event_id = str(uuid.uuid4())
+        self._remember_lineage(event_id, parents, origins)
+        span = self._recorder.tracer.start_span(span_name, context=context, attributes={
+            events.EVENT_ID: event_id,
+            events.EVENT_KIND: events.DENIED,
+            events.AGENT_ID: run.agent if run is not None else self._recorder.agent,
+            **(events.instance_attributes(run.instance, run.lineage) if run is not None else {}),
+            events.CAPTURE: "sdk",
+            events.PARENTS: parents,
+            events.ORIGINS: origins,
+            **attributes,
+            **events.payload_attributes(payload),
+        })
+        span.end()
+        ctx = span.get_span_context()
+        links._note(links.Link(event_id, ctx.trace_id, ctx.span_id))
+        return event_id
 
     # Agent runs and the messages between them.
 

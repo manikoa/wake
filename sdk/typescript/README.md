@@ -33,6 +33,23 @@ Wake becomes one of the Agents SDK's trace processors. Each agent's run is named
 
 Inputs and outputs are recorded when the SDK's `traceIncludeSensitiveData` is on, as it is by default. Without it, events have empty payloads, and the SDK's loop links them instead: a tool call comes from its agent's latest response, and a response reads that response and the tool results since. Chat Completions models link as Responses models do. A function tool runs with its event current, and an agent run inside it, such as one used as a tool, descends from that call.
 
+### Stopping an agent in its process
+
+Give it the brake's rules, and guard the agents you run:
+
+```ts
+import { Quarantine } from "wake-sdk/quarantine";
+
+const processor = install(recorder, { quarantine: new Quarantine("http://wake-proxy:9003", { agent: "support" }) });
+const result = await run(processor.guard(triageAgent, researcherAgent), "Refund order 1234");
+```
+
+`guard()` gives each function tool, agent used as a tool and MCP server of the agents it's given, and of every agent they hand off to, a tool input guardrail. The SDK doesn't say which agent an agent tool runs, so pass the agents used as tools too. A call is refused before it runs when a halt covers the agent making it, the instance its run is or any that started it, or the recorder's agent: the model gets the refusal as the tool's result, and the call is recorded as a `denied` event naming the halt (`wake.brake.halt_id`). A refused agent tool starts no run. A halted agent is offered no handoff. Bare agents in `handoffs` become the handoff the SDK would make of them.
+
+- **Which copy is calling.** The run is placed by the SDK's span current at the call, as its events are. While Wake can't place it, a halt on any copy of the agent it has seen start refuses the call.
+- **What it can't reach.** Only function tools take guardrails. Hosted tools, such as web search, run at OpenAI, and the SDK's other tool kinds, such as its shell and computer tools, can't be refused here.
+- **It fails closed and trusts the agent's code,** as for Claude below: stale rules, and a check that fails, refuse every call.
+
 ## Claude Agent SDK
 
 ```ts
@@ -48,12 +65,31 @@ for await (const message of claude.record(query({ prompt, options }), { prompt }
 }
 ```
 
-Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. Several of one type can run at once, so each is also an instance, `support/<subagent type>#<the Agent tool use that started it>`, in `wake.agent.instance`, with `wake.agent.lineage` naming what started it (see docs/events.md). One `agent_message` hands it the task and another carries its answer back. Links come from the SDK's ids:
+Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. Several of one type can run at once, so each is also an instance, `support/<subagent type>#<the Agent tool use that started it>`, in `wake.agent.instance`, with `wake.agent.lineage` naming what started it (see docs/events.md). One `agent_message` hands it the task once it has started, and another carries its answer back: when the tool returns, or, for a subagent the tool leaves running in the background, as it does by default, when Claude Code says it has finished. Links come from the SDK's ids:
 - A tool call's parent is the model call that asked for it.
 - A model call's parents are the call before it and the tool results and messages new in its context.
 - A later turn of the same session continues from the last.
 
 `options()` adds hooks that open each tool call before it runs. `tools()` wraps in-process tools so they run with their event current, so an MCP or A2A call they make through the proxy, or a memory write, links back to the tool call. Tools Claude Code runs itself, such as Bash, WebFetch or an external MCP server, are recorded from the stream but can't carry the link.
+
+### Stopping one subagent in its process
+
+Give it the brake's rules, and its hooks also refuse the tool calls of a halted agent, or of one halted subagent instance, before they run:
+
+```ts
+import { Quarantine } from "wake-sdk/quarantine";
+
+const claude = new WakeClaudeAgent(recorder, { quarantine: new Quarantine("http://wake-proxy:9003", { agent: "support" }) });
+```
+
+Wake's brake halts a subagent by the identity it calls with. One that calls through the proxy with credentials of its own is stopped there. One that runs in its parent's process with its parent's credentials can't be told from its parent outside that process, so this stops it inside: the rules carry the halts in force, fetched from the proxy every couple of seconds, and a tool call whose agent, subagent type, instance or any instance that started it is halted is refused, and recorded as a `denied` event naming the halt (`wake.brake.halt_id`). An Agent tool call is refused the same way: no subagent starts, so no `agent_message` hands one a task. That reaches Bash, file edits and anything else Claude Code runs itself, which never pass the proxy.
+
+- **Which copy is calling.** Claude Code names a subagent in its hooks by an `agent_id`, not by the Agent tool use Wake names the instance by. Wake learns which is which from the subagent's calls it has seen both ways, or from the Agent tool's result, which names the `agent_id`. Before it has, the caller could be any instance the session started, or one started by any of them that Wake hasn't read yet, since the hooks can run ahead of the code reading the stream. So a call is refused if a halt covers any of them.
+- **Background subagents.** A subagent the Agent tool leaves running in the background stays its instance until Claude Code says it has finished, in later turns too, so a halt on it holds after the tool has returned.
+- **It fails closed.** Rules older than the quarantine's ttl (30 seconds by default) refuse every tool call, as they refuse memory writes, under `stale-rules`. A check that fails refuses the call too, under `halt-check-failed`. A proxy that doesn't serve halts, being older than this, stops nothing here: the proxy deny still holds.
+- **It trusts the agent's code.** It runs in the agent's own process, so it holds only while that code does: a compromised agent can leave it out. The brake says so when it confirms a subagent stopped this way.
+
+The OpenAI Agents SDK and LangChain integrations stop their agents the same way, through the same rules (`stop.ts`); see their sections.
 
 ## LangChain agents written as plain TypeScript
 
@@ -71,6 +107,23 @@ await handler.agent("supervisor", { input: question, origin: "user" }, async () 
 ```
 
 A handoff is recorded as an `agent_message` event in the receiving agent's run, and it feeds that agent's next event. A run started inside another agent's run is an instance of its own, `<name>#<its span id>`, in `wake.agent.instance`, with `wake.agent.lineage` naming the run that started it, so two runs of one agent at once can be told apart. When prompts are built from strings, so no message ids link one call to the next, an event's parents are the earlier events in the same trace whose output appears in its input.
+
+### Stopping an agent in its process (LangChain and LangGraph)
+
+Give the handler the brake's rules, and use a `WakeToolNode` where a graph would use a `ToolNode`:
+
+```ts
+import { Quarantine } from "wake-sdk/quarantine";
+import { WakeCallbackHandler, WakeToolNode } from "wake-sdk/langgraph";
+
+const handler = new WakeCallbackHandler(recorder, { quarantine: new Quarantine("http://wake-proxy:9003", { agent: "clavr" }) });
+const tools = new WakeToolNode(handler, [refund]);
+```
+
+A halt covers a run by its name, the instance it is and the runs that started it, or the recorder's agent.
+- **Runs.** `handler.agent()` refuses to start a run a halt covers: it throws `AgentHalted` before calling its function, and records the attempt as a `denied` event in the name of the run that tried, with `wake.brake.receiver` naming the run refused. So a halted run starts nothing.
+- **Tool calls.** The `WakeToolNode` refuses a call a halt covers before it runs: the model gets the refusal as the tool's result, with status `error`, and the call is recorded as a `denied` event naming the halt, under the model call that asked for it. A tool called outside a `WakeToolNode` isn't refused.
+- **It fails closed and trusts the agent's code,** as for Claude above: stale rules, and a check that fails, refuse every call and run.
 
 ## The recorder
 
@@ -147,7 +200,7 @@ It fetches them as it starts, waiting at most a second, which `ready` waits for,
 
 One process can host several agents, as named runs (`handler.agent("email", ...)`), Claude subagents, or the agents of an OpenAI Agents workflow. The brake locks each by its own name, so the rules are fetched for each run's name too, from the run's first write, which waits at most a second for them. A run's writes are refused when its name, or the agent the `Quarantine` was given, is locked.
 
-It fails closed. When a fetch fails the last rules stand for `ttlMillis` (30 seconds by default). If no fetch has succeeded, or the rules are older than that, every write throws `MemoryLocked` and no entry is served, under the id `stale-rules`, until a fetch succeeds. `quarantine.health()` says whether the rules are fresh, and going stale is logged as a warning. Each fetch names the process as well as the agent.
+It fails closed. When a fetch fails the last rules stand for `ttlMillis` (30 seconds by default). If no fetch has succeeded, or the rules are older than that, every write throws `MemoryLocked` and no entry is served, under the id `stale-rules`, until a fetch succeeds. `quarantine.health()` says whether the rules are fresh, and going stale is logged as a warning. Each fetch names the process as well as the agent: the proxy notes fetches by both, and the brake confirms a quarantine, or a halt an integration stops in process, only once every process of the agent that fetched in the last minute has it.
 
 ## MCP calls through the proxy
 

@@ -22,11 +22,30 @@
  * it is by default. Without them, events are recorded with empty payloads, and the SDK's loop
  * links them instead: a tool call comes from its agent's latest response, and a response
  * reads that response and the tool results since.
+ *
+ * Given the brake's rules (install(recorder, { quarantine })), guard() also stops an agent, or
+ * one instance of it, in its own process: a call a halt covers, to a function tool, an agent
+ * used as a tool or an MCP server's tool, is refused before it runs, by a tool input guardrail,
+ * and recorded as denied; a refused agent tool starts no run. A halted agent is offered no
+ * handoff. Hosted tools run at OpenAI, and can't be refused here. It's a cooperative stop: it
+ * holds only while the agent's code does.
  */
 
 import { randomUUID } from "node:crypto";
 
-import { addTraceProcessor, getCurrentSpan } from "@openai/agents";
+import {
+  addTraceProcessor,
+  defineToolInputGuardrail,
+  getCurrentSpan,
+  handoff,
+  Handoff,
+  ToolGuardrailFunctionOutputFactory,
+  type Agent,
+  type HandoffEnabledFunction,
+  type ToolGuardrailFunctionOutput,
+  type ToolInputGuardrailData,
+  type ToolInputGuardrailDefinition,
+} from "@openai/agents";
 import { ROOT_CONTEXT, SpanStatusCode, trace, type Context, type Span as OtelSpan } from "@opentelemetry/api";
 
 import * as events from "./events.ts";
@@ -34,6 +53,7 @@ import { contextOf, EventGraph, failed, Recent, unique } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
 import type { Recorder } from "./recorder.ts";
+import { refusal, unchecked, type Halts, type Refusal } from "./stop.ts";
 
 // The Agents SDK's tracing objects, as far as Wake reads them.
 interface SdkTrace {
@@ -65,9 +85,12 @@ links._addResolver(() => {
   return undefined;
 });
 
-/** Adds Wake as a trace processor for every OpenAI Agents SDK run in this process. */
-export function install(recorder: Recorder): WakeTracingProcessor {
-  const processor = new WakeTracingProcessor(recorder);
+/**
+ * Adds Wake as a trace processor for every OpenAI Agents SDK run in this process. With
+ * quarantine, the brake's rules for the agent (Quarantine), guard() stops what a halt covers.
+ */
+export function install(recorder: Recorder, options: { quarantine?: Halts } = {}): WakeTracingProcessor {
+  const processor = new WakeTracingProcessor(recorder, options);
   addTraceProcessor(processor);
   return processor;
 }
@@ -140,9 +163,112 @@ export class WakeTracingProcessor extends EventGraph {
   readonly #toolInstances = new Recent<string, [string, string[]]>(); // tool call event id -> the instance making it, and its lineage
   readonly #toolsSince = new Recent<Key, string[]>(); // (trace, scope, agent) -> tool calls since its last response, when inputs are hidden
   readonly #nested = new Recent<string, true>(); // sdk span id of a tool call whose nested run's first response is recorded
+  readonly #quarantine: Halts | undefined;
+  readonly #halted = new Recent<string, string>(); // sdk span id of a tool call -> the halt its guardrail refused it under
+  readonly #instances = new Recent<string, [string, string[]]>(); // instance -> its agent and lineage, for each Wake has seen start
+  #guardrail: ToolInputGuardrailDefinition | undefined; // the tool input guardrail guard() adds, made once
 
-  constructor(recorder: Recorder) {
+  constructor(recorder: Recorder, { quarantine }: { quarantine?: Halts } = {}) {
     super(recorder);
+    this.#quarantine = quarantine;
+  }
+
+  // Cooperative stops.
+
+  /**
+   * Has the brake's halts stop these agents, and every agent they hand off to, in this process,
+   * and returns the first. Each function tool, agent used as a tool and MCP server gets a tool
+   * input guardrail that refuses a call a halt covers before it runs, and each handoff is offered
+   * only while the agent offering it isn't halted. Bare agents in handoffs become the handoff the
+   * SDK would make of them. The SDK doesn't say which agent an agent tool runs, so pass the
+   * agents used as tools too.
+   */
+  guard<A extends Agent<any, any>>(agent: A, ...others: Agent<any, any>[]): A {
+    if (this.#quarantine === undefined) throw new Error("guard() needs the brake's rules: install(recorder, { quarantine })");
+    const guardrail = (this.#guardrail ??= defineToolInputGuardrail({ name: "wake_halts", run: async (data) => this.#checkToolCall(data) }));
+    const seen = new Set<Agent<any, any>>();
+    const todo: Agent<any, any>[] = [agent, ...others];
+    for (let current = todo.pop(); current !== undefined; current = todo.pop()) {
+      if (seen.has(current)) continue;
+      seen.add(current);
+      for (const tool of current.tools) {
+        if (tool.type !== "function") continue; // hosted tools run at OpenAI
+        if (!(tool.inputGuardrails ?? []).includes(guardrail)) tool.inputGuardrails = [...(tool.inputGuardrails ?? []), guardrail];
+      }
+      for (const server of current.mcpServers as { toolInputGuardrails?: ToolInputGuardrailDefinition<any>[] }[]) {
+        if (!(server.toolInputGuardrails ?? []).includes(guardrail)) server.toolInputGuardrails = [...(server.toolInputGuardrails ?? []), guardrail];
+      }
+      current.handoffs = current.handoffs.map((item) => {
+        const guarded = this.#guardHandoff(item instanceof Handoff ? item : handoff(item));
+        todo.push(guarded.agent);
+        return guarded;
+      });
+    }
+    return agent;
+  }
+
+  /** The handoff, offered only while the agent offering it isn't halted. */
+  #guardHandoff(item: Handoff<any, any>): Handoff<any, any> {
+    const enabled = item.isEnabled as HandoffEnabledFunction<any> & { wake?: true };
+    if (enabled.wake) return item;
+    item.isEnabled = Object.assign(
+      async (args: Parameters<HandoffEnabledFunction<any>>[0]) => this._refusal(args.agent?.name ?? this._recorder.agent) === undefined && (await enabled(args)),
+      { wake: true as const },
+    );
+    return item;
+  }
+
+  /** The guardrail: refuses a call a halt covers, telling the model why. */
+  async #checkToolCall(data: ToolInputGuardrailData): Promise<ToolGuardrailFunctionOutput> {
+    let refused: Refusal | undefined;
+    try {
+      refused = this._refusal(data.agent?.name ?? this._recorder.agent, true);
+    } catch (error) {
+      log.warn("couldn't check the halts for a tool call; refusing it", error);
+      refused = unchecked();
+    }
+    if (refused === undefined) return ToolGuardrailFunctionOutputFactory.allow();
+    return ToolGuardrailFunctionOutputFactory.rejectContent(refused[1], { halt: refused[0] });
+  }
+
+  /**
+   * The refusal of what a run of agent is about to do, if a halt covers it: by its name, the
+   * instance the run is and those that started it. The run is the one the SDK's current span is
+   * in, as for its events. While Wake can't place it, a halt on any run of the agent Wake has
+   * seen refuses it. mark notes the refusal on the current tool call, so it's recorded as denied.
+   */
+  _refusal(agent: string, mark = false): Refusal | undefined {
+    if (this.#quarantine === undefined) return undefined;
+    let sid: string | undefined;
+    let refused: Refusal | undefined;
+    try {
+      sid = (getCurrentSpan() as SdkSpan | null)?.spanId ?? undefined;
+      const names = new Set([this._recorder.agent, agent]);
+      const unplaced: string[] = [];
+      let who = agent;
+      const agentSid = this.#agentAbove(sid);
+      if (agentSid !== undefined && this.#agentSpan.get(agentSid) === agent) {
+        const [instance, lineage] = this.#identity(agentSid);
+        for (const name of lineage) names.add(name);
+        if (instance !== undefined) {
+          names.add(instance);
+          who = instance;
+        }
+      } else {
+        for (const [instance, [name, lineage]] of this.#instances.entries()) {
+          if (name === agent) unplaced.push(instance, ...lineage);
+        }
+      }
+      refused = refusal(this.#quarantine, who, names, { unplaced });
+    } catch (error) {
+      log.warn(`couldn't check the halts for ${agent}; refusing`, error);
+      refused = unchecked();
+    }
+    if (refused !== undefined && mark && sid !== undefined && this.#pending.has(sid)) {
+      this.#halted.set(sid, refused[0]);
+      log.warn(`refused a tool call of ${agent}: ${refused[0]}`);
+    }
+    return refused;
   }
 
   // TracingProcessor.
@@ -177,6 +303,7 @@ export class WakeTracingProcessor extends EventGraph {
       if (kind === "agent") {
         this.#agentSpan.set(span.spanId, String(data.name));
         const [instance, lineage] = this.#identity(span.spanId);
+        if (instance !== undefined) this.#instances.set(instance, [String(data.name), lineage]);
         attributes = {
           "gen_ai.operation.name": "invoke_agent",
           "gen_ai.agent.name": String(data.name),
@@ -384,7 +511,17 @@ export class WakeTracingProcessor extends EventGraph {
     const attributes: Record<string, string> = { "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name };
     const server = mcpServer(data.mcp_data);
     if (server) attributes["wake.mcp.server"] = server;
-    this.#event(otel, span, eventId, events.TOOL_CALL, `execute_tool ${name}`, agent, parents, [`tool:${name}`], attributes, {
+    let kind = events.TOOL_CALL;
+    let origins = [`tool:${name}`];
+    const halt = this.#halted.pop(span.spanId);
+    if (halt !== undefined) {
+      // Refused in the agent's own process, under the halt: what the agent tried. The tool
+      // never ran, so nothing of it entered.
+      kind = events.DENIED;
+      origins = [];
+      attributes["wake.brake.halt_id"] = halt;
+    }
+    this.#event(otel, span, eventId, kind, `execute_tool ${name}`, agent, parents, origins, attributes, {
       input: input ?? null,
       output: data.output ?? null,
     });

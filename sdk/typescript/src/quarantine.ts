@@ -24,9 +24,17 @@
  * adapter writes under, from its first write on, and a run's writes are refused when its own
  * name or the process's agent is locked.
  *
- * The proxy notes each fetch, which is how the brake confirms an adapter has a quarantine.
- * Each fetch names the agent and this process (a process parameter the proxy is free to
- * ignore). Fetches go straight to the URL given, on an HTTP agent of Wake's own: the app's
+ * The rules carry the halts in force too, so an integration can stop its agent, or one
+ * instance of it such as an in-process subagent, in the agent's own process: the Claude Agent
+ * SDK, OpenAI Agents SDK and LangChain integrations refuse their tool calls, and the runs
+ * they'd start (halted, stop.ts). That reaches what the proxy deny can't, such as built-in
+ * tools and subagents that call with their parent's credentials, but like the rest of this it
+ * holds only while the agent's code does.
+ *
+ * The proxy notes each fetch by the agent and the process it names, which is how the brake
+ * confirms an adapter, or an integration's stop, has a quarantine or a halt: only once every
+ * process of the agent that fetched in the last minute has it. Each fetch names the agent and
+ * this process. Fetches go straight to the URL given, on an HTTP agent of Wake's own: the app's
  * proxy settings never apply. All of this runs in the agent's own process, so it holds only
  * as long as the agent's code does; the proxy deny doesn't depend on it.
  */
@@ -94,6 +102,8 @@ export interface Rules {
   locked_by?: string | null;
   hidden_by?: string | null;
   quarantines?: { id: string; selection?: Selection | null }[];
+  /** The halts in force, when the proxy says: the fleet, or the agents and instances named. */
+  halts?: { id: string; fleet?: boolean; agents?: string[] }[];
   [key: string]: unknown;
 }
 
@@ -120,17 +130,27 @@ function processId(): string {
 
 function valid(rules: unknown): rules is Rules {
   if (rules === null || typeof rules !== "object" || Array.isArray(rules)) return false;
-  const { locked_by: locked, hidden_by: hidden, quarantines = [] } = rules as Rules;
-  if ([locked, hidden].some((v) => v !== null && v !== undefined && typeof v !== "string") || !Array.isArray(quarantines)) {
-    return false;
-  }
-  return quarantines.every(
-    (q) =>
-      q !== null &&
-      typeof q === "object" &&
-      typeof q.id === "string" &&
-      q.id !== "" &&
-      (q.selection === null || q.selection === undefined || (typeof q.selection === "object" && !Array.isArray(q.selection))),
+  const { locked_by: locked, hidden_by: hidden, quarantines = [], halts = [] } = rules as Rules;
+  if ([locked, hidden].some((v) => v !== null && v !== undefined && typeof v !== "string")) return false;
+  if (!Array.isArray(quarantines) || !Array.isArray(halts)) return false;
+  return (
+    quarantines.every(
+      (q) =>
+        q !== null &&
+        typeof q === "object" &&
+        typeof q.id === "string" &&
+        q.id !== "" &&
+        (q.selection === null || q.selection === undefined || (typeof q.selection === "object" && !Array.isArray(q.selection))),
+    ) &&
+    halts.every(
+      (h) =>
+        h !== null &&
+        typeof h === "object" &&
+        typeof h.id === "string" &&
+        h.id !== "" &&
+        (h.fleet === undefined || typeof h.fleet === "boolean") &&
+        (h.agents === undefined || (Array.isArray(h.agents) && h.agents.every((a) => typeof a === "string"))),
+    )
   );
 }
 
@@ -265,6 +285,20 @@ export class Quarantine {
     this.#fetched.set(agent, tracked);
     tracked.first = this.fetch(this.#firstTimeout, agent).then(() => true);
     return tracked.first;
+  }
+
+  /**
+   * The halt that stops whoever goes by these names, if any: an agent's name, the subagent type
+   * it runs as, its instance and the instances that started it. STALE when the rules are. Null
+   * when the proxy doesn't say what's halted, being older than cooperative stops: there's
+   * nothing to go on, and the proxy deny still holds.
+   */
+  halted(names: Iterable<string>): string | null {
+    if (this.#isStale()) return STALE;
+    const halts = this.rules()?.halts;
+    if (!Array.isArray(halts)) return null;
+    const named = new Set(names);
+    return halts.find((h) => h.fleet === true || (h.agents ?? []).some((a) => named.has(a)))?.id ?? null;
   }
 
   /**
