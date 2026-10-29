@@ -14,9 +14,11 @@ The SDK runs Claude Code in a subprocess and streams its messages back, and Wake
 that stream as it passes. Each assistant message is a model call, and each tool use and
 its result a tool call. A subagent started with the Agent tool is an agent of its own,
 named <agent>/<subagent type>: one agent_message hands it the task and another carries
-its answer back. Links are exact, from the SDK's ids: a tool call's parent is the model
-call that asked for it, and a model call's parents are the call before it and the tool
-results and messages new in its context.
+its answer back. Several of one type can run at once, so each is also an instance,
+<agent>/<subagent type>#<the Agent tool use that started it>, and its events name the
+instance and the lineage that started it. Links are exact, from the SDK's ids: a tool
+call's parent is the model call that asked for it, and a model call's parents are the
+call before it and the tool results and messages new in its context.
 
 options() adds hooks that open each tool call before it runs, and tools() wraps
 in-process tools so they run with their event current: an MCP or A2A call they make
@@ -86,8 +88,11 @@ def _context(span) -> Any:
 class _Thread:
     """One agent's conversation in a run: the main agent's, or a subagent's."""
 
-    def __init__(self, agent: str, span, parents: list[str], origins: list[str], given: list[dict]) -> None:
+    def __init__(self, agent: str, span, parents: list[str], origins: list[str], given: list[dict],
+                 instance: str | None = None, lineage: tuple[str, ...] = ()) -> None:
         self.agent = agent
+        self.instance = instance  # a subagent's own instance; the main agent has none
+        self.lineage = lineage  # the agent and instances that started it, outermost first
         self.span = span  # its events nest under this span
         self.call: _Call | None = None  # the model call streaming now
         self.last_call: str | None = None
@@ -96,6 +101,10 @@ class _Thread:
         self.given = given  # what's new in its next model call's context
         self.waiting_since = time.time_ns()  # when it last handed control to the model
         self.prompt = given[0]["content"] if given else None
+
+    def started(self, agent: str, instance: str, span, parents: list[str], given: list[dict]) -> "_Thread":
+        """The thread of an instance this one starts."""
+        return _Thread(agent, span, parents, [], given, instance, (*self.lineage, self.instance or self.agent))
 
 
 class _Call:
@@ -124,6 +133,8 @@ class _Tool:
         self.name = name
         self.arguments = arguments
         self.agent = agent
+        self.instance: str | None = None
+        self.lineage: tuple[str, ...] = ()
         self.run = run
         self.parents: list[str] = []
         self.error: str | None = None
@@ -150,6 +161,7 @@ class WakeClaudeAgent(EventGraph):
         self._tools: dict[str, _Tool] = _Recent()  # tool use id -> its open tool call
         self._waiting = _Recent()  # (tool name, arguments) -> tool use ids an in-process tool may be
         self._tool_agents = _Recent()  # tool call event id -> the agent making it
+        self._tool_instances = _Recent()  # tool call event id -> the subagent instance making it, and its lineage
         self._sessions = _Recent(limit=1024)  # session id -> its run now
         self._last_calls = _Recent(limit=1024)  # session id -> its last model call, for the next turn
         self._active: list[_Run] = []
@@ -367,7 +379,8 @@ class WakeClaudeAgent(EventGraph):
         thread = run.threads.get(parent_tool_use_id)
         if thread is None:
             # A subagent whose start Wake didn't see.
-            thread = _Thread(f"{self._recorder.agent}/subagent", run.root, [], [], [])
+            agent = f"{self._recorder.agent}/subagent"
+            thread = run.threads[None].started(agent, f"{agent}#{parent_tool_use_id}", run.root, [], [])
             run.threads[parent_tool_use_id] = thread
         return thread
 
@@ -410,16 +423,18 @@ class WakeClaudeAgent(EventGraph):
         if call.error:
             payload["error"] = call.error
         self._emit(call.span, call.event_id, events.MODEL_CALL, f"chat {call.model}".strip(), thread.agent,
-                   call.parents, call.origins, attributes, payload, error=call.error)
+                   call.parents, call.origins, attributes, payload, error=call.error, who=thread)
         self._remember_output(call.span.get_span_context().trace_id, call.event_id, _text(call.output))
         call.span.end(end_time=call.ended_at)
 
     def _requested(self, run, thread, call, tool_use_id, name, arguments, *, server=False) -> None:
         tool = self._open_tool(run, tool_use_id, name, arguments, thread.agent, thread.span, server=server)
-        tool.agent = thread.agent
+        tool.agent, tool.instance, tool.lineage = thread.agent, thread.instance, thread.lineage
         tool.parents = list(dict.fromkeys([call.event_id] + call.found))
         with self._lock:
             self._tool_agents[tool.event_id] = thread.agent
+            if thread.instance:
+                self._tool_instances[tool.event_id] = (thread.instance, thread.lineage)
         self._remember_lineage(tool.event_id, tool.parents, [f"tool:{name}"])
 
     def _open_tool(self, run, tool_use_id, name, arguments, agent, parent_span, *, server=False) -> _Tool:
@@ -458,7 +473,7 @@ class WakeClaudeAgent(EventGraph):
         if error:
             payload["error"] = tool.error or _text(output) or error
         self._emit(tool.span, tool.event_id, events.TOOL_CALL, f"execute_tool {tool.name}", tool.agent,
-                   tool.parents, [f"tool:{tool.name}"], attributes, payload, error=error)
+                   tool.parents, [f"tool:{tool.name}"], attributes, payload, error=error, who=tool)
         self._remember_output(tool.span.get_span_context().trace_id, tool.event_id, _text(output))
         tool.span.end(end_time=tool.ended_at)
         return tool
@@ -469,18 +484,21 @@ class WakeClaudeAgent(EventGraph):
         prompt = arguments.get("prompt")
         event_id = str(uuid.uuid4())
         parents = list(dict.fromkeys([call.event_id] + call.found))
+        given = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else []
+        sub = thread.started(target, f"{target}#{block.id}", None, [event_id], given)
         span = self._recorder.tracer.start_span(f"agent_message {thread.agent} -> {target}", context=_context(thread.span))
         self._emit(span, event_id, events.AGENT_MESSAGE, f"agent_message {thread.agent} -> {target}", target,
                    parents, [f"agent:{thread.agent}"], {"gen_ai.agent.name": target},
-                   {"from": thread.agent, "to": target, "description": arguments.get("description"), "prompt": prompt})
+                   {"from": thread.agent, "to": target, "description": arguments.get("description"), "prompt": prompt},
+                   who=sub)
         span.end()
-        sub_span = self._recorder.tracer.start_span(
+        sub.span = self._recorder.tracer.start_span(
             f"invoke_agent {target}",
             context=_context(thread.span),
-            attributes={"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": target, events.AGENT_ID: target},
+            attributes={"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": target, events.AGENT_ID: target,
+                        **events.instance_attributes(sub.instance, sub.lineage)},
         )
-        given = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else []
-        run.threads[block.id] = _Thread(target, sub_span, [event_id], [], given)
+        run.threads[block.id] = sub
         run.handoffs[block.id] = event_id
 
     def _returned(self, run: _Run, thread: _Thread, block: ToolResultBlock) -> None:
@@ -492,12 +510,13 @@ class WakeClaudeAgent(EventGraph):
         span = self._recorder.tracer.start_span(f"agent_message {sub.agent} -> {thread.agent}", context=_context(thread.span))
         self._emit(span, event_id, events.AGENT_MESSAGE, f"agent_message {sub.agent} -> {thread.agent}", thread.agent,
                    [source] if source else [], [f"agent:{sub.agent}"], {"gen_ai.agent.name": thread.agent},
-                   {"from": sub.agent, "to": thread.agent, "output": block.content})
+                   {"from": sub.agent, "to": thread.agent, "output": block.content}, who=thread)
         self._remember_output(span.get_span_context().trace_id, event_id, _text(block.content))
         span.end()
         thread.parents.append(event_id)
 
-    def _emit(self, span, event_id, kind, name, agent, parents, origins, attributes, payload, *, error=None) -> None:
+    def _emit(self, span, event_id, kind, name, agent, parents, origins, attributes, payload, *, error=None,
+              who: "_Thread | _Tool | None" = None) -> None:
         parents = list(dict.fromkeys(parents))
         self._remember_lineage(event_id, parents, origins)
         span.update_name(name)
@@ -508,6 +527,7 @@ class WakeClaudeAgent(EventGraph):
             events.CAPTURE: "sdk",
             events.PARENTS: parents,
             events.ORIGINS: origins,
+            **(events.instance_attributes(who.instance, who.lineage) if who is not None else {}),
             **attributes,
         })
         span.set_attributes(events.payload_attributes(payload))
@@ -557,3 +577,19 @@ class WakeClaudeAgent(EventGraph):
             if agent:
                 return agent
         return self._recorder.agent
+
+    def _current_instance(self) -> "tuple[str | None, tuple[str, ...]]":
+        link = links.current()
+        if link is None:
+            return None, ()
+        with self._lock:
+            instance = self._tool_instances.get(link.event_id)
+            if instance:
+                return instance
+            tool = next((t for t in self._tools.values() if t.event_id == link.event_id), None)
+        if tool is None or tool.run is None or tool.agent == self._recorder.agent:
+            return None, ()
+        # The hook opened the tool before the stream said which subagent asked for it. With
+        # one instance of that agent running, it's that one; with more, it isn't guessed.
+        running = [t for t in list(tool.run.threads.values()) if t.agent == tool.agent and t.instance]
+        return (running[0].instance, running[0].lineage) if len(running) == 1 else (None, ())

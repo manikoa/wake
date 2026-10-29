@@ -26,6 +26,7 @@ Wake becomes one of the Agents SDK's trace processors. Each agent's run is named
 - A tool call's parent is the response that requested it.
 - A response's parents are the earlier responses and tool results in its input.
 - A handoff is an `agent_message` that feeds the receiving agent's next step.
+- An agent run inside a tool call, as with `agent.as_tool()`, is an instance of its own, `<agent>#<the tool call's span id>`, in `wake.agent.instance`, with `wake.agent.lineage` naming the agent that called it (see docs/events.md). Each such run is linked within itself, so two copies of one agent called at once never take each other's steps as parents.
 
 Inputs and outputs are recorded when the SDK's `trace_include_sensitive_data` is on, as it is by default. Without it, events have empty payloads, and the SDK's loop links them instead: a tool call comes from its agent's latest response, and a response reads that response and the tool results since. Chat Completions models, LiteLLM's included, link as Responses models do, and an agent run inside a tool call, such as one used as a tool, descends from that call. Install with the `openai-agents` extra.
 
@@ -43,7 +44,7 @@ async for message in claude.record(query(prompt=prompt, options=options), prompt
     ...
 ```
 
-Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. One `agent_message` hands it the task and another carries its answer back. Links come from the SDK's ids:
+Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. Several of one type can run at once, so each is also an instance, `support/<subagent type>#<the Agent tool use that started it>`, in `wake.agent.instance`, with `wake.agent.lineage` naming what started it (see docs/events.md). One `agent_message` hands it the task and another carries its answer back. Links come from the SDK's ids:
 - A tool call's parent is the model call that asked for it.
 - A model call's parents are the call before it and the tool results and messages new in its context.
 - With `ClaudeSDKClient`, wrap each `receive_response()`, and a later turn continues from the last.
@@ -64,7 +65,7 @@ with handler.agent("supervisor", input=question, origin="user"):
         run.reply(answer)
 ```
 
-A handoff is recorded as an `agent_message` event in the receiving agent's run, and it feeds that agent's next event. When prompts are built from strings, so no message ids link one call to the next, an event's parents are the earlier events in the same trace whose output appears in its input.
+A handoff is recorded as an `agent_message` event in the receiving agent's run, and it feeds that agent's next event. A run started inside another agent's run is an instance of its own, `<name>#<its span id>`, in `wake.agent.instance`, with `wake.agent.lineage` naming the run that started it, so two runs of one agent at once can be told apart. When prompts are built from strings, so no message ids link one call to the next, an event's parents are the earlier events in the same trace whose output appears in its input.
 
 The recorder sends to `WAKE_ENDPOINT`, or `http://localhost:4318` by default. Over TLS with a private CA, set `WAKE_CA_FILE` to the CA's certificate. Wake reads only its own `WAKE_*` settings. The app's `OTEL_*` variables, such as its sampler, exporter headers or attribute limits, configure the app's telemetry and never Wake's. Its proxy settings, such as `HTTPS_PROXY`, and `REQUESTS_CA_BUNDLE` and `.netrc` apply to its own traffic, and Wake's goes straight to the collector. Wake records every event even under an unsampled parent. `flush()` waits at most its timeout, and returns False if events were dropped since the last flush. `health()` counts events sent and dropped, and `failed`, those the SDK couldn't record. Install with the `langchain` or `langgraph` extra.
 

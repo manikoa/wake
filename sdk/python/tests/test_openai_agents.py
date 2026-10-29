@@ -297,3 +297,100 @@ def test_an_agent_run_inside_a_tool_descends_from_the_tool_call():
     assert attrs(tool)["wake.event.id"] in attrs(nested)["wake.parents"]
     assert "user" not in attrs(nested)["wake.origins"]
     assert attrs(first)["wake.origins"] == ("user",)
+    # It's an instance, started by support's tool call; support's own events aren't.
+    assert attrs(nested)["wake.agent.instance"].startswith("summarizer#")
+    assert attrs(nested)["wake.agent.lineage"] == ("support",)
+    assert all("wake.agent.instance" not in attrs(e) for e in (first, tool, last))
+
+
+class ResearcherModel(Model):
+    """A researcher that looks its question up, then answers from what it found: by what's
+    in its input, so copies running at once each follow their own run. It yields between
+    steps, so copies interleave as they would on a real model."""
+
+    async def get_response(self, system_instructions, input, model_settings, tools, output_schema, handoffs, tracing,
+                           previous_response_id=None, conversation_id=None, prompt=None, **kwargs):
+        await asyncio.sleep(0)
+        found = [i for i in input if _type(i) == "function_call_output"] if isinstance(input, list) else []
+        question = input if isinstance(input, str) else next(
+            (i["content"] for i in input if isinstance(i, dict) and i.get("role") == "user"), "")
+        output = [say(f"Answer: {found[-1]['output']}")] if found else [
+            call("lookup", json.dumps({"q": question}), f"call_{uuid.uuid4().hex[:8]}")]
+        with response_span(disabled=tracing.is_disabled()) as span:
+            if tracing.include_data():
+                span.span_data.response = Response.model_construct(id=f"resp_{uuid.uuid4().hex[:8]}", model="fake-model",
+                                                                   output=output, object="response")
+                span.span_data.input = input
+        await asyncio.sleep(0)
+        return ModelResponse(output=output, usage=Usage(), response_id=None)
+
+    def stream_response(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+def _type(item):
+    return item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+
+
+def two_researchers(memory=None):
+    @function_tool
+    async def lookup(q: str) -> str:
+        """Look a question up."""
+        await asyncio.sleep(0)
+        if memory is not None:
+            memory.write_file(memory_dir / f"{uuid.uuid4().hex}.md", f"Found: {q}")
+        return f"Found: {q}"
+
+    researcher = Agent(name="researcher", tools=[lookup], model=ResearcherModel())
+    research = researcher.as_tool(tool_name="research", tool_description="Research one question.")
+    # The same question twice: nothing in the arguments tells the copies apart.
+    return Agent(name="triage", tools=[research], model=FakeModel([
+        [call("research", json.dumps({"input": "refund window"}), "call_a"),
+         call("research", json.dumps({"input": "refund window"}), "call_b")],
+        [say("Both answered.")],
+    ]))
+
+
+memory_dir = None
+
+
+@pytest.mark.parametrize("sensitive", [True, False])
+def test_an_agent_called_twice_as_a_tool_is_two_instances_that_never_cross(sensitive, tmp_path):
+    from agents import RunConfig
+    from wake.memory import Memory
+
+    global memory_dir
+    memory_dir = tmp_path
+    exporter = InMemorySpanExporter()
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter))
+    set_trace_processors([processor])
+    try:
+        asyncio.run(Runner.run(two_researchers(Memory(processor)), "Check our refund terms.",
+                               run_config=RunConfig(trace_include_sensitive_data=sensitive)))
+    finally:
+        set_trace_processors([])
+    processor._recorder.flush()
+    events_ = wake_events(exporter.get_finished_spans())
+
+    by_instance: dict[str, list] = {}
+    for e in events_:
+        if attrs(e)["wake.agent.id"] == "researcher":
+            assert attrs(e)["wake.agent.lineage"] == ("triage",), attrs(e)
+            by_instance.setdefault(attrs(e)["wake.agent.instance"], []).append(e)
+        else:
+            assert "wake.agent.instance" not in attrs(e), attrs(e)
+    assert len(by_instance) == 2, list(by_instance)
+    triage_ids = {attrs(e)["wake.event.id"] for e in events_ if attrs(e)["wake.agent.id"] == "triage"}
+    for instance, own in by_instance.items():
+        kinds = sorted(attrs(e)["wake.event.kind"] for e in own)
+        assert kinds == ["memory_write", "model_call", "model_call", "tool_call"], (instance, kinds)
+        own_ids = {attrs(e)["wake.event.id"] for e in own}
+        for e in own:
+            # Each copy links only within itself, and to the triage call that started it.
+            crossed = set(attrs(e)["wake.parents"]) - own_ids - triage_ids
+            assert not crossed, f"{instance} {attrs(e)['wake.event.kind']} links to the other copy: {crossed}"
+        first, last = sorted((e for e in own if attrs(e)["wake.event.kind"] == "model_call"), key=lambda e: e.start_time)
+        (lookup,) = [e for e in own if attrs(e)["wake.event.kind"] == "tool_call"]
+        # Its tool ran from its own first response, and its answer read that tool's result.
+        assert set(attrs(lookup)["wake.parents"]) == {attrs(first)["wake.event.id"]}
+        assert attrs(lookup)["wake.event.id"] in attrs(last)["wake.parents"]

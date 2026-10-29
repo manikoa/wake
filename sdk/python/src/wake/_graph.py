@@ -107,6 +107,11 @@ class EventGraph:
     def _current_agent(self) -> str:
         return self._recorder.agent
 
+    def _current_instance(self) -> "tuple[str | None, tuple[str, ...]]":
+        """The instance of the current agent and what started it, when the agent is one of
+        several that can run at once (docs/events.md). None for an agent that runs as one."""
+        return None, ()
+
     def _remember_output(self, trace_id: int, event_id: str, text: str) -> None:
         text = text.strip()
         if len(text) < _MIN_MATCH:

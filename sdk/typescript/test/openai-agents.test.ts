@@ -5,12 +5,13 @@
  */
 
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 
-import { Agent, Runner, run, setTraceProcessors, tool, Usage, withGenerationSpan, type ModelRequest, type ModelResponse } from "@openai/agents";
+import { Agent, Runner, run, setTraceProcessors, tool, Usage, withGenerationSpan, withResponseSpan, type ModelRequest, type ModelResponse } from "@openai/agents";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace";
 import { z } from "zod";
 
@@ -247,4 +248,104 @@ test("an agent run inside a tool descends from the tool call", async () => {
   assert.ok(parents(nested).includes(id(toolCall)));
   assert.ok(!origins(nested).includes("user"));
   assert.deepEqual(origins(first), ["user"]);
+  // It's an instance, started by support's tool call; support's own events aren't.
+  assert.match(attr(nested, "wake.agent.instance") as string, /^summarizer#/);
+  assert.deepEqual(attr(nested, "wake.agent.lineage"), ["support"]);
+  assert.ok([first, toolCall, last].every((e) => attr(e, "wake.agent.instance") === undefined));
 });
+
+/**
+ * A researcher that looks its question up, then answers from what it found: by what's in its
+ * input, so copies running at once each follow their own run. It yields between steps, so
+ * copies interleave as they would on a real model.
+ */
+class ResearcherModel extends FakeModel {
+  constructor() {
+    super([]);
+  }
+
+  override async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    await new Promise((resolve) => setImmediate(resolve));
+    const input = Array.isArray(request.input) ? (request.input as Record<string, unknown>[]) : [];
+    const found = input.filter((i) => i.type === "function_call_result");
+    const question = typeof request.input === "string" ? request.input : String(input.find((i) => i.role === "user")?.content ?? "");
+    const output = found.length > 0 ? [say(`Answer: ${JSON.stringify(found.at(-1)!.output)}`)] : [call("lookup", JSON.stringify({ q: question }), `call_${randomUUID().slice(0, 8)}`)];
+    const answer = { output: asItems(output), usage: new Usage(), responseId: undefined } as unknown as ModelResponse;
+    const result = !request.tracing
+      ? answer
+      : await withResponseSpanFor(request, output, answer);
+    await new Promise((resolve) => setImmediate(resolve));
+    return result;
+  }
+}
+
+async function withResponseSpanFor(request: ModelRequest, output: ApiItem[], answer: ModelResponse): Promise<ModelResponse> {
+  return withResponseSpan(async (span) => {
+    if (request.tracing === true) {
+      const responseId = `resp_${randomUUID().slice(0, 8)}`;
+      span.spanData.response_id = responseId;
+      span.spanData._input = request.input as never;
+      span.spanData._response = { id: responseId, model: "fake-model", output, object: "response" };
+    }
+    return answer;
+  });
+}
+
+for (const sensitive of [true, false]) {
+  test(`an agent called twice as a tool is two instances that never cross (sensitive data ${sensitive ? "on" : "off"})`, async () => {
+    const { recorder, spans } = recorded("support");
+    const processor = new WakeTracingProcessor(recorder);
+    const memory = new Memory(processor);
+    const dir = await mkdtemp(join(tmpdir(), "wake-openai-"));
+    const lookup = tool({
+      name: "lookup",
+      description: "Look a question up.",
+      parameters: z.object({ q: z.string() }),
+      execute: async ({ q }) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        await memory.writeFile(join(dir, `${randomUUID()}.md`), `Found: ${q}`);
+        return `Found: ${q}`;
+      },
+    });
+    const researcher = new Agent({ name: "researcher", tools: [lookup], model: new ResearcherModel() });
+    const triage = new Agent({
+      name: "triage",
+      tools: [researcher.asTool({ toolName: "research", toolDescription: "Research one question." })],
+      model: new FakeModel([
+        // The same question twice: nothing in the arguments tells the copies apart.
+        [call("research", JSON.stringify({ input: "refund window" }), "call_a"), call("research", JSON.stringify({ input: "refund window" }), "call_b")],
+        [say("Both answered.")],
+      ]),
+    });
+    setTraceProcessors([processor]);
+    await new Runner({ traceIncludeSensitiveData: sensitive }).run(triage, "Check our refund terms.");
+    const events = wakeEvents(await spans());
+
+    const byInstance = new Map<string, ReadableSpan[]>();
+    for (const e of events) {
+      if (attr(e, "wake.agent.id") === "researcher") {
+        assert.deepEqual(attr(e, "wake.agent.lineage"), ["triage"]);
+        const instance = attr(e, "wake.agent.instance") as string;
+        byInstance.set(instance, [...(byInstance.get(instance) ?? []), e]);
+      } else {
+        assert.equal(attr(e, "wake.agent.instance"), undefined, String(attr(e, "wake.event.kind")));
+      }
+    }
+    assert.equal(byInstance.size, 2, [...byInstance.keys()].join(", "));
+    const triageIds = ids(...events.filter((e) => attr(e, "wake.agent.id") === "triage"));
+    for (const [instance, own] of byInstance) {
+      assert.deepEqual(own.map((e) => attr(e, "wake.event.kind")).sort(), ["memory_write", "model_call", "model_call", "tool_call"], instance);
+      const ownIds = ids(...own);
+      for (const e of own) {
+        // Each copy links only within itself, and to the triage call that started it.
+        const crossed = parents(e).filter((p) => !ownIds.has(p) && !triageIds.has(p));
+        assert.deepEqual(crossed, [], `${instance} ${String(attr(e, "wake.event.kind"))} links to the other copy`);
+      }
+      const [first, last] = own.filter((e) => attr(e, "wake.event.kind") === "model_call");
+      const [lookupCall] = own.filter((e) => attr(e, "wake.event.kind") === "tool_call");
+      // Its tool ran from its own first response, and its answer read that tool's result.
+      assert.deepEqual(new Set(parents(lookupCall)), ids(first));
+      assert.ok(parents(last).includes(id(lookupCall)));
+    }
+  });
+}
