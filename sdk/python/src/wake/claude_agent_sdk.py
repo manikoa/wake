@@ -13,27 +13,38 @@
 The SDK runs Claude Code in a subprocess and streams its messages back, and Wake reads
 that stream as it passes. Each assistant message is a model call, and each tool use and
 its result a tool call. A subagent started with the Agent tool is an agent of its own,
-named <agent>/<subagent type>: one agent_message hands it the task and another carries
-its answer back. Several of one type can run at once, so each is also an instance,
-<agent>/<subagent type>#<the Agent tool use that started it>, and its events name the
-instance and the lineage that started it. Links are exact, from the SDK's ids: a tool
-call's parent is the model call that asked for it, and a model call's parents are the
-call before it and the tool results and messages new in its context.
+named <agent>/<subagent type>: one agent_message hands it the task once it has started,
+and another carries its answer back, when the tool returns or, for a subagent left
+running in the background, when Claude Code says it has finished. Several of one type can
+run at once, so each is also an instance, <agent>/<subagent type>#<the Agent tool use that
+started it>, and its events name the instance and the lineage that started it. Links are
+exact, from the SDK's ids: a tool call's parent is the model call that asked for it, and a
+model call's parents are the call before it and the tool results and messages new in its
+context.
 
 options() adds hooks that open each tool call before it runs, and tools() wraps
 in-process tools so they run with their event current: an MCP or A2A call they make
 through the proxy, or a memory write, links back to the tool call. Tools Claude Code runs
 itself, such as Bash, WebFetch or an external MCP server, are recorded from the stream
 but can't carry the link.
+
+Given the brake's rules (WakeClaudeAgent(recorder, quarantine=Quarantine(...))), the
+hooks also stop the agent, or one subagent instance of it, in its own process: a tool
+call a halt covers is refused before it runs, and recorded as denied, an Agent tool call
+too, which then starts no subagent. That reaches what the proxy deny can't, such as Bash,
+and subagents that call with their parent's credentials, which the proxy can't tell from
+their parent. It's a cooperative stop: it holds only while the agent's code does, and a
+compromised agent can leave it out.
 """
 
 import dataclasses
+import logging
 import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterable, AsyncIterator
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -54,9 +65,16 @@ from wake import events, links
 from wake._graph import EventGraph, _Recent, never_raise
 from wake.recorder import Recorder
 
+if TYPE_CHECKING:
+    from wake.quarantine import Quarantine
+
+log = logging.getLogger("wake")
 
 # The tool Claude Code starts a subagent with; older versions call it Task.
 SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
+
+# What the Agent tool's result says of a subagent it left running in the background.
+LAUNCHED = frozenset({"async_launched", "remote_launched"})
 
 
 def _canonical(value: Any) -> str:
@@ -101,10 +119,25 @@ class _Thread:
         self.given = given  # what's new in its next model call's context
         self.waiting_since = time.time_ns()  # when it last handed control to the model
         self.prompt = given[0]["content"] if given else None
+        self.spawn: _Spawn | None = None  # a subagent's start, until it's known to have started
+        self.background = False  # a subagent the Agent tool left running in the background
 
     def started(self, agent: str, instance: str, span, parents: list[str], given: list[dict]) -> "_Thread":
         """The thread of an instance this one starts."""
         return _Thread(agent, span, parents, [], given, instance, (*self.lineage, self.instance or self.agent))
+
+
+class _Spawn:
+    """An Agent tool use, until its subagent is known to have started. One refused before
+    then, as by a halt, starts no subagent, and is recorded as the refused tool call it is."""
+
+    def __init__(self, starter: _Thread, tool: str, arguments: Any, parents: list[str]) -> None:
+        self.starter = starter  # the thread that asked for it
+        self.tool = tool
+        self.arguments = arguments
+        self.parents = parents  # the model call that asked for it, and what fed it
+        self.event_id = str(uuid.uuid4())  # the agent_message handing the subagent its task
+        self.at = time.time_ns()
 
 
 class _Call:
@@ -140,6 +173,7 @@ class _Tool:
         self.error: str | None = None
         self.ended_at: int | None = None
         self.frame = None  # the in-process tool's link frame, once it runs
+        self.halted: str | None = None  # the halt its call was refused under
 
 
 class _Run:
@@ -156,12 +190,22 @@ class _Run:
 class WakeClaudeAgent(EventGraph):
     """Records one Claude agent's runs, and the subagents it starts."""
 
-    def __init__(self, recorder: Recorder) -> None:
+    def __init__(self, recorder: Recorder, quarantine: "Quarantine | None" = None) -> None:
+        """With quarantine, the brake's rules for this agent (wake.quarantine), a tool call by
+        the agent, or by a subagent instance of it, that a halt covers is refused before it
+        runs, and recorded as denied. It trusts the agent's code: see cooperative stops in
+        the README."""
         super().__init__(recorder)
+        self._quarantine = quarantine
         self._tools: dict[str, _Tool] = _Recent()  # tool use id -> its open tool call
         self._waiting = _Recent()  # (tool name, arguments) -> tool use ids an in-process tool may be
         self._tool_agents = _Recent()  # tool call event id -> the agent making it
         self._tool_instances = _Recent()  # tool call event id -> the subagent instance making it, and its lineage
+        self._agent_ids = _Recent()  # tool use id -> the agent_id its hook named, for a subagent's
+        self._subagents = _Recent()  # a hook's agent_id -> the names of the instance it is: itself, then its lineage
+        self._spawned = _Recent()  # Agent tool use id -> its session, and the agent, instance and lineage it started
+        self._halted = _Recent()  # tool use id -> the halt a hook refused it under
+        self._ambiguous = _Recent()  # tool call event id -> True: an in-process call Wake can't tell from another
         self._sessions = _Recent(limit=1024)  # session id -> its run now
         self._last_calls = _Recent(limit=1024)  # session id -> its last model call, for the next turn
         self._active: list[_Run] = []
@@ -201,7 +245,11 @@ class WakeClaudeAgent(EventGraph):
 
     async def _pre_tool_use(self, hook_input, tool_use_id, context) -> dict:
         self._hook_opened(hook_input, tool_use_id)
-        return {}
+        halt = self._halting(hook_input, tool_use_id)
+        if halt is None:
+            return {}
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": halt[1]}}
 
     async def _post_tool_use(self, hook_input, tool_use_id, context) -> dict:
         self._hook_closed(hook_input, tool_use_id)
@@ -210,14 +258,74 @@ class WakeClaudeAgent(EventGraph):
     @never_raise
     def _hook_opened(self, hook_input, tool_use_id) -> None:
         name = hook_input.get("tool_name") or ""
+        agent_id = hook_input.get("agent_id")
+        if tool_use_id and agent_id:
+            with self._lock:
+                self._agent_ids[tool_use_id] = agent_id
         if not tool_use_id or name in SUBAGENT_TOOLS:
             return
         run = self._run_for(hook_input.get("session_id"))
         if run is None:
             return  # the stream opens it instead
-        agent_type = hook_input.get("agent_type") if hook_input.get("agent_id") else None
+        agent_type = hook_input.get("agent_type") if agent_id else None
         agent = f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
-        self._open_tool(run, tool_use_id, name, hook_input.get("tool_input"), agent, run.root)
+        tool = self._open_tool(run, tool_use_id, name, hook_input.get("tool_input"), agent, run.root)
+        if not agent_id:
+            return
+        with self._lock:
+            if tool.instance:
+                # The stream said first which instance asked for it.
+                self._subagents[agent_id] = (tool.instance, *tool.lineage)
+            elif known := self._subagents.get(agent_id):
+                # Its agent_id is placed already, by its earlier calls or the Agent tool's result.
+                tool.instance, tool.lineage = known[0], tuple(known[1:])
+                self._tool_instances[tool.event_id] = (tool.instance, tool.lineage)
+
+    # Cooperative stops.
+
+    @never_raise
+    def _halting(self, hook_input, tool_use_id) -> "tuple[str, str] | None":
+        """The halt that stops this tool call, and why, if one covers who's making it: the
+        agent, the subagent type it runs as, and the instance it is and those that started it.
+        A subagent's instance is known by the agent_id its hooks name, from its earlier calls
+        or the Agent tool's result. Before that, Wake can't tell which instance is calling: it
+        could be any the session started, or one started by any of them that the stream hasn't
+        shown yet, since hooks can run ahead of the code reading it. So the call is refused if a
+        halt covers any of them."""
+        if self._quarantine is None:
+            return None
+        agent_id = hook_input.get("agent_id")
+        agent_type = hook_input.get("agent_type") if agent_id else None
+        agent = f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
+        names = {self._recorder.agent, agent}
+        who = agent
+        with self._lock:
+            known = self._subagents.get(agent_id) if agent_id else None
+        if known:
+            names.update(known)
+            who = known[0]
+        halt = self._quarantine.halted(names)
+        reason = f"Wake halted {who} ({halt}), so this tool call wasn't run."
+        if halt is None and agent_id and not known:
+            halt = self._quarantine.halted(names | self._instances(hook_input.get("session_id")))
+            reason = (f"Wake can't yet tell which copy of {agent} is calling, and a halt ({halt}) may cover it, "
+                      f"so this tool call wasn't run.")
+        if halt is None:
+            return None
+        with self._lock:
+            if tool_use_id:
+                self._halted[tool_use_id] = halt
+            tool = self._tools.get(tool_use_id) if tool_use_id else None
+        if tool is not None:
+            tool.halted = halt
+        log.warning("wake: refused %s's %s call: %s", who, hook_input.get("tool_name") or "tool", halt)
+        return halt, reason
+
+    def _instances(self, session_id: str | None) -> set[str]:
+        """Every instance Wake has seen start in this session, and what started each."""
+        with self._lock:
+            return {name for session, _, instance, lineage in self._spawned.values()
+                    if session in (session_id, None) for name in (instance, *lineage)}
 
     @never_raise
     def _hook_closed(self, hook_input, tool_use_id) -> None:
@@ -245,10 +353,18 @@ class WakeClaudeAgent(EventGraph):
     def _enter(self, name: str, arguments: Any):
         key = (name, _canonical(arguments))
         with self._lock:
-            waiting = self._waiting.get(key)
+            waiting = self._waiting.get(key) or deque()
+            alike = [t for t in (self._tools.get(i) for i in waiting) if t is not None and not t.halted]
+            if len(alike) > 1 and not (alike[0].instance and all(t.instance == alike[0].instance for t in alike)):
+                # Calls alike, by instances that differ or aren't known yet, and Claude Code may
+                # run them in either order: which is which is a guess, so none names an instance.
+                for t in alike:
+                    self._ambiguous[t.event_id] = True
             tool = None
             while waiting and tool is None:
                 tool = self._tools.get(waiting.popleft())
+                if tool is not None and tool.halted:
+                    tool = None  # refused, so it never runs
         if tool is None:
             return None
         tool.frame = links._enter(tool.link)
@@ -300,6 +416,8 @@ class WakeClaudeAgent(EventGraph):
             run.root.set_attributes({"wake.claude.session_id": message.session_id, "wake.claude.turns": message.num_turns})
             if message.is_error:
                 run.root.set_status(Status(StatusCode.ERROR, message.subtype))
+        elif isinstance(message, SystemMessage) and message.subtype == "task_notification":
+            self._finished(run, message.data)
 
     def _join_session(self, run: _Run, session_id: str) -> None:
         run.session_id = session_id
@@ -335,10 +453,11 @@ class WakeClaudeAgent(EventGraph):
                 if block.name in SUBAGENT_TOOLS:
                     self._hand_off(run, thread, call, block)
                 else:
-                    self._requested(run, thread, call, block.id, block.name, block.input)
+                    self._requested(run, thread, [call.event_id, *call.found], block.id, block.name, block.input)
             elif isinstance(block, ServerToolUseBlock):
                 call.output.append({"type": "server_tool_use", "id": block.id, "name": block.name, "input": block.input})
-                self._requested(run, thread, call, block.id, block.name, block.input, server=True)
+                self._requested(run, thread, [call.event_id, *call.found], block.id, block.name, block.input,
+                                server=True)
                 call.server_tools.append(block.id)
             elif isinstance(block, (ServerToolResultBlock, ToolResultBlock)):
                 call.output.append({"type": "tool_result", "tool_use_id": block.tool_use_id, "content": block.content})
@@ -353,20 +472,32 @@ class WakeClaudeAgent(EventGraph):
         self._end_call(thread)
         content = message.content
         blocks = [TextBlock(text=content)] if isinstance(content, str) else content
+        # The tool's own output, beside the text the model reads, when the message answers one
+        # tool use, as Claude Code's do.
+        results = [b for b in blocks if isinstance(b, ToolResultBlock)]
+        output = getattr(message, "tool_use_result", None) if len(results) == 1 else None
         for block in blocks:
             if isinstance(block, ToolResultBlock):
                 item = {"type": "tool_result", "tool_use_id": block.tool_use_id, "content": block.content}
                 if block.is_error:
                     item["is_error"] = True
                 thread.given.append(item)
-                if block.tool_use_id in run.threads:
-                    self._returned(run, thread, block)
-                else:
-                    tool = self._finish_tool(block.tool_use_id, block.content, block.is_error)
-                    if tool is not None:
-                        # The tool, and whatever its result came from, such as an A2A reply.
-                        thread.parents.append(tool.event_id)
-                        thread.parents += links._returned(tool.frame)
+                sub = run.threads.get(block.tool_use_id)
+                if sub is not None and sub.spawn is not None:
+                    with self._lock:
+                        halted = block.tool_use_id in self._halted
+                    if halted or block.is_error:
+                        # Refused before the subagent started, as by a halt: it never ran.
+                        self._never_started(run, block.tool_use_id)
+                        sub = None
+                if sub is not None:
+                    self._answered(run, thread, sub, block, output)
+                    continue
+                tool = self._finish_tool(block.tool_use_id, block.content, block.is_error)
+                if tool is not None:
+                    # The tool, and whatever its result came from, such as an A2A reply.
+                    thread.parents.append(tool.event_id)
+                    thread.parents += links._returned(tool.frame)
             elif isinstance(block, TextBlock):
                 if block.text == thread.prompt:
                     continue  # the prompt it started with, echoed back
@@ -377,11 +508,24 @@ class WakeClaudeAgent(EventGraph):
 
     def _thread(self, run: _Run, parent_tool_use_id: str | None) -> _Thread:
         thread = run.threads.get(parent_tool_use_id)
-        if thread is None:
+        if thread is not None:
+            if thread.spawn is not None:
+                self._deliver(thread)  # its first message: it has started
+            return thread
+        with self._lock:
+            spawned = self._spawned.get(parent_tool_use_id) if parent_tool_use_id else None
+        if spawned is not None:
+            # A subagent started earlier, such as in an earlier turn, and running on in the
+            # background: still the same instance.
+            _, agent, instance, lineage = spawned
+            thread = _Thread(agent, None, [], [], [], instance, lineage)
+            thread.background = True
+        else:
             # A subagent whose start Wake didn't see.
             agent = f"{self._recorder.agent}/subagent"
-            thread = run.threads[None].started(agent, f"{agent}#{parent_tool_use_id}", run.root, [], [])
-            run.threads[parent_tool_use_id] = thread
+            thread = run.threads[None].started(agent, f"{agent}#{parent_tool_use_id}", None, [], [])
+        thread.span = self._invoke(thread, run.root)
+        run.threads[parent_tool_use_id] = thread
         return thread
 
     # Events.
@@ -427,14 +571,18 @@ class WakeClaudeAgent(EventGraph):
         self._remember_output(call.span.get_span_context().trace_id, call.event_id, _text(call.output))
         call.span.end(end_time=call.ended_at)
 
-    def _requested(self, run, thread, call, tool_use_id, name, arguments, *, server=False) -> None:
+    def _requested(self, run, thread, parents, tool_use_id, name, arguments, *, server=False) -> None:
         tool = self._open_tool(run, tool_use_id, name, arguments, thread.agent, thread.span, server=server)
         tool.agent, tool.instance, tool.lineage = thread.agent, thread.instance, thread.lineage
-        tool.parents = list(dict.fromkeys([call.event_id] + call.found))
+        tool.parents = list(dict.fromkeys(parents))
         with self._lock:
             self._tool_agents[tool.event_id] = thread.agent
             if thread.instance:
                 self._tool_instances[tool.event_id] = (thread.instance, thread.lineage)
+                agent_id = self._agent_ids.get(tool_use_id)
+                if agent_id:
+                    # Its hook came first, naming the subagent by agent_id: now it's placed.
+                    self._subagents[agent_id] = (thread.instance, *thread.lineage)
         self._remember_lineage(tool.event_id, tool.parents, [f"tool:{name}"])
 
     def _open_tool(self, run, tool_use_id, name, arguments, agent, parent_span, *, server=False) -> _Tool:
@@ -448,6 +596,7 @@ class WakeClaudeAgent(EventGraph):
         tool = _Tool(event_id, span, name, arguments, agent, run)
         self._remember_lineage(event_id, [], [f"tool:{name}"])
         with self._lock:
+            tool.halted = self._halted.get(tool_use_id)  # its hook refused it before the stream got here
             self._tools[tool_use_id] = tool
             self._tool_agents[event_id] = agent
             if not server:
@@ -472,46 +621,112 @@ class WakeClaudeAgent(EventGraph):
         payload: dict[str, Any] = {"input": tool.arguments, "output": output}
         if error:
             payload["error"] = tool.error or _text(output) or error
-        self._emit(tool.span, tool.event_id, events.TOOL_CALL, f"execute_tool {tool.name}", tool.agent,
+        kind = events.TOOL_CALL
+        if tool.halted:
+            # Refused in the agent's own process, under the halt: what the agent tried.
+            kind, attributes["wake.brake.halt_id"] = events.DENIED, tool.halted
+        self._emit(tool.span, tool.event_id, kind, f"execute_tool {tool.name}", tool.agent,
                    tool.parents, [f"tool:{tool.name}"], attributes, payload, error=error, who=tool)
         self._remember_output(tool.span.get_span_context().trace_id, tool.event_id, _text(output))
         tool.span.end(end_time=tool.ended_at)
         return tool
 
     def _hand_off(self, run: _Run, thread: _Thread, call: _Call, block: ToolUseBlock) -> None:
+        parents = list(dict.fromkeys([call.event_id] + call.found))
+        with self._lock:
+            refused = block.id in self._halted
+        if refused:
+            # Its hook refused it before the stream got here: no subagent starts.
+            self._requested(run, thread, parents, block.id, block.name, block.input)
+            return
         arguments = block.input if isinstance(block.input, dict) else {}
         target = f"{self._recorder.agent}/{arguments.get('subagent_type') or 'general-purpose'}"
         prompt = arguments.get("prompt")
-        event_id = str(uuid.uuid4())
-        parents = list(dict.fromkeys([call.event_id] + call.found))
+        spawn = _Spawn(thread, block.name, block.input, parents)
         given = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else []
-        sub = thread.started(target, f"{target}#{block.id}", None, [event_id], given)
-        span = self._recorder.tracer.start_span(f"agent_message {thread.agent} -> {target}", context=_context(thread.span))
-        self._emit(span, event_id, events.AGENT_MESSAGE, f"agent_message {thread.agent} -> {target}", target,
-                   parents, [f"agent:{thread.agent}"], {"gen_ai.agent.name": target},
-                   {"from": thread.agent, "to": target, "description": arguments.get("description"), "prompt": prompt},
-                   who=sub)
-        span.end()
-        sub.span = self._recorder.tracer.start_span(
-            f"invoke_agent {target}",
-            context=_context(thread.span),
-            attributes={"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": target, events.AGENT_ID: target,
-                        **events.instance_attributes(sub.instance, sub.lineage)},
-        )
+        sub = thread.started(target, f"{target}#{block.id}", None, [spawn.event_id], given)
+        # The handoff is recorded once the subagent has started, by its first message or the
+        # tool's result: a hook may yet refuse it.
+        sub.spawn = spawn
         run.threads[block.id] = sub
-        run.handoffs[block.id] = event_id
+        run.handoffs[block.id] = spawn.event_id
+        with self._lock:
+            self._spawned[block.id] = (run.session_id, target, sub.instance, sub.lineage)
 
-    def _returned(self, run: _Run, thread: _Thread, block: ToolResultBlock) -> None:
-        sub = run.threads.pop(block.tool_use_id)
+    def _deliver(self, sub: _Thread) -> None:
+        """Records the agent_message handing a subagent its task, now that it has started."""
+        spawn, sub.spawn = sub.spawn, None
+        if spawn is None:
+            return
+        starter, arguments = spawn.starter, spawn.arguments if isinstance(spawn.arguments, dict) else {}
+        name = f"agent_message {starter.agent} -> {sub.agent}"
+        span = self._recorder.tracer.start_span(name, context=_context(starter.span), start_time=spawn.at)
+        self._emit(span, spawn.event_id, events.AGENT_MESSAGE, name, sub.agent, spawn.parents,
+                   [f"agent:{starter.agent}"], {"gen_ai.agent.name": sub.agent},
+                   {"from": starter.agent, "to": sub.agent, "description": arguments.get("description"),
+                    "prompt": arguments.get("prompt")},
+                   who=sub)
+        span.end(end_time=spawn.at)
+        sub.span = self._invoke(sub, starter.span, start_time=spawn.at)
+
+    def _invoke(self, sub: _Thread, parent_span, start_time: int | None = None):
+        """The span a subagent's events nest under."""
+        return self._recorder.tracer.start_span(
+            f"invoke_agent {sub.agent}",
+            context=_context(parent_span),
+            start_time=start_time,
+            attributes={"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": sub.agent,
+                        events.AGENT_ID: sub.agent, **events.instance_attributes(sub.instance, sub.lineage)},
+        )
+
+    def _never_started(self, run: _Run, tool_use_id: str) -> None:
+        """Opens an Agent tool call whose subagent never started, refused before it did, as the
+        tool call it was: no handoff, and a denied event when a halt refused it."""
+        sub = run.threads.pop(tool_use_id)
+        run.handoffs.pop(tool_use_id, None)
+        with self._lock:
+            self._spawned.pop(tool_use_id, None)
+        spawn = sub.spawn
+        self._requested(run, spawn.starter, spawn.parents, tool_use_id, spawn.tool, spawn.arguments)
+
+    def _answered(self, run: _Run, thread: _Thread, sub: _Thread, block: ToolResultBlock, output: Any) -> None:
+        """The Agent tool's result: the subagent's answer, or that it runs on in the background."""
+        output = output if isinstance(output, dict) else {}
+        agent_id = output.get("agentId")
+        if isinstance(agent_id, str) and agent_id:
+            # The id its hooks name it by: its calls are placed from here on, whatever the
+            # stream has shown.
+            with self._lock:
+                self._subagents[agent_id] = (sub.instance, *sub.lineage)
+        self._deliver(sub)
+        if output.get("status") in LAUNCHED:
+            # It works on, and answers when Claude Code says it has finished.
+            sub.background = True
+            return
+        self._returned(run, thread, block.tool_use_id, block.content)
+
+    def _finished(self, run: _Run, data: dict) -> None:
+        """A task Claude Code ran in the background has ended: for a subagent, its answer."""
+        tool_use_id = data.get("tool_use_id")
+        sub = run.threads.get(tool_use_id) if tool_use_id else None
+        if sub is None or not sub.background:
+            return
+        # The answer goes to what started it, or to the agent once that's gone.
+        starter = next((t for t in list(run.threads.values()) if t.instance and t.instance == sub.lineage[-1]),
+                       run.threads[None])
+        self._returned(run, starter, tool_use_id, data.get("summary"))
+
+    def _returned(self, run: _Run, thread: _Thread, tool_use_id: str, content: Any) -> None:
+        sub = run.threads.pop(tool_use_id)
         self._end_call(sub)
         sub.span.end()
-        source = sub.last_call or run.handoffs.get(block.tool_use_id)
+        source = sub.last_call or run.handoffs.get(tool_use_id)
         event_id = str(uuid.uuid4())
         span = self._recorder.tracer.start_span(f"agent_message {sub.agent} -> {thread.agent}", context=_context(thread.span))
         self._emit(span, event_id, events.AGENT_MESSAGE, f"agent_message {sub.agent} -> {thread.agent}", thread.agent,
                    [source] if source else [], [f"agent:{sub.agent}"], {"gen_ai.agent.name": thread.agent},
-                   {"from": sub.agent, "to": thread.agent, "output": block.content}, who=thread)
-        self._remember_output(span.get_span_context().trace_id, event_id, _text(block.content))
+                   {"from": sub.agent, "to": thread.agent, "output": content}, who=thread)
+        self._remember_output(span.get_span_context().trace_id, event_id, _text(content))
         span.end()
         thread.parents.append(event_id)
 
@@ -541,6 +756,13 @@ class WakeClaudeAgent(EventGraph):
         if run is None:
             return
         for key, thread in list(run.threads.items()):
+            if thread.spawn is not None:
+                with self._lock:
+                    refused = key in self._halted
+                if refused:
+                    self._never_started(run, key)  # finished below, with the run's other open calls
+                    continue
+                self._deliver(thread)
             self._end_call(thread)
             if key is not None:
                 thread.span.end()
@@ -563,10 +785,13 @@ class WakeClaudeAgent(EventGraph):
     # Helpers.
 
     def _run_for(self, session_id: str | None) -> _Run | None:
+        """The run a hook's session is in: before a run has read its first message, the newest
+        that hasn't. Never a run of another session, as one still going after this session's
+        has ended, while a subagent of this one runs on."""
         with self._lock:
             run = self._sessions.get(session_id) if session_id else None
-            if run is None and self._active:
-                run = self._active[-1]
+            if run is None:
+                run = next((r for r in reversed(self._active) if r.session_id is None), None)
         return run
 
     def _current_agent(self) -> str:
@@ -583,13 +808,8 @@ class WakeClaudeAgent(EventGraph):
         if link is None:
             return None, ()
         with self._lock:
-            instance = self._tool_instances.get(link.event_id)
-            if instance:
-                return instance
-            tool = next((t for t in self._tools.values() if t.event_id == link.event_id), None)
-        if tool is None or tool.run is None or tool.agent == self._recorder.agent:
-            return None, ()
-        # The hook opened the tool before the stream said which subagent asked for it. With
-        # one instance of that agent running, it's that one; with more, it isn't guessed.
-        running = [t for t in list(tool.run.threads.values()) if t.agent == tool.agent and t.instance]
-        return (running[0].instance, running[0].lineage) if len(running) == 1 else (None, ())
+            if link.event_id in self._ambiguous:
+                return None, ()
+            # Known from the stream, or from the agent_id its hook named. Before either, the
+            # instance is left out rather than guessed: one the stream hasn't shown may be calling.
+            return self._tool_instances.get(link.event_id) or (None, ())

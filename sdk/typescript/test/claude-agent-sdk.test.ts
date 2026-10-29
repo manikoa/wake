@@ -20,7 +20,7 @@ import { z } from "zod";
 import { links, Recorder } from "../src/index.ts";
 import { WakeClaudeAgent } from "../src/claude-agent-sdk.ts";
 import { Memory } from "../src/memory.ts";
-import { fakeClaudeCode, type FakeClaudeCode } from "./claude-fakes.ts";
+import { caller, fakeClaudeCode, type FakeClaudeCode } from "./claude-fakes.ts";
 import { attr, id, origins, parents, parentSpanId, payload, recorded, wakeEvents } from "./helpers.ts";
 
 const PROMPT = "Can we refund order 1234?";
@@ -37,13 +37,15 @@ async function supportRun(cli: FakeClaudeCode): Promise<void> {
   await cli.useTool("toolu_order", "mcp__crm__lookup_order", { order: "1234" }, () => cli.callTool("crm", "lookup_order", { order: "1234" }));
   const research = { description: "Check the refund policy", prompt: "What is our refund window?", subagent_type: "researcher" };
   cli.assistant("msg_2", [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: research }]);
-  await cli.hook("PreToolUse", "toolu_agent", { tool_name: "Agent", tool_input: research });
-  cli.user([{ type: "text", text: "What is our refund window?" }], "toolu_agent");
-  const fetch = { url: "https://example.com/refunds", prompt: "refund window" };
-  cli.assistant("msg_3", [{ type: "tool_use", id: "toolu_fetch", name: "WebFetch", input: fetch }], "toolu_agent");
-  await cli.useTool("toolu_fetch", "WebFetch", fetch, async () => POLICY, { parent: "toolu_agent", agent: "researcher" });
-  cli.assistant("msg_4", [{ type: "text", text: `The policy says: ${POLICY}` }], "toolu_agent");
-  cli.user([{ type: "tool_result", tool_use_id: "toolu_agent", content: [{ type: "text", text: `The policy says: ${POLICY}` }] }]);
+  const researcher = async () => {
+    cli.user([{ type: "text", text: "What is our refund window?" }], "toolu_agent");
+    const fetch = { url: "https://example.com/refunds", prompt: "refund window" };
+    cli.assistant("msg_3", [{ type: "tool_use", id: "toolu_fetch", name: "WebFetch", input: fetch }], "toolu_agent");
+    await cli.useTool("toolu_fetch", "WebFetch", fetch, async () => POLICY, { parent: "toolu_agent", agent: "researcher" });
+    cli.assistant("msg_4", [{ type: "text", text: `The policy says: ${POLICY}` }], "toolu_agent");
+    return `The policy says: ${POLICY}`;
+  };
+  await cli.spawn("toolu_agent", research, researcher, { subagentId: "agent-researcher" });
   cli.assistant("msg_5", [{ type: "text", text: ANSWER }]);
   cli.emit({ type: "result", subtype: "success", duration_ms: 10, duration_api_ms: 8, is_error: false, num_turns: 5, session_id: "session-1", result: ANSWER });
 }
@@ -58,7 +60,8 @@ function lookupOrder(handler: () => Promise<void> = async () => {}) {
   });
 }
 
-async function runSupport(claude: WakeClaudeAgent, script = supportRun, tools = [lookupOrder()]): Promise<SDKMessage[]> {
+/** The messages the run streamed, put in read as the code reading the stream gets each. */
+async function runSupport(claude: WakeClaudeAgent, script = supportRun, tools = [lookupOrder()], read: SDKMessage[] = []): Promise<SDKMessage[]> {
   const crm = createSdkMcpServer({ name: "crm", tools: claude.tools(tools) });
   const options = claude.options({
     mcpServers: { crm },
@@ -66,9 +69,8 @@ async function runSupport(claude: WakeClaudeAgent, script = supportRun, tools = 
     spawnClaudeCodeProcess: fakeClaudeCode(script),
     pathToClaudeCodeExecutable: "claude",
   });
-  const messages: SDKMessage[] = [];
-  for await (const message of claude.record(query({ prompt: PROMPT, options }), { prompt: PROMPT })) messages.push(message);
-  return messages;
+  for await (const message of claude.record(query({ prompt: PROMPT, options }), { prompt: PROMPT })) read.push(message);
+  return read;
 }
 
 let supported: Promise<{ messages: SDKMessage[]; spans: ReadableSpan[] }> | undefined;
@@ -165,13 +167,25 @@ test("the subagent is an instance started by its agent", async () => {
   assert.deepEqual(identity(sub), ["support/researcher#toolu_agent", ["support"]]);
 });
 
+function research(ask: string) {
+  return { description: ask, prompt: ask, subagent_type: "researcher" };
+}
+
+/** Of these Agent tool uses, those the hooks let start. */
+async function started<T extends [string, string, ...string[]]>(cli: FakeClaudeCode, asks: T[]): Promise<T[]> {
+  const allowed: T[] = [];
+  for (const ask of asks) if (await cli.allowed(ask[0], "Agent", research(ask[1]), {})) allowed.push(ask);
+  return allowed;
+}
+
 async function twoResearchers(cli: FakeClaudeCode): Promise<void> {
   cli.emit({ type: "system", subtype: "init", session_id: "session-1", uuid: "u0" });
-  const asks: [string, string, string][] = [
+  let asks: [string, string, string][] = [
     ["toolu_window", "Check the refund window", "Thirty days."],
     ["toolu_shipping", "Check who pays return shipping", "We do."],
   ];
-  cli.assistant("msg_1", asks.map(([use, ask]) => ({ type: "tool_use", id: use, name: "Agent", input: { description: ask, prompt: ask, subagent_type: "researcher" } })));
+  cli.assistant("msg_1", asks.map(([use, ask]) => ({ type: "tool_use", id: use, name: "Agent", input: research(ask) })));
+  asks = await started(cli, asks);
   for (const [use, ask, answer] of asks) {
     cli.user([{ type: "text", text: ask }], use);
     cli.assistant(`msg_${use}`, [{ type: "text", text: answer }], use);
@@ -202,6 +216,332 @@ test("two subagents of one type are two instances", async () => {
   const answers = events.filter((e) => e.name === "agent_message support/researcher -> support");
   assert.equal(answers.length, 2);
   assert.ok(answers.every((a) => identity(a).every((v) => v === undefined)), "each answer reaches the main agent");
+});
+
+/** Stands in for the brake's rules (Quarantine): the halts in force. */
+class Halts {
+  halts: { id: string; fleet?: boolean; agents?: string[] }[] = [];
+  halted(names: Iterable<string>): string | null {
+    const named = new Set(names);
+    return this.halts.find((h) => h.fleet || (h.agents ?? []).some((a) => named.has(a)))?.id ?? null;
+  }
+}
+
+async function until(condition: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 400; i++) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`never: ${what}`);
+}
+
+const WINDOW = "support/researcher#toolu_window";
+const SHIPPING = "support/researcher#toolu_shipping";
+
+/** Two researcher copies each fetch a page, then run a command; one is halted once both have fetched. */
+function twoResearchersWorking(claude: WakeClaudeAgent, halts: Halts, seen: FakeClaudeCode[]) {
+  return async (cli: FakeClaudeCode): Promise<void> => {
+    seen.push(cli);
+    cli.emit({ type: "system", subtype: "init", session_id: "session-1", uuid: "u0" });
+    let asks: [string, string][] = [
+      ["toolu_window", "Check the refund window"],
+      ["toolu_shipping", "Check who pays return shipping"],
+    ];
+    cli.assistant("msg_1", asks.map(([use, ask]) => ({ type: "tool_use", id: use, name: "Agent", input: research(ask) })));
+    asks = await started(cli, asks);
+    for (const [use, ask] of asks) cli.user([{ type: "text", text: ask }], use);
+    for (const [use] of asks) {
+      const fetch = { url: `https://example.com/${use}`, prompt: "policy" };
+      cli.assistant(`msg_${use}_1`, [{ type: "tool_use", id: `${use}_fetch`, name: "WebFetch", input: fetch }], use);
+      await cli.useTool(`${use}_fetch`, "WebFetch", fetch, async () => POLICY, { parent: use, agent: "researcher", agentId: `agent-${use}` });
+    }
+    await until(() => claude._subagents.size === 2, "each copy placed by its agent_id");
+    halts.halts = [{ id: "halt-window", agents: [WINDOW] }];
+    for (const [use] of asks) {
+      const command = { command: `echo ${use}` };
+      cli.assistant(`msg_${use}_2`, [{ type: "tool_use", id: `${use}_bash`, name: "Bash", input: command }], use);
+      await cli.useTool(`${use}_bash`, "Bash", command, async () => "ok", { parent: use, agent: "researcher", agentId: `agent-${use}` });
+    }
+    for (const [use] of asks) cli.user([{ type: "tool_result", tool_use_id: use, content: [{ type: "text", text: "done" }] }]);
+    // The main agent isn't halted: its own tool call runs.
+    cli.assistant("msg_2", [{ type: "tool_use", id: "toolu_main_bash", name: "Bash", input: { command: "date" } }]);
+    await cli.useTool("toolu_main_bash", "Bash", { command: "date" }, async () => "ok");
+    cli.assistant("msg_3", [{ type: "text", text: ANSWER }]);
+    cli.emit({ type: "result", subtype: "success", duration_ms: 10, duration_api_ms: 8, is_error: false, num_turns: 3, session_id: "session-1", result: ANSWER });
+  };
+}
+
+test("a halted subagent is stopped in process, and its sibling goes on", async () => {
+  const { recorder, spans } = recorded("support");
+  const halts = new Halts();
+  const claude = new WakeClaudeAgent(recorder, { quarantine: halts });
+  const seen: FakeClaudeCode[] = [];
+  await runSupport(claude, twoResearchersWorking(claude, halts, seen));
+  assert.deepEqual(seen[0].refused, ["toolu_window_bash"], "only the halted copy's command was refused");
+  const events = wakeEvents(await spans());
+  const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "halt-window");
+  assert.equal(attr(denied[0], "gen_ai.tool.name"), "Bash");
+  assert.deepEqual(identity(denied[0]), [WINDOW, ["support"]], "recorded as the halted instance's attempt");
+  const ran = events.filter((e) => attr(e, "wake.event.kind") === "tool_call" && attr(e, "gen_ai.tool.name") === "Bash");
+  assert.deepEqual(ran.map((e) => (identity(e)[0] as string | undefined) ?? "main").sort(), ["main", SHIPPING]);
+});
+
+type Json = Record<string, unknown>;
+
+/** Messages as the SDK yields them, the stream held open until done settles. */
+async function* stream(messages: Json[], done?: Promise<void>): AsyncGenerator<Json> {
+  for (const message of messages) yield message;
+  await done;
+}
+
+const INIT = { type: "system", subtype: "init", session_id: "session-1", uuid: "u0" };
+
+function result(text: string): Json {
+  return { type: "result", subtype: "success", duration_ms: 10, duration_api_ms: 8, is_error: false, num_turns: 2, session_id: "session-1", result: text };
+}
+
+test("while Wake can't tell which copy is calling, a halt that may cover it stops it", async () => {
+  // A hook can come before the stream says which copy asked for its tool, or even that the copy
+  // started. Two copies of a type have started, neither yet placed by its agent_id, and one is
+  // halted.
+  const halts = new Halts();
+  halts.halts = [{ id: "halt-window", agents: [WINDOW] }];
+  const claude = new WakeClaudeAgent(recorded("support").recorder, { quarantine: halts });
+  let finish!: () => void;
+  const spawns = ["toolu_window", "toolu_shipping"].map((use) => ({ type: "tool_use", id: use, name: "Agent", input: research("Check") }));
+  const run = claude.record(stream([
+    { type: "system", subtype: "init", session_id: "session-1" },
+    { type: "assistant", parent_tool_use_id: null, session_id: "session-1", message: { id: "msg_1", model: "claude-opus-5-5", content: spawns } },
+  ], new Promise((resolve) => (finish = resolve))));
+  await run.next();
+  await run.next();
+  const ask = (agentId: string, agentType = "researcher") => claude._halting({ session_id: "session-1", agent_id: agentId, agent_type: agentType, tool_name: "Bash" }, undefined);
+  let [halt, reason] = ask("agent-1")!;
+  assert.equal(halt, "halt-window");
+  assert.ok(reason.includes("can't yet tell which copy of support/researcher is calling"), reason);
+  // Placing one copy doesn't place the other: an unknown agent_id may be a copy the stream hasn't
+  // shown yet.
+  claude._subagents.set("agent-2", [SHIPPING, "support"]);
+  assert.equal(ask("agent-1")?.[0], "halt-window");
+  assert.equal(ask("agent-2"), undefined, "the sibling goes on");
+  claude._subagents.set("agent-1", [WINDOW, "support"]);
+  [halt, reason] = ask("agent-1")!;
+  assert.equal(halt, "halt-window");
+  assert.ok(reason.startsWith(`Wake halted ${WINDOW}`), reason);
+  assert.equal(ask("agent-3", "writer")?.[0], "halt-window", "a subagent the halted copy started, not yet shown");
+  halts.halts = [];
+  assert.equal(ask("agent-1"), undefined);
+  assert.equal(ask("agent-3", "writer"), undefined);
+  finish();
+  await run.next();
+});
+
+const LEAD = "support/lead#toolu_lead";
+
+test("a subagent the stream hasn't shown is stopped by a halt on what started it", async () => {
+  // The halted lead started a writer, whose first call comes before the stream says so.
+  const { recorder, spans } = recorded("support");
+  const halts = new Halts();
+  const claude = new WakeClaudeAgent(recorder, { quarantine: halts });
+  const seen: FakeClaudeCode[] = [];
+  const read: SDKMessage[] = [];
+  const script = async (cli: FakeClaudeCode) => {
+    seen.push(cli);
+    cli.emit(INIT);
+    const lead = { description: "Lead", prompt: "Lead the research", subagent_type: "lead" };
+    const write = { description: "Write", prompt: "Write it up", subagent_type: "writer" };
+    cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_lead", name: "Agent", input: lead }]);
+    const leading = async () => {
+      cli.user([{ type: "text", text: lead.prompt }], "toolu_lead");
+      await until(() => read.some((m) => m.type === "user" && m.parent_tool_use_id === "toolu_lead"), "the lead is read");
+      assert.ok(await cli.allowed("toolu_writer", "Agent", write, caller({ agent: "lead" })));
+      halts.halts = [{ id: "halt-lead", agents: [LEAD] }];
+      const command = { command: "cat notes.md" };
+      const readLate = () => {
+        cli.assistant("msg_lead_1", [{ type: "tool_use", id: "toolu_writer", name: "Agent", input: write }], "toolu_lead");
+        cli.user([{ type: "text", text: write.prompt }], "toolu_writer");
+        cli.assistant("msg_writer_1", [{ type: "tool_use", id: "toolu_writer_bash", name: "Bash", input: command }], "toolu_writer");
+      };
+      await cli.useTool("toolu_writer_bash", "Bash", command, async () => "ok", { parent: "toolu_writer", agent: "writer", ask: readLate });
+      cli.assistant("msg_writer_2", [{ type: "text", text: "Stopped." }], "toolu_writer");
+      cli.user([{ type: "tool_result", tool_use_id: "toolu_writer", content: [{ type: "text", text: "Stopped." }] }], "toolu_lead");
+      return "Stopped.";
+    };
+    await cli.spawn("toolu_lead", lead, leading, { subagentId: "agent-lead" });
+    cli.assistant("msg_2", [{ type: "text", text: ANSWER }]);
+    cli.emit(result(ANSWER));
+  };
+  await runSupport(claude, script, [lookupOrder()], read);
+  assert.deepEqual(seen[0].refused, ["toolu_writer_bash"], "refused while Wake couldn't tell who was calling");
+  const denied = wakeEvents(await spans(), "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "halt-lead");
+  assert.deepEqual(identity(denied[0]), ["support/writer#toolu_writer", ["support", LEAD]], "named once the stream said");
+});
+
+test("a halt of the agent stops it and starts no subagent, and no halt stops nothing", async () => {
+  const { recorder, spans } = recorded("support");
+  const halts = new Halts();
+  halts.halts = [{ id: "halt-support", agents: ["support", "0oa1support"] }];
+  const before = seenLinks.length;
+  await runSupport(new WakeClaudeAgent(recorder, { quarantine: halts }));
+  const all = await spans();
+  assert.deepEqual(
+    summary(all),
+    [
+      ["model_call", "support", "chat claude-opus-5-5"],
+      ["denied", "support", "execute_tool mcp__crm__lookup_order"],
+      ["model_call", "support", "chat claude-opus-5-5"],
+      ["denied", "support", "execute_tool Agent"],
+      ["model_call", "support", "chat claude-opus-5-5"],
+    ],
+    "the subagent never started: nothing handed it a task, and it did nothing",
+  );
+  assert.deepEqual(new Set(wakeEvents(all, "denied").map((e) => attr(e, "wake.brake.halt_id"))), new Set(["halt-support"]));
+  assert.ok(!all.some((s) => s.name.startsWith("invoke_agent support/")));
+  assert.equal(seenLinks.length, before, "the in-process tool never ran");
+  // Without a halt, the same run records as before: nothing refused.
+  assert.equal(wakeEvents((await support()).spans, "denied").length, 0);
+});
+
+for (const hookFirst of [false, true]) {
+  test(`a spawn a halt refuses is recorded as a denied call, ${hookFirst ? "its hook" : "the stream"} first`, async () => {
+    const { recorder, spans } = recorded("support");
+    const halts = new Halts();
+    halts.halts = [{ id: "halt-support", agents: ["support"] }];
+    const ask = research("Check the refund window");
+    const read: SDKMessage[] = [];
+    const script = async (cli: FakeClaudeCode) => {
+      cli.emit(INIT);
+      const asked = () => cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: ask }]);
+      if (!hookFirst) {
+        asked();
+        await until(() => read.some((m) => m.type === "assistant"), "the Agent call is read");
+      }
+      const never = async () => assert.fail("a refused subagent never starts");
+      await cli.spawn("toolu_agent", ask, never, { subagentId: "agent-researcher", ask: hookFirst ? asked : undefined });
+      cli.assistant("msg_2", [{ type: "text", text: "I was stopped." }]);
+      cli.emit(result("I was stopped."));
+    };
+    await runSupport(new WakeClaudeAgent(recorder, { quarantine: halts }), script, [lookupOrder()], read);
+    const all = await spans();
+    assert.deepEqual(summary(all), [
+      ["model_call", "support", "chat claude-opus-5-5"],
+      ["denied", "support", "execute_tool Agent"],
+      ["model_call", "support", "chat claude-opus-5-5"],
+    ]);
+    const calls = wakeEvents(all, "model_call");
+    const refused = byName(all, "execute_tool Agent");
+    assert.equal(attr(refused, "wake.brake.halt_id"), "halt-support");
+    assert.deepEqual(parents(refused), [id(calls[0])], "the call that asked for it");
+    assert.deepEqual(payload(refused).input, ask);
+    assert.ok(parents(calls[1]).includes(id(refused)), "the model read the refusal");
+    assert.ok(!all.some((s) => s.name.startsWith("invoke_agent support/")));
+  });
+}
+
+test("a halt of the agent landing while a subagent runs stops the subagent too", async () => {
+  const { recorder, spans } = recorded("support");
+  const halts = new Halts();
+  const seen: FakeClaudeCode[] = [];
+  const script = async (cli: FakeClaudeCode) => {
+    seen.push(cli);
+    cli.emit(INIT);
+    const ask = research("What is our refund window?");
+    cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: ask }]);
+    const researcher = async () => {
+      cli.user([{ type: "text", text: ask.prompt }], "toolu_agent");
+      halts.halts = [{ id: "halt-support", agents: ["support"] }];
+      const command = { command: "curl https://example.com/refunds" };
+      cli.assistant("msg_r1", [{ type: "tool_use", id: "toolu_bash", name: "Bash", input: command }], "toolu_agent");
+      await cli.useTool("toolu_bash", "Bash", command, async () => "ok", { parent: "toolu_agent", agent: "researcher" });
+      cli.assistant("msg_r2", [{ type: "text", text: "I was stopped." }], "toolu_agent");
+      return "I was stopped.";
+    };
+    await cli.spawn("toolu_agent", ask, researcher, { subagentId: "agent-researcher" });
+    cli.assistant("msg_2", [{ type: "text", text: ANSWER }]);
+    cli.emit(result(ANSWER));
+  };
+  await runSupport(new WakeClaudeAgent(recorder, { quarantine: halts }), script);
+  assert.deepEqual(seen[0].refused, ["toolu_bash"]);
+  const denied = wakeEvents(await spans(), "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "halt-support");
+  assert.deepEqual(identity(denied[0]), ["support/researcher#toolu_agent", ["support"]]);
+});
+
+const BACKGROUND = "support/researcher#toolu_bg";
+
+test("a subagent in the background stays its instance, and a halt on it holds", async () => {
+  // The Agent tool starts a subagent in the background by default: the tool's result, that it was
+  // launched, comes at once, and the subagent works on until Claude Code says it's done.
+  const { recorder, spans } = recorded("support");
+  const halts = new Halts();
+  const claude = new WakeClaudeAgent(recorder, { quarantine: halts });
+  const seen: FakeClaudeCode[] = [];
+  const read: SDKMessage[] = [];
+  const script = async (cli: FakeClaudeCode) => {
+    seen.push(cli);
+    cli.emit(INIT);
+    const ask = research("What is our refund window?");
+    cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_bg", name: "Agent", input: ask }]);
+    const researcher = async () => {
+      cli.user([{ type: "text", text: ask.prompt }], "toolu_bg");
+      await until(() => read.some((m) => m.type === "user" && m.tool_use_result !== undefined), "the launch is read");
+      halts.halts = [{ id: "halt-bg", agents: [BACKGROUND] }]; // the instance the log named
+      const command = { command: "curl https://example.com/refunds" };
+      const asked = () => cli.assistant("msg_bg_1", [{ type: "tool_use", id: "toolu_bg_bash", name: "Bash", input: command }], "toolu_bg");
+      // Its hook comes before the stream shows the call.
+      await cli.useTool("toolu_bg_bash", "Bash", command, async () => "ok", { parent: "toolu_bg", agent: "researcher", agentId: "agent-bg", ask: asked });
+      cli.assistant("msg_bg_2", [{ type: "text", text: `The policy says: ${POLICY}` }], "toolu_bg");
+      return `The policy says: ${POLICY}`;
+    };
+    await cli.spawn("toolu_bg", ask, researcher, { subagentId: "agent-bg", background: true });
+    cli.assistant("msg_2", [{ type: "text", text: ANSWER }]);
+    cli.emit(result(ANSWER));
+  };
+  await runSupport(claude, script, [lookupOrder()], read);
+  assert.deepEqual(seen[0].refused, ["toolu_bg_bash"], "the halt on the instance held");
+  const events = wakeEvents(await spans());
+  const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "halt-bg");
+  assert.deepEqual(new Set(events.map((e) => attr(e, "wake.agent.id"))), new Set(["support", "support/researcher"]));
+  for (const event of events.filter((e) => attr(e, "wake.agent.id") === "support/researcher")) {
+    assert.deepEqual(identity(event), [BACKGROUND, ["support"]], `${event.name} is still the instance`);
+  }
+  const answers = events.filter((e) => e.name === "agent_message support/researcher -> support");
+  assert.equal(answers.length, 1);
+  const calls = events.filter((e) => attr(e, "wake.event.kind") === "model_call");
+  const last = calls.filter((c) => attr(c, "wake.agent.id") === "support/researcher").at(-1)!;
+  const after = calls.filter((c) => attr(c, "wake.agent.id") === "support").at(-1)!;
+  assert.deepEqual(parents(answers[0]), [id(last)], "it answers once it has finished");
+  assert.ok(parents(after).includes(id(answers[0])), "and the agent reads the answer");
+});
+
+type HookCallback = (input: Json, toolUseId: string | undefined, options: { signal: AbortSignal }) => Promise<Json>;
+
+test("a finished run's hooks never reach another session's run", async () => {
+  // A subagent left running in the background can call after its session's run has ended, while
+  // a run of another session goes on: the call isn't that run's.
+  const { recorder, spans } = recorded("support");
+  const claude = new WakeClaudeAgent(recorder);
+  const { hooks } = claude.options({}) as { hooks: Record<string, { hooks: HookCallback[] }[]> };
+  let finish!: () => void;
+  const other = claude.record(stream([{ type: "system", subtype: "init", session_id: "session-2" }], new Promise((resolve) => (finish = resolve))));
+  await other.next();
+  for await (const _ of claude.record(stream([{ type: "system", subtype: "init", session_id: "session-1" }]))) {
+    // the whole of its run
+  }
+  const late = { hook_event_name: "PreToolUse", session_id: "session-1", tool_name: "Bash", tool_input: { command: "date" }, agent_id: "agent-bg", agent_type: "researcher" };
+  await hooks.PreToolUse[0].hooks[0](late, "toolu_late", { signal: new AbortController().signal });
+  finish();
+  for await (const _ of other) {
+    // the rest of the other run
+  }
+  assert.ok(!(await spans()).some((s) => s.name === "execute_tool Bash"));
 });
 
 test("an in-process tool runs with its event current", async () => {
@@ -265,17 +605,19 @@ test("a memory write in a tool is labeled with its origins", async () => {
 
 async function researcherRemembers(cli: FakeClaudeCode): Promise<void> {
   cli.emit({ type: "system", subtype: "init", session_id: "session-1", uuid: "u0" });
-  const research = { description: "Look the order up", prompt: "Look order 1234 up", subagent_type: "researcher" };
-  cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: research }]);
-  await cli.hook("PreToolUse", "toolu_agent", { tool_name: "Agent", tool_input: research });
-  cli.user([{ type: "text", text: "Look order 1234 up" }], "toolu_agent");
-  cli.assistant("msg_2", [{ type: "tool_use", id: "toolu_order", name: "mcp__crm__lookup_order", input: { order: "1234" } }], "toolu_agent");
-  await cli.useTool("toolu_order", "mcp__crm__lookup_order", { order: "1234" }, () => cli.callTool("crm", "lookup_order", { order: "1234" }), {
-    parent: "toolu_agent",
-    agent: "researcher",
-  });
-  cli.assistant("msg_3", [{ type: "text", text: ORDER }], "toolu_agent");
-  cli.user([{ type: "tool_result", tool_use_id: "toolu_agent", content: [{ type: "text", text: ORDER }] }]);
+  const ask = { description: "Look the order up", prompt: "Look order 1234 up", subagent_type: "researcher" };
+  cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: ask }]);
+  const researcher = async () => {
+    cli.user([{ type: "text", text: "Look order 1234 up" }], "toolu_agent");
+    cli.assistant("msg_2", [{ type: "tool_use", id: "toolu_order", name: "mcp__crm__lookup_order", input: { order: "1234" } }], "toolu_agent");
+    await cli.useTool("toolu_order", "mcp__crm__lookup_order", { order: "1234" }, () => cli.callTool("crm", "lookup_order", { order: "1234" }), {
+      parent: "toolu_agent",
+      agent: "researcher",
+    });
+    cli.assistant("msg_3", [{ type: "text", text: ORDER }], "toolu_agent");
+    return ORDER;
+  };
+  await cli.spawn("toolu_agent", ask, researcher, { subagentId: "agent-researcher" });
   cli.assistant("msg_4", [{ type: "text", text: ANSWER }]);
   cli.emit({ type: "result", subtype: "success", duration_ms: 10, duration_api_ms: 8, is_error: false, num_turns: 4, session_id: "session-1", result: ANSWER });
 }
@@ -293,4 +635,74 @@ test("a memory write in a subagent's tool names the instance", async () => {
   assert.equal(attr(write, "wake.agent.id"), "support/researcher");
   assert.deepEqual(identity(lookup), ["support/researcher#toolu_agent", ["support"]]);
   assert.deepEqual(identity(write), ["support/researcher#toolu_agent", ["support"]]);
+});
+
+test("a memory write by a subagent Wake can't place yet names no instance", async () => {
+  // A second researcher's in-process tool runs before the stream says the second started, while
+  // the first is known: which copy wrote isn't guessed.
+  const { recorder, spans } = recorded("support");
+  const claude = new WakeClaudeAgent(recorder);
+  const memory = new Memory(claude);
+  const dir = await mkdtemp(join(tmpdir(), "wake-claude-"));
+  const read: SDKMessage[] = [];
+  const [first, second, order] = [research("Look order 1234 up"), research("Look order 1234 up again"), { order: "1234" }];
+  const script = async (cli: FakeClaudeCode) => {
+    cli.emit(INIT);
+    cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_r1", name: "Agent", input: first }]);
+    assert.ok(await cli.allowed("toolu_r1", "Agent", first, {}));
+    cli.user([{ type: "text", text: first.prompt }], "toolu_r1");
+    await until(() => read.some((m) => m.type === "user" && m.parent_tool_use_id === "toolu_r1"), "the first is read");
+    assert.ok(await cli.allowed("toolu_r2", "Agent", second, {}));
+    await cli.hook("PreToolUse", "toolu_r2_order", { tool_name: "mcp__crm__lookup_order", tool_input: order, ...caller({ agent: "researcher", agentId: "agent-r2" }) });
+    const output = await cli.callTool("crm", "lookup_order", order);
+    // What the stream says of the second, read only now.
+    cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_r2", name: "Agent", input: second }]);
+    cli.user([{ type: "text", text: second.prompt }], "toolu_r2");
+    cli.assistant("msg_r2", [{ type: "tool_use", id: "toolu_r2_order", name: "mcp__crm__lookup_order", input: order }], "toolu_r2");
+    cli.user([{ type: "tool_result", tool_use_id: "toolu_r2_order", content: output }], "toolu_r2");
+    for (const use of ["toolu_r1", "toolu_r2"]) cli.user([{ type: "tool_result", tool_use_id: use, content: [{ type: "text", text: ORDER }] }]);
+    cli.assistant("msg_2", [{ type: "text", text: ANSWER }]);
+    cli.emit(result(ANSWER));
+  };
+  await runSupport(claude, script, [lookupOrder(() => memory.writeFile(join(dir, "notes.md"), ORDER))], read);
+  const all = await spans();
+  const lookup = byName(all, "execute_tool mcp__crm__lookup_order");
+  const [write] = wakeEvents(all, "memory_write");
+  assert.equal(parents(write)[0], id(lookup));
+  assert.equal(attr(write, "wake.agent.id"), "support/researcher");
+  assert.deepEqual(identity(write), [undefined, undefined], "not guessed to be the copy the stream had shown");
+  assert.deepEqual(identity(lookup), ["support/researcher#toolu_r2", ["support"]], "named once the stream said");
+});
+
+test("calls alike by two copies at once name no instance in what they write", async () => {
+  // Two researchers call the in-process tool with the same arguments at once, and the second's
+  // call runs first. Nothing tells the tool which call it's running.
+  const { recorder, spans } = recorded("support");
+  const claude = new WakeClaudeAgent(recorder);
+  const memory = new Memory(claude);
+  const dir = await mkdtemp(join(tmpdir(), "wake-claude-"));
+  const asks: [string, string][] = [
+    ["toolu_r1", "Look order 1234 up"],
+    ["toolu_r2", "Look it up too"],
+  ];
+  const order = { order: "1234" };
+  const script = async (cli: FakeClaudeCode) => {
+    cli.emit(INIT);
+    cli.assistant("msg_1", asks.map(([use, ask]) => ({ type: "tool_use", id: use, name: "Agent", input: research(ask) })));
+    for (const [use, ask] of await started(cli, asks)) cli.user([{ type: "text", text: ask }], use);
+    for (const [use] of asks) {
+      cli.assistant(`msg_${use}`, [{ type: "tool_use", id: `${use}_order`, name: "mcp__crm__lookup_order", input: order }], use);
+      await cli.hook("PreToolUse", `${use}_order`, { tool_name: "mcp__crm__lookup_order", tool_input: order, ...caller({ agent: "researcher", agentId: `agent-${use}` }) });
+    }
+    const outputs = [await cli.callTool("crm", "lookup_order", order), await cli.callTool("crm", "lookup_order", order, false)];
+    for (const [i, [use]] of [...asks].reverse().entries()) cli.user([{ type: "tool_result", tool_use_id: `${use}_order`, content: outputs[i] }], use);
+    for (const [use] of asks) cli.user([{ type: "tool_result", tool_use_id: use, content: [{ type: "text", text: ORDER }] }]);
+    cli.assistant("msg_2", [{ type: "text", text: ANSWER }]);
+    cli.emit(result(ANSWER));
+  };
+  await runSupport(claude, script, [lookupOrder(() => memory.writeFile(join(dir, "notes.md"), ORDER))]);
+  const writes = wakeEvents(await spans(), "memory_write");
+  assert.equal(writes.length, 2);
+  assert.ok(writes.every((w) => attr(w, "wake.agent.id") === "support/researcher"));
+  assert.ok(writes.every((w) => identity(w).every((v) => v === undefined)), "either could be either copy's");
 });

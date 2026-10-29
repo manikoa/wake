@@ -14,18 +14,26 @@
  * The SDK runs Claude Code in a subprocess and streams its messages back, and Wake reads that
  * stream as it passes. Each assistant message is a model call, and each tool use and its
  * result a tool call. A subagent started with the Agent tool is an agent of its own, named
- * <agent>/<subagent type>: one agent_message hands it the task and another carries its answer
- * back. Several of one type can run at once, so each is also an instance, <agent>/<subagent
- * type>#<the Agent tool use that started it>, and its events name the instance and the
- * lineage that started it. Links are exact, from the SDK's ids: a tool call's parent is the
- * model call that asked for it, and a model call's parents are the call before it and the
- * tool results and messages new in its context.
+ * <agent>/<subagent type>: one agent_message hands it the task once it has started, and
+ * another carries its answer back, when the tool returns or, for a subagent left running in
+ * the background, when Claude Code says it has finished. Several of one type can run at once,
+ * so each is also an instance, <agent>/<subagent type>#<the Agent tool use that started it>,
+ * and its events name the instance and the lineage that started it. Links are exact, from the
+ * SDK's ids: a tool call's parent is the model call that asked for it, and a model call's
+ * parents are the call before it and the tool results and messages new in its context.
  *
  * options() adds hooks that open each tool call before it runs, and tools() wraps in-process
  * tools so they run with their event current: an MCP or A2A call they make through the
  * proxy, or a memory write, links back to the tool call. Tools Claude Code runs itself, such
  * as Bash, WebFetch or an external MCP server, are recorded from the stream but can't carry
  * the link.
+ *
+ * Given the brake's rules (new WakeClaudeAgent(recorder, { quarantine })), the hooks also stop
+ * the agent, or one subagent instance of it, in its own process: a tool call a halt covers is
+ * refused before it runs, and recorded as denied, an Agent tool call too, which then starts no
+ * subagent. That reaches what the proxy deny can't, such as Bash, and subagents that call with
+ * their parent's credentials, which the proxy can't tell from their parent. It's a cooperative
+ * stop: it holds only while the agent's code does, and a compromised agent can leave it out.
  */
 
 import { randomUUID } from "node:crypto";
@@ -36,10 +44,14 @@ import * as events from "./events.ts";
 import { contextOf, EventGraph, failed, Recent, unique } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
+import type { Quarantine } from "./quarantine.ts";
 import { now, type Recorder } from "./recorder.ts";
 
 /** The tool Claude Code starts a subagent with; older versions call it Task. */
 export const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+
+/** What the Agent tool's result says of a subagent it left running in the background. */
+const LAUNCHED = new Set(["async_launched", "remote_launched"]);
 
 type Json = Record<string, unknown>;
 
@@ -82,6 +94,8 @@ class Thread {
   given: Json[]; // what's new in its next model call's context
   waitingSince = now(); // when it last handed control to the model
   readonly prompt: unknown;
+  spawn: Spawn | undefined; // a subagent's start, until it's known to have started
+  background = false; // a subagent the Agent tool left running in the background
 
   constructor(
     agent: string,
@@ -105,6 +119,26 @@ class Thread {
   /** The thread of an instance this one starts. */
   started(agent: string, instance: string, span: Span | undefined, parents: string[], given: Json[]): Thread {
     return new Thread(agent, span, parents, [], given, instance, [...this.lineage, this.instance ?? this.agent]);
+  }
+}
+
+/**
+ * An Agent tool use, until its subagent is known to have started. One refused before then, as
+ * by a halt, starts no subagent, and is recorded as the refused tool call it is.
+ */
+class Spawn {
+  readonly starter: Thread; // the thread that asked for it
+  readonly tool: string;
+  readonly args: unknown;
+  readonly parents: string[]; // the model call that asked for it, and what fed it
+  readonly eventId = randomUUID(); // the agent_message handing the subagent its task
+  readonly at = now();
+
+  constructor(starter: Thread, tool: string, args: unknown, parents: string[]) {
+    this.starter = starter;
+    this.tool = tool;
+    this.args = args;
+    this.parents = parents;
   }
 }
 
@@ -144,6 +178,7 @@ class Tool {
   error: string | undefined;
   endedAt: number | undefined;
   frame: links.Frame | undefined; // the in-process tool's link frame, once it runs
+  halted: string | undefined; // the halt its call was refused under
 
   constructor(eventId: string, span: Span, name: string, args: unknown, agent: string, run: Run | undefined) {
     this.eventId = eventId;
@@ -190,9 +225,22 @@ export class WakeClaudeAgent extends EventGraph {
   readonly #sessions = new Recent<string, Run>(1024); // session id -> its run now
   readonly #lastCalls = new Recent<string, string>(1024); // session id -> its last model call, for the next turn
   readonly #active: Run[] = [];
+  readonly #agentIds = new Recent<string, string>(); // tool use id -> the agent_id its hook named, for a subagent's
+  /** A hook's agent_id -> the names of the instance it is: itself, then its lineage. */
+  readonly _subagents = new Recent<string, readonly string[]>();
+  readonly #spawned = new Recent<string, [string | undefined, string, string, readonly string[]]>(); // Agent tool use id -> its session, and the agent, instance and lineage it started
+  readonly #halted = new Recent<string, string>(); // tool use id -> the halt a hook refused it under
+  readonly #ambiguous = new Recent<string, true>(); // tool call event id -> an in-process call Wake can't tell from another
+  readonly #quarantine: Pick<Quarantine, "halted"> | undefined;
 
-  constructor(recorder: Recorder) {
+  /**
+   * With quarantine, the brake's rules for this agent, a tool call by the agent, or by a
+   * subagent instance of it, that a halt covers is refused before it runs, and recorded as
+   * denied. It trusts the agent's code: see cooperative stops in the README.
+   */
+  constructor(recorder: Recorder, { quarantine }: { quarantine?: Pick<Quarantine, "halted"> } = {}) {
     super(recorder);
+    this.#quarantine = quarantine;
   }
 
   // Setup.
@@ -236,7 +284,9 @@ export class WakeClaudeAgent extends EventGraph {
 
   readonly #preToolUse: HookCallback = async (input, toolUseId) => {
     this.#safely("hookOpened", () => this.#hookOpened(input, toolUseId));
-    return {};
+    const halt = this.#safely("halting", () => this._halting(input, toolUseId));
+    if (halt === undefined) return {};
+    return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: halt[1] } };
   };
 
   readonly #postToolUse: HookCallback = async (input, toolUseId) => {
@@ -246,12 +296,64 @@ export class WakeClaudeAgent extends EventGraph {
 
   #hookOpened(input: Json, toolUseId: string | undefined): void {
     const name = typeof input.tool_name === "string" ? input.tool_name : "";
+    const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : undefined;
+    if (toolUseId && agentId) this.#agentIds.set(toolUseId, agentId);
     if (!toolUseId || SUBAGENT_TOOLS.has(name)) return;
     const run = this.#runFor(input.session_id as string | undefined);
     if (run === undefined) return; // the stream opens it instead
-    const agentType = input.agent_id ? (input.agent_type as string | undefined) : undefined;
+    const agentType = agentId ? (input.agent_type as string | undefined) : undefined;
     const agent = agentType ? `${this._recorder.agent}/${agentType}` : this._recorder.agent;
-    this.#openTool(run, toolUseId, name, input.tool_input, agent, run.root);
+    const tool = this.#openTool(run, toolUseId, name, input.tool_input, agent, run.root);
+    if (agentId === undefined) return;
+    const known = this._subagents.get(agentId);
+    if (tool.instance) {
+      // The stream said first which instance asked for it.
+      this._subagents.set(agentId, [tool.instance, ...tool.lineage]);
+    } else if (known !== undefined) {
+      // Its agent_id is placed already, by its earlier calls or the Agent tool's result.
+      tool.instance = known[0];
+      tool.lineage = known.slice(1);
+      this.#toolInstances.set(tool.eventId, [tool.instance, tool.lineage]);
+    }
+  }
+
+  // Cooperative stops.
+
+  /**
+   * The halt that stops this tool call, and why, if one covers who's making it: the agent, the
+   * subagent type it runs as, and the instance it is and those that started it. A subagent's
+   * instance is known by the agent_id its hooks name, from its earlier calls or the Agent tool's
+   * result. Before that, Wake can't tell which instance is calling: it could be any the session
+   * started, or one started by any of them that the stream hasn't shown yet, since hooks can run
+   * ahead of the code reading it. So the call is refused if a halt covers any of them.
+   */
+  _halting(input: Json, toolUseId: string | undefined): [string, string] | undefined {
+    if (this.#quarantine === undefined) return undefined;
+    const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : undefined;
+    const agentType = agentId ? (input.agent_type as string | undefined) : undefined;
+    const agent = agentType ? `${this._recorder.agent}/${agentType}` : this._recorder.agent;
+    const known = agentId !== undefined ? this._subagents.get(agentId) : undefined;
+    const names = [this._recorder.agent, agent, ...(known ?? [])];
+    const who = known?.[0] ?? agent;
+    let halt = this.#quarantine.halted(names);
+    let reason = `Wake halted ${who} (${halt}), so this tool call wasn't run.`;
+    if (halt === null && agentId !== undefined && known === undefined) {
+      halt = this.#quarantine.halted([...names, ...this.#instances(input.session_id as string | undefined)]);
+      reason = `Wake can't yet tell which copy of ${agent} is calling, and a halt (${halt}) may cover it, so this tool call wasn't run.`;
+    }
+    if (halt === null) return undefined;
+    if (toolUseId) this.#halted.set(toolUseId, halt);
+    const tool = toolUseId ? this.#tools.get(toolUseId) : undefined;
+    if (tool !== undefined) tool.halted = halt;
+    log.warn(`refused ${who}'s ${typeof input.tool_name === "string" ? input.tool_name : "tool"} call: ${halt}`);
+    return [halt, reason];
+  }
+
+  /** Every instance Wake has seen start in this session, and what started each. */
+  #instances(sessionId: string | undefined): string[] {
+    return [...this.#spawned.values()]
+      .filter(([session]) => session === sessionId || session === undefined)
+      .flatMap(([, , instance, lineage]) => [instance, ...lineage]);
   }
 
   #hookClosed(input: Json, toolUseId: string | undefined): void {
@@ -276,9 +378,18 @@ export class WakeClaudeAgent extends EventGraph {
   }
 
   #enter(name: string, args: unknown): links.Frame | undefined {
-    const waiting = this.#waiting.get(JSON.stringify([name, canonical(args)]));
+    const waiting = this.#waiting.get(JSON.stringify([name, canonical(args)])) ?? [];
+    const alike = waiting.map((id) => this.#tools.get(id)).filter((t): t is Tool => t !== undefined && !t.halted);
+    if (alike.length > 1 && !(alike[0].instance && alike.every((t) => t.instance === alike[0].instance))) {
+      // Calls alike, by instances that differ or aren't known yet, and Claude Code may run them
+      // in either order: which is which is a guess, so none names an instance.
+      for (const t of alike) this.#ambiguous.set(t.eventId, true);
+    }
     let tool: Tool | undefined;
-    while (waiting !== undefined && waiting.length > 0 && tool === undefined) tool = this.#tools.get(waiting.shift()!);
+    while (waiting.length > 0 && tool === undefined) {
+      tool = this.#tools.get(waiting.shift()!);
+      if (tool?.halted) tool = undefined; // refused, so it never runs
+    }
     if (tool === undefined) return undefined;
     tool.frame = links._frame(tool.link);
     return tool.frame;
@@ -320,6 +431,8 @@ export class WakeClaudeAgent extends EventGraph {
       for (const thread of run.threads.values()) this.#endCall(thread);
       run.root.setAttributes({ "wake.claude.session_id": String(message.session_id ?? ""), "wake.claude.turns": Number(message.num_turns ?? 0) });
       if (message.is_error) run.root.setStatus({ code: SpanStatusCode.ERROR, message: String(message.subtype ?? "error") });
+    } else if (message.type === "system" && message.subtype === "task_notification") {
+      this.#finished(run, message);
     }
   }
 
@@ -356,10 +469,10 @@ export class WakeClaudeAgent extends EventGraph {
       } else if (type === "tool_use") {
         call.output.push({ type: "tool_use", id: block.id, name: block.name, input: block.input });
         if (SUBAGENT_TOOLS.has(block.name as string)) this.#handOff(run, thread, call, block);
-        else this.#requested(run, thread, call, block.id as string, block.name as string, block.input);
+        else this.#requested(run, thread, [call.eventId, ...call.found], block.id as string, block.name as string, block.input);
       } else if (type === "server_tool_use") {
         call.output.push({ type: "server_tool_use", id: block.id, name: block.name, input: block.input });
-        this.#requested(run, thread, call, block.id as string, block.name as string, block.input, true);
+        this.#requested(run, thread, [call.eventId, ...call.found], block.id as string, block.name as string, block.input, true);
         call.serverTools.push(block.id as string);
       } else if (type === "tool_result" || type?.endsWith("_tool_result")) {
         call.output.push({ type: "tool_result", tool_use_id: block.tool_use_id, content: block.content });
@@ -378,19 +491,28 @@ export class WakeClaudeAgent extends EventGraph {
     this.#endCall(thread);
     const content = ((message.message ?? {}) as Json).content;
     const blocks: Json[] = typeof content === "string" ? [{ type: "text", text: content }] : Array.isArray(content) ? content : [];
+    // The tool's own output, beside the text the model reads, when the message answers one tool
+    // use, as Claude Code's do.
+    const output = blocks.filter((b) => b.type === "tool_result").length === 1 ? message.tool_use_result : undefined;
     for (const block of blocks) {
       if (block.type === "tool_result") {
         const toolUseId = block.tool_use_id as string;
         const item: Json = { type: "tool_result", tool_use_id: toolUseId, content: block.content };
         if (block.is_error) item.is_error = true;
         thread.given.push(item);
-        if (run.threads.has(toolUseId)) {
-          this.#returned(run, thread, toolUseId, block.content);
-        } else {
-          const tool = this.#finishTool(toolUseId, block.content, block.is_error as boolean | undefined);
-          // The tool, and whatever its result came from, such as an A2A reply.
-          if (tool !== undefined) thread.parents.push(tool.eventId, ...links._returned(tool.frame));
+        let sub = run.threads.get(toolUseId);
+        if (sub?.spawn !== undefined && (this.#halted.has(toolUseId) || block.is_error)) {
+          // Refused before the subagent started, as by a halt: it never ran.
+          this.#neverStarted(run, toolUseId);
+          sub = undefined;
         }
+        if (sub !== undefined) {
+          this.#answered(run, thread, sub, toolUseId, block.content, output);
+          continue;
+        }
+        const tool = this.#finishTool(toolUseId, block.content, block.is_error as boolean | undefined);
+        // The tool, and whatever its result came from, such as an A2A reply.
+        if (tool !== undefined) thread.parents.push(tool.eventId, ...links._returned(tool.frame));
       } else if (block.type === "text") {
         if (block.text === thread.prompt) continue; // the prompt it started with, echoed back
         thread.given.push({ role: "user", content: block.text });
@@ -403,12 +525,24 @@ export class WakeClaudeAgent extends EventGraph {
   #thread(run: Run, parentToolUseId: string | null | undefined): Thread {
     const key = parentToolUseId ?? null;
     let thread = run.threads.get(key);
-    if (thread === undefined) {
+    if (thread !== undefined) {
+      if (thread.spawn !== undefined) this.#deliver(thread); // its first message: it has started
+      return thread;
+    }
+    const spawned = key !== null ? this.#spawned.get(key) : undefined;
+    if (spawned !== undefined) {
+      // A subagent started earlier, such as in an earlier turn, and running on in the
+      // background: still the same instance.
+      const [, agent, instance, lineage] = spawned;
+      thread = new Thread(agent, undefined, [], [], [], instance, lineage);
+      thread.background = true;
+    } else {
       // A subagent whose start Wake didn't see.
       const agent = `${this._recorder.agent}/subagent`;
-      thread = run.threads.get(null)!.started(agent, `${agent}#${key}`, run.root, [], []);
-      run.threads.set(key, thread);
+      thread = run.threads.get(null)!.started(agent, `${agent}#${key}`, undefined, [], []);
     }
+    thread.span = this.#invoke(thread, run.root);
+    run.threads.set(key, thread);
     return thread;
   }
 
@@ -459,14 +593,19 @@ export class WakeClaudeAgent extends EventGraph {
     call.span.end(call.endedAt);
   }
 
-  #requested(run: Run, thread: Thread, call: Call, toolUseId: string, name: string, args: unknown, server = false): void {
+  #requested(run: Run, thread: Thread, parents: string[], toolUseId: string, name: string, args: unknown, server = false): void {
     const tool = this.#openTool(run, toolUseId, name, args, thread.agent, thread.span, server);
     tool.agent = thread.agent;
     tool.instance = thread.instance;
     tool.lineage = thread.lineage;
-    tool.parents = unique([call.eventId, ...call.found]);
+    tool.parents = unique(parents);
     this.#toolAgents.set(tool.eventId, thread.agent);
-    if (thread.instance) this.#toolInstances.set(tool.eventId, [thread.instance, thread.lineage]);
+    if (thread.instance) {
+      this.#toolInstances.set(tool.eventId, [thread.instance, thread.lineage]);
+      // Its hook came first, naming the subagent by agent_id: now it's placed.
+      const agentId = this.#agentIds.get(toolUseId);
+      if (agentId) this._subagents.set(agentId, [thread.instance, ...thread.lineage]);
+    }
     this._rememberLineage(tool.eventId, tool.parents, [`tool:${name}`]);
   }
 
@@ -480,6 +619,7 @@ export class WakeClaudeAgent extends EventGraph {
       under(parentSpan),
     );
     const tool = new Tool(eventId, span, name, args, agent, run);
+    tool.halted = this.#halted.get(toolUseId); // its hook refused it before the stream got here
     this._rememberLineage(eventId, [], [`tool:${name}`]);
     this.#tools.set(toolUseId, tool);
     this.#toolAgents.set(eventId, agent);
@@ -502,44 +642,110 @@ export class WakeClaudeAgent extends EventGraph {
     if (parts[0] === "mcp" && parts.length >= 3) attributes["wake.mcp.server"] = parts[1];
     const payload: Json = { input: tool.args ?? null, output: output ?? null };
     if (error) payload.error = tool.error ?? (text(output) || error);
-    this.#emit(tool.span, tool.eventId, events.TOOL_CALL, `execute_tool ${tool.name}`, tool.agent, tool.parents, [`tool:${tool.name}`], attributes, payload, error, tool);
+    let kind = events.TOOL_CALL;
+    if (tool.halted) {
+      // Refused in the agent's own process, under the halt: what the agent tried.
+      kind = events.DENIED;
+      attributes["wake.brake.halt_id"] = tool.halted;
+    }
+    this.#emit(tool.span, tool.eventId, kind, `execute_tool ${tool.name}`, tool.agent, tool.parents, [`tool:${tool.name}`], attributes, payload, error, tool);
     this._rememberOutput(tool.span.spanContext().traceId, tool.eventId, text(output));
     tool.span.end(tool.endedAt ?? now());
     return tool;
   }
 
   #handOff(run: Run, thread: Thread, call: Call, block: Json): void {
+    const toolUseId = block.id as string;
+    const parents = unique([call.eventId, ...call.found]);
+    if (this.#halted.has(toolUseId)) {
+      // Its hook refused it before the stream got here: no subagent starts.
+      this.#requested(run, thread, parents, toolUseId, block.name as string, block.input);
+      return;
+    }
     const args = (block.input !== null && typeof block.input === "object" ? block.input : {}) as Json;
     const target = `${this._recorder.agent}/${(args.subagent_type as string | undefined) || "general-purpose"}`;
     const prompt = args.prompt;
-    const eventId = randomUUID();
-    const parents = unique([call.eventId, ...call.found]);
+    const spawn = new Spawn(thread, block.name as string, block.input, parents);
     const given = typeof prompt === "string" ? [{ role: "user", content: prompt }] : [];
-    const sub = thread.started(target, `${target}#${block.id as string}`, undefined, [eventId], given);
-    const name = `agent_message ${thread.agent} -> ${target}`;
-    const span = this._recorder.tracer.startSpan(name, { startTime: now() }, under(thread.span));
-    this.#emit(span, eventId, events.AGENT_MESSAGE, name, target, parents, [`agent:${thread.agent}`], { "gen_ai.agent.name": target }, {
-      from: thread.agent,
-      to: target,
+    const sub = thread.started(target, `${target}#${toolUseId}`, undefined, [spawn.eventId], given);
+    // The handoff is recorded once the subagent has started, by its first message or the tool's
+    // result: a hook may yet refuse it.
+    sub.spawn = spawn;
+    run.threads.set(toolUseId, sub);
+    run.handoffs.set(toolUseId, spawn.eventId);
+    this.#spawned.set(toolUseId, [run.sessionId, target, sub.instance!, sub.lineage]);
+  }
+
+  /** Records the agent_message handing a subagent its task, now that it has started. */
+  #deliver(sub: Thread): void {
+    const spawn = sub.spawn;
+    if (spawn === undefined) return;
+    sub.spawn = undefined;
+    const starter = spawn.starter;
+    const args = (spawn.args !== null && typeof spawn.args === "object" ? spawn.args : {}) as Json;
+    const name = `agent_message ${starter.agent} -> ${sub.agent}`;
+    const span = this._recorder.tracer.startSpan(name, { startTime: spawn.at }, under(starter.span));
+    this.#emit(span, spawn.eventId, events.AGENT_MESSAGE, name, sub.agent, spawn.parents, [`agent:${starter.agent}`], { "gen_ai.agent.name": sub.agent }, {
+      from: starter.agent,
+      to: sub.agent,
       description: args.description ?? null,
-      prompt: prompt ?? null,
+      prompt: args.prompt ?? null,
     }, undefined, sub);
-    span.end(now());
-    sub.span = this._recorder.tracer.startSpan(
-      `invoke_agent ${target}`,
+    span.end(spawn.at);
+    sub.span = this.#invoke(sub, starter.span, spawn.at);
+  }
+
+  /** The span a subagent's events nest under. */
+  #invoke(sub: Thread, parentSpan: Span | undefined, startTime = now()): Span {
+    return this._recorder.tracer.startSpan(
+      `invoke_agent ${sub.agent}`,
       {
         attributes: {
           "gen_ai.operation.name": "invoke_agent",
-          "gen_ai.agent.name": target,
-          [events.AGENT_ID]: target,
+          "gen_ai.agent.name": sub.agent,
+          [events.AGENT_ID]: sub.agent,
           ...events.instanceAttributes(sub.instance, sub.lineage),
         },
-        startTime: now(),
+        startTime,
       },
-      under(thread.span),
+      under(parentSpan),
     );
-    run.threads.set(block.id as string, sub);
-    run.handoffs.set(block.id as string, eventId);
+  }
+
+  /**
+   * Opens an Agent tool call whose subagent never started, refused before it did, as the tool
+   * call it was: no handoff, and a denied event when a halt refused it.
+   */
+  #neverStarted(run: Run, toolUseId: string): void {
+    const spawn = run.threads.get(toolUseId)!.spawn!;
+    run.threads.delete(toolUseId);
+    run.handoffs.delete(toolUseId);
+    this.#spawned.delete(toolUseId);
+    this.#requested(run, spawn.starter, spawn.parents, toolUseId, spawn.tool, spawn.args);
+  }
+
+  /** The Agent tool's result: the subagent's answer, or that it runs on in the background. */
+  #answered(run: Run, thread: Thread, sub: Thread, toolUseId: string, content: unknown, output: unknown): void {
+    const result = (output !== null && typeof output === "object" ? output : {}) as Json;
+    // The id its hooks name it by: its calls are placed from here on, whatever the stream has shown.
+    if (typeof result.agentId === "string" && result.agentId) this._subagents.set(result.agentId, [sub.instance!, ...sub.lineage]);
+    this.#deliver(sub);
+    if (LAUNCHED.has(result.status as string)) {
+      // It works on, and answers when Claude Code says it has finished.
+      sub.background = true;
+      return;
+    }
+    this.#returned(run, thread, toolUseId, content);
+  }
+
+  /** A task Claude Code ran in the background has ended: for a subagent, its answer. */
+  #finished(run: Run, message: Json): void {
+    const toolUseId = typeof message.tool_use_id === "string" ? message.tool_use_id : undefined;
+    const sub = toolUseId !== undefined ? run.threads.get(toolUseId) : undefined;
+    if (toolUseId === undefined || sub === undefined || !sub.background) return;
+    // The answer goes to what started it, or to the agent once that's gone.
+    const starter = [...run.threads.values()].find((t) => t.instance && t.instance === sub.lineage.at(-1)) ?? run.threads.get(null)!;
+    this.#returned(run, starter, toolUseId, message.summary);
   }
 
   #returned(run: Run, thread: Thread, toolUseId: string, content: unknown): void {
@@ -596,6 +802,13 @@ export class WakeClaudeAgent extends EventGraph {
   #endRun(run: Run | undefined): void {
     if (run === undefined) return;
     for (const [key, thread] of [...run.threads]) {
+      if (thread.spawn !== undefined) {
+        if (key !== null && this.#halted.has(key)) {
+          this.#neverStarted(run, key); // finished below, with the run's other open calls
+          continue;
+        }
+        this.#deliver(thread);
+      }
       this.#endCall(thread);
       if (key !== null) thread.span?.end(now());
     }
@@ -614,8 +827,13 @@ export class WakeClaudeAgent extends EventGraph {
 
   // Helpers.
 
+  /**
+   * The run a hook's session is in: before a run has read its first message, the newest that
+   * hasn't. Never a run of another session, as one still going after this session's has ended,
+   * while a subagent of this one runs on.
+   */
   #runFor(sessionId: string | undefined): Run | undefined {
-    return (sessionId ? this.#sessions.get(sessionId) : undefined) ?? this.#active.at(-1);
+    return (sessionId ? this.#sessions.get(sessionId) : undefined) ?? this.#active.findLast((r) => r.sessionId === undefined);
   }
 
   /** The agent whose tool call is running, for a memory write it makes. */
@@ -626,15 +844,10 @@ export class WakeClaudeAgent extends EventGraph {
 
   override _currentInstance(): [string | undefined, readonly string[]] {
     const link = links.current();
-    if (link === undefined) return [undefined, []];
-    const known = this.#toolInstances.get(link.eventId);
-    if (known !== undefined) return known;
-    const tool = [...this.#tools.values()].find((t) => t.eventId === link.eventId);
-    if (tool === undefined || tool.run === undefined || tool.agent === this._recorder.agent) return [undefined, []];
-    // The hook opened the tool before the stream said which subagent asked for it. With one
-    // instance of that agent running, it's that one; with more, it isn't guessed.
-    const running = [...tool.run.threads.values()].filter((t) => t.agent === tool.agent && t.instance);
-    return running.length === 1 ? [running[0].instance, running[0].lineage] : [undefined, []];
+    if (link === undefined || this.#ambiguous.has(link.eventId)) return [undefined, []];
+    // Known from the stream, or from the agent_id its hook named. Before either, the instance is
+    // left out rather than guessed: one the stream hasn't shown may be calling.
+    return this.#toolInstances.get(link.eventId) ?? [undefined, []];
   }
 
   /** Under the tool call or message that started this run, if any. */
