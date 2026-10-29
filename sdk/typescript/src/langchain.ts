@@ -26,6 +26,12 @@
  *
  * A tool made with LangChain's tool() runs with its event current, so an MCP or A2A call it
  * makes, or a memory write, links back to it, and so does a run it starts.
+ *
+ * Given the brake's rules (new WakeCallbackHandler(recorder, { quarantine })), the handler also
+ * stops an agent, or one run of it, in its own process: agent() refuses to start a run a halt
+ * covers, throwing AgentHalted, and a LangGraph WakeToolNode (wake-sdk/langgraph) refuses a tool
+ * call a halt covers before it runs, telling the model why. Both are recorded as denied. It's a
+ * cooperative stop: it holds only while the agent's code does.
  */
 
 import { randomUUID } from "node:crypto";
@@ -33,10 +39,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import { registerConfigureHook, setContextVariable } from "@langchain/core/context";
-import type { BaseMessage } from "@langchain/core/messages";
+import { ToolMessage, type BaseMessage } from "@langchain/core/messages";
 import type { LLMResult } from "@langchain/core/outputs";
 import { AsyncLocalStorageProviderSingleton } from "@langchain/core/singletons";
-import { ROOT_CONTEXT, SpanStatusCode, trace, type Context, type Span } from "@opentelemetry/api";
+import { ROOT_CONTEXT, SpanStatusCode, trace, type Context, type Span, type SpanContext } from "@opentelemetry/api";
 
 import * as events from "./events.ts";
 import { failed, Graph, MIN_MATCH, Recent, contextOf, traceIdOf, unique } from "./graph.ts";
@@ -44,6 +50,9 @@ import * as links from "./links.ts";
 import { log } from "./log.ts";
 import type { Recorder } from "./recorder.ts";
 import { registerToolCall, unregisterToolCall } from "./registry.ts";
+import { AgentHalted, refusal, unchecked, type Halts, type Refusal } from "./stop.ts";
+
+export { AgentHalted } from "./stop.ts";
 
 const currentRun = new AsyncLocalStorage<AgentRun | undefined>();
 
@@ -175,14 +184,21 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
   readonly #seenUserMessages = new Recent<string, true>(); // message id, or trace id and digest for one with none
   readonly #linked = new Recent<string, { parents: string[]; taken: boolean }>(); // top level run id -> the link it started under
   readonly #underTool = new Recent<string, true>(); // tool call run id whose nested run's first event is recorded
+  readonly #quarantine: Halts | undefined;
+  readonly #callContext = new Recent<string, SpanContext>(); // tool call id -> the model call that requested it
   #installed: Installed | undefined;
 
-  constructor(recorder: Recorder) {
+  /**
+   * With quarantine, the brake's rules for the agent (Quarantine), agent() and WakeToolNode
+   * stop what a halt covers.
+   */
+  constructor(recorder: Recorder, { quarantine }: { quarantine?: Halts } = {}) {
     // Callbacks are awaited, in order, so a tool call finds the model call that requested
     // it and is recorded before the tool runs. The work done here is small and never waits
     // on the network.
     super({ _awaitHandler: true });
     this._recorder = recorder;
+    this.#quarantine = quarantine;
   }
 
   override copy(): this {
@@ -212,11 +228,15 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
    * Inside another agent's run, input is a message from that agent: it's recorded as an
    * agent_message event that feeds this run's next event. At the top, origin labels where
    * input came from, such as "user". Call reply() on the run to record the answer going back.
+   *
+   * With the brake's rules, a run a halt covers, by its name or what starts it, isn't started:
+   * this throws AgentHalted, and the attempt is recorded as denied.
    */
   agent<T>(name: string, fn: (run: AgentRun) => T): T;
   agent<T>(name: string, options: AgentOptions, fn: (run: AgentRun) => T): T;
   agent<T>(name: string, optionsOrFn: AgentOptions | ((run: AgentRun) => T), maybeFn?: (run: AgentRun) => T): T {
     const [options, fn] = typeof optionsOrFn === "function" ? [{}, optionsOrFn] : [optionsOrFn, maybeFn!];
+    this.#refuseStart(name, options.input);
     const run = this.#startRun(name, options.input, options.origin);
     let result: T;
     try {
@@ -341,8 +361,11 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
           outputs.push(message(m));
           texts.push(text(m.content));
           if (m.id) this.#eventByMessage.set(m.id, pending.eventId);
+          const span = this.#spans.get(runId);
           for (const call of (m as { tool_calls?: { id?: string }[] }).tool_calls ?? []) {
             if (call.id) this.#eventByToolCall.set(call.id, pending.eventId);
+            // Where a refusal of the call is recorded, if it's refused.
+            if (call.id && this.#quarantine !== undefined && span !== undefined) this.#callContext.set(call.id, span.spanContext());
           }
         }
       }
@@ -401,6 +424,133 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
       this.#rememberToolResult(runId, undefined);
       this.#endEvent(runId, null, error);
     });
+  }
+
+  // Cooperative stops.
+
+  /**
+   * The answer to a tool call a halt covers, by the agent making it, the run it's in and what
+   * started that run, recorded as denied; undefined for a call to run. WakeToolNode
+   * (wake-sdk/langgraph) asks before each call.
+   */
+  _toolRefusal(call: { name?: string; args?: unknown; id?: string }): ToolMessage | undefined {
+    if (this.#quarantine === undefined) return undefined;
+    const run = currentRun.getStore();
+    let who = this._recorder.agent;
+    let refused: Refusal | undefined;
+    try {
+      const names = [this._recorder.agent];
+      if (run !== undefined) {
+        names.push(run.agent, ...run.lineage);
+        if (run.instance !== undefined) names.push(run.instance);
+        who = run.instance ?? run.agent;
+      }
+      refused = refusal(this.#quarantine, who, names);
+    } catch (error) {
+      log.warn("couldn't check the halts for a tool call; refusing it", error);
+      refused = unchecked();
+    }
+    if (refused === undefined) return undefined;
+    const name = call.name || "tool";
+    const [halt, reason] = refused;
+    this.#safely("refused tool call", () => this.#refusedCall(run, name, call, halt, reason));
+    log.warn(`refused a ${name} call of ${who}: ${halt}`);
+    return new ToolMessage({ content: reason, tool_call_id: call.id ?? "", name, status: "error" });
+  }
+
+  /** Throws AgentHalted, recording the attempt, if a halt covers the run of name about to start here. */
+  #refuseStart(name: string, input: unknown): void {
+    if (this.#quarantine === undefined) return;
+    const enclosing = currentRun.getStore();
+    const outcome = `this run of ${name} wasn't started`;
+    let refused: Refusal | undefined;
+    try {
+      const lineage = enclosing !== undefined ? [...enclosing.lineage, enclosing.instance ?? enclosing.agent] : [];
+      refused = refusal(this.#quarantine, name, [this._recorder.agent, name, ...lineage], { outcome });
+    } catch (error) {
+      log.warn(`couldn't check the halts for a run of ${name}; refusing it`, error);
+      refused = unchecked(outcome);
+    }
+    if (refused === undefined) return;
+    const [halt] = refused;
+    this.#safely("refused run", () => this.#refusedStart(enclosing, name, input, halt));
+    log.warn(`refused to start a run of ${name}: ${halt}`);
+    throw new AgentHalted(refused);
+  }
+
+  /**
+   * Records a tool call a halt refused before it ran: what the agent tried, under the model
+   * call that asked for it. The tool never ran, so it has no origins. The model's next call
+   * reads the refusal.
+   */
+  #refusedCall(run: AgentRun | undefined, name: string, call: { args?: unknown; id?: string }, halt: string, reason: string): void {
+    const requestedBy = call.id ? this.#eventByToolCall.get(call.id) : undefined;
+    const requester = call.id ? this.#callContext.get(call.id) : undefined;
+    const context =
+      requester !== undefined
+        ? trace.setSpanContext(ROOT_CONTEXT, requester)
+        : run?._span !== undefined
+          ? trace.setSpan(ROOT_CONTEXT, run._span)
+          : this._eventContext();
+    const attributes: Record<string, string> = { "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name, "wake.brake.halt_id": halt };
+    if (call.id) attributes["gen_ai.tool.call.id"] = call.id;
+    const eventId = this.#denied(`execute_tool ${name}`, run, requestedBy !== undefined ? [requestedBy] : [], [], attributes, { input: call.args ?? null, output: reason }, context);
+    if (call.id) this.#resultByToolCall.set(call.id, eventId);
+  }
+
+  /**
+   * Records a run a halt refused to start: the attempt to hand it its task, in the name of what
+   * tried. Nothing entered the run, so it has no origins.
+   */
+  #refusedStart(sender: AgentRun | undefined, name: string, content: unknown, halt: string): void {
+    const context = sender?._span !== undefined ? trace.setSpan(ROOT_CONTEXT, sender._span) : this._eventContext();
+    const traceId = traceIdOf(context);
+    const parents = traceId && content !== undefined && content !== null ? this._matchingOutputs(traceId, text(content)) : [];
+    const agent = sender?.agent ?? this._recorder.agent;
+    this.#denied(
+      `agent_message ${agent} -> ${name}`,
+      sender,
+      parents,
+      [],
+      { "gen_ai.agent.name": name, "wake.brake.halt_id": halt, "wake.brake.receiver": name },
+      { from: agent, to: name, content: content ?? null },
+      context,
+    );
+  }
+
+  /** Records a denied event, ended as soon as it starts, and returns its id. */
+  #denied(
+    name: string,
+    run: AgentRun | undefined,
+    parents: string[],
+    origins: string[],
+    attributes: Record<string, string>,
+    payload: unknown,
+    context: Context | undefined,
+  ): string {
+    const eventId = randomUUID();
+    this._rememberLineage(eventId, parents, origins);
+    const span = this._recorder.tracer.startSpan(
+      name,
+      {
+        attributes: {
+          [events.EVENT_ID]: eventId,
+          [events.EVENT_KIND]: events.DENIED,
+          [events.AGENT_ID]: run?.agent ?? this._recorder.agent,
+          ...(run !== undefined ? events.instanceAttributes(run.instance, run.lineage) : {}),
+          [events.CAPTURE]: "sdk",
+          [events.PARENTS]: parents,
+          [events.ORIGINS]: origins,
+          ...attributes,
+          ...events.payloadAttributes(payload),
+        },
+      },
+      context,
+    );
+    span.end();
+    const ctx = span.spanContext();
+    links._note(new links.Link(eventId, ctx.traceId, ctx.spanId));
+    return eventId;
   }
 
   // Agent runs and the messages between them.

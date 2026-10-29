@@ -90,6 +90,12 @@ A call already under way when a halt lands is **cut**, and recorded the same way
 - **Its MCP form:** the `method` is the MCP method and the `host` the MCP server. The event's parent is the call's own `tool_call`, which records what the tool returned, though the caller never got it.
 - **What the exchange carried before the cut** is recorded as usual.
 
+An SDK that stops an agent in its own process records each call it refuses as a `denied` event of its own, captured by `sdk`. The Claude Agent SDK, OpenAI Agents SDK and LangChain integrations do, in both SDKs (see their READMEs).
+- **What it records:** the tool call the agent tried, with its arguments and the refusal as its output. Its parent is the model call that asked for it, and the model's next call reads the refusal.
+- **Its halt:** `wake.brake.halt_id` names the halt that covered the call, or `stale-rules` while the SDK's rules are stale, or `halt-check-failed` when it couldn't check them: it fails closed.
+- **No `wake.origins`:** nothing entered at the denial. The tool never ran, so nothing of it reached the agent, and a later step's chain doesn't count it.
+- **A refused run:** a LangChain run refused before it started is recorded as the `agent_message` that would have handed it its task, in the name of the run that tried, with `wake.brake.receiver` naming the run refused, and no `wake.origins` either.
+
 ## Memory
 
 The memory adapter records each write to a memory store or memory file as a `memory_write` event, and each read as a `memory_read`. Both have `wake.capture` `memory_adapter`, `wake.memory.store` and `wake.memory.entry`.

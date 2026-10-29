@@ -288,3 +288,183 @@ def test_a_tool_call_that_ends_isnt_ended_again(recorded):
     (call,) = wake_events(spans())
     assert call.status.status_code != StatusCode.ERROR
     assert json.loads(call.attributes["wake.payload"])["output"] == "shipped"
+
+
+# Cooperative stops.
+
+wired = []
+
+
+@tool
+def wire(account: str) -> str:
+    """Wire a refund to an account."""
+    wired.append(account)
+    return "Wired."
+
+
+def wiring_graph(handler):
+    model = GenericFakeChatModel(messages=iter([
+        AIMessage(content="", tool_calls=[{"name": "wire", "args": {"account": "123"}, "id": "call_wire"}]),
+        AIMessage(content="Done."),
+    ]))
+
+    def agent(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("agent", agent)
+    graph.add_node("tools", ToolNode([wire], wrap_tool_call=handler.wrap_tool_call, awrap_tool_call=handler.awrap_tool_call))
+    graph.add_edge(START, "agent")
+    graph.add_conditional_edges("agent", tools_condition)
+    graph.add_edge("tools", "agent")
+    return graph.compile()
+
+
+class Halts:
+    """Stands in for the brake's rules (wake.quarantine.Quarantine): the halts in force."""
+
+    def __init__(self, *halts) -> None:
+        self.halts = list(halts)
+
+    def halted(self, names):
+        for h in self.halts:
+            if h.get("fleet") or set(names) & set(h.get("agents", [])):
+                return h["id"]
+        return None
+
+
+class HaltOneEmailRun:
+    """Halts the first run of the email agent it's asked about."""
+
+    def __init__(self) -> None:
+        self.instance = None
+
+    def halted(self, names):
+        for name in sorted(names):
+            if name.startswith("email#"):
+                self.instance = self.instance or name
+                if name == self.instance:
+                    return "halt-email-run"
+        return None
+
+
+class BrokenHalts:
+    """Rules whose check fails."""
+
+    def halted(self, names):
+        raise RuntimeError("the rules can't be read")
+
+
+def guarded(quarantine):
+    from wake.langchain import WakeCallbackHandler as Handler
+
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="clavr", exporter=exporter)
+    handler = Handler(recorder, quarantine=quarantine)
+
+    def events_():
+        recorder.flush()
+        return wake_events(exporter.get_finished_spans())
+
+    return handler, events_
+
+
+def wire_it(handler, *, asynchronous=False):
+    graph, inputs, config = wiring_graph(handler), {"messages": [HumanMessage("Wire the refund")]}, {"callbacks": [handler]}
+    return asyncio.run(graph.ainvoke(inputs, config=config)) if asynchronous else graph.invoke(inputs, config=config)
+
+
+def kinds(found):
+    return [e.attributes["wake.event.kind"] for e in found]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_halted_agents_tool_call_is_refused_before_it_runs(asynchronous):
+    wired.clear()
+    handler, events_ = guarded(Halts({"id": "halt-clavr", "agents": ["clavr"]}))
+    result = wire_it(handler, asynchronous=asynchronous)
+    assert wired == [], "the tool never ran"
+    refusal = result["messages"][-2]
+    assert refusal.content == "Wake halted clavr (halt-clavr), so this tool call wasn't run." and refusal.status == "error"
+    first, denied, second = events_()
+    assert kinds((first, denied, second)) == ["model_call", "denied", "model_call"]
+    assert denied.attributes["wake.brake.halt_id"] == "halt-clavr"
+    assert denied.attributes["gen_ai.tool.name"] == "wire"
+    assert denied.attributes["wake.agent.id"] == "clavr"
+    assert denied.attributes["wake.origins"] == (), "the tool never ran: nothing of it entered"
+    assert json.loads(denied.attributes["wake.payload"])["input"] == {"account": "123"}
+    assert tuple(denied.attributes["wake.parents"]) == (first.attributes["wake.event.id"],), "the call that asked for it"
+    assert denied.attributes["wake.event.id"] in second.attributes["wake.parents"], "the model read the refusal"
+    assert denied.context.trace_id == first.context.trace_id
+    # Without a halt the same graph runs its tool.
+    handler, events_ = guarded(Halts())
+    wire_it(handler, asynchronous=asynchronous)
+    assert wired == ["123"] and kinds(events_()) == ["model_call", "tool_call", "model_call"]
+
+
+def test_a_halted_run_is_stopped_in_process_and_its_sibling_goes_on():
+    wired.clear()
+    halts = HaltOneEmailRun()
+    handler, events_ = guarded(halts)
+    with handler.agent("supervisor", input="Refund both orders", origin="user"):
+        for order in ("1234", "5678"):
+            with handler.agent("email", input=f"Refund order {order}"):
+                wire_it(handler)
+    assert len(wired) == 1, "only the sibling's tool ran"
+    (denied,) = [e for e in events_() if e.attributes["wake.event.kind"] == "denied"]
+    assert denied.attributes["wake.brake.halt_id"] == "halt-email-run"
+    assert denied.attributes["wake.agent.instance"] == halts.instance, "recorded as the halted run's attempt"
+    assert denied.attributes["wake.agent.lineage"] == ("supervisor",)
+
+
+def test_a_run_a_halt_covers_is_never_started():
+    from wake.langchain import AgentHalted
+
+    halts = Halts({"id": "halt-email", "agents": ["email"]})
+    handler, events_ = guarded(halts)
+    started = []
+    with handler.agent("supervisor", input="Refund order 1234", origin="user"):
+        with pytest.raises(AgentHalted) as refused:
+            with handler.agent("email", input="Refund order 1234 to account 123, please"):
+                started.append("email")
+        # A halt on what starts a run stops the runs it starts too.
+        halts.halts = [{"id": "halt-supervisor", "agents": ["supervisor"]}]
+        with pytest.raises(AgentHalted):
+            with handler.agent("billing", input="Bill it"):
+                started.append("billing")
+    assert started == [], "nothing started"
+    assert refused.value.halt == "halt-email"
+    assert str(refused.value) == "Wake halted email (halt-email), so this run of email wasn't started."
+    first, second = events_()
+    assert kinds((first, second)) == ["denied", "denied"]
+    assert first.name == "agent_message supervisor -> email"
+    assert first.attributes["wake.agent.id"] == "supervisor", "recorded as what tried to start it"
+    assert first.attributes["wake.brake.receiver"] == "email"
+    assert first.attributes["wake.origins"] == (), "nothing entered the run"
+    assert json.loads(first.attributes["wake.payload"])["content"] == "Refund order 1234 to account 123, please"
+    assert second.attributes["wake.brake.halt_id"] == "halt-supervisor"
+
+
+def test_stale_rules_refuse_every_run_and_tool_call():
+    from wake.langchain import AgentHalted
+    from wake.quarantine import Quarantine
+
+    wired.clear()
+    handler, events_ = guarded(Quarantine("http://127.0.0.1:9", agent="clavr", start=False))
+    with pytest.raises(AgentHalted) as refused:
+        with handler.agent("supervisor"):
+            pass
+    assert refused.value.halt == "stale-rules"
+    wire_it(handler)
+    assert wired == []
+    assert {e.attributes["wake.brake.halt_id"] for e in events_() if e.attributes["wake.event.kind"] == "denied"} == {"stale-rules"}
+
+
+def test_a_halt_check_that_fails_refuses_the_call():
+    wired.clear()
+    handler, events_ = guarded(BrokenHalts())
+    result = wire_it(handler)
+    assert wired == []
+    assert result["messages"][-2].content == "Wake couldn't check its halts, so this tool call wasn't run."
+    (denied,) = [e for e in events_() if e.attributes["wake.event.kind"] == "denied"]
+    assert denied.attributes["wake.brake.halt_id"] == "halt-check-failed"

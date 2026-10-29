@@ -18,6 +18,8 @@ import { z } from "zod";
 import { links, Recorder } from "../src/index.ts";
 import { Memory } from "../src/memory.ts";
 import { WakeTracingProcessor } from "../src/openai-agents.ts";
+import { Quarantine } from "../src/quarantine.ts";
+import { UNCHECKED } from "../src/stop.ts";
 import { attr, id, ids, origins, parents, recorded, wakeEvents } from "./helpers.ts";
 import { asItems, call, FakeModel, say, type ApiItem } from "./openai-fakes.ts";
 
@@ -349,3 +351,175 @@ for (const sensitive of [true, false]) {
     }
   });
 }
+
+// Cooperative stops.
+
+type Halt = { id: string; fleet?: boolean; agents?: string[] };
+
+/** Stands in for the brake's rules (Quarantine): the halts in force. */
+class Halts {
+  halts: Halt[];
+  constructor(...halts: Halt[]) {
+    this.halts = halts;
+  }
+  halted(names: Iterable<string>): string | null {
+    const named = new Set(names);
+    return this.halts.find((h) => h.fleet || (h.agents ?? []).some((a) => named.has(a)))?.id ?? null;
+  }
+}
+
+/** Halts the first copy of the researcher it's asked about. */
+class HaltOneResearcher {
+  instance: string | undefined;
+  halted(names: Iterable<string>): string | null {
+    for (const name of [...names].sort()) {
+      if (!name.startsWith("researcher#")) continue;
+      this.instance ??= name;
+      if (name === this.instance) return "halt-researcher";
+    }
+    return null;
+  }
+}
+
+/** Rules whose check fails. */
+const brokenHalts = {
+  halted(): string | null {
+    throw new Error("the rules can't be read");
+  },
+};
+
+function twoResearchers() {
+  const lookups: string[] = [];
+  const lookup = tool({
+    name: "lookup",
+    description: "Look a question up.",
+    parameters: z.object({ q: z.string() }),
+    execute: async ({ q }) => {
+      await new Promise((resolve) => setImmediate(resolve));
+      lookups.push(q);
+      return `Found: ${q}`;
+    },
+  });
+  const researcher = new Agent({ name: "researcher", tools: [lookup], model: new ResearcherModel() });
+  const triage = new Agent({
+    name: "triage",
+    tools: [researcher.asTool({ toolName: "research", toolDescription: "Research one question." })],
+    model: new FakeModel([
+      [call("research", JSON.stringify({ input: "refund window" }), "call_a"), call("research", JSON.stringify({ input: "refund window" }), "call_b")],
+      [say("Both answered.")],
+    ]),
+  });
+  return { triage, researcher, lookups };
+}
+
+async function guardedRun(quarantine: { halted(names: Iterable<string>): string | null }, agent: Agent<any, any>, ...others: Agent<any, any>[]) {
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine });
+  setTraceProcessors([processor]);
+  const result = await new Runner().run(processor.guard(agent, ...others), "Check our refund terms.");
+  return { result, events: wakeEvents(await spans()), processor };
+}
+
+const kinds = (found: ReadableSpan[]) => found.map((e) => attr(e, "wake.event.kind"));
+const haltsOf = (found: ReadableSpan[]) => new Set(found.filter((e) => attr(e, "wake.event.kind") === "denied").map((e) => attr(e, "wake.brake.halt_id")));
+
+test("a halted instance is stopped in process, and its sibling goes on", async () => {
+  const halts = new HaltOneResearcher();
+  const { triage, researcher, lookups } = twoResearchers();
+  const { events } = await guardedRun(halts, triage, researcher);
+  const calls = events.filter((e) => attr(e, "gen_ai.tool.name") === "lookup");
+  assert.deepEqual(kinds(calls).sort(), ["denied", "tool_call"], "only the halted copy's call was refused");
+  assert.equal(lookups.length, 1, "only the sibling's lookup ran");
+  const denied = calls.find((e) => attr(e, "wake.event.kind") === "denied")!;
+  assert.equal(attr(denied, "wake.brake.halt_id"), "halt-researcher");
+  assert.equal(attr(denied, "wake.agent.instance"), halts.instance, "recorded as the halted copy's attempt");
+  assert.deepEqual(attr(denied, "wake.agent.lineage"), ["triage"]);
+  assert.deepEqual(origins(denied), [], "the tool never ran: nothing of it entered");
+  const ran = calls.find((e) => attr(e, "wake.event.kind") === "tool_call")!;
+  assert.notEqual(attr(ran, "wake.agent.instance"), halts.instance);
+  // The refused call has the response that asked for it as its parent, like any call.
+  const responses = ids(...events.filter((e) => attr(e, "wake.event.kind") === "model_call" && attr(e, "wake.agent.instance") === halts.instance));
+  assert.ok(parents(denied).length > 0 && parents(denied).every((p) => responses.has(p)));
+});
+
+test("a halted agent's spawn starts nothing", async () => {
+  const { triage, researcher, lookups } = twoResearchers();
+  const { result, events } = await guardedRun(new Halts({ id: "halt-triage", agents: ["triage"] }), triage, researcher);
+  assert.deepEqual(
+    events.map((e) => [attr(e, "wake.agent.id"), attr(e, "wake.event.kind"), attr(e, "gen_ai.tool.name")]),
+    [
+      ["triage", "model_call", undefined],
+      ["triage", "denied", "research"],
+      ["triage", "denied", "research"],
+      ["triage", "model_call", undefined],
+    ],
+    "no copy of the researcher started",
+  );
+  assert.equal(lookups.length, 0);
+  assert.deepEqual(haltsOf(events), new Set(["halt-triage"]));
+  assert.equal(result.finalOutput, "Both answered.");
+});
+
+test("stale rules refuse every call", async () => {
+  const { triage, researcher } = twoResearchers();
+  const neverFetched = new Quarantine("http://127.0.0.1:9", { agent: "support", start: false });
+  const { events } = await guardedRun(neverFetched, triage, researcher);
+  assert.deepEqual(kinds(events), ["model_call", "denied", "denied", "model_call"]);
+  assert.deepEqual(haltsOf(events), new Set(["stale-rules"]));
+});
+
+test("a halt check that fails refuses the call", async () => {
+  const { triage, researcher } = twoResearchers();
+  const { events } = await guardedRun(brokenHalts, triage, researcher);
+  assert.deepEqual(kinds(events), ["model_call", "denied", "denied", "model_call"]);
+  assert.deepEqual(haltsOf(events), new Set([UNCHECKED]));
+});
+
+test("while Wake can't place a run, a halt on any copy of its agent stops it", async () => {
+  const halts = new HaltOneResearcher();
+  const { triage, researcher } = twoResearchers();
+  const { processor } = await guardedRun(halts, triage, researcher);
+  // Outside any run: Wake can't tell which copy of the researcher this would be.
+  const refused = processor._refusal("researcher");
+  assert.equal(refused?.[0], "halt-researcher");
+  assert.ok(refused?.[1].includes("can't yet tell which copy of researcher is calling"), refused?.[1]);
+  assert.equal(processor._refusal("triage"), undefined);
+});
+
+/** Answers at once, noting the handoffs it was offered. */
+class OfferedModel extends FakeModel {
+  offered: string[] | undefined;
+  constructor() {
+    super([[say("Done.")]]);
+  }
+  override async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.offered = request.handoffs.map((h) => h.toolName);
+    return super.getResponse(request);
+  }
+}
+
+for (const halted of [false, true]) {
+  test(`a halted agent is offered no handoff (${halted ? "halted" : "running"})`, async () => {
+    const model = new OfferedModel();
+    const billing = new Agent({ name: "billing", model: new FakeModel([[say("Paid.")]]) });
+    const triage = new Agent({ name: "triage", handoffs: [billing], model });
+    await guardedRun(new Halts(...(halted ? [{ id: "halt-triage", agents: ["triage"] }] : [])), triage);
+    assert.deepEqual(model.offered, halted ? [] : ["transfer_to_billing"]);
+  });
+}
+
+test("guard reaches handed-off agents and guards each tool once", () => {
+  const look = tool({ name: "look", description: "Look a question up.", parameters: z.object({ q: z.string() }), execute: async ({ q }) => q });
+  const pay = tool({ name: "pay", description: "Pay an order.", parameters: z.object({ order: z.string() }), execute: async ({ order }) => order });
+  const researcher = new Agent({ name: "researcher", tools: [look] });
+  const billing = new Agent({ name: "billing", tools: [pay] });
+  const research = researcher.asTool({ toolName: "research", toolDescription: "Research." });
+  const triage = new Agent({ name: "triage", tools: [research], handoffs: [billing] });
+  const processor = new WakeTracingProcessor(recorded("support").recorder, { quarantine: new Halts() });
+  processor.guard(triage, researcher);
+  processor.guard(triage, researcher);
+  assert.equal(look.inputGuardrails?.length, 1, "the agent used as a tool, once however often it's guarded");
+  assert.equal(pay.inputGuardrails?.length, 1, "the agent handed off to");
+  assert.equal(research.inputGuardrails?.length, 1, "the agent tool itself: a spawn");
+  assert.throws(() => new WakeTracingProcessor(recorded("support").recorder).guard(triage), /needs the brake's rules/);
+});

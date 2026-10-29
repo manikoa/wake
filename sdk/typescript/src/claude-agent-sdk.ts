@@ -46,6 +46,7 @@ import * as links from "./links.ts";
 import { log } from "./log.ts";
 import type { Quarantine } from "./quarantine.ts";
 import { now, type Recorder } from "./recorder.ts";
+import { refusal, unchecked, type Refusal } from "./stop.ts";
 
 /** The tool Claude Code starts a subagent with; older versions call it Task. */
 export const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
@@ -284,9 +285,9 @@ export class WakeClaudeAgent extends EventGraph {
 
   readonly #preToolUse: HookCallback = async (input, toolUseId) => {
     this.#safely("hookOpened", () => this.#hookOpened(input, toolUseId));
-    const halt = this.#safely("halting", () => this._halting(input, toolUseId));
-    if (halt === undefined) return {};
-    return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: halt[1] } };
+    const refused = this._halting(input, toolUseId);
+    if (refused === undefined) return {};
+    return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: refused[1] } };
   };
 
   readonly #postToolUse: HookCallback = async (input, toolUseId) => {
@@ -325,28 +326,35 @@ export class WakeClaudeAgent extends EventGraph {
    * instance is known by the agent_id its hooks name, from its earlier calls or the Agent tool's
    * result. Before that, Wake can't tell which instance is calling: it could be any the session
    * started, or one started by any of them that the stream hasn't shown yet, since hooks can run
-   * ahead of the code reading it. So the call is refused if a halt covers any of them.
+   * ahead of the code reading it. So the call is refused if a halt covers any of them. A check
+   * that fails refuses the call too.
    */
-  _halting(input: Json, toolUseId: string | undefined): [string, string] | undefined {
+  _halting(input: Json, toolUseId: string | undefined): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
-    const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : undefined;
-    const agentType = agentId ? (input.agent_type as string | undefined) : undefined;
-    const agent = agentType ? `${this._recorder.agent}/${agentType}` : this._recorder.agent;
-    const known = agentId !== undefined ? this._subagents.get(agentId) : undefined;
-    const names = [this._recorder.agent, agent, ...(known ?? [])];
-    const who = known?.[0] ?? agent;
-    let halt = this.#quarantine.halted(names);
-    let reason = `Wake halted ${who} (${halt}), so this tool call wasn't run.`;
-    if (halt === null && agentId !== undefined && known === undefined) {
-      halt = this.#quarantine.halted([...names, ...this.#instances(input.session_id as string | undefined)]);
-      reason = `Wake can't yet tell which copy of ${agent} is calling, and a halt (${halt}) may cover it, so this tool call wasn't run.`;
+    let who = this._recorder.agent;
+    let refused: Refusal | undefined;
+    try {
+      const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : undefined;
+      const agentType = agentId ? (input.agent_type as string | undefined) : undefined;
+      const agent = agentType ? `${this._recorder.agent}/${agentType}` : this._recorder.agent;
+      const known = agentId !== undefined ? this._subagents.get(agentId) : undefined;
+      who = known?.[0] ?? agent;
+      const unplaced = agentId !== undefined && known === undefined ? this.#instances(input.session_id as string | undefined) : [];
+      refused = refusal(this.#quarantine, who, [this._recorder.agent, agent, ...(known ?? [])], { unplaced });
+    } catch (error) {
+      log.warn("couldn't check the halts for a tool call; refusing it", error);
+      refused = unchecked();
     }
-    if (halt === null) return undefined;
-    if (toolUseId) this.#halted.set(toolUseId, halt);
-    const tool = toolUseId ? this.#tools.get(toolUseId) : undefined;
-    if (tool !== undefined) tool.halted = halt;
-    log.warn(`refused ${who}'s ${typeof input.tool_name === "string" ? input.tool_name : "tool"} call: ${halt}`);
-    return [halt, reason];
+    if (refused === undefined) return undefined;
+    const [halt] = refused;
+    // Refused all the same if this fails; only its record may say less.
+    this.#safely("halting", () => {
+      if (toolUseId) this.#halted.set(toolUseId, halt);
+      const tool = toolUseId ? this.#tools.get(toolUseId) : undefined;
+      if (tool !== undefined) tool.halted = halt;
+    });
+    log.warn(`refused a tool call of ${who}: ${halt}`);
+    return refused;
   }
 
   /** Every instance Wake has seen start in this session, and what started each. */
@@ -643,12 +651,15 @@ export class WakeClaudeAgent extends EventGraph {
     const payload: Json = { input: tool.args ?? null, output: output ?? null };
     if (error) payload.error = tool.error ?? (text(output) || error);
     let kind = events.TOOL_CALL;
+    let origins = [`tool:${tool.name}`];
     if (tool.halted) {
-      // Refused in the agent's own process, under the halt: what the agent tried.
+      // Refused in the agent's own process, under the halt: what the agent tried. The tool
+      // never ran, so nothing of it entered.
       kind = events.DENIED;
+      origins = [];
       attributes["wake.brake.halt_id"] = tool.halted;
     }
-    this.#emit(tool.span, tool.eventId, kind, `execute_tool ${tool.name}`, tool.agent, tool.parents, [`tool:${tool.name}`], attributes, payload, error, tool);
+    this.#emit(tool.span, tool.eventId, kind, `execute_tool ${tool.name}`, tool.agent, tool.parents, origins, attributes, payload, error, tool);
     this._rememberOutput(tool.span.spanContext().traceId, tool.eventId, text(output));
     tool.span.end(tool.endedAt ?? now());
     return tool;

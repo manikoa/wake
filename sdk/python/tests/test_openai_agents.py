@@ -394,3 +394,165 @@ def test_an_agent_called_twice_as_a_tool_is_two_instances_that_never_cross(sensi
         # Its tool ran from its own first response, and its answer read that tool's result.
         assert set(attrs(lookup)["wake.parents"]) == {attrs(first)["wake.event.id"]}
         assert attrs(lookup)["wake.event.id"] in attrs(last)["wake.parents"]
+
+
+# Cooperative stops.
+
+
+class Halts:
+    """Stands in for the brake's rules (wake.quarantine.Quarantine): the halts in force."""
+
+    def __init__(self, *halts) -> None:
+        self.halts = list(halts)
+
+    def halted(self, names):
+        for h in self.halts:
+            if h.get("fleet") or set(names) & set(h.get("agents", [])):
+                return h["id"]
+        return None
+
+
+class HaltOneResearcher:
+    """Halts the first copy of the researcher it's asked about."""
+
+    def __init__(self) -> None:
+        self.instance = None
+
+    def halted(self, names):
+        for name in sorted(names):
+            if name.startswith("researcher#"):
+                self.instance = self.instance or name
+                if name == self.instance:
+                    return "halt-researcher"
+        return None
+
+
+class BrokenHalts:
+    """Rules whose check fails."""
+
+    def halted(self, names):
+        raise RuntimeError("the rules can't be read")
+
+
+def guarded_run(agent, quarantine):
+    exporter = InMemorySpanExporter()
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter), quarantine=quarantine)
+    set_trace_processors([processor])
+    try:
+        result = asyncio.run(Runner.run(processor.guard(agent), "Check our refund terms."))
+    finally:
+        set_trace_processors([])
+    processor._recorder.flush()
+    return result, wake_events(exporter.get_finished_spans()), processor
+
+
+def kinds_of(events_, *, tool=None):
+    return [attrs(e)["wake.event.kind"] for e in events_ if tool is None or attrs(e).get("gen_ai.tool.name") == tool]
+
+
+def test_a_halted_instance_is_stopped_in_process_and_its_sibling_goes_on():
+    halts = HaltOneResearcher()
+    _, events_, _ = guarded_run(two_researchers(), halts)
+    lookups = [e for e in events_ if attrs(e).get("gen_ai.tool.name") == "lookup"]
+    assert sorted(kinds_of(lookups)) == ["denied", "tool_call"], "only the halted copy's call was refused"
+    (denied,) = [e for e in lookups if attrs(e)["wake.event.kind"] == "denied"]
+    assert attrs(denied)["wake.brake.halt_id"] == "halt-researcher"
+    assert attrs(denied)["wake.agent.instance"] == halts.instance, "recorded as the halted copy's attempt"
+    assert attrs(denied)["wake.agent.lineage"] == ("triage",)
+    assert attrs(denied)["wake.origins"] == (), "the tool never ran: nothing of it entered"
+    assert json.loads(attrs(denied)["wake.payload"])["output"].startswith(f"Wake halted {halts.instance} (halt-researcher)")
+    (ran,) = [e for e in lookups if attrs(e)["wake.event.kind"] == "tool_call"]
+    assert attrs(ran)["wake.agent.instance"] != halts.instance
+    # The refused call has the response that asked for it as its parent, like any call.
+    responses = {attrs(e)["wake.event.id"] for e in events_ if attrs(e)["wake.event.kind"] == "model_call"
+                 and attrs(e).get("wake.agent.instance") == halts.instance}
+    assert set(attrs(denied)["wake.parents"]) <= responses and attrs(denied)["wake.parents"]
+
+
+def test_a_halted_agents_spawn_starts_nothing():
+    halts = Halts({"id": "halt-triage", "agents": ["triage"]})
+    result, events_, _ = guarded_run(two_researchers(), halts)
+    assert [(attrs(e)["wake.agent.id"], attrs(e)["wake.event.kind"], attrs(e).get("gen_ai.tool.name")) for e in events_] == [
+        ("triage", "model_call", None),
+        ("triage", "denied", "research"),
+        ("triage", "denied", "research"),
+        ("triage", "model_call", None),
+    ], "no copy of the researcher started"
+    assert {attrs(e)["wake.brake.halt_id"] for e in events_ if attrs(e)["wake.event.kind"] == "denied"} == {"halt-triage"}
+    assert result.final_output == "Both answered."
+
+
+def test_stale_rules_refuse_every_call():
+    from wake.quarantine import Quarantine
+
+    never_fetched = Quarantine("http://127.0.0.1:9", agent="support", start=False)
+    _, events_, _ = guarded_run(two_researchers(), never_fetched)
+    assert kinds_of(events_) == ["model_call", "denied", "denied", "model_call"]
+    assert {attrs(e)["wake.brake.halt_id"] for e in events_ if attrs(e)["wake.event.kind"] == "denied"} == {"stale-rules"}
+
+
+def test_a_halt_check_that_fails_refuses_the_call():
+    _, events_, _ = guarded_run(two_researchers(), BrokenHalts())
+    assert kinds_of(events_) == ["model_call", "denied", "denied", "model_call"]
+    (refused, _) = [e for e in events_ if attrs(e)["wake.event.kind"] == "denied"]
+    assert attrs(refused)["wake.brake.halt_id"] == "halt-check-failed"
+    assert json.loads(attrs(refused)["wake.payload"])["output"] == "Wake couldn't check its halts, so this tool call wasn't run."
+
+
+def test_while_wake_cant_place_a_run_a_halt_on_any_copy_of_its_agent_stops_it():
+    halts = HaltOneResearcher()
+    _, _, processor = guarded_run(two_researchers(), halts)
+    # Outside any run: Wake can't tell which copy of the researcher this would be.
+    refused = processor._refusal("researcher")
+    assert refused is not None and refused.halt == "halt-researcher"
+    assert f"can't yet tell which copy of researcher is calling" in refused.reason
+    assert processor._refusal("triage") is None
+
+
+class OfferedModel(FakeModel):
+    """Answers at once, noting the handoffs it was offered."""
+
+    def __init__(self) -> None:
+        super().__init__([[say("Done.")]])
+        self.offered = None
+
+    async def get_response(self, system_instructions, input, model_settings, tools, output_schema, handoffs, tracing,
+                           previous_response_id=None, conversation_id=None, prompt=None, **kwargs):
+        self.offered = [h.tool_name for h in handoffs]
+        return await super().get_response(system_instructions, input, model_settings, tools, output_schema, handoffs,
+                                          tracing, previous_response_id, conversation_id, prompt, **kwargs)
+
+
+@pytest.mark.parametrize("halted", [False, True], ids=["running", "halted"])
+def test_a_halted_agent_is_offered_no_handoff(halted):
+    model = OfferedModel()
+    billing = Agent(name="billing", model=FakeModel([[say("Paid.")]]))
+    triage = Agent(name="triage", handoffs=[billing], model=model)
+    guarded_run(triage, Halts(*[{"id": "halt-triage", "agents": ["triage"]}] * halted))
+    assert model.offered == ([] if halted else ["transfer_to_billing"])
+
+
+def test_guard_reaches_agents_used_as_tools_and_handed_off_to_once():
+    @function_tool
+    def look(q: str) -> str:
+        """Look a question up."""
+        return q
+
+    @function_tool
+    def pay(order: str) -> str:
+        """Pay an order."""
+        return order
+
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=InMemorySpanExporter()), quarantine=Halts())
+    researcher = Agent(name="researcher", tools=[look])
+    billing = Agent(name="billing", tools=[pay])
+    triage = Agent(name="triage", tools=[researcher.as_tool(tool_name="research", tool_description="Research.")],
+                   handoffs=[billing])
+    processor.guard(triage)
+    processor.guard(triage)
+    guarded = [processor._guardrail]
+    assert look.tool_input_guardrails == guarded, "the agent used as a tool, once however often it's guarded"
+    assert pay.tool_input_guardrails == guarded, "the agent handed off to"
+    assert triage.tools[0].tool_input_guardrails == guarded, "the agent tool itself: a spawn"
+    with pytest.raises(ValueError):
+        WakeTracingProcessor(Recorder(agent="support", exporter=InMemorySpanExporter())).guard(triage)

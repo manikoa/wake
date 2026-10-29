@@ -61,8 +61,8 @@ from claude_agent_sdk import (
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
-from wake import events, links
-from wake._graph import EventGraph, _Recent, never_raise
+from wake import events, links, stop
+from wake._graph import EventGraph, _Recent, failed, never_raise
 from wake.recorder import Recorder
 
 if TYPE_CHECKING:
@@ -245,11 +245,11 @@ class WakeClaudeAgent(EventGraph):
 
     async def _pre_tool_use(self, hook_input, tool_use_id, context) -> dict:
         self._hook_opened(hook_input, tool_use_id)
-        halt = self._halting(hook_input, tool_use_id)
-        if halt is None:
+        refused = self._halting(hook_input, tool_use_id)
+        if refused is None:
             return {}
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                       "permissionDecisionReason": halt[1]}}
+                                       "permissionDecisionReason": refused.reason}}
 
     async def _post_tool_use(self, hook_input, tool_use_id, context) -> dict:
         self._hook_closed(hook_input, tool_use_id)
@@ -283,43 +283,47 @@ class WakeClaudeAgent(EventGraph):
 
     # Cooperative stops.
 
-    @never_raise
-    def _halting(self, hook_input, tool_use_id) -> "tuple[str, str] | None":
+    def _halting(self, hook_input, tool_use_id) -> "stop.Refusal | None":
         """The halt that stops this tool call, and why, if one covers who's making it: the
         agent, the subagent type it runs as, and the instance it is and those that started it.
         A subagent's instance is known by the agent_id its hooks name, from its earlier calls
         or the Agent tool's result. Before that, Wake can't tell which instance is calling: it
         could be any the session started, or one started by any of them that the stream hasn't
         shown yet, since hooks can run ahead of the code reading it. So the call is refused if a
-        halt covers any of them."""
+        halt covers any of them. A check that fails refuses the call too."""
         if self._quarantine is None:
             return None
-        agent_id = hook_input.get("agent_id")
-        agent_type = hook_input.get("agent_type") if agent_id else None
-        agent = f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
-        names = {self._recorder.agent, agent}
-        who = agent
-        with self._lock:
-            known = self._subagents.get(agent_id) if agent_id else None
-        if known:
-            names.update(known)
-            who = known[0]
-        halt = self._quarantine.halted(names)
-        reason = f"Wake halted {who} ({halt}), so this tool call wasn't run."
-        if halt is None and agent_id and not known:
-            halt = self._quarantine.halted(names | self._instances(hook_input.get("session_id")))
-            reason = (f"Wake can't yet tell which copy of {agent} is calling, and a halt ({halt}) may cover it, "
-                      f"so this tool call wasn't run.")
-        if halt is None:
+        who = self._recorder.agent
+        try:
+            agent_id = hook_input.get("agent_id")
+            agent_type = hook_input.get("agent_type") if agent_id else None
+            agent = f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
+            names = {self._recorder.agent, agent}
+            who = agent
+            with self._lock:
+                known = self._subagents.get(agent_id) if agent_id else None
+            if known:
+                names.update(known)
+                who = known[0]
+            unplaced = self._instances(hook_input.get("session_id")) if agent_id and not known else ()
+            refused = stop.refusal(self._quarantine, who, names, unplaced=unplaced)
+        except Exception:
+            log.warning("wake: couldn't check the halts for a tool call; refusing it", exc_info=True)
+            refused = stop.unchecked()
+        if refused is None:
             return None
-        with self._lock:
-            if tool_use_id:
-                self._halted[tool_use_id] = halt
-            tool = self._tools.get(tool_use_id) if tool_use_id else None
-        if tool is not None:
-            tool.halted = halt
-        log.warning("wake: refused %s's %s call: %s", who, hook_input.get("tool_name") or "tool", halt)
-        return halt, reason
+        try:
+            with self._lock:
+                if tool_use_id:
+                    self._halted[tool_use_id] = refused.halt
+                tool = self._tools.get(tool_use_id) if tool_use_id else None
+            if tool is not None:
+                tool.halted = refused.halt
+        except Exception:
+            # Refused all the same; only its record may say less.
+            failed(self._recorder, "_halting")
+        log.warning("wake: refused a tool call of %s: %s", who, refused.halt)
+        return refused
 
     def _instances(self, session_id: str | None) -> set[str]:
         """Every instance Wake has seen start in this session, and what started each."""
@@ -621,12 +625,13 @@ class WakeClaudeAgent(EventGraph):
         payload: dict[str, Any] = {"input": tool.arguments, "output": output}
         if error:
             payload["error"] = tool.error or _text(output) or error
-        kind = events.TOOL_CALL
+        kind, origins = events.TOOL_CALL, [f"tool:{tool.name}"]
         if tool.halted:
-            # Refused in the agent's own process, under the halt: what the agent tried.
-            kind, attributes["wake.brake.halt_id"] = events.DENIED, tool.halted
+            # Refused in the agent's own process, under the halt: what the agent tried. The
+            # tool never ran, so nothing of it entered.
+            kind, origins, attributes["wake.brake.halt_id"] = events.DENIED, [], tool.halted
         self._emit(tool.span, tool.event_id, kind, f"execute_tool {tool.name}", tool.agent,
-                   tool.parents, [f"tool:{tool.name}"], attributes, payload, error=error, who=tool)
+                   tool.parents, origins, attributes, payload, error=error, who=tool)
         self._remember_output(tool.span.get_span_context().trace_id, tool.event_id, _text(output))
         tool.span.end(end_time=tool.ended_at)
         return tool

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 
-import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, type ToolMessage } from "@langchain/core/messages";
 import { RunnableLambda } from "@langchain/core/runnables";
 import { tool } from "@langchain/core/tools";
 import { MessagesAnnotation, START, StateGraph } from "@langchain/langgraph";
@@ -11,7 +11,9 @@ import { SpanStatusCode } from "@opentelemetry/api";
 import { z } from "zod";
 
 import { links, Recorder } from "../src/index.ts";
-import { WakeCallbackHandler } from "../src/langgraph.ts";
+import { AgentHalted, WakeCallbackHandler, WakeToolNode } from "../src/langgraph.ts";
+import { Quarantine } from "../src/quarantine.ts";
+import { UNCHECKED } from "../src/stop.ts";
 import { ANSWER, ask, emailAgentGraph } from "./email-agent.ts";
 import { attr, id, ids, origins, parents, parentSpanId, recorded, ScriptedChatModel, wakeEvents } from "./helpers.ts";
 
@@ -204,4 +206,168 @@ test("a tool call that ends isn't ended again", async () => {
   assert.equal(more.length, 0);
   assert.notEqual(call.status.code, SpanStatusCode.ERROR);
   assert.equal(JSON.parse(attr(call, "wake.payload") as string).output, "shipped");
+});
+
+// Cooperative stops.
+
+type Halt = { id: string; fleet?: boolean; agents?: string[] };
+
+/** Stands in for the brake's rules (Quarantine): the halts in force. */
+class Halts {
+  halts: Halt[];
+  constructor(...halts: Halt[]) {
+    this.halts = halts;
+  }
+  halted(names: Iterable<string>): string | null {
+    const named = new Set(names);
+    return this.halts.find((h) => h.fleet || (h.agents ?? []).some((a) => named.has(a)))?.id ?? null;
+  }
+}
+
+/** Halts the first run of the email agent it's asked about. */
+class HaltOneEmailRun {
+  instance: string | undefined;
+  halted(names: Iterable<string>): string | null {
+    for (const name of [...names].sort()) {
+      if (!name.startsWith("email#")) continue;
+      this.instance ??= name;
+      if (name === this.instance) return "halt-email-run";
+    }
+    return null;
+  }
+}
+
+/** Rules whose check fails. */
+const brokenHalts = {
+  halted(): string | null {
+    throw new Error("the rules can't be read");
+  },
+};
+
+const wired: string[] = [];
+
+const wire = tool(
+  async ({ account }) => {
+    wired.push(account);
+    return "Wired.";
+  },
+  { name: "wire", description: "Wire a refund to an account.", schema: z.object({ account: z.string() }) },
+);
+
+function wiringGraph(handler: WakeCallbackHandler) {
+  const model = new ScriptedChatModel([new AIMessage({ content: "", tool_calls: [{ name: "wire", args: { account: "123" }, id: "call_wire" }] }), "Done."]);
+  return new StateGraph(MessagesAnnotation)
+    .addNode("agent", async (state) => ({ messages: [await model.invoke(state.messages)] }))
+    .addNode("tools", new WakeToolNode(handler, [wire]))
+    .addEdge(START, "agent")
+    .addConditionalEdges("agent", toolsCondition)
+    .addEdge("tools", "agent")
+    .compile();
+}
+
+function guarded(quarantine: { halted(names: Iterable<string>): string | null }) {
+  const { recorder, spans } = recorded("clavr");
+  return { handler: new WakeCallbackHandler(recorder, { quarantine }), events: async () => wakeEvents(await spans()) };
+}
+
+function wireIt(handler: WakeCallbackHandler) {
+  return wiringGraph(handler).invoke({ messages: [new HumanMessage("Wire the refund")] }, { callbacks: [handler] });
+}
+
+const kinds = (found: { attributes: Record<string, unknown> }[]) => found.map((e) => e.attributes["wake.event.kind"]);
+
+test("a halted agent's tool call is refused before it runs", async () => {
+  wired.length = 0;
+  const { handler, events } = guarded(new Halts({ id: "halt-clavr", agents: ["clavr"] }));
+  const result = await wireIt(handler);
+  assert.deepEqual(wired, [], "the tool never ran");
+  const refusal = result.messages.at(-2) as ToolMessage;
+  assert.equal(refusal.content, "Wake halted clavr (halt-clavr), so this tool call wasn't run.");
+  assert.equal(refusal.status, "error");
+  const [first, denied, second, ...rest] = await events();
+  assert.equal(rest.length, 0);
+  assert.deepEqual(kinds([first, denied, second]), ["model_call", "denied", "model_call"]);
+  assert.equal(attr(denied, "wake.brake.halt_id"), "halt-clavr");
+  assert.equal(attr(denied, "gen_ai.tool.name"), "wire");
+  assert.equal(attr(denied, "wake.agent.id"), "clavr");
+  assert.deepEqual(origins(denied), [], "the tool never ran: nothing of it entered");
+  assert.deepEqual(JSON.parse(attr(denied, "wake.payload") as string).input, { account: "123" });
+  assert.deepEqual(parents(denied), [id(first)], "the call that asked for it");
+  assert.ok(parents(second).includes(id(denied)), "the model read the refusal");
+  assert.equal(denied.spanContext().traceId, first.spanContext().traceId);
+  // Without a halt the same graph runs its tool.
+  const running = guarded(new Halts());
+  await wireIt(running.handler);
+  assert.deepEqual(wired, ["123"]);
+  assert.deepEqual(kinds(await running.events()), ["model_call", "tool_call", "model_call"]);
+});
+
+test("a halted run is stopped in process, and its sibling goes on", async () => {
+  wired.length = 0;
+  const halts = new HaltOneEmailRun();
+  const { handler, events } = guarded(halts);
+  await handler.agent("supervisor", { input: "Refund both orders", origin: "user" }, async () => {
+    for (const order of ["1234", "5678"]) {
+      await handler.agent("email", { input: `Refund order ${order}` }, () => wireIt(handler));
+    }
+  });
+  assert.equal(wired.length, 1, "only the sibling's tool ran");
+  const denied = (await events()).filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "halt-email-run");
+  assert.equal(attr(denied[0], "wake.agent.instance"), halts.instance, "recorded as the halted run's attempt");
+  assert.deepEqual(attr(denied[0], "wake.agent.lineage"), ["supervisor"]);
+});
+
+test("a run a halt covers is never started", async () => {
+  const halts = new Halts({ id: "halt-email", agents: ["email"] });
+  const { handler, events } = guarded(halts);
+  const started: string[] = [];
+  let refused: unknown;
+  handler.agent("supervisor", { input: "Refund order 1234", origin: "user" }, () => {
+    try {
+      handler.agent("email", { input: "Refund order 1234 to account 123, please" }, () => started.push("email"));
+    } catch (error) {
+      refused = error;
+    }
+    // A halt on what starts a run stops the runs it starts too.
+    halts.halts = [{ id: "halt-supervisor", agents: ["supervisor"] }];
+    assert.throws(() => handler.agent("billing", { input: "Bill it" }, () => started.push("billing")), AgentHalted);
+  });
+  assert.deepEqual(started, [], "nothing started");
+  assert.ok(refused instanceof AgentHalted);
+  assert.equal(refused.halt, "halt-email");
+  assert.equal(refused.message, "Wake halted email (halt-email), so this run of email wasn't started.");
+  const [first, second, ...rest] = await events();
+  assert.equal(rest.length, 0);
+  assert.deepEqual(kinds([first, second]), ["denied", "denied"]);
+  assert.equal(first.name, "agent_message supervisor -> email");
+  assert.equal(attr(first, "wake.agent.id"), "supervisor", "recorded as what tried to start it");
+  assert.equal(attr(first, "wake.brake.receiver"), "email");
+  assert.deepEqual(origins(first), [], "nothing entered the run");
+  assert.equal(JSON.parse(attr(first, "wake.payload") as string).content, "Refund order 1234 to account 123, please");
+  assert.equal(attr(second, "wake.brake.halt_id"), "halt-supervisor");
+});
+
+test("stale rules refuse every run and tool call", async () => {
+  wired.length = 0;
+  const { handler, events } = guarded(new Quarantine("http://127.0.0.1:9", { agent: "clavr", start: false }));
+  assert.throws(
+    () => handler.agent("supervisor", () => undefined),
+    (error: unknown) => error instanceof AgentHalted && error.halt === "stale-rules",
+  );
+  await wireIt(handler);
+  assert.deepEqual(wired, []);
+  const denied = (await events()).filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.deepEqual(new Set(denied.map((e) => attr(e, "wake.brake.halt_id"))), new Set(["stale-rules"]));
+});
+
+test("a halt check that fails refuses the call", async () => {
+  wired.length = 0;
+  const { handler, events } = guarded(brokenHalts);
+  const result = await wireIt(handler);
+  assert.deepEqual(wired, []);
+  assert.equal((result.messages.at(-2) as ToolMessage).content, "Wake couldn't check its halts, so this tool call wasn't run.");
+  const denied = (await events()).filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.deepEqual(denied.map((e) => attr(e, "wake.brake.halt_id")), [UNCHECKED]);
 });

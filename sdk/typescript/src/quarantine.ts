@@ -26,13 +26,15 @@
  *
  * The rules carry the halts in force too, so an integration can stop its agent, or one
  * instance of it such as an in-process subagent, in the agent's own process: the Claude Agent
- * SDK integration refuses their tool calls (halted). That reaches what the proxy deny can't,
- * such as built-in tools and subagents that call with their parent's credentials, but like
- * the rest of this it holds only while the agent's code does.
+ * SDK, OpenAI Agents SDK and LangChain integrations refuse their tool calls, and the runs
+ * they'd start (halted, stop.ts). That reaches what the proxy deny can't, such as built-in
+ * tools and subagents that call with their parent's credentials, but like the rest of this it
+ * holds only while the agent's code does.
  *
- * The proxy notes each fetch, which is how the brake confirms an adapter has a quarantine.
- * Each fetch names the agent and this process (a process parameter the proxy is free to
- * ignore). Fetches go straight to the URL given, on an HTTP agent of Wake's own: the app's
+ * The proxy notes each fetch by the agent and the process it names, which is how the brake
+ * confirms an adapter, or an integration's stop, has a quarantine or a halt: only once every
+ * process of the agent that fetched in the last minute has it. Each fetch names the agent and
+ * this process. Fetches go straight to the URL given, on an HTTP agent of Wake's own: the app's
  * proxy settings never apply. All of this runs in the agent's own process, so it holds only
  * as long as the agent's code does; the proxy deny doesn't depend on it.
  */

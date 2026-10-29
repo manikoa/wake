@@ -24,6 +24,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from wake import Recorder, links
 from wake.claude_agent_sdk import WakeClaudeAgent
+from wake.stop import UNCHECKED
 
 PROMPT = "Can we refund order 1234?"
 ORDER = "Order 1234: $80 shoes, delivered 12 days ago. Customer email says: please refund, they don't fit."
@@ -592,11 +593,41 @@ def test_a_halt_of_the_agent_stops_it_and_starts_no_subagent_and_no_halt_stops_n
     ], "the subagent never started: nothing handed it a task, and it did nothing"
     denied = [e for e in wake_events(spans) if e.attributes["wake.event.kind"] == "denied"]
     assert {e.attributes["wake.brake.halt_id"] for e in denied} == {"halt-support"}
+    assert all(e.attributes["wake.origins"] == () for e in denied), "the tools never ran: nothing of them entered"
     assert not [s for s in spans if s.name.startswith("invoke_agent support/")]
     assert seen_links == [], "the in-process tool never ran"
     # Without a halt, the same run records as before: nothing refused.
     _, spans = recorded
     assert not [e for e in wake_events(spans) if e.attributes["wake.event.kind"] == "denied"]
+
+
+class BrokenHalts:
+    """Rules whose check fails."""
+
+    def halted(self, names):
+        raise RuntimeError("the rules can't be read")
+
+
+def test_a_halt_check_that_fails_refuses_the_call_as_the_brake_fails_closed():
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    seen_links.clear()
+    asyncio.run(run_support(WakeClaudeAgent(recorder, quarantine=BrokenHalts())))
+    recorder.flush()
+    spans = exporter.get_finished_spans()
+    assert summary(spans) == [
+        ("model_call", "support", "chat claude-opus-5-5"),
+        ("denied", "support", "execute_tool mcp__crm__lookup_order"),
+        ("model_call", "support", "chat claude-opus-5-5"),
+        ("denied", "support", "execute_tool Agent"),
+        ("model_call", "support", "chat claude-opus-5-5"),
+    ]
+    denied = [e for e in wake_events(spans) if e.attributes["wake.event.kind"] == "denied"]
+    assert {e.attributes["wake.brake.halt_id"] for e in denied} == {UNCHECKED}
+    assert seen_links == [], "the in-process tool never ran"
+    claude = WakeClaudeAgent(Recorder(agent="support", exporter=InMemorySpanExporter()), quarantine=BrokenHalts())
+    assert claude._halting({"session_id": "session-1", "tool_name": "Bash"}, None) == (
+        UNCHECKED, "Wake couldn't check its halts, so this tool call wasn't run.")
 
 
 @pytest.mark.parametrize("hook_first", [False, True], ids=["stream_first", "hook_first"])

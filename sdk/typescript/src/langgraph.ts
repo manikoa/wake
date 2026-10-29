@@ -1,27 +1,52 @@
 /**
  * LangGraph support. LangGraph runs are LangChain runs, so the handler in wake-sdk/langchain
- * records them; WakeStore records LangGraph's long-term memory store.
+ * records them; WakeStore records LangGraph's long-term memory store, and WakeToolNode stops a
+ * halted agent's tool calls.
  *
  *     const memory = new Memory(handler);
  *     const store = new WakeStore(new InMemoryStore(), memory); // or any BaseStore, such as PostgresStore
  *     const graph = builder.compile({ store });
  */
 
+import type { ToolMessage } from "@langchain/core/messages";
+import type { ToolCall } from "@langchain/core/messages/tool";
 import {
   BaseStore,
+  type Command,
   type GetOperation,
   type Item,
+  type LangGraphRunnableConfig,
   type Operation,
   type OperationResults,
   type PutOperation,
   type SearchOperation,
 } from "@langchain/langgraph";
+import { ToolNode } from "@langchain/langgraph/prebuilt";
 
+import type { WakeCallbackHandler } from "./langchain.ts";
 import { LABEL_KEY, type Label, type Memory, type WriteLabel } from "./memory.ts";
 
 type SearchItem = Item & { score?: number };
 
-export { AgentRun, WakeCallbackHandler } from "./langchain.ts";
+export { AgentHalted, AgentRun, WakeCallbackHandler } from "./langchain.ts";
+
+/**
+ * A ToolNode that refuses a tool call a halt covers before it runs, answering the model with
+ * why, and records it as denied: new WakeToolNode(handler, tools), where the handler was given
+ * the brake's rules. Any other call runs as in a ToolNode.
+ */
+export class WakeToolNode<T = any> extends ToolNode<T> {
+  readonly #handler: WakeCallbackHandler;
+
+  constructor(handler: WakeCallbackHandler, ...args: ConstructorParameters<typeof ToolNode>) {
+    super(...args);
+    this.#handler = handler;
+  }
+
+  protected override async runTool(call: ToolCall, config: LangGraphRunnableConfig, state: unknown): Promise<ToolMessage | Command> {
+    return this.#handler._toolRefusal(call) ?? super.runTool(call, config, state);
+  }
+}
 
 function isPut(op: Operation): op is PutOperation {
   return "value" in op && "key" in op;

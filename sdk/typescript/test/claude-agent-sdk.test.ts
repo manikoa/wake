@@ -20,6 +20,7 @@ import { z } from "zod";
 import { links, Recorder } from "../src/index.ts";
 import { WakeClaudeAgent } from "../src/claude-agent-sdk.ts";
 import { Memory } from "../src/memory.ts";
+import { UNCHECKED } from "../src/stop.ts";
 import { caller, fakeClaudeCode, type FakeClaudeCode } from "./claude-fakes.ts";
 import { attr, id, origins, parents, parentSpanId, payload, recorded, wakeEvents } from "./helpers.ts";
 
@@ -400,10 +401,37 @@ test("a halt of the agent stops it and starts no subagent, and no halt stops not
     "the subagent never started: nothing handed it a task, and it did nothing",
   );
   assert.deepEqual(new Set(wakeEvents(all, "denied").map((e) => attr(e, "wake.brake.halt_id"))), new Set(["halt-support"]));
+  assert.ok(wakeEvents(all, "denied").every((e) => origins(e).length === 0), "the tools never ran: nothing of them entered");
   assert.ok(!all.some((s) => s.name.startsWith("invoke_agent support/")));
   assert.equal(seenLinks.length, before, "the in-process tool never ran");
   // Without a halt, the same run records as before: nothing refused.
   assert.equal(wakeEvents((await support()).spans, "denied").length, 0);
+});
+
+test("a halt check that fails refuses the call: the brake fails closed", async () => {
+  const { recorder, spans } = recorded("support");
+  const broken = {
+    halted(): string | null {
+      throw new Error("the rules can't be read");
+    },
+  };
+  const before = seenLinks.length;
+  await runSupport(new WakeClaudeAgent(recorder, { quarantine: broken }));
+  const all = await spans();
+  assert.deepEqual(summary(all), [
+    ["model_call", "support", "chat claude-opus-5-5"],
+    ["denied", "support", "execute_tool mcp__crm__lookup_order"],
+    ["model_call", "support", "chat claude-opus-5-5"],
+    ["denied", "support", "execute_tool Agent"],
+    ["model_call", "support", "chat claude-opus-5-5"],
+  ]);
+  assert.deepEqual(new Set(wakeEvents(all, "denied").map((e) => attr(e, "wake.brake.halt_id"))), new Set([UNCHECKED]));
+  assert.equal(seenLinks.length, before, "the in-process tool never ran");
+  const claude = new WakeClaudeAgent(recorded("support").recorder, { quarantine: broken });
+  assert.deepEqual(claude._halting({ session_id: "session-1", tool_name: "Bash" }, undefined), [
+    UNCHECKED,
+    "Wake couldn't check its halts, so this tool call wasn't run.",
+  ]);
 });
 
 for (const hookFirst of [false, true]) {

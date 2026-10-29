@@ -22,26 +22,41 @@ Inputs and outputs are only in the trace when the SDK's trace_include_sensitive_
 on, as it is by default. Without them, events are recorded with empty payloads, and the
 SDK's loop links them instead: a tool call comes from its agent's latest response, and a
 response reads that response and the tool results since.
+
+Given the brake's rules (install(recorder, quarantine=Quarantine(...))), guard(agent) also
+stops an agent, or one instance of it, in its own process: a call a halt covers, to a
+function tool, an agent used as a tool or an MCP server's tool, is refused before it runs,
+by a tool input guardrail, and recorded as denied; a refused agent tool starts no run. A
+halted agent is offered no handoff. Hosted tools run at OpenAI, and can't be refused here.
+It's a cooperative stop: it holds only while the agent's code does.
 """
 
 import hashlib
+import inspect
+import logging
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
-from wake import events, links
+from wake import events, links, stop
 from wake._graph import EventGraph, _Recent, never_raise
 from wake.recorder import Recorder
 
+if TYPE_CHECKING:
+    from wake.quarantine import Quarantine
+
+log = logging.getLogger("wake")
 
 
-def install(recorder: Recorder) -> "WakeTracingProcessor":
-    """Adds Wake as a trace processor for every OpenAI Agents SDK run in this process."""
+def install(recorder: Recorder, quarantine: "Quarantine | None" = None) -> "WakeTracingProcessor":
+    """Adds Wake as a trace processor for every OpenAI Agents SDK run in this process. With
+    quarantine, the brake's rules for the agent (wake.quarantine), guard() stops what a halt
+    covers."""
     from agents.tracing import add_trace_processor
 
-    processor = WakeTracingProcessor(recorder)
+    processor = WakeTracingProcessor(recorder, quarantine=quarantine)
     add_trace_processor(processor)
     return processor
 
@@ -84,8 +99,12 @@ def _text(value: Any) -> str:
 class WakeTracingProcessor(EventGraph):
     """An OpenAI Agents SDK TracingProcessor that records Wake events."""
 
-    def __init__(self, recorder: Recorder) -> None:
+    def __init__(self, recorder: Recorder, quarantine: "Quarantine | None" = None) -> None:
         super().__init__(recorder)
+        self._quarantine = quarantine
+        self._guardrail = None  # the tool input guardrail guard() adds, made once
+        self._halted = _Recent()  # sdk span id of a tool call -> the halt its guardrail refused it under
+        self._instances = _Recent()  # instance -> its agent and lineage, for each Wake has seen start
         self._parent = _Recent()  # sdk span id -> its parent's sdk span id
         self._agent_span = _Recent()  # sdk span id of an agent span -> agent name
         self._pending = _Recent()  # sdk span id -> what on_span_start set up
@@ -144,6 +163,8 @@ class WakeTracingProcessor(EventGraph):
             with self._lock:
                 self._agent_span[span.span_id] = data.name
                 instance, lineage = self._identity(span.span_id)
+                if instance:
+                    self._instances[instance] = (data.name, lineage)
             attributes = {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name,
                           events.AGENT_ID: data.name, **events.instance_attributes(instance, lineage)}
         otel = self._recorder.tracer.start_span(f"{kind} {getattr(data, 'name', '') or ''}".strip(), context=self._context(span), attributes=attributes)
@@ -190,6 +211,118 @@ class WakeTracingProcessor(EventGraph):
 
     def force_flush(self) -> None:
         self._recorder.flush()
+
+    # Cooperative stops.
+
+    def guard(self, agent):
+        """Has the brake's halts stop this agent, and every agent it reaches as a tool or by a
+        handoff, in this process, and returns it. Each function tool, agent used as a tool and
+        MCP server gets a tool input guardrail that refuses a call a halt covers before it
+        runs, and each handoff is offered only while the agent offering it isn't halted.
+        Bare agents in handoffs become the handoff the SDK would make of them."""
+        from agents import Agent, FunctionTool, Handoff, handoff
+        from agents.tool_guardrails import ToolInputGuardrail
+
+        if self._quarantine is None:
+            raise ValueError("guard() needs the brake's rules: install(recorder, quarantine=Quarantine(...))")
+        if self._guardrail is None:
+            self._guardrail = ToolInputGuardrail(guardrail_function=self._check_tool_call, name="wake_halts")
+        seen: set[int] = set()
+        todo = [agent]
+        while todo:
+            current = todo.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            for tool in current.tools:
+                if not isinstance(tool, FunctionTool):
+                    continue  # hosted tools run at OpenAI
+                if self._guardrail not in (tool.tool_input_guardrails or []):
+                    tool.tool_input_guardrails = [*(tool.tool_input_guardrails or []), self._guardrail]
+                if getattr(tool, "_is_agent_tool", False) and getattr(tool, "_agent_instance", None) is not None:
+                    todo.append(tool._agent_instance)
+            for server in getattr(current, "mcp_servers", None) or []:
+                if hasattr(server, "tool_input_guardrails") and self._guardrail not in (server.tool_input_guardrails or []):
+                    server.tool_input_guardrails = [*(server.tool_input_guardrails or []), self._guardrail]
+            handoffs = []
+            for item in current.handoffs:
+                if isinstance(item, Agent):
+                    todo.append(item)
+                    item = handoff(item)
+                elif isinstance(item, Handoff) and item._agent_ref is not None and item._agent_ref() is not None:
+                    todo.append(item._agent_ref())
+                handoffs.append(self._guard_handoff(item))
+            current.handoffs = handoffs
+        return agent
+
+    def _guard_handoff(self, item):
+        """The handoff, offered only while the agent offering it isn't halted."""
+        enabled = item.is_enabled
+        if getattr(enabled, "_wake", False):
+            return item
+
+        async def is_enabled(context, agent) -> bool:
+            if self._refusal(getattr(agent, "name", None) or self._recorder.agent) is not None:
+                return False
+            if isinstance(enabled, bool):
+                return enabled
+            result = enabled(context, agent)
+            return bool(await result) if inspect.isawaitable(result) else bool(result)
+
+        is_enabled._wake = True  # type: ignore[attr-defined]
+        item.is_enabled = is_enabled
+        return item
+
+    def _check_tool_call(self, data):
+        """The guardrail: refuses a call a halt covers, telling the model why."""
+        from agents.tool_guardrails import ToolGuardrailFunctionOutput
+
+        try:
+            refused = self._refusal(getattr(data.agent, "name", None) or self._recorder.agent, mark=True)
+        except Exception:
+            log.warning("wake: couldn't check the halts for a tool call; refusing it", exc_info=True)
+            refused = stop.unchecked()
+        if refused is None:
+            return ToolGuardrailFunctionOutput.allow()
+        return ToolGuardrailFunctionOutput.reject_content(refused.reason, output_info={"halt": refused.halt})
+
+    def _refusal(self, agent: str, *, mark: bool = False) -> "stop.Refusal | None":
+        """The refusal of what a run of agent is about to do, if a halt covers it: by its name,
+        the instance the run is and those that started it. The run is the one the SDK's current
+        span is in, as for its events. While Wake can't place it, a halt on any run of the
+        agent Wake has seen refuses it. mark notes the refusal on the current tool call, so it
+        is recorded as denied."""
+        if self._quarantine is None:
+            return None
+        sid = None
+        try:
+            from agents.tracing import get_current_span
+
+            span = get_current_span()
+            sid = getattr(span, "span_id", None)
+            names, unplaced, who = {self._recorder.agent, agent}, set(), agent
+            with self._lock:
+                agent_sid = self._agent_above(sid) if sid is not None else None
+                if agent_sid is not None and self._agent_span.get(agent_sid) == agent:
+                    instance, lineage = self._identity(agent_sid)
+                    names.update(lineage)
+                    if instance:
+                        names.add(instance)
+                        who = instance
+                else:
+                    for instance, (name, lineage) in self._instances.items():
+                        if name == agent:
+                            unplaced.update((instance, *lineage))
+            refused = stop.refusal(self._quarantine, who, names, unplaced=unplaced)
+        except Exception:
+            log.warning("wake: couldn't check the halts for %s; refusing", agent, exc_info=True)
+            refused = stop.unchecked()
+        if refused is not None and mark and sid is not None:
+            with self._lock:
+                if sid in self._pending:
+                    self._halted[sid] = refused.halt
+            log.warning("wake: refused a tool call of %s: %s", agent, refused.halt)
+        return refused
 
     # Spans.
 
@@ -339,8 +472,15 @@ class WakeTracingProcessor(EventGraph):
         attributes = {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": data.name}
         if mcp and mcp.get("server"):
             attributes["wake.mcp.server"] = str(mcp["server"])
-        self._event(otel, span, event_id, events.TOOL_CALL, f"execute_tool {data.name}", agent, parents,
-                    [f"tool:{data.name}"], attributes, {"input": data.input, "output": _plain(data.output)})
+        kind, origins = events.TOOL_CALL, [f"tool:{data.name}"]
+        with self._lock:
+            halt = self._halted.pop(span.span_id, None)
+        if halt:
+            # Refused in the agent's own process, under the halt: what the agent tried. The
+            # tool never ran, so nothing of it entered.
+            kind, origins, attributes["wake.brake.halt_id"] = events.DENIED, [], halt
+        self._event(otel, span, event_id, kind, f"execute_tool {data.name}", agent, parents,
+                    origins, attributes, {"input": data.input, "output": _plain(data.output)})
         self._remember_output(trace_id, event_id, _text(data.output) if not isinstance(data.output, str) else data.output)
         otel.end()
 
