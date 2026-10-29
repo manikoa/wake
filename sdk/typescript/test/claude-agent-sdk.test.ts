@@ -434,40 +434,53 @@ test("a halt check that fails refuses the call: the brake fails closed", async (
   ]);
 });
 
-for (const hookFirst of [false, true]) {
-  test(`a spawn a halt refuses is recorded as a denied call, ${hookFirst ? "its hook" : "the stream"} first`, async () => {
-    const { recorder, spans } = recorded("support");
-    const halts = new Halts();
-    halts.halts = [{ id: "halt-support", agents: ["support"] }];
-    const ask = research("Check the refund window");
-    const read: SDKMessage[] = [];
-    const script = async (cli: FakeClaudeCode) => {
-      cli.emit(INIT);
-      const asked = () => cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: ask }]);
-      if (!hookFirst) {
-        asked();
-        await until(() => read.some((m) => m.type === "assistant"), "the Agent call is read");
-      }
-      const never = async () => assert.fail("a refused subagent never starts");
-      await cli.spawn("toolu_agent", ask, never, { subagentId: "agent-researcher", ask: hookFirst ? asked : undefined });
-      cli.assistant("msg_2", [{ type: "text", text: "I was stopped." }]);
-      cli.emit(result("I was stopped."));
-    };
-    await runSupport(new WakeClaudeAgent(recorder, { quarantine: halts }), script, [lookupOrder()], read);
-    const all = await spans();
-    assert.deepEqual(summary(all), [
-      ["model_call", "support", "chat claude-opus-5-5"],
-      ["denied", "support", "execute_tool Agent"],
-      ["model_call", "support", "chat claude-opus-5-5"],
-    ]);
-    const calls = wakeEvents(all, "model_call");
-    const refused = byName(all, "execute_tool Agent");
-    assert.equal(attr(refused, "wake.brake.halt_id"), "halt-support");
-    assert.deepEqual(parents(refused), [id(calls[0])], "the call that asked for it");
-    assert.deepEqual(payload(refused).input, ask);
-    assert.ok(parents(calls[1]).includes(id(refused)), "the model read the refusal");
-    assert.ok(!all.some((s) => s.name.startsWith("invoke_agent support/")));
-  });
+// A halt on the agent stops it starting anything; one on a subagent type stops any agent
+// starting one of that type, though the agent itself goes on.
+for (const halted of ["support", "support/researcher"]) {
+  for (const hookFirst of [false, true]) {
+    test(`a spawn a halt on ${halted} refuses is recorded as a denied call, ${hookFirst ? "its hook" : "the stream"} first`, async () => {
+      const { recorder, spans } = recorded("support");
+      const halts = new Halts();
+      halts.halts = [{ id: "halt-support", agents: [halted] }];
+      const ask = research("Check the refund window");
+      const read: SDKMessage[] = [];
+      const seen: FakeClaudeCode[] = [];
+      const script = async (cli: FakeClaudeCode) => {
+        seen.push(cli);
+        cli.emit(INIT);
+        const asked = () => cli.assistant("msg_1", [{ type: "tool_use", id: "toolu_agent", name: "Agent", input: ask }]);
+        if (!hookFirst) {
+          asked();
+          await until(() => read.some((m) => m.type === "assistant"), "the Agent call is read");
+        }
+        const never = async () => assert.fail("a refused subagent never starts");
+        await cli.spawn("toolu_agent", ask, never, { subagentId: "agent-researcher", ask: hookFirst ? asked : undefined });
+        cli.assistant("msg_2", [{ type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "date" } }]);
+        await cli.useTool("toolu_bash", "Bash", { command: "date" }, async () => "ok");
+        cli.assistant("msg_3", [{ type: "text", text: "I was stopped." }]);
+        cli.emit(result("I was stopped."));
+      };
+      await runSupport(new WakeClaudeAgent(recorder, { quarantine: halts }), script, [lookupOrder()], read);
+      const all = await spans();
+      const agentHalted = halted === "support";
+      assert.deepEqual(summary(all), [
+        ["model_call", "support", "chat claude-opus-5-5"],
+        ["denied", "support", "execute_tool Agent"],
+        ["model_call", "support", "chat claude-opus-5-5"],
+        [agentHalted ? "denied" : "tool_call", "support", "execute_tool Bash"],
+        ["model_call", "support", "chat claude-opus-5-5"],
+      ]);
+      assert.deepEqual(seen[0].refused, agentHalted ? ["toolu_agent", "toolu_bash"] : ["toolu_agent"]);
+      const calls = wakeEvents(all, "model_call");
+      const refused = byName(all, "execute_tool Agent");
+      assert.equal(attr(refused, "wake.brake.halt_id"), "halt-support");
+      assert.deepEqual(parents(refused), [id(calls[0])], "the call that asked for it");
+      assert.deepEqual(payload(refused).input, ask);
+      assert.equal(payload(refused).output, `Wake halted ${halted} (halt-support), so this tool call wasn't run.`);
+      assert.ok(parents(calls[1]).includes(id(refused)), "the model read the refusal");
+      assert.ok(!all.some((s) => s.name.startsWith("invoke_agent support/")));
+    });
+  }
 }
 
 test("a halt of the agent landing while a subagent runs stops the subagent too", async () => {

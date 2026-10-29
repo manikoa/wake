@@ -24,22 +24,28 @@ name or the process's agent is locked.
 
 The rules carry the halts in force too, so an integration can stop its agent, or one
 instance of it such as an in-process subagent, in the agent's own process: the Claude
-Agent SDK, OpenAI Agents SDK and LangChain integrations refuse their tool calls, and the
-runs they'd start (halted, wake.stop). That reaches what the proxy deny can't, such as
-built-in tools and subagents that call with their parent's credentials, but like the rest
-of this it holds only while the agent's code does.
+Agent SDK integration, OpenAI Agents SDK's guard() and a LangChain handler given these rules
+refuse their tool calls, and the runs they'd start (halted, wake.stop). That reaches what
+the proxy deny can't, such as built-in tools and subagents that call with their parent's
+credentials, but like the rest of this it holds only while the agent's code does.
 
 The proxy notes each fetch by the agent and the process it names, which is how the brake
 confirms an adapter, or an integration's stop, has a quarantine or a halt: only once every
-process of the agent that fetched in the last minute has it. Each fetch names the agent
-and this process, and a forked process starts fetching on its own. Fetches go straight to the URL
-given: the app's proxy settings, such as HTTP_PROXY, never apply. All of this runs in the
-agent's own process, so it holds only as long as the agent's code does; the proxy deny
+process of the agent it still waits on has it. Each fetch names the agent and this
+process, and gives the process's ttl in whole seconds (ttl=), rounded up: the proxy holds a
+process's note back for that long, since until then the process may still act on the rules
+it last fetched, and after it the process refuses everything as stale. Once an integration
+that refuses halted instances' calls uses these rules, each fetch says so too (stops=1), and
+the brake calls an in-process stop of an instance confirmed only when the agent's processes
+say they stop instances. A forked process starts fetching on its own. Fetches go straight to
+the URL given: the app's proxy settings, such as HTTP_PROXY, never apply. All of this runs in
+the agent's own process, so it holds only as long as the agent's code does; the proxy deny
 doesn't depend on it.
 """
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -150,6 +156,7 @@ class Quarantine:
         self._warned_stale = False
         self._warned_full = False
         self._closed = False
+        self._stops = False  # whether an integration refuses halted instances' calls with these rules
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         if start:
@@ -201,7 +208,10 @@ class Quarantine:
         given. Never raises: on failure the last rules stand until they're stale."""
         agent = agent or self._agent
         try:
-            query = urllib.parse.urlencode({"agent": agent, "process": self._process})
+            params = {"agent": agent, "process": self._process, "ttl": math.ceil(self._ttl)}
+            if self._stops:
+                params["stops"] = 1
+            query = urllib.parse.urlencode(params)
             with _opener.open(f"{self._url}?{query}", timeout=timeout or self._timeout) as response:
                 body = response.read(MAX_RULES_BYTES + 1)
             if len(body) > MAX_RULES_BYTES:
@@ -239,6 +249,11 @@ class Quarantine:
     def close(self) -> None:
         self._closed = True
         self._stop.set()
+
+    def _stops_instances(self) -> None:
+        """Called by an integration that refuses halted instances' calls with these rules
+        (wake.stop.stops_with): from the next fetch on, each says so."""
+        self._stops = True
 
     def health(self) -> QuarantineHealth:
         """Whether the rules for the quarantine's agent are fresh."""

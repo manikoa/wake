@@ -65,7 +65,7 @@ When an SDK can't tell which instance made a call, it leaves the instance out ra
 What makes an instance, by integration:
 
 - **Claude Agent SDK:** each subagent the Agent tool starts, `<agent>/<subagent type>#<the Agent tool use id>`. The `agent_message` handing it its task is recorded once it has started, so an Agent tool call refused before then, as by a halt, makes no instance: it's recorded as the refused tool call it is. One the tool leaves running in the background, as it does by default, stays that instance until Claude Code says it has finished, in later turns too, and its answer is recorded then.
-- **OpenAI Agents SDK:** an agent run inside a tool call, as with `agent.as_tool()`, `<agent>#<the tool call's span id>` (the SDK's own span id), started by the agent that made the call. A response can call one agent as a tool several times at once, so each run inside a tool call is also linked as a workflow of its own: one copy's steps never take another's as parents, whatever their arguments. An agent a handoff reaches inside such a run is an instance of that run too. Runs of the workflow's own, handoffs included, aren't instances.
+- **OpenAI Agents SDK:** an agent run inside a tool call, as with `agent.as_tool()`, `<agent>#<its first agent span's id>` (the SDK's own span id), started by the agent that made the call. A response can call one agent as a tool several times at once, and a tool can run it several times, so each run is linked as a workflow of its own, its content matched within it: one copy's steps never take another's as parents, whatever their arguments or output. What a run inside a tool call said last is a parent of the step that reads the tool's result. An agent a handoff reaches inside such a run is an instance of that run too, under the same id. Runs of the workflow's own, handoffs included, aren't instances, but two at once in one trace are linked apart all the same. Runs are told apart by the task span the SDK opens for each, as it does by default; with those turned off, the runs inside one tool call, or at the top of one trace, share one instance and one set of links.
 - **LangChain and LangGraph:** a named run (`handler.agent(name)`) started inside another agent's run, `<name>#<its invoke_agent span id>`, started by that run. A LangGraph node is a step of the agent running the graph, not an agent of its own, so a node run several times at once isn't an instance.
 
 These come from the SDK, inside the agent's process, so they say what the agent reported, like the rest of an SDK event. Instances of one agent share its process and credentials, so the proxy sees them as that agent.
@@ -85,7 +85,7 @@ A message from agent A to agent B is an `agent_message` event in B's run, record
 - `wake.parents` are the events in A whose output the message carries.
 - `wake.payload` is `{"from": "<A>", "to": "<B>", "content": ...}`.
 
-The message is a parent of B's next event. An answer going back from B to A is another `agent_message`, this time in A's run, and it's a parent of the step in A that reads it. How the link travels between processes is in [linking.md](linking.md).
+The message is a parent of B's next event. An answer going back from B to A is another `agent_message`, this time in A's run, and it's a parent of the step in A that reads it. Where an SDK sees both ends, as for LangChain named runs in one process, the sender's latest event is a parent too, so a message the app words its own way still descends from what the sender did. How the link travels between processes is in [linking.md](linking.md).
 
 ## Denied calls
 
@@ -107,11 +107,11 @@ A call already under way when a halt lands is **cut**, and recorded the same way
 - **Its MCP form:** the `method` is the MCP method and the `host` the MCP server. The event's parent is the call's own `tool_call`, which records what the tool returned, though the caller never got it.
 - **What the exchange carried before the cut** is recorded as usual.
 
-An SDK that stops an agent in its own process records each call it refuses as a `denied` event of its own, captured by `sdk`. The Claude Agent SDK, OpenAI Agents SDK and LangChain integrations do, in both SDKs (see their READMEs).
-- **What it records:** the tool call the agent tried, with its arguments and the refusal as its output. Its parent is the model call that asked for it, and the model's next call reads the refusal.
+An SDK that stops an agent in its own process records each call it refuses as a `denied` event of its own, captured by `sdk`, once however many of its checks see the call. The Claude Agent SDK, OpenAI Agents SDK and LangChain integrations do, in both SDKs (see their READMEs).
+- **What it records:** the tool call the agent tried, with its arguments and the refusal as its output. That holds for a tool the agent runs itself, such as a shell or an editor, and for a call refused before the framework opened a span for it. Its parent is the model call that asked for it, and the model's next call reads the refusal.
 - **Its halt:** `wake.brake.halt_id` names the halt that covered the call, or `stale-rules` while the SDK's rules are stale, or `halt-check-failed` when it couldn't check them: it fails closed.
 - **No `wake.origins`:** nothing entered at the denial. The tool never ran, so nothing of it reached the agent, and a later step's chain doesn't count it.
-- **A refused run:** a LangChain run refused before it started is recorded as the `agent_message` that would have handed it its task, in the name of the run that tried, with `wake.brake.receiver` naming the run refused, and no `wake.origins` either.
+- **A refused run:** a LangChain run refused before it started, or an OpenAI Agents handoff refused as it started, is recorded as the `agent_message` that would have handed the run its task, in the name of what tried, with `wake.brake.receiver` naming the run refused, and no `wake.origins` either. A Claude Agent tool call that would start a halted subagent type is recorded as the refused tool call it is.
 
 ## Memory
 

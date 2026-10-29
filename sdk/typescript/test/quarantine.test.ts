@@ -12,10 +12,16 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 
 import { InMemoryStore } from "@langchain/langgraph";
+import { Agent } from "@openai/agents";
+import { InMemorySpanExporter } from "@opentelemetry/sdk-trace";
 
+import { WakeClaudeAgent } from "../src/claude-agent-sdk.ts";
+import { Recorder } from "../src/index.ts";
+import { WakeCallbackHandler } from "../src/langchain.ts";
 import { log } from "../src/log.ts";
 import { WakeStore } from "../src/langgraph.ts";
 import { contentOf, digest, LABEL_KEY, LABEL_SUFFIX, Memory } from "../src/memory.ts";
+import { WakeTracingProcessor } from "../src/openai-agents.ts";
 import { MemoryLocked, MemoryQuarantined, Quarantine, STALE } from "../src/quarantine.ts";
 import { attr, id, parents, sdk, tick, withAppProxy } from "./helpers.ts";
 import { EMAIL, rememberFromEmail, Session } from "./sessions.ts";
@@ -96,7 +102,7 @@ test("a locked agent can't write, and the refusal is recorded", async () => {
   const session = new Session("billing");
   r.quarantine({ locked_by: "q1", lock: { agents: ["billing"] } });
   const memory = await quarantined(session, r, "billing");
-  assert.match(r.fetchedBy.at(-1)!, /^\/v1\/memory\?agent=billing&process=\d+\.[0-9a-f]{12}$/);
+  assert.match(r.fetchedBy.at(-1)!, /^\/v1\/memory\?agent=billing&process=\d+\.[0-9a-f]{12}&ttl=30$/);
   const inner = new InMemoryStore();
   const store = new WakeStore(inner, memory);
 
@@ -257,6 +263,37 @@ test("the rules say who is halted", async () => {
     assert.equal(await q.fetch(), false);
     assert.equal(q.halted(["billing"]), "h-fleet");
   }
+});
+
+test("each fetch gives the ttl, and says once an integration stops instances", async () => {
+  const r = await rules();
+  const fetched = async (q: Quarantine) => {
+    r.fetchedBy.length = 0;
+    assert.ok(await q.fetch());
+    assert.equal(r.fetchedBy.length, 1);
+    return Object.fromEntries(new URL(r.fetchedBy[0], "http://x").searchParams);
+  };
+  const recorder = new Recorder({ agent: "support", exporter: new InMemorySpanExporter() });
+  let q = new Quarantine(r.url, { agent: "support", start: false, ttlMillis: 2500 });
+  new Memory(new Session("support").handler, { quarantine: q });
+  let query = await fetched(q);
+  assert.equal(query.ttl, "3", "in whole seconds, rounded up: the proxy holds the process back that long");
+  assert.equal(query.stops, undefined, "a memory adapter stops no instance");
+  const stopping: Record<string, (q: Quarantine) => unknown> = {
+    claude: (q) => new WakeClaudeAgent(recorder, { quarantine: q }),
+    langchain: (q) => new WakeCallbackHandler(recorder, { quarantine: q }),
+    openaiAgents: (q) => new WakeTracingProcessor(recorder, { quarantine: q }).guard(new Agent({ name: "support" })),
+  };
+  for (const [name, uses] of Object.entries(stopping)) {
+    q = new Quarantine(r.url, { agent: "support", start: false });
+    uses(q);
+    query = await fetched(q);
+    assert.deepEqual([query.agent, query.ttl, query.stops], ["support", "30", "1"], name);
+  }
+  // Installed, OpenAI Agents stops nothing until guard() runs.
+  q = new Quarantine(r.url, { agent: "support", start: false });
+  new WakeTracingProcessor(recorder, { quarantine: q });
+  assert.equal((await fetched(q)).stops, undefined);
 });
 
 test("stale rules halt everyone", async () => {

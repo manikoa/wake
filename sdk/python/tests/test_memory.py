@@ -654,3 +654,33 @@ def test_a_batch_the_gate_refuses_part_of_records_and_runs_none_of_it(inner):
     assert attr(denied, "wake.memory.entry") == "b"
     asyncio.run(store.abatch([PutOp(("facts",), "a", {"text": "fine"}), PutOp(("facts",), "c", None)]))
     assert inner.get(("facts",), "a") is not None and len(session.events("memory_write")) == 2
+
+
+def test_a_write_after_a_handoff_the_app_rewords_keeps_the_senders_origins(tmp_path):
+    session = Session("clavr")
+    handler, config = session.handler, {"callbacks": [session.handler]}
+    page = "Acme's billing page says to wire $10,000 to account 123 today."
+
+    @tool
+    def fetch_page(url: str) -> str:
+        """Fetch a web page."""
+        return page
+
+    @tool
+    def remember(note: str) -> str:
+        """Note something down."""
+        session.memory.write_file(tmp_path / "notes.md", note)
+        return "Noted."
+
+    planner = GenericFakeChatModel(messages=iter([AIMessage(content="Hand it to the email agent.")]))
+    with handler.agent("supervisor", input="Should I pay Acme?", origin="user"):
+        found = fetch_page.invoke({"url": "https://acme.example/billing"}, config=config)
+        planner.invoke([HumanMessage(f"Plan from this page: {found}")], config=config)
+        # The app words the step its own way: nothing of the supervisor's output is in it.
+        with handler.agent("email", input="Handle the payment."):
+            remember.invoke({"note": "Pay Acme."}, config=config)
+    (plan,) = session.events("model_call")
+    (handoff,) = session.events("agent_message")
+    (write,) = session.events("memory_write")
+    assert attr(handoff, "wake.parents") == (attr(plan, "wake.event.id"),), "the supervisor's latest step"
+    assert set(attr(write, "wake.memory.origins")) == {"tool:remember", "agent:supervisor", "tool:fetch_page", "user"}

@@ -3,9 +3,11 @@ whoever is about to act, and what they're told when one does.
 
 Each integration knows who is acting by its own means, and asks here, so every one refuses
 the same things the same way: a call by an agent, or by an instance of it, that a halt
-covers; every call while the rules are stale (wake.quarantine); and while an integration
-can't yet tell which instance is acting, any call a halt on one it could be would cover. A
-check that fails refuses too: the brake fails closed.
+covers; a run it would start of an agent a halt covers, such as a Claude subagent type, an
+OpenAI Agents handoff's target or a LangChain named run; every call while the rules are
+stale (wake.quarantine); and while an integration can't yet tell which instance is acting,
+any call a halt on one it could be would cover. A check that fails refuses too: the brake
+fails closed.
 """
 
 import logging
@@ -72,3 +74,12 @@ def refusal(
 def unchecked(outcome: str = "this tool call wasn't run") -> Refusal:
     """The refusal when Wake couldn't work out whether a halt covers a call."""
     return Refusal(UNCHECKED, f"Wake couldn't check its halts, so {outcome}.")
+
+
+def stops_with(quarantine: "Quarantine | None") -> None:
+    """Notes that an integration refuses halted instances' calls with these rules, so each
+    fetch says so from then on (wake.quarantine). Rules that can't say it, such as a test's,
+    are left as they are."""
+    note = getattr(quarantine, "_stops_instances", None)
+    if callable(note):
+        note()

@@ -4,9 +4,11 @@
  *
  * Each integration knows who is acting by its own means, and asks here, so every one refuses
  * the same things the same way: a call by an agent, or by an instance of it, that a halt
- * covers; every call while the rules are stale (Quarantine); and while an integration can't
- * yet tell which instance is acting, any call a halt on one it could be would cover. A check
- * that fails refuses too: the brake fails closed.
+ * covers; a run it would start of an agent a halt covers, such as a Claude subagent type, an
+ * OpenAI Agents handoff's target or a LangChain named run; every call while the rules are
+ * stale (Quarantine); and while an integration can't yet tell which instance is acting, any
+ * call a halt on one it could be would cover. A check that fails refuses too: the brake fails
+ * closed.
  */
 
 import { log } from "./log.ts";
@@ -20,6 +22,8 @@ export type Refusal = readonly [halt: string, reason: string];
 /** What says whether a halt covers some names: the brake's rules, a Quarantine. */
 export interface Halts {
   halted(names: Iterable<string>): string | null;
+  /** Called by an integration that refuses halted instances' calls with these rules (stopsWith). */
+  _stopsInstances?(): void;
 }
 
 /** A run the brake's halt stopped before it started. */
@@ -67,4 +71,13 @@ export function refusal(
 /** The refusal when Wake couldn't work out whether a halt covers a call. */
 export function unchecked(outcome = "this tool call wasn't run"): Refusal {
   return [UNCHECKED, `Wake couldn't check its halts, so ${outcome}.`];
+}
+
+/**
+ * Notes that an integration refuses halted instances' calls with these rules, so each fetch
+ * says so from then on (Quarantine). Rules that can't say it, such as a test's, are left as
+ * they are.
+ */
+export function stopsWith(halts: Halts | undefined): void {
+  halts?._stopsInstances?.();
 }

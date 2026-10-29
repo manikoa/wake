@@ -31,7 +31,8 @@
  * Given the brake's rules (new WakeClaudeAgent(recorder, { quarantine })), the hooks also stop
  * the agent, or one subagent instance of it, in its own process: a tool call a halt covers is
  * refused before it runs, and recorded as denied, an Agent tool call too, which then starts no
- * subagent. That reaches what the proxy deny can't, such as Bash, and subagents that call with
+ * subagent, and so is an Agent tool call that would start a subagent of a type a halt covers.
+ * That reaches what the proxy deny can't, such as Bash, and subagents that call with
  * their parent's credentials, which the proxy can't tell from their parent. It's a cooperative
  * stop: it holds only while the agent's code does, and a compromised agent can leave it out.
  */
@@ -46,7 +47,7 @@ import * as links from "./links.ts";
 import { log } from "./log.ts";
 import type { Quarantine } from "./quarantine.ts";
 import { now, type Recorder } from "./recorder.ts";
-import { refusal, unchecked, type Refusal } from "./stop.ts";
+import { refusal, stopsWith, unchecked, type Refusal } from "./stop.ts";
 
 /** The tool Claude Code starts a subagent with; older versions call it Task. */
 export const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
@@ -79,6 +80,12 @@ function text(content: unknown): string {
 
 function under(span: Span | undefined): Context | undefined {
   return span !== undefined ? trace.setSpan(ROOT_CONTEXT, span) : undefined;
+}
+
+/** The agent an Agent tool call starts: <agent>/<its subagent type>. */
+function subagent(agent: string, args: unknown): string {
+  const type = args !== null && typeof args === "object" ? (args as Json).subagent_type : undefined;
+  return `${agent}/${(typeof type === "string" && type) || "general-purpose"}`;
 }
 
 
@@ -242,6 +249,7 @@ export class WakeClaudeAgent extends EventGraph {
   constructor(recorder: Recorder, { quarantine }: { quarantine?: Pick<Quarantine, "halted"> } = {}) {
     super(recorder);
     this.#quarantine = quarantine;
+    stopsWith(quarantine);
   }
 
   // Setup.
@@ -326,8 +334,9 @@ export class WakeClaudeAgent extends EventGraph {
    * instance is known by the agent_id its hooks name, from its earlier calls or the Agent tool's
    * result. Before that, Wake can't tell which instance is calling: it could be any the session
    * started, or one started by any of them that the stream hasn't shown yet, since hooks can run
-   * ahead of the code reading it. So the call is refused if a halt covers any of them. A check
-   * that fails refuses the call too.
+   * ahead of the code reading it. So the call is refused if a halt covers any of them. An Agent
+   * tool call is refused too when a halt covers the subagent type it would start. A check that
+   * fails refuses the call too.
    */
   _halting(input: Json, toolUseId: string | undefined): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
@@ -341,6 +350,11 @@ export class WakeClaudeAgent extends EventGraph {
       who = known?.[0] ?? agent;
       const unplaced = agentId !== undefined && known === undefined ? this.#instances(input.session_id as string | undefined) : [];
       refused = refusal(this.#quarantine, who, [this._recorder.agent, agent, ...(known ?? [])], { unplaced });
+      if (refused === undefined && SUBAGENT_TOOLS.has(input.tool_name as string)) {
+        // What it would start: a new instance of that type, which no halt can name yet.
+        const target = subagent(this._recorder.agent, input.tool_input);
+        refused = refusal(this.#quarantine, target, [target]);
+      }
     } catch (error) {
       log.warn("couldn't check the halts for a tool call; refusing it", error);
       refused = unchecked();
@@ -674,7 +688,7 @@ export class WakeClaudeAgent extends EventGraph {
       return;
     }
     const args = (block.input !== null && typeof block.input === "object" ? block.input : {}) as Json;
-    const target = `${this._recorder.agent}/${(args.subagent_type as string | undefined) || "general-purpose"}`;
+    const target = subagent(this._recorder.agent, args);
     const prompt = args.prompt;
     const spawn = new Spawn(thread, block.name as string, block.input, parents);
     const given = typeof prompt === "string" ? [{ role: "user", content: prompt }] : [];
