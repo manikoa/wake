@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod origins;
 pub mod pipeline;
 pub mod policy;
+pub mod redact;
 pub mod signer;
 pub mod svid;
 pub mod token;

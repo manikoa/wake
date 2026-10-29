@@ -16,6 +16,9 @@ Or record every LangChain call in the process, and name the agent behind each ru
             answer = await email_agent.run(step_query)
             run.reply(answer)
 
+A run started inside another agent's run is an instance of its own, <name>#<its span id>,
+started by that run (docs/events.md), so two runs of one agent at once can be told apart.
+
 Causal edges follow the messages: a model call's parents are the events that
 produced the AI and tool messages in its context, and a tool call's parent is
 the model call that requested it. When an app builds its prompts from strings,
@@ -69,6 +72,13 @@ class AgentRun:
         self._handler = handler
         self._span = span
         self._parent = parent
+        # Started inside another agent's run, it's an instance of its own, started by that one.
+        self.instance: str | None = None
+        self.lineage: tuple[str, ...] = ()
+        if parent is not None:
+            suffix = format(span.get_span_context().span_id, "016x") if span is not None else uuid.uuid4().hex[:16]
+            self.instance = f"{agent}#{suffix}"
+            self.lineage = (*parent.lineage, parent.instance or parent.agent)
         self._lock = threading.Lock()
         # The message that started this run feeds its next event.
         self._next_parents: list[str] = []
@@ -370,6 +380,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             failed(self._recorder, "agent run")
             return AgentRun(self, name, None, enclosing)
         run = AgentRun(self, name, span, enclosing)
+        span.set_attributes(events.instance_attributes(run.instance, run.lineage))
         try:
             if enclosing is not None and input is not None:
                 message_id = self._record_message(sender=enclosing, receiver=run, content=input)
@@ -402,6 +413,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             events.EVENT_ID: event_id,
             events.EVENT_KIND: events.AGENT_MESSAGE,
             events.AGENT_ID: receiver.agent,
+            **events.instance_attributes(receiver.instance, receiver.lineage),
             events.CAPTURE: "sdk",
             events.PARENTS: parents,
             events.ORIGINS: [f"agent:{sender.agent}"],
@@ -465,6 +477,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             events.EVENT_ID: event_id,
             events.EVENT_KIND: kind,
             events.AGENT_ID: agent,
+            **(events.instance_attributes(run.instance, run.lineage) if run else {}),
             events.CAPTURE: "sdk",
             events.PARENTS: parents,
             events.ORIGINS: origins,
@@ -545,6 +558,10 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
     def _current_agent(self) -> str:
         run = _current_run.get()
         return run.agent if run else self._recorder.agent
+
+    def _current_instance(self) -> "tuple[str | None, tuple[str, ...]]":
+        run = _current_run.get()
+        return (run.instance, run.lineage) if run else (None, ())
 
     def _remember_tool_result(self, run_id: UUID, output: Any) -> None:
         with self._lock:

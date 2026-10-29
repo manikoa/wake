@@ -12,8 +12,11 @@ ids: a tool call's parent is the response that requested it, and a response's pa
 are the earlier responses and tool results in its input, as Responses items or as Chat
 Completions messages. A handoff is an agent_message in the receiving agent's name, fed by
 the response that handed off, and it feeds that agent's next step. An agent run inside a
-recorded tool call, such as an agent used as a tool, descends from that tool call. Where
-nothing else links events, content does, as for LangChain.
+recorded tool call, such as an agent used as a tool, descends from that tool call, and is
+an instance of its agent of its own, <agent>#<the tool call's span>, since a response can
+call the same agent as a tool more than once at a time (docs/events.md). Each such run is
+linked within itself, as a workflow of its own. Where nothing else links events, content
+does, as for LangChain.
 
 Inputs and outputs are only in the trace when the SDK's trace_include_sensitive_data is
 on, as it is by default. Without them, events are recorded with empty payloads, and the
@@ -86,18 +89,21 @@ class WakeTracingProcessor(EventGraph):
         self._parent = _Recent()  # sdk span id -> its parent's sdk span id
         self._agent_span = _Recent()  # sdk span id of an agent span -> agent name
         self._pending = _Recent()  # sdk span id -> what on_span_start set up
-        self._call = _Recent()  # (trace, tool name, arguments) -> (call id, response event id)
+        self._call = _Recent()  # (trace, scope, tool name, arguments) -> (call id, response event id)
         self._event_by_call = _Recent()  # call id -> tool call event id
         self._returned_by_event = _Recent()  # tool call event id -> events its output came from
         self._event_by_item = _Recent()  # response or output item id -> response event id
-        self._last_response = _Recent()  # (trace, agent) -> response event id
-        self._handed_off = _Recent()  # (trace, agent) -> handoff event id, feeding its next step
+        # A run's scope is the tool call it runs inside, its sdk span id, or None for the
+        # workflow's own: two copies of one agent called as tools at once never share state.
+        self._last_response = _Recent()  # (trace, scope, agent) -> response event id
+        self._handed_off = _Recent()  # (trace, scope, agent) -> handoff event id, feeding its next step
         self._seen_user = _Recent()  # (trace, digest) for user input already seen
         self._roots = _Recent(limit=1024)  # sdk trace id -> the workflow's root span
         self._linked = _Recent(limit=1024)  # sdk trace id -> what started it, feeding its first response
         self._spans = _Recent(limit=10_000)  # sdk span id -> its open span
         self._tool_agents = _Recent()  # tool call event id -> the agent making it
-        self._tools_since = _Recent()  # (trace, agent) -> tool calls since its last response, when inputs are hidden
+        self._tool_instances = _Recent()  # tool call event id -> the instance making it, and its lineage
+        self._tools_since = _Recent()  # (trace, scope, agent) -> tool calls since its last response, when inputs are hidden
         self._nested = _Recent()  # sdk span id of a tool call whose nested run's first response is recorded
 
     # TracingProcessor.
@@ -137,7 +143,9 @@ class WakeTracingProcessor(EventGraph):
         if kind == "agent":
             with self._lock:
                 self._agent_span[span.span_id] = data.name
-            attributes = {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name, events.AGENT_ID: data.name}
+                instance, lineage = self._identity(span.span_id)
+            attributes = {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name,
+                          events.AGENT_ID: data.name, **events.instance_attributes(instance, lineage)}
         otel = self._recorder.tracer.start_span(f"{kind} {getattr(data, 'name', '') or ''}".strip(), context=self._context(span), attributes=attributes)
         with self._lock:
             self._spans[span.span_id] = otel
@@ -151,12 +159,17 @@ class WakeTracingProcessor(EventGraph):
             # name stand in as its parents until it ends, for a memory write it makes.
             agent = self._agent_for(span)
             with self._lock:
+                scope = self._scope(span)
+                instance = self._identity(self._agent_above(span.parent_id))
                 self._pending[span.span_id] = {"event_id": event_id, "link": link}
                 self._tool_agents[event_id] = agent
-                requested_by = [r for (t, n, _), (_, r) in self._call.items() if t == span.trace_id and n == data.name]
-                if not requested_by and self._last_response.get((span.trace_id, agent)):
+                if instance[0]:
+                    self._tool_instances[event_id] = instance
+                requested_by = [r for (t, sc, n, _), (_, r) in self._call.items()
+                                if t == span.trace_id and sc == scope and n == data.name]
+                if not requested_by and self._last_response.get((span.trace_id, scope, agent)):
                     # Without sensitive data no call names it: the agent's latest response did.
-                    requested_by = [self._last_response[(span.trace_id, agent)]]
+                    requested_by = [self._last_response[(span.trace_id, scope, agent)]]
             self._remember_lineage(event_id, list(dict.fromkeys(requested_by)), [f"tool:{data.name}"])
 
     @never_raise
@@ -210,6 +223,7 @@ class WakeTracingProcessor(EventGraph):
         parents: list[str] = []
         origins: list[str] = []
         with self._lock:
+            scope = self._scope(span)
             linked = self._linked.pop(trace_key, None)
             if linked:
                 parents += linked
@@ -220,16 +234,16 @@ class WakeTracingProcessor(EventGraph):
             if tool is not None and tool[0] not in self._nested:
                 self._nested[tool[0]] = True
                 parents.append(tool[1])
-            handoff = self._handed_off.pop((trace_key, agent), None)
+            handoff = self._handed_off.pop((trace_key, scope, agent), None)
             if handoff:
                 parents.append(handoff)
             if hidden:
                 # The SDK's loop says what this response read: the agent's last response
                 # and the tool results since. Its first reads the workflow's input.
-                last = self._last_response.get((trace_key, agent))
+                last = self._last_response.get((trace_key, scope, agent))
                 if last:
                     parents.append(last)
-                parents += self._tools_since.pop((trace_key, agent), None) or []
+                parents += self._tools_since.pop((trace_key, scope, agent), None) or []
                 if not (linked or tool or handoff or last):
                     origins.append(events.ORIGIN_USER)
             for item in items:
@@ -262,20 +276,20 @@ class WakeTracingProcessor(EventGraph):
             "gen_ai.request.model": model,
         }, {"input": _plain(items), "output": _plain(output_items)})
         with self._lock:
-            self._last_response[(trace_key, agent)] = event_id
+            self._last_response[(trace_key, scope, agent)] = event_id
             if response_id:
                 self._event_by_item[response_id] = event_id
             for item in output_items:
                 if _field(item, "id"):
                     self._event_by_item[_field(item, "id")] = event_id
                 if _field(item, "type") == "function_call":
-                    key = (trace_key, _field(item, "name"), _field(item, "arguments"))
+                    key = (trace_key, scope, _field(item, "name"), _field(item, "arguments"))
                     self._call[key] = (_field(item, "call_id"), event_id)
                 # Chat Completions models, LiteLLM's included, report an assistant message
                 # with its tool calls.
                 for requested in _field(item, "tool_calls") or []:
                     function = _field(requested, "function") or {}
-                    key = (trace_key, _field(function, "name"), _field(function, "arguments"))
+                    key = (trace_key, scope, _field(function, "name"), _field(function, "arguments"))
                     self._call[key] = (_field(requested, "id"), event_id)
         self._remember_output(trace_id, event_id, _text(output_items))
         otel.end()
@@ -298,8 +312,9 @@ class WakeTracingProcessor(EventGraph):
         trace_id = otel.get_span_context().trace_id
         parents: list[str] = []
         with self._lock:
-            call = self._call.pop((span.trace_id, data.name, data.input), None)
-            handoff = self._handed_off.pop((span.trace_id, agent), None)
+            scope = self._scope(span)
+            call = self._call.pop((span.trace_id, scope, data.name, data.input), None)
+            handoff = self._handed_off.pop((span.trace_id, scope, agent), None)
         if handoff:
             parents.append(handoff)
         if call:
@@ -315,9 +330,9 @@ class WakeTracingProcessor(EventGraph):
             # Without sensitive data the SDK leaves the arguments out, but a tool only runs
             # from its agent's latest response, and its result feeds the agent's next one.
             with self._lock:
-                last = self._last_response.get((span.trace_id, agent))
-                since = self._tools_since.get((span.trace_id, agent)) or []
-                self._tools_since[(span.trace_id, agent)] = [*since, event_id]
+                last = self._last_response.get((span.trace_id, scope, agent))
+                since = self._tools_since.get((span.trace_id, scope, agent)) or []
+                self._tools_since[(span.trace_id, scope, agent)] = [*since, event_id]
             if last:
                 parents.append(last)
         mcp = data.mcp_data if isinstance(getattr(data, "mcp_data", None), dict) else None
@@ -332,7 +347,8 @@ class WakeTracingProcessor(EventGraph):
     def _handoff_ended(self, span, data) -> None:
         source, target = data.from_agent or "unknown", data.to_agent or "unknown"
         with self._lock:
-            requested_by = self._last_response.get((span.trace_id, source))
+            scope = self._scope(span)
+            requested_by = self._last_response.get((span.trace_id, scope, source))
         otel = self._take(span)
         if otel is None:
             return
@@ -341,7 +357,7 @@ class WakeTracingProcessor(EventGraph):
                     [requested_by] if requested_by else [], [f"agent:{source}"],
                     {"gen_ai.agent.name": target}, {"from": source, "to": target})
         with self._lock:
-            self._handed_off[(span.trace_id, target)] = event_id
+            self._handed_off[(span.trace_id, scope, target)] = event_id
         otel.end()
 
     # Helpers.
@@ -349,13 +365,53 @@ class WakeTracingProcessor(EventGraph):
     def _enclosing_tool(self, span) -> tuple[str, str] | None:
         """The recorded tool call a span runs inside, as its sdk span id and event id, if
         any. Call with the lock held."""
-        sid = span.parent_id
+        return self._tool_above(span.parent_id)
+
+    def _tool_above(self, sid) -> tuple[str, str] | None:
+        """The recorded tool call at or above sdk span sid, as its sdk span id and event id.
+        Call with the lock held."""
         while sid is not None:
             pending = self._pending.get(sid)
             if pending is not None:
                 return sid, pending["event_id"]
             sid = self._parent.get(sid)
         return None
+
+    def _scope(self, span) -> str | None:
+        """The run a span belongs to: the tool call it runs inside, or None for the
+        workflow's own. Call with the lock held."""
+        tool = self._enclosing_tool(span)
+        return tool[0] if tool else None
+
+    def _agent_above(self, sid) -> str | None:
+        """The agent span at or above sdk span sid. Call with the lock held."""
+        while sid is not None:
+            if sid in self._agent_span:
+                return sid
+            sid = self._parent.get(sid)
+        return None
+
+    def _run(self, agent_sid) -> tuple[str | None, tuple[str, ...]]:
+        """The tool call an agent span's run is inside, and the lineage that started it:
+        the agent that made the call, after its own lineage. None for a run of the
+        workflow's own. Call with the lock held."""
+        if agent_sid is None:
+            return None, ()
+        tool = self._tool_above(self._parent.get(agent_sid))
+        if tool is None:
+            return None, ()
+        outer = self._agent_above(self._parent.get(tool[0]))
+        outer_instance, outer_lineage = self._identity(outer)
+        outer_name = self._agent_span.get(outer) if outer is not None else self._recorder.agent
+        return tool[0], (*outer_lineage, outer_instance or outer_name)
+
+    def _identity(self, agent_sid) -> tuple[str | None, tuple[str, ...]]:
+        """The instance an agent span's run is, <agent>#<the tool call's sdk span id>, and
+        the lineage that started it. Call with the lock held."""
+        tool, lineage = self._run(agent_sid)
+        if tool is None:
+            return None, ()
+        return f"{self._agent_span[agent_sid]}#{tool}", lineage
 
     def _agent_for(self, span) -> str:
         with self._lock:
@@ -376,6 +432,16 @@ class WakeTracingProcessor(EventGraph):
                 return agent
         return self._recorder.agent
 
+    def _current_instance(self) -> "tuple[str | None, tuple[str, ...]]":
+        """The instance whose tool call is running, for a memory write it makes."""
+        link = links.current()
+        if link is not None:
+            with self._lock:
+                instance = self._tool_instances.get(link.event_id)
+            if instance:
+                return instance
+        return None, ()
+
     def _context(self, span):
         """Under the closest enclosing span Wake opened, else the workflow's root."""
         with self._lock:
@@ -394,6 +460,10 @@ class WakeTracingProcessor(EventGraph):
     def _event(self, otel, span, event_id, kind, name, agent, parents, origins, attributes, payload) -> None:
         parents = list(dict.fromkeys(parents))
         self._remember_lineage(event_id, parents, origins)
+        with self._lock:
+            # In the run the span is in. A handoff is recorded in its target's name, and the
+            # target runs where its source did: the same run, as an instance of its own.
+            tool, lineage = self._run(self._agent_above(span.parent_id))
         otel.update_name(name)
         otel.set_attributes({
             events.EVENT_ID: event_id,
@@ -402,6 +472,7 @@ class WakeTracingProcessor(EventGraph):
             events.CAPTURE: "sdk",
             events.PARENTS: parents,
             events.ORIGINS: origins,
+            **events.instance_attributes(f"{agent}#{tool}" if tool else None, lineage),
             **attributes,
         })
         if span.error:

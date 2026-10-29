@@ -60,3 +60,9 @@ path = "fuzz_targets/flow_policy.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "redact"
+path = "fuzz_targets/redact.rs"
+test = false
+doc = false

@@ -671,6 +671,7 @@ export class Memory {
           [events.EVENT_ID]: id,
           [events.EVENT_KIND]: kind,
           [events.AGENT_ID]: h._currentAgent(),
+          ...events.instanceAttributes(...h._currentInstance()),
           [events.CAPTURE]: "memory_adapter",
           [events.PARENTS]: parents,
           [events.ORIGINS]: origins,

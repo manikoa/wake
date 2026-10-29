@@ -26,6 +26,7 @@ Wake becomes one of the Agents SDK's trace processors. Each agent's run is named
 - A tool call's parent is the response that requested it.
 - A response's parents are the earlier responses and tool results in its input.
 - A handoff is an `agent_message` that feeds the receiving agent's next step.
+- An agent run inside a tool call, as with `agent.as_tool()`, is an instance of its own, `<agent>#<the tool call's span id>`, in `wake.agent.instance`, with `wake.agent.lineage` naming the agent that called it (see docs/events.md). Each such run is linked within itself, so two copies of one agent called at once never take each other's steps as parents.
 
 Inputs and outputs are recorded when the SDK's `trace_include_sensitive_data` is on, as it is by default. Without it, events have empty payloads, and the SDK's loop links them instead: a tool call comes from its agent's latest response, and a response reads that response and the tool results since. Chat Completions models, LiteLLM's included, link as Responses models do, and an agent run inside a tool call, such as one used as a tool, descends from that call. Install with the `openai-agents` extra.
 
@@ -43,7 +44,7 @@ async for message in claude.record(query(prompt=prompt, options=options), prompt
     ...
 ```
 
-Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. One `agent_message` hands it the task and another carries its answer back. Links come from the SDK's ids:
+Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. Several of one type can run at once, so each is also an instance, `support/<subagent type>#<the Agent tool use that started it>`, in `wake.agent.instance`, with `wake.agent.lineage` naming what started it (see docs/events.md). One `agent_message` hands it the task and another carries its answer back. Links come from the SDK's ids:
 - A tool call's parent is the model call that asked for it.
 - A model call's parents are the call before it and the tool results and messages new in its context.
 - With `ClaudeSDKClient`, wrap each `receive_response()`, and a later turn continues from the last.
@@ -64,7 +65,7 @@ with handler.agent("supervisor", input=question, origin="user"):
         run.reply(answer)
 ```
 
-A handoff is recorded as an `agent_message` event in the receiving agent's run, and it feeds that agent's next event. When prompts are built from strings, so no message ids link one call to the next, an event's parents are the earlier events in the same trace whose output appears in its input.
+A handoff is recorded as an `agent_message` event in the receiving agent's run, and it feeds that agent's next event. A run started inside another agent's run is an instance of its own, `<name>#<its span id>`, in `wake.agent.instance`, with `wake.agent.lineage` naming the run that started it, so two runs of one agent at once can be told apart. When prompts are built from strings, so no message ids link one call to the next, an event's parents are the earlier events in the same trace whose output appears in its input.
 
 The recorder sends to `WAKE_ENDPOINT`, or `http://localhost:4318` by default. Over TLS with a private CA, set `WAKE_CA_FILE` to the CA's certificate. Wake reads only its own `WAKE_*` settings. The app's `OTEL_*` variables, such as its sampler, exporter headers or attribute limits, configure the app's telemetry and never Wake's. Its proxy settings, such as `HTTPS_PROXY`, and `REQUESTS_CA_BUNDLE` and `.netrc` apply to its own traffic, and Wake's goes straight to the collector. Wake records every event even under an unsampled parent. `flush()` waits at most its timeout, and returns False if events were dropped since the last flush. `health()` counts events sent and dropped, and `failed`, those the SDK couldn't record. Install with the `langchain` or `langgraph` extra.
 
@@ -192,6 +193,19 @@ class Researcher(AgentExecutor):
 The reply names the receiver's last step, and the proxy names its record of the reply in the response's `wake-parents` header, which Wake's HTTP client reads. So the sender's next model call, the one that reads the tool's result, descends from the reply and from whatever the receiver read to produce it. Without the proxy, call `wake_a2a.replied(reply)` on each reply the client yields.
 
 A run started inside the block is linked whatever records it: LangChain or LangGraph, the OpenAI Agents SDK or the Claude Agent SDK. Its first step's parent is the proxy's record of the message when the message went through agentgateway, or else the sender's tool call. For other servers, pass the request's headers and the message's metadata to `wake.links.received(headers=..., metadata=...)`. The same holds for a run started inside a recorded tool call: it descends from the tool call. Install with the `a2a` extra.
+
+## A sub-agent's own AWS session
+
+When each sub-agent assumes its agent's AWS role in a session of its own, name the session for it, and Wake's brake can deny that session alone, leaving the role's other sessions, its parent's and its siblings', be (`aws_sub_agent_sessions` in the brake's inventory):
+
+```python
+from wake.aws import session_name
+
+name = session_name(instance)  # the sub-agent's identity, as the brake halts it
+sts.assume_role(RoleArn=role, RoleSessionName=name, SourceIdentity=name)
+```
+
+The name is the sub-agent's identity when IAM takes it as it is (2 to 64 of `A-Z a-z 0-9 _ + = , . @ -`), and otherwise a readable form of it ending in a hash, the same name the brake gives it (checked against `sdk/testdata/aws_session_names.json`). Two identities can share a name, as when one reads like another's hashed name; halting either then denies the sessions of both, more than the halt named but never less. Prefer `SourceIdentity`: AWS never lets a session change it, and it carries over when the session assumes another role.
 
 ## When the collector is down
 

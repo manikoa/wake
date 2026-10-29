@@ -29,6 +29,7 @@ Wake becomes one of the Agents SDK's trace processors. Each agent's run is named
 - A tool call's parent is the response that requested it.
 - A response's parents are the earlier responses and tool results in its input.
 - A handoff is an `agent_message` that feeds the receiving agent's next step.
+- An agent run inside a tool call, as with `agent.asTool()`, is an instance of its own, `<agent>#<the tool call's span id>`, in `wake.agent.instance`, with `wake.agent.lineage` naming the agent that called it (see docs/events.md). Each such run is linked within itself, so two copies of one agent called at once never take each other's steps as parents.
 
 Inputs and outputs are recorded when the SDK's `traceIncludeSensitiveData` is on, as it is by default. Without it, events have empty payloads, and the SDK's loop links them instead: a tool call comes from its agent's latest response, and a response reads that response and the tool results since. Chat Completions models link as Responses models do. A function tool runs with its event current, and an agent run inside it, such as one used as a tool, descends from that call.
 
@@ -47,7 +48,7 @@ for await (const message of claude.record(query({ prompt, options }), { prompt }
 }
 ```
 
-Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. One `agent_message` hands it the task and another carries its answer back. Links come from the SDK's ids:
+Wake reads the messages the SDK streams back from Claude Code and passes them on unchanged. Each response is a model call, and each tool use and its result a tool call. A subagent started with the Agent tool is recorded as its own agent, named `support/<subagent type>`. Several of one type can run at once, so each is also an instance, `support/<subagent type>#<the Agent tool use that started it>`, in `wake.agent.instance`, with `wake.agent.lineage` naming what started it (see docs/events.md). One `agent_message` hands it the task and another carries its answer back. Links come from the SDK's ids:
 - A tool call's parent is the model call that asked for it.
 - A model call's parents are the call before it and the tool results and messages new in its context.
 - A later turn of the same session continues from the last.
@@ -69,7 +70,7 @@ await handler.agent("supervisor", { input: question, origin: "user" }, async () 
 });
 ```
 
-A handoff is recorded as an `agent_message` event in the receiving agent's run, and it feeds that agent's next event. When prompts are built from strings, so no message ids link one call to the next, an event's parents are the earlier events in the same trace whose output appears in its input.
+A handoff is recorded as an `agent_message` event in the receiving agent's run, and it feeds that agent's next event. A run started inside another agent's run is an instance of its own, `<name>#<its span id>`, in `wake.agent.instance`, with `wake.agent.lineage` naming the run that started it, so two runs of one agent at once can be told apart. When prompts are built from strings, so no message ids link one call to the next, an event's parents are the earlier events in the same trace whose output appears in its input.
 
 ## The recorder
 
@@ -205,6 +206,19 @@ The reply names the receiver's last step, and the proxy names its record of the 
 A run started inside `received` is linked whatever records it: LangChain or LangGraph, the OpenAI Agents SDK or the Claude Agent SDK. Its first step's parent is the proxy's record of the message when the message went through agentgateway, or else the sender's tool call. For other servers, pass the request's headers and the message's metadata to `links.received({ headers, metadata }, fn)`. The same holds for a run started inside a recorded tool call: it descends from the tool call.
 
 The current link is kept per task of execution in an `AsyncLocalStorage`, as [docs/linking.md](../../docs/linking.md) describes. A promise `fn` returns keeps the link current until it settles.
+
+## A sub-agent's own AWS session
+
+When each sub-agent assumes its agent's AWS role in a session of its own, name the session for it, and Wake's brake can deny that session alone, leaving the role's other sessions, its parent's and its siblings', be (`aws_sub_agent_sessions` in the brake's inventory):
+
+```ts
+import { sessionName } from "wake-sdk/aws";
+
+const name = sessionName(instance); // the sub-agent's identity, as the brake halts it
+await sts.send(new AssumeRoleCommand({ RoleArn: role, RoleSessionName: name, SourceIdentity: name }));
+```
+
+The name is the sub-agent's identity when IAM takes it as it is (2 to 64 of `A-Z a-z 0-9 _ + = , . @ -`), and otherwise a readable form of it ending in a hash, the same name the brake gives it (checked against `sdk/testdata/aws_session_names.json`). Two identities can share a name, as when one reads like another's hashed name; halting either then denies the sessions of both, more than the halt named but never less. Prefer `SourceIdentity`: AWS never lets a session change it, and it carries over when the session assumes another role.
 
 ## When the collector is down
 

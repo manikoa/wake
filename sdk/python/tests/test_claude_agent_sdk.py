@@ -160,8 +160,8 @@ async def lookup_order(arguments):
     return {"content": [{"type": "text", "text": ORDER}]}
 
 
-async def run_support(claude: WakeClaudeAgent, script=support_run):
-    crm = create_sdk_mcp_server("crm", tools=claude.tools([lookup_order]))
+async def run_support(claude: WakeClaudeAgent, script=support_run, tools=(lookup_order,)):
+    crm = create_sdk_mcp_server("crm", tools=claude.tools(list(tools)))
     options = claude.options(ClaudeAgentOptions(
         mcp_servers={"crm": crm},
         agents={"researcher": AgentDefinition(description="Looks things up", prompt="Research carefully.")},
@@ -259,6 +259,58 @@ def test_one_trace_with_the_subagent_nested(recorded):
     assert all(c.parent.span_id == sub.context.span_id for c in calls)
 
 
+def identity(event):
+    return event.attributes.get("wake.agent.instance"), event.attributes.get("wake.agent.lineage")
+
+
+def test_the_subagent_is_an_instance_started_by_its_agent(recorded):
+    _, spans = recorded
+    for event in wake_events(spans):
+        if event.attributes["wake.agent.id"] == "support/researcher":
+            assert identity(event) == ("support/researcher#toolu_agent", ("support",)), event.name
+        else:
+            assert identity(event) == (None, None), f"{event.name} is the main agent's own"
+    sub = next(s for s in spans if s.name == "invoke_agent support/researcher")
+    assert identity(sub) == ("support/researcher#toolu_agent", ("support",))
+
+
+async def two_researchers(cli: FakeClaudeCode) -> None:
+    await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
+    asks = {"toolu_window": ("Check the refund window", "Thirty days."),
+            "toolu_shipping": ("Check who pays return shipping", "We do.")}
+    await cli.assistant("msg_1", *[{"type": "tool_use", "id": use, "name": "Agent",
+                                    "input": {"description": ask, "prompt": ask, "subagent_type": "researcher"}}
+                                   for use, (ask, _) in asks.items()])
+    for use, (ask, answer) in asks.items():
+        await cli.user({"type": "text", "text": ask}, parent=use)
+        await cli.assistant(f"msg_{use}", {"type": "text", "text": answer}, parent=use)
+    for use, (_, answer) in asks.items():
+        await cli.user({"type": "tool_result", "tool_use_id": use, "content": [{"type": "text", "text": answer}]})
+    await cli.assistant("msg_2", {"type": "text", "text": ANSWER})
+    await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8, "is_error": False,
+                    "num_turns": 2, "session_id": "session-1", "result": ANSWER})
+
+
+def test_two_subagents_of_one_type_are_two_instances():
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    asyncio.run(run_support(WakeClaudeAgent(recorder), script=two_researchers))
+    recorder.flush()
+    spans = exporter.get_finished_spans()
+    kinds: dict[str, list[str]] = {}
+    for event in wake_events(spans):
+        if event.attributes["wake.agent.id"] == "support/researcher":
+            instance, lineage = identity(event)
+            assert lineage == ("support",)
+            kinds.setdefault(instance, []).append(event.attributes["wake.event.kind"])
+    assert {i: sorted(k) for i, k in kinds.items()} == {
+        "support/researcher#toolu_window": ["agent_message", "model_call"],
+        "support/researcher#toolu_shipping": ["agent_message", "model_call"],
+    }, "each started its own run, under one agent name"
+    answers = [e for e in wake_events(spans) if e.name == "agent_message support/researcher -> support"]
+    assert len(answers) == 2 and all(identity(a) == (None, None) for a in answers), "each answer reaches the main agent"
+
+
 def test_an_in_process_tool_runs_with_its_event_current(recorded):
     _, spans = recorded
     lookup = by_name(spans, "execute_tool mcp__crm__lookup_order")
@@ -352,4 +404,54 @@ def test_a_memory_write_in_a_tool_is_labeled_with_its_origins(tmp_path):
     (write,) = [e for e in wake_events(spans) if e.attributes["wake.event.kind"] == "memory_write"]
     assert write.attributes["wake.parents"][0] == event_id(lookup)
     assert write.attributes["wake.agent.id"] == "support"
+    assert identity(write) == (None, None), "the main agent wrote it"
     assert set(write.attributes["wake.memory.origins"]) == {"tool:mcp__crm__lookup_order", "user"}
+
+
+async def researcher_remembers(cli: FakeClaudeCode) -> None:
+    await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
+    research = {"description": "Look the order up", "prompt": "Look order 1234 up", "subagent_type": "researcher"}
+    await cli.assistant("msg_1", {"type": "tool_use", "id": "toolu_agent", "name": "Agent", "input": research})
+    await cli.hook("PreToolUse", "toolu_agent", tool_name="Agent", tool_input=research)
+    await cli.user({"type": "text", "text": "Look order 1234 up"}, parent="toolu_agent")
+    await cli.assistant("msg_2", {"type": "tool_use", "id": "toolu_order", "name": "mcp__crm__lookup_order",
+                                  "input": {"order": "1234"}}, parent="toolu_agent")
+
+    async def lookup():
+        await cli.mcp("crm", "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                            "clientInfo": {"name": "claude-code", "version": "2"}}, request_id=1)
+        await cli.mcp("crm", "notifications/initialized", {})
+        response = await cli.mcp("crm", "tools/call", {"name": "lookup_order", "arguments": {"order": "1234"}},
+                                 request_id=2)
+        return response["result"]["content"][0]["text"]
+
+    await cli.use_tool("toolu_order", "mcp__crm__lookup_order", {"order": "1234"}, lookup, parent="toolu_agent",
+                       agent="researcher")
+    await cli.assistant("msg_3", {"type": "text", "text": ORDER}, parent="toolu_agent")
+    await cli.user({"type": "tool_result", "tool_use_id": "toolu_agent", "content": [{"type": "text", "text": ORDER}]})
+    await cli.assistant("msg_4", {"type": "text", "text": ANSWER})
+    await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8, "is_error": False,
+                    "num_turns": 4, "session_id": "session-1", "result": ANSWER})
+
+
+def test_a_memory_write_in_a_subagents_tool_names_the_instance(tmp_path):
+    from wake.memory import Memory
+
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    claude = WakeClaudeAgent(recorder)
+    memory = Memory(claude)
+
+    @tool("lookup_order", "Look an order up", {"order": str})
+    async def remembering_lookup(arguments):
+        memory.write_file(tmp_path / "notes.md", ORDER)
+        return {"content": [{"type": "text", "text": ORDER}]}
+
+    asyncio.run(run_support(claude, script=researcher_remembers, tools=[remembering_lookup]))
+    recorder.flush()
+    spans = exporter.get_finished_spans()
+    lookup = by_name(spans, "execute_tool mcp__crm__lookup_order")
+    (write,) = [e for e in wake_events(spans) if e.attributes["wake.event.kind"] == "memory_write"]
+    assert write.attributes["wake.parents"][0] == event_id(lookup)
+    assert write.attributes["wake.agent.id"] == "support/researcher"
+    assert identity(lookup) == identity(write) == ("support/researcher#toolu_agent", ("support",))

@@ -7,6 +7,8 @@ from typing import Any
 EVENT_ID = "wake.event.id"
 EVENT_KIND = "wake.event.kind"
 AGENT_ID = "wake.agent.id"
+AGENT_INSTANCE = "wake.agent.instance"
+AGENT_LINEAGE = "wake.agent.lineage"
 CAPTURE = "wake.capture"
 PARENTS = "wake.parents"
 ORIGINS = "wake.origins"
@@ -75,6 +77,14 @@ def _repr(value: Any) -> str:
         return repr(value)
     except Exception:
         return f"<{type(value).__name__}>"
+
+
+def instance_attributes(instance: str | None, lineage: "list[str] | tuple[str, ...]") -> dict[str, Any]:
+    """The attributes naming one running instance of an agent, and what started it, for an
+    agent that can run as several at once, such as a subagent. Empty for any other."""
+    if not instance:
+        return {}
+    return {AGENT_INSTANCE: instance, AGENT_LINEAGE: list(lineage)}
 
 
 def payload_attributes(payload: Any) -> dict[str, str]:
