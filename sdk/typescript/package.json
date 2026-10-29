@@ -43,6 +43,10 @@
       "types": "./dist/quarantine.d.ts",
       "default": "./dist/quarantine.js"
     },
+    "./aws": {
+      "types": "./dist/aws.d.ts",
+      "default": "./dist/aws.js"
+    },
     "./langchain": {
       "types": "./dist/langchain.d.ts",
       "default": "./dist/langchain.js"
