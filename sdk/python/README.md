@@ -193,6 +193,19 @@ The reply names the receiver's last step, and the proxy names its record of the 
 
 A run started inside the block is linked whatever records it: LangChain or LangGraph, the OpenAI Agents SDK or the Claude Agent SDK. Its first step's parent is the proxy's record of the message when the message went through agentgateway, or else the sender's tool call. For other servers, pass the request's headers and the message's metadata to `wake.links.received(headers=..., metadata=...)`. The same holds for a run started inside a recorded tool call: it descends from the tool call. Install with the `a2a` extra.
 
+## A sub-agent's own AWS session
+
+When each sub-agent assumes its agent's AWS role in a session of its own, name the session for it, and Wake's brake can deny that session alone, leaving the role's other sessions, its parent's and its siblings', be (`aws_sub_agent_sessions` in the brake's inventory):
+
+```python
+from wake.aws import session_name
+
+name = session_name(instance)  # the sub-agent's identity, as the brake halts it
+sts.assume_role(RoleArn=role, RoleSessionName=name, SourceIdentity=name)
+```
+
+The name is the sub-agent's identity when IAM takes it as it is (2 to 64 of `A-Z a-z 0-9 _ + = , . @ -`), and otherwise a readable form of it ending in a hash, the same name the brake gives it (checked against `sdk/testdata/aws_session_names.json`). Prefer `SourceIdentity`: AWS never lets a session change it, and it carries over when the session assumes another role.
+
 ## When the collector is down
 
 Events go out from a queue on a background thread, so the agent never waits on the collector.

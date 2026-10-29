@@ -206,6 +206,19 @@ A run started inside `received` is linked whatever records it: LangChain or Lang
 
 The current link is kept per task of execution in an `AsyncLocalStorage`, as [docs/linking.md](../../docs/linking.md) describes. A promise `fn` returns keeps the link current until it settles.
 
+## A sub-agent's own AWS session
+
+When each sub-agent assumes its agent's AWS role in a session of its own, name the session for it, and Wake's brake can deny that session alone, leaving the role's other sessions, its parent's and its siblings', be (`aws_sub_agent_sessions` in the brake's inventory):
+
+```ts
+import { sessionName } from "wake-sdk/aws";
+
+const name = sessionName(instance); // the sub-agent's identity, as the brake halts it
+await sts.send(new AssumeRoleCommand({ RoleArn: role, RoleSessionName: name, SourceIdentity: name }));
+```
+
+The name is the sub-agent's identity when IAM takes it as it is (2 to 64 of `A-Z a-z 0-9 _ + = , . @ -`), and otherwise a readable form of it ending in a hash, the same name the brake gives it (checked against `sdk/testdata/aws_session_names.json`). Prefer `SourceIdentity`: AWS never lets a session change it, and it carries over when the session assumes another role.
+
 ## When the collector is down
 
 Events go out from a queue in the background, so the agent never waits on the collector.
