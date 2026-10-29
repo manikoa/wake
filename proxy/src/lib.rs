@@ -8,6 +8,7 @@ pub mod authz;
 pub mod budget;
 pub mod canonical;
 pub mod capture;
+pub mod charters;
 pub mod control;
 pub mod export;
 pub mod extmcp;

@@ -19,7 +19,8 @@
 //!   replaces it, and is kept aside, not overwritten.
 //!
 //! The same state holds memory quarantines, which the SDKs' memory adapters fetch
-//! (memory.rs): agents whose memory writes are refused, and entries no longer served.
+//! (memory.rs): agents whose memory writes are refused, and entries no longer served. And
+//! run charters (charters.rs): what a run must never do, its budget and when it expires.
 //!
 //! Each change is announced (changes()), so a call already under way when a halt lands can
 //! be cut: an A2A exchange on an ext_proc stream, or an MCP result on its way back.
@@ -33,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::agents::Agents;
+use crate::charters::{self, Charter, Resource};
 use crate::token::Token;
 
 /// What a halt covers. A field it doesn't know is refused, not dropped: a scope misspelled
@@ -161,6 +163,9 @@ pub struct State {
     pub halts: Vec<Halt>,
     #[serde(default)]
     pub quarantines: Vec<Quarantine>,
+    /// The run charters in force, in the order they were put.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub charters: Vec<Charter>,
     /// Set when the state on disk couldn't be read: everything is denied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreadable: Option<String>,
@@ -207,6 +212,8 @@ pub struct Halts {
     seen: Mutex<Notes>,
     // The callers the deny lever has seen, kept in memory only, like seen.
     callers: Mutex<Callers>,
+    // Each charter's never, compiled, and what its budget has used, in memory only.
+    charters: charters::Runtime,
     // The version in force, sent on each change.
     changed: watch::Sender<u64>,
 }
@@ -313,6 +320,7 @@ impl Halts {
             agents: Arc::new(Agents::none()),
             seen: Mutex::new(Notes::default()),
             callers: Mutex::new(Callers::default()),
+            charters: charters::Runtime::default(),
         }
     }
 
@@ -404,6 +412,81 @@ impl Halts {
     /// version.
     pub fn release(&self, id: &str) -> Changed {
         self.change(|state| state.quarantines.retain(|q| q.id != id))
+    }
+
+    /// Puts a run charter in force, or replaces one with the same id. What its budget has
+    /// used so far stays: the brake puts a charter again when it can't confirm it.
+    pub fn put_charter(&self, mut charter: Charter) -> Changed {
+        charter.applied_at = STAMP;
+        self.change(|state| {
+            state.charters.retain(|c| c.id != charter.id);
+            state.charters.push(charter);
+        })
+    }
+
+    /// Whether a charter with this id would fit: the proxy holds at most MAX_CHARTERS, and
+    /// putting one again replaces it.
+    pub fn charter_fits(&self, id: &str) -> bool {
+        let state = self.current();
+        state.charters.len() < charters::MAX_CHARTERS || state.charters.iter().any(|c| c.id == id)
+    }
+
+    /// Ends a run charter, and forgets what its budget used. Ending one that isn't in force
+    /// changes nothing but the version.
+    pub fn end_charter(&self, id: &str) -> Changed {
+        let changed = self.change(|state| state.charters.retain(|c| c.id != id));
+        self.charters.forget(id);
+        changed
+    }
+
+    /// The charters in force, each with what its budget has used, limit by limit.
+    pub fn charters(&self) -> Vec<(Charter, Vec<u64>)> {
+        let used = self.charters.used();
+        self.current()
+            .charters
+            .iter()
+            .map(|c| {
+                let mut counts = used.get(&c.id).cloned().unwrap_or_default();
+                counts.resize(c.budget.len(), 0);
+                (c.clone(), counts)
+            })
+            .collect()
+    }
+
+    /// Whether a run charter denies a call from caller, the identity the gateway
+    /// authenticated, presenting token, to resource, what the call reaches when the hook
+    /// knows it. Each charter covers the calls its scope names as a halt's would, but for
+    /// those to an agent: the run's own calls. The first that denies is named; a call none
+    /// denies is counted against their budgets (charters.rs).
+    pub fn charter_deciding(
+        &self,
+        caller: Option<&str>,
+        token: Option<&Token>,
+        resource: Option<Resource<'_>>,
+        now: u64,
+    ) -> Option<charters::Denial> {
+        let state = self.current();
+        if state.charters.is_empty() {
+            return None;
+        }
+        let who = self.who(caller, token);
+        let covering: Vec<&Charter> = state.charters.iter().filter(|c| self.covers(&c.scope, &who)).collect();
+        let caller = charters::Caller {
+            name: who.identity.map(|i| self.agents.record(i)).unwrap_or("unknown"),
+            under: who.chain.clone(),
+            unknown: who.unknown,
+        };
+        let resource = resource.map(|r| match r {
+            Resource::Agent(agent) => Resource::Agent(self.agents.named(agent)),
+            tool => tool,
+        });
+        self.charters.decide(
+            &covering,
+            &caller,
+            |a| self.agents.named(a).to_string(),
+            resource,
+            now / 1_000_000_000,
+        )
     }
 
     /// The rules for one agent's memory adapter, noting that the agent has them now. A
@@ -566,6 +649,9 @@ impl Halts {
         for q in next.quarantines.iter_mut().filter(|q| q.applied_at == STAMP) {
             q.applied_at = at;
         }
+        for c in next.charters.iter_mut().filter(|c| c.applied_at == STAMP) {
+            c.applied_at = at;
+        }
         self.swap(next.clone());
         match disk.write(&next) {
             Ok(()) => Ok(next),
@@ -603,28 +689,15 @@ impl Halts {
     /// a halted agent in its unknown part, so every agent halt denies it too.
     pub fn deciding_with(&self, caller: Option<&str>, receiver: Option<&str>, token: Option<&Token>) -> Vec<Halt> {
         let state = self.current();
-        let identity = caller.filter(|c| !c.is_empty());
+        let who = self.who(caller, token);
         let receiver = receiver.filter(|r| !r.is_empty()).map(|r| self.agents.named(r));
-        let chain: Vec<&str> = token
-            .map(|t| t.under().map(|a| self.agents.named(a)).collect())
-            .unwrap_or_default();
-        let own = token.filter(|t| identity.is_some_and(|i| t.actors.first().is_some_and(|a| a == i)));
-        let placed = own.is_some_and(|t| !t.cut && t.under().any(|a| self.agents.knows(a)));
-        let unknown = (self.agents.caller(identity).is_none() && !placed) || token.is_some_and(|t| t.cut);
-        let token_id = token.and_then(|t| t.id.as_deref());
-        let names = |agent: &str, halt: &Halt| halt.scope.agents.iter().any(|h| self.agents.named(h) == agent);
         let mut out: Vec<Halt> = state
             .halts
             .iter()
             .filter(|h| {
                 h.scope.fleet
-                    // The caller, by its agent's name or, unlisted, its own identity.
-                    || identity.is_some_and(|i| names(self.agents.named(i), h))
-                    || receiver.is_some_and(|r| names(r, h))
-                    || chain.iter().any(|a| names(a, h))
-                    || token_id.is_some_and(|id| h.scope.tokens.iter().any(|t| t == id))
-                    // A caller nobody can name or place could be the halted agent.
-                    || (unknown && !h.scope.agents.is_empty())
+                    || self.covers(&h.scope, &who)
+                    || receiver.is_some_and(|r| h.scope.agents.iter().any(|a| self.agents.named(a) == r))
             })
             .cloned()
             .collect();
@@ -649,7 +722,47 @@ impl Halts {
     }
 }
 
-// A halt or quarantine's applied_at until the change puts it in force.
+/// Who makes a call, as a halt's or a charter's scope is matched against it.
+struct Who<'a> {
+    identity: Option<&'a str>,
+    /// Every agent the call is made under, by its agent's name: the token's actors and whom
+    /// they act for (Token::under).
+    chain: Vec<&'a str>,
+    token_id: Option<&'a str>,
+    /// Nobody can name or place the caller, or its token's chain was cut: it could be any
+    /// agent.
+    unknown: bool,
+}
+
+impl Halts {
+    fn who<'a>(&'a self, caller: Option<&'a str>, token: Option<&'a Token>) -> Who<'a> {
+        let identity = caller.filter(|c| !c.is_empty());
+        let chain = token
+            .map(|t| t.under().map(|a| self.agents.named(a)).collect())
+            .unwrap_or_default();
+        let own = token.filter(|t| identity.is_some_and(|i| t.actors.first().is_some_and(|a| a == i)));
+        let placed = own.is_some_and(|t| !t.cut && t.under().any(|a| self.agents.knows(a)));
+        Who {
+            identity,
+            chain,
+            token_id: token.and_then(|t| t.id.as_deref()),
+            unknown: (self.agents.caller(identity).is_none() && !placed) || token.is_some_and(|t| t.cut),
+        }
+    }
+
+    /// Whether scope covers a call made by who: it names the caller, by its agent's name or,
+    /// unlisted, its own identity; an agent the call is made under; or its token. A caller
+    /// nobody can name or place could be any agent scope names, so it's covered too.
+    fn covers(&self, scope: &Scope, who: &Who<'_>) -> bool {
+        let names = |agent: &str| scope.agents.iter().any(|h| self.agents.named(h) == agent);
+        who.identity.is_some_and(|i| names(self.agents.named(i)))
+            || who.chain.iter().any(|a| names(a))
+            || who.token_id.is_some_and(|id| scope.tokens.iter().any(|t| t == id))
+            || (who.unknown && !scope.agents.is_empty())
+    }
+}
+
+// A halt, quarantine or charter's applied_at until the change puts it in force.
 const STAMP: u64 = 0;
 
 impl Disk {
@@ -746,6 +859,149 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().join(format!("wake-halts-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn charter(id: &str, scope: Scope, never: &str, budget: Vec<charters::Limit>) -> Charter {
+        Charter {
+            id: id.into(),
+            scope,
+            expires_at: 4_000_000_000,
+            never: never.into(),
+            budget,
+            issued_at: 1,
+            applied_at: 0,
+        }
+    }
+
+    const NO_DELETES: &str = r#"forbid(principal, action, resource == Wake::Tool::"delete_customer");"#;
+
+    fn one_refund() -> Vec<charters::Limit> {
+        vec![charters::Limit {
+            tools: vec!["refund".into()],
+            calls: 1,
+        }]
+    }
+
+    #[test]
+    fn a_charter_holds_its_runs_calls_and_no_others() {
+        let map = br#"{"support": ["0oa1support"], "billing": ["0oa1billing"]}"#;
+        let halts = Halts::in_memory().with_agents(Arc::new(Agents::from_json(map).unwrap()));
+        let state = halts
+            .put_charter(charter("run-1", agents(&[CHILD_1]), NO_DELETES, one_refund()))
+            .unwrap();
+        assert!(state.charters[0].applied_at > 0, "stamped once in force");
+        let at = now();
+        let deciding = |caller: Option<&str>, token: Option<&Token>, tool: &str| {
+            halts
+                .charter_deciding(caller, token, Some(Resource::Tool(tool)), at)
+                .map(|d| (d.halt.id, d.why))
+        };
+        let run = Some(("charter:run-1".to_string(), "never"));
+        let child_1 = token("0oa1support", &[CHILD_1], "tok-1");
+        assert_eq!(deciding(Some(CHILD_1), Some(&child_1), "delete_customer"), run);
+        assert_eq!(deciding(Some(CHILD_1), Some(&child_1), "refund"), None);
+        assert_eq!(
+            deciding(Some(CHILD_1), Some(&child_1), "refund").map(|d| d.1),
+            Some("budget")
+        );
+        // A sub-agent the run started acts under it, so it's the run's too.
+        let grandchild = token("0oa1support", &["support/researcher/fetch#toolu_9", CHILD_1], "tok-9");
+        assert_eq!(
+            deciding(
+                Some("support/researcher/fetch#toolu_9"),
+                Some(&grandchild),
+                "delete_customer"
+            ),
+            run
+        );
+        // Its sibling, its parent and billing aren't held to it.
+        let child_2 = token("0oa1support", &[CHILD_2], "tok-2");
+        assert_eq!(deciding(Some(CHILD_2), Some(&child_2), "delete_customer"), None);
+        let support = token("0oa1support", &[], "tok-0");
+        assert_eq!(deciding(Some("0oa1support"), Some(&support), "delete_customer"), None);
+        assert_eq!(deciding(Some("0oa1billing"), None, "delete_customer"), None);
+        // A caller nobody can name or place could be the run's.
+        assert_eq!(deciding(None, None, "delete_customer"), run);
+        assert_eq!(
+            deciding(Some("spiffe://wake.local/agent/stranger"), None, "delete_customer"),
+            run
+        );
+        // But it isn't counted against the run's budget, so it can't use it up.
+        assert_eq!(deciding(None, None, "refund"), None);
+        assert_eq!(halts.charters()[0].1, vec![1]);
+
+        // Put again, as the brake does when it can't confirm it, it keeps what it used.
+        halts
+            .put_charter(charter("run-1", agents(&[CHILD_1]), NO_DELETES, one_refund()))
+            .unwrap();
+        assert_eq!(halts.charters()[0].1, vec![1]);
+        assert_eq!(
+            deciding(Some(CHILD_1), Some(&child_1), "refund").map(|d| d.1),
+            Some("budget")
+        );
+
+        // A run named by a token issued for it: whoever presents it. Expired, it denies
+        // every call that token makes, whatever the call reaches.
+        let mut expired = charter(
+            "run-2",
+            Scope {
+                tokens: vec!["tok-run".into()],
+                ..Default::default()
+            },
+            "",
+            vec![],
+        );
+        expired.expires_at = 1;
+        halts.put_charter(expired).unwrap();
+        let with_run_token = token("user-42", &["0oa1billing"], "tok-run");
+        assert_eq!(
+            halts
+                .charter_deciding(Some("0oa1billing"), Some(&with_run_token), None, at)
+                .map(|d| (d.halt.id, d.why)),
+            Some(("charter:run-2".into(), "expired"))
+        );
+        assert_eq!(halts.charter_deciding(Some("0oa1billing"), None, None, at), None);
+
+        // Ended, a charter holds nothing, and a new one with its id starts afresh.
+        halts.end_charter("run-1").unwrap();
+        assert_eq!(deciding(Some(CHILD_1), Some(&child_1), "delete_customer"), None);
+        halts
+            .put_charter(charter("run-1", agents(&[CHILD_1]), NO_DELETES, one_refund()))
+            .unwrap();
+        assert_eq!(deciding(Some(CHILD_1), Some(&child_1), "refund"), None);
+    }
+
+    #[test]
+    fn a_proxy_holds_so_many_charters() {
+        let halts = Halts::in_memory();
+        for i in 0..charters::MAX_CHARTERS {
+            halts
+                .put_charter(charter(&format!("run-{i}"), agents(&[CHILD_1]), "", vec![]))
+                .unwrap();
+        }
+        assert!(!halts.charter_fits("run-new"));
+        assert!(halts.charter_fits("run-7"), "put again, it replaces itself");
+        halts.end_charter("run-7").unwrap();
+        assert!(halts.charter_fits("run-new"));
+    }
+
+    #[test]
+    fn a_charter_is_kept_on_disk_as_a_halt_is() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        Halts::init(&dir).unwrap();
+        let halts = Halts::load(&dir);
+        halts
+            .put_charter(charter("run-1", agents(&["support"]), NO_DELETES, one_refund()))
+            .unwrap();
+        let again = Halts::load(&dir);
+        assert_eq!(again.state().charters, halts.state().charters);
+        assert!(
+            again
+                .charter_deciding(Some("support"), None, Some(Resource::Tool("delete_customer")), now())
+                .is_some()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -11,6 +11,11 @@
 //! GET    /v1/callers            each identity the deny lever has seen calling: its agent, the
 //!                               delegation chain and token ids it came with, and when;
 //!                               ?identity=<id> only that one, and the callers whose chain names it
+//! PUT    /v1/charters/{id}      {"scope": {"agents": [...], "tokens": [...]}, "expires_at": <Unix s>,
+//!                               "never": "<Cedar>", "budget": [{"tools": [...], "calls": n}], "issued_at": <Unix ns>}
+//! DELETE /v1/charters/{id}
+//! GET    /v1/charters           the run charters in force, each with what its budget has used
+//! POST   /v1/charters/check     a charter's body: 200 if it could be put, else 400 and why
 //! ```
 //!
 //! Each answers with the state now in force and its version, and a change answers 200 only
@@ -43,6 +48,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{self, RootCertStore, ServerConfig};
 
+use crate::charters::{Charter, Limit};
 use crate::halts::{self, Halts, Scope, Selection};
 use crate::listen::{self, Limits};
 use crate::signer::spiffe_id;
@@ -239,6 +245,92 @@ async fn release_quarantine(State(halts): State<Arc<Halts>>, Path(id): Path<Stri
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutCharter {
+    scope: Scope,
+    expires_at: u64,
+    #[serde(default)]
+    never: String,
+    #[serde(default)]
+    budget: Vec<Limit>,
+    #[serde(default)]
+    issued_at: Option<u64>,
+}
+
+impl PutCharter {
+    fn charter(self, id: String) -> Charter {
+        Charter {
+            id,
+            scope: self.scope,
+            expires_at: self.expires_at,
+            never: self.never,
+            budget: self.budget,
+            issued_at: self.issued_at.unwrap_or_else(halts::now),
+            applied_at: 0,
+        }
+    }
+}
+
+async fn put_charter(
+    State(halts): State<Arc<Halts>>,
+    Path(id): Path<String>,
+    Json(body): Json<PutCharter>,
+) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
+    let charter = body.charter(id);
+    if let Err(why) = charter.check() {
+        return (StatusCode::BAD_REQUEST, why).into_response();
+    }
+    // Full is for now, not a charter the proxy refuses: one fits once another has ended.
+    if !halts.charter_fits(&charter.id) {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "the proxy holds {} charters already: one fits once another ends",
+                crate::charters::MAX_CHARTERS
+            ),
+        )
+            .into_response();
+    }
+    stored(tokio::task::spawn_blocking(move || halts.put_charter(charter)).await)
+}
+
+async fn end_charter(State(halts): State<Arc<Halts>>, Path(id): Path<String>) -> Response {
+    if let Err(failure) = valid_id(&id) {
+        return failure.into_response();
+    }
+    stored(tokio::task::spawn_blocking(move || halts.end_charter(&id)).await)
+}
+
+/// Checks a charter without putting it, so the brake can refuse one before it starts.
+async fn check_charter(Json(body): Json<PutCharter>) -> Response {
+    match body.charter("check".into()).check() {
+        Ok(()) => (StatusCode::OK, "the charter could be put").into_response(),
+        Err(why) => (StatusCode::BAD_REQUEST, why).into_response(),
+    }
+}
+
+/// A charter in force, with what its budget has used, limit by limit.
+#[derive(serde::Serialize)]
+struct CharterInForce {
+    #[serde(flatten)]
+    charter: Charter,
+    used: Vec<u64>,
+}
+
+async fn list_charters(State(halts): State<Arc<Halts>>) -> Json<Vec<CharterInForce>> {
+    Json(
+        halts
+            .charters()
+            .into_iter()
+            .map(|(charter, used)| CharterInForce { charter, used })
+            .collect(),
+    )
+}
+
+#[derive(Deserialize)]
 struct CallersQuery {
     identity: Option<String>,
 }
@@ -267,6 +359,9 @@ pub fn router(halts: Arc<Halts>) -> Router {
         )
         .route("/v1/memory/seen", get(memory_seen))
         .route("/v1/callers", get(callers))
+        .route("/v1/charters", get(list_charters))
+        .route("/v1/charters/check", axum::routing::post(check_charter))
+        .route("/v1/charters/{id}", axum::routing::put(put_charter).delete(end_charter))
         .with_state(halts)
 }
 

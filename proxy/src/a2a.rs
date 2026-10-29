@@ -81,6 +81,52 @@ pub fn parse_request(body: &[u8]) -> Request {
 pub struct Reply {
     pub parents: Vec<String>,
     pub task_id: Option<String>,
+    /// The last task state it gives, as task_state spells it.
+    pub state: Option<&'static str>,
+    /// Whether any response in it is a JSON-RPC error.
+    pub error: bool,
+    /// Whether any response in it has a result.
+    pub answered: bool,
+}
+
+/// The task states A2A defines, as `wake.a2a.task_state` records them: v0.3's spelling,
+/// which v1.0's `TASK_STATE_INPUT_REQUIRED` and the like map onto.
+pub const TASK_STATES: [&str; 9] = [
+    "submitted",
+    "working",
+    "input-required",
+    "completed",
+    "canceled",
+    "failed",
+    "rejected",
+    "auth-required",
+    "unknown",
+];
+
+/// A task state as a reply spells it, in v0.3's spelling. None for anything A2A doesn't
+/// define.
+pub fn task_state(raw: &str) -> Option<&'static str> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let state = lower.strip_prefix("task_state_").unwrap_or(&lower).replace('_', "-");
+    let state = match state.as_str() {
+        "cancelled" => "canceled",
+        "unspecified" => "unknown",
+        s => s,
+    };
+    TASK_STATES.into_iter().find(|s| *s == state)
+}
+
+impl Reply {
+    /// Whether the call went well, as `wake.call.ok` records it: the receiver answered with
+    /// a result, no JSON-RPC error, and no task that failed, was rejected or was canceled,
+    /// with a 2xx. None when nothing in it could be read, as when it was cut short.
+    pub fn ok(&self, status: Option<u16>, cut: bool) -> Option<bool> {
+        let failed = matches!(self.state, Some("failed" | "rejected" | "canceled"));
+        if self.error || failed || status.is_some_and(|s| !(200..300).contains(&s)) {
+            return Some(false);
+        }
+        (self.answered && !cut).then_some(true)
+    }
 }
 
 /// Reads a reply. body is a JSON-RPC response, or a text/event-stream of them.
@@ -96,7 +142,11 @@ pub fn parse_reply(body: &[u8], streamed: bool) -> Reply {
     };
     let mut out = Reply::default();
     for r in responses {
+        if r.get("error").is_some() {
+            out.error = true;
+        }
         let Some(result) = r.get("result") else { continue };
+        out.answered = true;
         // v1.0 wraps the payload in a field naming its kind; v0.3 returns it bare. Each
         // comes with whether it is a Task, whose own id is the task's.
         let bare_task = result.get("kind").and_then(Value::as_str) == Some("task");
@@ -112,19 +162,27 @@ pub fn parse_reply(body: &[u8], streamed: bool) -> Reply {
             if out.task_id.is_none() {
                 out.task_id = task_id_of(payload, is_task);
             }
+            // The latest state wins: a stream's updates come in order.
+            if let Some(state) = payload
+                .get("status")
+                .and_then(|s| s.get("state"))
+                .and_then(Value::as_str)
+                .and_then(task_state)
+            {
+                out.state = Some(state);
+            }
             // A message, or a task or status update whose status carries one.
             let messages = [Some(payload), payload.get("status").and_then(|s| s.get("message"))];
             for message in messages.into_iter().flatten() {
                 for p in parents_in(message.get("metadata")) {
-                    if !out.parents.contains(&p) {
+                    if out.parents.len() < crate::mcp::MAX_PARENTS && !out.parents.contains(&p) {
                         out.parents.push(p);
                     }
                 }
             }
         }
-        if out.parents.len() >= crate::mcp::MAX_PARENTS {
-            break;
-        }
+        // Past the parents it keeps, it reads on: a later update can still say the task
+        // failed, or an error.
     }
     out.parents.truncate(crate::mcp::MAX_PARENTS);
     out
@@ -196,6 +254,73 @@ impl Tasks {
 }
 
 #[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn task_states_read_in_either_version() {
+        for (raw, state) in [
+            ("completed", Some("completed")),
+            ("TASK_STATE_COMPLETED", Some("completed")),
+            ("TASK_STATE_INPUT_REQUIRED", Some("input-required")),
+            ("input-required", Some("input-required")),
+            ("TASK_STATE_AUTH_REQUIRED", Some("auth-required")),
+            ("TASK_STATE_CANCELLED", Some("canceled")),
+            ("TASK_STATE_UNSPECIFIED", Some("unknown")),
+            (" Failed ", Some("failed")),
+            ("done", None),
+            ("", None),
+        ] {
+            assert_eq!(task_state(raw), state, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_reply_says_how_the_call_went() {
+        let completed = parse_reply(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"kind":"task","id":"t1","status":{"state":"completed"}}}"#,
+            false,
+        );
+        assert_eq!(completed.state, Some("completed"));
+        assert_eq!(completed.ok(Some(200), false), Some(true));
+        // A 5xx, or the body cut short, says otherwise or nothing.
+        assert_eq!(completed.ok(Some(502), false), Some(false));
+        assert_eq!(completed.ok(Some(200), true), None);
+
+        // A stream's last state wins.
+        let stream = b"data: {\"result\":{\"kind\":\"status-update\",\"status\":{\"state\":\"working\"}}}\n\ndata: {\"result\":{\"statusUpdate\":{\"taskId\":\"t2\",\"status\":{\"state\":\"TASK_STATE_FAILED\"}}}}\n\n";
+        let failed = parse_reply(stream, true);
+        assert_eq!(failed.state, Some("failed"));
+        assert_eq!(failed.ok(Some(200), false), Some(false));
+
+        // Past the parents it keeps, it reads on to the state and any error.
+        let ids: Vec<String> = (0..80).map(|i| format!("\"p{i}\"")).collect();
+        let stream = r#"data: {"result":{"kind":"message","metadata":{"dev.wake/parents":[IDS]}}}
+
+data: {"result":{"statusUpdate":{"taskId":"t3","status":{"state":"failed"}}}}
+
+data: {"error":{"code":-32603,"message":"boom"}}
+"#
+        .replace("IDS", &ids.join(","));
+        let late = parse_reply(stream.as_bytes(), true);
+        assert_eq!(late.parents.len(), crate::mcp::MAX_PARENTS);
+        assert_eq!((late.state, late.error), (Some("failed"), true));
+
+        let error = parse_reply(
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Task not found"}}"#,
+            false,
+        );
+        assert!(error.error && !error.answered);
+        assert_eq!(error.ok(Some(200), false), Some(false));
+
+        // A plain message: answered, no task.
+        let message = parse_reply(br#"{"result":{"kind":"message","parts":[]}}"#, false);
+        assert_eq!((message.state, message.ok(None, false)), (None, Some(true)));
+        assert_eq!(parse_reply(b"not json", false).ok(Some(200), false), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -260,7 +385,10 @@ mod tests {
             parse_reply(task, false),
             Reply {
                 parents: vec!["b2".into()],
-                task_id: Some("t1".into())
+                task_id: Some("t1".into()),
+                state: Some("completed"),
+                error: false,
+                answered: true,
             }
         );
         let stream = b"data: {\"result\":{\"statusUpdate\":{\"taskId\":\"t2\",\"status\":{\"message\":{\"metadata\":{\"dev.wake/parents\":[\"b3\"]}}}}}}\n\n";
@@ -268,7 +396,10 @@ mod tests {
             parse_reply(stream, true),
             Reply {
                 parents: vec!["b3".into()],
-                task_id: Some("t2".into())
+                task_id: Some("t2".into()),
+                state: None,
+                error: false,
+                answered: true,
             }
         );
 

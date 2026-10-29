@@ -20,6 +20,8 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.token.id` | string | The token's `jti`, when it has one |
 | `wake.token.expires_unix` | int | The token's `exp`, in Unix seconds |
 | `wake.token.bound` | bool | Whether the token is bound to its holder's key (it has a `cnf` claim, as DPoP and mTLS-bound tokens do), rather than usable by whoever holds a copy. Set on every event that records a token, so it, not `wake.token.subject`, says whether the caller presented one |
+| `wake.call.ok` | bool | Set by the proxy on a call it saw answered: whether it went well. On an MCP `tool_call`, a result came back that doesn't say `isError`; a call with no response seen didn't (agentgateway skips the response hook on a JSON-RPC error). On an A2A reply, the receiver answered with a 2xx, a result, no JSON-RPC error and no task that failed, was rejected or was canceled. Left out when the answer was cut short or can't be read. A run charter's checks that it's done count only calls that went well |
+| `wake.a2a.task_state` | string | Set by the proxy on an A2A reply that gives a task's state: the last one it gives, in v0.3's spelling (`submitted`, `working`, `input-required`, `completed`, `canceled`, `failed`, `rejected`, `auth-required`, `unknown`), which v1.0's `TASK_STATE_COMPLETED` and the like map onto. `completed` is the receiver saying its task is done |
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
 | `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it. A payload too large to send whole is cut short and says so: the proxy keeps 1 MiB of each body, as a string, and adds `"truncated": true`. The SDKs send `{"truncated": true, "bytes", "sha256", "prefix"}` in place of one over 4 MiB, with the whole payload's size and hex SHA-256, and its first 2 MiB as a string. The collector reads a payload sent as bytes as the bytes it holds, and refuses one of any other type (see Secrets) |
@@ -97,6 +99,8 @@ The proxy's deny lever records each call it denies as a `denied` event, captured
 A call a **flow policy** denies (see [proxy.md](proxy.md)) is recorded the same way, under `wake.brake.halt_id` `policy:<rule id>`.
 - **Payload:** it adds `origins`, the origins that entered the caller and that the rule keeps from the call. When the caller counted as having every origin, it's `*`, and `every_origin` says why.
 - **No `wake.origins`:** no content entered at the denial.
+
+A call a **run charter** denies (see [proxy.md](proxy.md), "Run charters") is recorded the same way, under `wake.brake.halt_id` `charter:<charter id>`. Its payload adds `charter`, the charter's id; `why`: `never`, `budget`, `expired`, or `unreadable` for a `never` that can't be read; and `detail`, in words: the forbids that deny the call, the limit it's past, or when the charter expired.
 
 A call already under way when a halt lands is **cut**, and recorded the same way: an A2A exchange the proxy is carrying, such as a streamed reply, or an MCP call whose result was on its way back to the caller.
 - **Payload:** it adds `"cut": true`, and `recorded_as`, the id of the event that recorded the call, when there is one.
