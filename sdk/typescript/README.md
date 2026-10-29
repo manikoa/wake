@@ -217,7 +217,7 @@ const name = sessionName(instance); // the sub-agent's identity, as the brake ha
 await sts.send(new AssumeRoleCommand({ RoleArn: role, RoleSessionName: name, SourceIdentity: name }));
 ```
 
-The name is the sub-agent's identity when IAM takes it as it is (2 to 64 of `A-Z a-z 0-9 _ + = , . @ -`), and otherwise a readable form of it ending in a hash, the same name the brake gives it (checked against `sdk/testdata/aws_session_names.json`). Prefer `SourceIdentity`: AWS never lets a session change it, and it carries over when the session assumes another role.
+The name is the sub-agent's identity when IAM takes it as it is (2 to 64 of `A-Z a-z 0-9 _ + = , . @ -`), and otherwise a readable form of it ending in a hash, the same name the brake gives it (checked against `sdk/testdata/aws_session_names.json`). Two identities can share a name, as when one reads like another's hashed name; halting either then denies the sessions of both, more than the halt named but never less. Prefer `SourceIdentity`: AWS never lets a session change it, and it carries over when the session assumes another role.
 
 ## When the collector is down
 

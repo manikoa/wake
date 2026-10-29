@@ -15,6 +15,11 @@ test("a session is named as the brake names it", () => {
   }
 });
 
-test("two identities never share a name", () => {
+test("an identity cleaned to look like another gets a name of its own", () => {
   assert.notEqual(sessionName("support/researcher#toolu_1"), sessionName("support-researcher-toolu_1"));
+});
+
+test("two identities can share a name, so halting either denies both", () => {
+  // More is denied than the halt named, never less: a halted identity's sessions always go by its name.
+  assert.equal(sessionName("support-researcher-toolu_1-0a0378fa58a21af6"), sessionName("support/researcher#toolu_1"));
 });

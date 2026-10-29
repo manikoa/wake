@@ -6,5 +6,6 @@
   ["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
   ["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-9537c5fdf120482f"],
   ["spiffe://wake.local/agent/support/researcher-with-a-long-name#toolu_01ABCDEF", "spiffe---wake.local-agent-support-researcher-wi-882f40d17d001104"],
-  ["研究员#1", "----------1-fe85afc457e69d16"]
+  ["研究员#1", "----------1-fe85afc457e69d16"],
+  ["\ud800x", "---x-a87ce46793cc659b"]
 ]

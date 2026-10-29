@@ -17,9 +17,12 @@
  *
  * IAM takes 2 to 64 of A-Z a-z 0-9 _ + = , . @ - for either. An identity IAM takes as it is
  * is the name. Any other has each byte of its UTF-8 outside those made "-", is cut to 47, and
- * ends in "-" and 16 hex digits of its SHA-256, so two identities never share a name. The brake
- * (wake-platform's brake/aws.SessionName) and the Python SDK (wake.aws) name a session the same
- * way, checked against sdk/testdata/aws_session_names.json.
+ * ends in "-" and 16 hex digits of its SHA-256, a lone surrogate counting as U+FFFD. Two
+ * identities can still share a name, as when one IAM takes as it is reads like another's:
+ * support-researcher-toolu_1-0a0378fa58a21af6 is also the name of support/researcher#toolu_1.
+ * Halting either then denies the sessions of both, so a shared name only ever denies more than
+ * the halt named, never less. The brake (wake-platform's brake/aws.SessionName) and the Python
+ * SDK (wake.aws) name a session the same way, checked against sdk/testdata/aws_session_names.json.
  */
 
 import { createHash } from "node:crypto";
