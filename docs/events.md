@@ -16,8 +16,9 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.capture` | string | What recorded it: `sdk`, `proxy` or `memory_adapter` |
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
-| `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it. A payload too large to send whole is cut short and says so: the proxy keeps 1 MiB of each body, as a string, and adds `"truncated": true`. The SDKs send `{"truncated": true, "bytes", "sha256", "prefix"}` in place of one over 4 MiB, with the whole payload's size and hex SHA-256, and its first 2 MiB as a string |
-| `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload`'s UTF-8 bytes. Set by the signer from the payload it received, replacing any value the sender gave. An event with no payload has none: the signer removes one the sender gave |
+| `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it. A payload too large to send whole is cut short and says so: the proxy keeps 1 MiB of each body, as a string, and adds `"truncated": true`. The SDKs send `{"truncated": true, "bytes", "sha256", "prefix"}` in place of one over 4 MiB, with the whole payload's size and hex SHA-256, and its first 2 MiB as a string. The collector reads a payload sent as bytes as the bytes it holds, and refuses one of any other type (see Secrets) |
+| `wake.payload.sha256` | string | Hex SHA-256 of `wake.payload`'s UTF-8 bytes. Set by the signer from the payload it received, once its secrets are redacted (see Secrets), replacing any value the sender gave. An event with no payload has none: the signer removes one the sender gave |
+| `wake.payload.redacted` | string[] | Set by the signer when it redacts secrets from the payload: the kinds it replaced, sorted, such as `["github_token", "jwt"]`. A list the sender gave is removed, and a placeholder already in the payload isn't counted. Signed, so a credential crossing an agent boundary is on the record even though the credential isn't |
 | `wake.signature` | string | Base64 signature, added by the signer: Ed25519 from the collector, ECDSA P-256 from the proxy (see [signing.md](signing.md)) |
 | `wake.signer` | string | SPIFFE id of the signer |
 | `wake.signature.certificate` | string | Set by a signer that signs with an X.509-SVID, such as the proxy: base64 of the DER SVID followed by any intermediates. Not signed; the CA's signature vouches for it |
@@ -102,7 +103,7 @@ The memory adapter records each write to a memory store or memory file as a `mem
 
   `origins` is the union of origins upstream of the write that the SDK recorded. `wake.memory.origins` on the write holds the same list. A store keeps the label in the entry under `__wake__`; a memory file keeps it next to the file as `<file>.wake.json`.
 - **A read's origin** is `memory:<store>/<entry>`. When the entry's label digest matches what was read, the read's parent is the write, and `wake.memory.origins` repeats the label's origins. An entry with no label (`wake.memory.labeled` false), or one changed since it was written (`wake.memory.changed` true), gets no parent. So anything that follows from it is flagged, rather than trusted, by the completeness metric. The read's payload holds the label's `event`, `origins`, `sha256` and `agent`, and not its history.
-- **The digest**, `wake.memory.sha256`, is the hex SHA-256 of the content's UTF-8 bytes. For a memory file that's its text, byte for byte as it is on disk. For a store it's the value without its label, as JSON: keys sorted in code point order, `", "` and `": "` between items, non-ASCII as it is, and each whole number an integer, so `500.0` is `500`, since JavaScript can't tell them apart. It's the label's `sha256`, and the payload's `content` is the text it covers. A write carries it for what it wrote, a read for exactly what it read, and a rollback for what it restored; a delete has none. The SDKs share test vectors for it in `sdk/testdata/memory_digests.json`. Like every `wake.*` attribute it's signed, so the provenance graph can check a read against the write its parent names, and a rollback against the write it restores.
+- **The digest**, `wake.memory.sha256`, is the hex SHA-256 of the content's UTF-8 bytes. For a memory file that's its text, byte for byte as it is on disk. For a store it's the value without its label, as JSON: keys sorted in code point order, `", "` and `": "` between items, non-ASCII as it is, and each whole number an integer, so `500.0` is `500`, since JavaScript can't tell them apart. It's the label's `sha256`, and the payload's `content` is the text it covers, less any credentials redacted from the payload before signing (see Secrets): the digest is always of the content as written, and the provenance graph compares digests, never a digest with the payload. A write carries it for what it wrote, a read for exactly what it read, and a rollback for what it restored; a delete has none. The SDKs share test vectors for it in `sdk/testdata/memory_digests.json`. Like every `wake.*` attribute it's signed, so the provenance graph can check a read against the write its parent names, and a rollback against the write it restores.
 
 The label is a pointer, not evidence: anything that can write the store can forge one. The signed `memory_write` it names, and the digest, are what make it checkable.
 
@@ -117,6 +118,38 @@ The label is a pointer, not evidence: anything that can write the store can forg
 ## How the SDK finds parents
 
 Where the framework gives message ids, parents follow them: the AI and tool messages in a model call's context, and the model call that requested a tool call. Where an app builds prompts from strings, so nothing links one call to the next, the SDK compares content within the trace: an earlier event is a parent when its output appears in the new event's input, or, for a tool call, when the tool's arguments appear in its output. Short outputs aren't matched, so a parent found this way is unlikely to be chance. An event with no parent found is left unlinked rather than given a guess.
+
+## Secrets
+
+The log keeps every payload for good, so a credential an agent puts in a message, a tool call or memory would be readable there, by anyone who can read the log, for as long as it's kept. Before an event is signed, its signer replaces every credential it recognizes in the payload: the collector for the SDK and memory adapter events it signs, and the proxy for its own. The signature and `wake.payload.sha256` cover the payload as it's kept.
+
+The collector logs the events it can't trust too, as evidence: one whose signature fails, one that repeats an attribute, and one unsigned that it doesn't sign. It redacts their payloads the same way first, listing what it replaced in `wake.payload.redacted` and setting `wake.payload.sha256` from what's kept, so the payload can still be read from the log and checked against its digest. They stay invalid, and a signature one came with no longer covers it. An event the proxy validly signed is different: the collector can't change it without breaking the signature that vouches for it, so its payload is logged as the proxy signed it. A proxy from before redaction (October 28, 2026) signs credentials as they are, and has to be upgraded.
+
+Each credential becomes a placeholder naming its kind and the first 12 hex digits of the credential's SHA-256, so two mentions of one credential can be matched without either being readable:
+
+```text
+[redacted jwt sha256:56aec5e5c6aa jti:tok-7]
+```
+
+| Kind | What it matches |
+|---|---|
+| `private_key` | A PEM private key block, `-----BEGIN … PRIVATE KEY-----`, or an OpenPGP `-----BEGIN PGP PRIVATE KEY BLOCK-----`, to its END line, or as far as its body runs if it's cut short. Its line breaks can be raw or escaped for JSON at any depth, as in a key in JSON held in a string in the payload, and so can the `+`, `/` and `=` some encoders escape: .NET writes `+` as `\u002B`, PHP `/` as `\/` |
+| `jwt` | A signed JWT: three base64url parts, the first two JSON objects (`eyJ…`). Its placeholder keeps the token's `jti` when that's a plain id (up to 128 of `A-Z a-z 0-9 . _ : -`) that doesn't itself look like a credential, so it can be matched to `wake.token.id` |
+| `github_token` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` tokens and `github_pat_` tokens |
+| `google_api_key`, `google_oauth_token` | `AIza…` keys and `ya29.…` access tokens |
+| `slack_token` | `xoxa-`, `xoxb-`, `xoxp-`, `xoxo-`, `xoxs-`, `xoxr-` tokens and `xapp-` app tokens |
+| `llm_api_key` | `sk-ant-…`, `sk-proj-…`, `sk-svcacct-…`, `sk-admin-…` and older `sk-…` keys |
+| `stripe_key` | `sk_live_…` and `rk_live_…` keys |
+| `bearer_token` | `Bearer` (or `bearer`, `BEARER`) and a token of at least 20 characters, when it isn't a JWT |
+| `basic_auth` | `Basic` (or `basic`, `BASIC`) and base64 of `user:password`, as in an `Authorization` header. Base64 that isn't UTF-8 text with a colon in it is left, so a word after "Basic" isn't taken for credentials |
+| `url_password` | The password in a URL's `scheme://user:password@`. The rest of the URL is kept |
+| `aws_secret_key` | An AWS secret access key, 40 characters of base64, right after `aws_secret_access_key`, `AWS_SECRET_ACCESS_KEY`, `SecretAccessKey` or `secretAccessKey` and then `=`, `:` or `>` (STS's XML), with any quotes and spaces between |
+
+Only formats that name themselves are matched, so ordinary text is never taken for a secret. Not caught: a password or key in a form nothing identifies, and an AWS secret access key on its own or under another name, since 40 characters of base64 could be anything. A secret is matched only where a word starts: at the start of the payload, after a whole JSON escape such as `\n` or `\u00e9`, or after a character that can't be part of a word, other than the `]` that ends a placeholder. So `task-` followed by an MD5 isn't taken for an `sk-` key, and a match never starts inside an escape: the SDKs send `®yJ…` as `\u00aeyJ…`, which holds no JWT. What's replaced never holds a quote or part of an escape, so a JSON payload stays JSON, however deep its strings nest JSON, and redacting twice changes nothing more. `wake.payload.redacted` lists only what the signer replaced: a placeholder already in the payload, whatever put it there, isn't counted. The patterns run in order, in time linear in the payload whatever an agent sends: Rust's regex crate in the proxy, and Go's regexp in the collector, which matches a secret that starts a word by hand, only where one of its literals is, since Go's regexp would step through every byte to find a word start. A test holds those to the regexps. `collector/event/testdata/redaction.json` holds both to the same output, byte for byte, and both are fuzzed, with non-ASCII as it is and escaped, as the SDKs send it.
+
+A payload is text: a string, or bytes, which the collector reads as the bytes they hold, so they're redacted, digested and logged like a string. A value of any other type has no text to redact, since a map or a list shows bytes inside it as base64: the collector won't sign an event that has one, and never logs it.
+
+The SDKs send payloads whole, over TLS, to the collector, which redacts them before signing. Redacting in the agent's process would add work to every call the agent makes, which recording mustn't.
 
 ## What gets signed
 

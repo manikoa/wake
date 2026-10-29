@@ -142,25 +142,29 @@ func (s *signer) process(span ptrace.Span) {
 	repeated, isRepeated := event.DropRepeatedKeys(span)
 	attrs.Remove(event.SignatureError)
 	attrs.PutInt(event.Received, s.now().UnixNano())
-	if isRepeated {
+	_, signed := attrs.Get(event.Signature)
+	capture, _ := attrs.Get(event.Capture)
+	var err error
+	switch {
+	case isRepeated:
 		// What it said under the repeated key is ambiguous, so it's neither signed nor
 		// trusted. It's kept, as the first copy of each key, as evidence.
-		mark(span, fmt.Errorf("attribute %s appears more than once", repeated))
-		return
-	}
-	if _, signed := attrs.Get(event.Signature); signed {
+		err = fmt.Errorf("attribute %s appears more than once", repeated)
+	case signed:
 		// Keep events whose signatures fail: they're evidence too.
-		mark(span, event.Verify(span, s.trust))
-		return
-	}
-	capture, _ := attrs.Get(event.Capture)
-	switch capture.Str() {
-	case "sdk", "memory_adapter":
-		mark(span, event.Sign(span, s.key))
+		err = event.Verify(span, s.trust)
+	case capture.Str() == "sdk" || capture.Str() == "memory_adapter":
+		err = event.Sign(span, s.key)
 	default:
 		// Proxies sign their own events, so an unsigned one can't be trusted.
-		mark(span, fmt.Errorf("unsigned, and the collector only signs sdk and memory_adapter events, not %q", capture.Str()))
+		err = fmt.Errorf("unsigned, and the collector only signs sdk and memory_adapter events, not %q", capture.Str())
 	}
+	if err != nil {
+		// Invalid, it still goes to the log, so its payload's credentials are replaced
+		// first, as signing replaces them.
+		event.RedactInvalid(span)
+	}
+	mark(span, err)
 }
 
 func mark(span ptrace.Span, err error) {
