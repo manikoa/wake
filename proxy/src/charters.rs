@@ -14,9 +14,10 @@
 //!   sub-agents. A caller nobody can name or place is held to a policy if it could be any
 //!   agent the charter names.
 //! - `budget` limits the MCP calls the run makes, all of them or those to the tools a limit
-//!   names. A call past a limit is denied, and a denied call isn't counted. Counts are kept
-//!   in memory, by each proxy for the calls through it. A caller nobody can name or place
-//!   isn't counted, so one outside the run can't use the run's budget up.
+//!   names. A call past a limit is denied, and a denied call isn't counted. Each proxy
+//!   counts the calls through it, and writes its counts beside the state once a second, so a
+//!   restart counts again at most a second's calls. A caller nobody can name or place isn't
+//!   counted, so one outside the run can't use the run's budget up.
 //! - From `expires_at` on, every call is denied.
 //!
 //! Charters are kept in the halts' state, so they're on disk and versioned, and the brake
@@ -25,6 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cedar_policy::{
@@ -369,13 +371,16 @@ pub struct Denial {
 /// A never compiled, or why it couldn't be.
 type CompiledNever = Arc<Result<Compiled, String>>;
 
-/// What a proxy keeps of each charter beside the state, in memory: its never, compiled once,
-/// and what its budget has used.
+/// What a proxy keeps of each charter beside the state: its never, compiled once, and what
+/// its budget has used, which the halts write to a file of their own (halts::COUNTS_FILE).
 #[derive(Default)]
 pub struct Runtime {
     /// Each charter's never, as the text it was compiled from.
     compiled: Mutex<HashMap<String, (String, CompiledNever)>>,
     used: Mutex<HashMap<String, Vec<u64>>>,
+    /// Moves on each time what the budgets used changes, so a writer can tell there's
+    /// something new to write.
+    changes: AtomicU64,
 }
 
 impl Runtime {
@@ -470,6 +475,9 @@ impl Runtime {
                 counted.push((&c.id, i));
             }
         }
+        if !counted.is_empty() {
+            self.changes.fetch_add(1, Ordering::Relaxed);
+        }
         for (id, i) in counted {
             if let Some(n) = used.get_mut(id).and_then(|counts| counts.get_mut(i)) {
                 *n += 1;
@@ -483,10 +491,25 @@ impl Runtime {
         self.used.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    /// How many times what the budgets used has changed.
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Relaxed)
+    }
+
+    /// Takes up what budgets used before a restart, for charters this proxy hasn't counted
+    /// anything for since.
+    pub fn take_up(&self, counts: HashMap<String, Vec<u64>>) {
+        let mut used = self.used.lock().unwrap_or_else(|p| p.into_inner());
+        for (id, counts) in counts {
+            used.entry(id).or_insert(counts);
+        }
+    }
+
     /// Forgets what the proxy kept of a charter that's ended.
     pub fn forget(&self, id: &str) {
         self.compiled.lock().unwrap_or_else(|p| p.into_inner()).remove(id);
         self.used.lock().unwrap_or_else(|p| p.into_inner()).remove(id);
+        self.changes.fetch_add(1, Ordering::Relaxed);
     }
 }
 

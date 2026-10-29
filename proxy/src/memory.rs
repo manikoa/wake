@@ -3,18 +3,20 @@
 //! can reach it without reaching the control API.
 //!
 //! ```text
-//! GET /v1/memory?agent=<id>   {"version", "locked_by", "hidden_by", "quarantines": [...], "halts": [...]}
+//! GET /v1/memory?agent=<id>&process=<id>   {"version", "locked_by", "hidden_by", "quarantines": [...], "halts": [...]}
 //! ```
 //!
 //! The halts let an SDK stop its agent, or one instance of it such as an in-process
 //! sub-agent, in its own process: the calls that never reach the proxy, and the sub-agents
 //! the proxy can't tell from their parent because they share its credentials.
 //!
-//! Each fetch is noted, and the brake reads the notes from the control API to confirm an
-//! agent's adapter has the quarantine. The agent names itself, so that confirmation trusts
-//! the agent's process, as the adapter's enforcement does; the proxy deny doesn't. Agents
-//! can reach this port, so it caps its connections and how long each stays open
-//! (listen::MEMORY), and the notes are bounded (halts.rs).
+//! Each fetch is noted, under the agent and the process the SDK names, and the brake reads
+//! the notes from the control API to confirm an agent's SDK has a quarantine or halt: in
+//! every process of the agent still fetching, not only the first to fetch it. The agent
+//! names itself, so that confirmation trusts the agent's process, as the adapter's
+//! enforcement does; the proxy deny doesn't. Agents can reach this port, so it caps its
+//! connections and how long each stays open (listen::MEMORY), and the notes are bounded
+//! (halts.rs).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,7 +34,11 @@ async fn rules(State(halts): State<Arc<Halts>>, Query(query): Query<HashMap<Stri
     let agent = query.get("agent").map(String::as_str).unwrap_or("");
     // An agent name is short; a longer one isn't noted.
     let agent = if agent.len() <= 256 { agent } else { "" };
-    Json(halts.memory_rules(agent))
+    // So is the SDKs' name for a process, its pid and a random suffix; a longer one is
+    // noted as the process with no name.
+    let process = query.get("process").map(String::as_str).unwrap_or("");
+    let process = if process.len() <= 128 { process } else { "" };
+    Json(halts.memory_rules(agent, process))
 }
 
 pub fn router(halts: Arc<Halts>) -> Router {
