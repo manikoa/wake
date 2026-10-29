@@ -28,11 +28,12 @@ To place a new piece of code, ask: **could an agent, with the credentials and ac
 
 2. **The customer holds the evidence.** The log writes to the customer's own bucket with object lock (S3 Object Lock, GCS retention lock, Azure immutable storage) or is anchored in a transparency log. Wake's own services must not be able to rewrite history, and anyone must be able to check the log without trusting Wake.
 
-3. **Orchestrate, don't replace.** Pull the levers platforms already expose: proxy deny, OAuth token revocation, Shared Signals, identity provider disable APIs, sandbox APIs. Wake never becomes another identity provider or gateway. The proxy is agentgateway with Wake's additions, not a new gateway.
+3. **Orchestrate, don't replace.** Pull the levers platforms already expose: proxy deny, OAuth token revocation, Shared Signals, identity provider disable APIs, sandbox APIs. Wake never becomes another identity provider, token issuer, credential broker or gateway. The proxy is agentgateway with Wake's additions, not a new gateway. The customer's identity provider issues every agent's and sub-agent's credentials; Wake records which token each holds (its id and delegation chain, never the token), denies it at the proxy and revokes it through the provider.
 
 4. **Recording never blocks; the brake fails closed.**
    - Recording: SDK and adapter code never raises into agent code and never adds blocking work to the agent's call path. Use a bounded buffer and send asynchronously. If the recorder is down or events are dropped, the agent keeps working and a health signal pages someone.
-   - Brake: a lever counts as fired only when it is positively verified. If the brake can't confirm a lever fired, it treats that path as live: it shows it as live, keeps retrying, and never reports the fleet as stopped.
+   - Brake: a lever counts as fired only when it is positively verified. If the brake can't confirm a lever fired, it treats that path as live: it shows it as live, keeps retrying, and never reports the fleet as stopped. A sub-agent that shares its parent's process and credentials can't be stopped alone at the proxy or the identity provider; the brake says so rather than reporting it stopped.
+   - Identity sets the grain of control: Wake can stop, taint and trace only as finely as the gateway can tell agents apart. Name a caller by the agent acting (a delegated token's `act`), not by the user it acts for.
 
 5. **Open source at the core.** The open source recorder is the SDKs, the proxy, the memory adapter and a self hosted signed log, all under Apache 2.0 (the same license as agentgateway). Only the recorder lives in this repo. The hosted log, the dashboard (provenance and downstream views), the brake and the control plane live in a separate private repository. See `docs/repo-layout.md` for the folders and rules.
 
@@ -52,12 +53,12 @@ Follow the architecture from top to bottom. Each pick comes with the roadmap's r
 | Provenance graph | Postgres for metadata and causal edges, ClickHouse for raw events, filled by an ingester that reads the signed log | Built from the log, so the log stays the source of truth; recursive queries cover the graph until a graph database is clearly needed; ClickHouse handles trace volume |
 | Detect | Cedar policies in the proxy, rules over ClickHouse, out of band monitors from more than one lab | Cedar is analyzable and is what AWS AgentCore Policy uses |
 | Brake | Temporal workflows with Go workers calling each lever | Durable fan out with retries and verification, so a revocation never fails silently |
-| Identity and keys | SPIFFE/SPIRE plus cloud KMS, with customer held keys as an option | Short lived identities for capture components; agents never hold signing keys |
+| Identity and keys | SPIFFE/SPIRE plus cloud KMS, with customer held keys as an option; agents' own credentials from the customer's identity provider | Short lived identities for capture components; agents never hold signing keys; Wake records each delegated token's id and actor, never the token |
 | Dashboard | Next.js and React Flow in a Turborepo | Familiar from Clavr; React Flow draws the provenance graph |
 | Deployment | Containers, Helm and Terraform; hosted control plane on GCP (Cloud Run, Cloud SQL) | Customers run the data plane in AWS, Azure or GCP |
 | Shipping safely | Sigstore signed releases, SLSA provenance, SBOMs, a fuzzed proxy, an early SOC 2 | Wake becomes the most attractive target in every customer's stack |
 
-That's four languages, each where it's strongest: Rust for the proxy, Go for the collector and the brake, TypeScript and Python for the SDKs and the dashboard. Don't add a fifth. Use managed ClickHouse and Temporal until customers need everything self hosted. Skip Kafka, a graph database, your own identity provider and your own policy language.
+That's four languages, each where it's strongest: Rust for the proxy, Go for the collector and the brake, TypeScript and Python for the SDKs and the dashboard. Don't add a fifth. Use managed ClickHouse and Temporal until customers need everything self hosted. Skip Kafka, a graph database, your own identity provider or token service, and your own policy language.
 
 For OpenTelemetry, use the GenAI semantic conventions where they exist (they're still marked Development) and keep Wake's provenance fields in their own attribute namespace, so they can move onto the standard when it settles.
 

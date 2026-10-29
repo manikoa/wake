@@ -15,9 +15,11 @@
  * stream as it passes. Each assistant message is a model call, and each tool use and its
  * result a tool call. A subagent started with the Agent tool is an agent of its own, named
  * <agent>/<subagent type>: one agent_message hands it the task and another carries its answer
- * back. Links are exact, from the SDK's ids: a tool call's parent is the model call that
- * asked for it, and a model call's parents are the call before it and the tool results and
- * messages new in its context.
+ * back. Several of one type can run at once, so each is also an instance, <agent>/<subagent
+ * type>#<the Agent tool use that started it>, and its events name the instance and the
+ * lineage that started it. Links are exact, from the SDK's ids: a tool call's parent is the
+ * model call that asked for it, and a model call's parents are the call before it and the
+ * tool results and messages new in its context.
  *
  * options() adds hooks that open each tool call before it runs, and tools() wraps in-process
  * tools so they run with their event current: an MCP or A2A call they make through the
@@ -70,7 +72,9 @@ function under(span: Span | undefined): Context | undefined {
 /** One agent's conversation in a run: the main agent's, or a subagent's. */
 class Thread {
   readonly agent: string;
-  readonly span: Span | undefined; // its events nest under this span
+  readonly instance: string | undefined; // a subagent's own instance; the main agent has none
+  readonly lineage: readonly string[]; // the agent and instances that started it, outermost first
+  span: Span | undefined; // its events nest under this span
   call: Call | undefined; // the model call streaming now
   lastCall: string | undefined;
   parents: string[]; // what feeds its next model call
@@ -79,13 +83,28 @@ class Thread {
   waitingSince = now(); // when it last handed control to the model
   readonly prompt: unknown;
 
-  constructor(agent: string, span: Span | undefined, parents: string[], origins: string[], given: Json[]) {
+  constructor(
+    agent: string,
+    span: Span | undefined,
+    parents: string[],
+    origins: string[],
+    given: Json[],
+    instance?: string,
+    lineage: readonly string[] = [],
+  ) {
     this.agent = agent;
+    this.instance = instance;
+    this.lineage = lineage;
     this.span = span;
     this.parents = parents;
     this.origins = origins;
     this.given = given;
     this.prompt = given[0]?.content;
+  }
+
+  /** The thread of an instance this one starts. */
+  started(agent: string, instance: string, span: Span | undefined, parents: string[], given: Json[]): Thread {
+    return new Thread(agent, span, parents, [], given, instance, [...this.lineage, this.instance ?? this.agent]);
   }
 }
 
@@ -118,6 +137,8 @@ class Tool {
   readonly name: string;
   readonly args: unknown;
   agent: string;
+  instance: string | undefined;
+  lineage: readonly string[] = [];
   readonly run: Run | undefined;
   parents: string[] = [];
   error: string | undefined;
@@ -165,6 +186,7 @@ export class WakeClaudeAgent extends EventGraph {
   readonly #tools = new Recent<string, Tool>(); // tool use id -> its open tool call
   readonly #waiting = new Recent<string, string[]>(); // (tool name, arguments) -> tool use ids an in-process tool may be
   readonly #toolAgents = new Recent<string, string>(); // tool call event id -> the agent making it
+  readonly #toolInstances = new Recent<string, [string, readonly string[]]>(); // tool call event id -> the subagent instance making it, and its lineage
   readonly #sessions = new Recent<string, Run>(1024); // session id -> its run now
   readonly #lastCalls = new Recent<string, string>(1024); // session id -> its last model call, for the next turn
   readonly #active: Run[] = [];
@@ -383,7 +405,8 @@ export class WakeClaudeAgent extends EventGraph {
     let thread = run.threads.get(key);
     if (thread === undefined) {
       // A subagent whose start Wake didn't see.
-      thread = new Thread(`${this._recorder.agent}/subagent`, run.root, [], [], []);
+      const agent = `${this._recorder.agent}/subagent`;
+      thread = run.threads.get(null)!.started(agent, `${agent}#${key}`, run.root, [], []);
       run.threads.set(key, thread);
     }
     return thread;
@@ -431,7 +454,7 @@ export class WakeClaudeAgent extends EventGraph {
     }
     const payload: Json = { model: call.model, input: call.given, output: call.output };
     if (call.error) payload.error = call.error;
-    this.#emit(call.span, call.eventId, events.MODEL_CALL, `chat ${call.model}`.trim(), thread.agent, call.parents, call.origins, attributes, payload, call.error);
+    this.#emit(call.span, call.eventId, events.MODEL_CALL, `chat ${call.model}`.trim(), thread.agent, call.parents, call.origins, attributes, payload, call.error, thread);
     this._rememberOutput(call.span.spanContext().traceId, call.eventId, text(call.output));
     call.span.end(call.endedAt);
   }
@@ -439,8 +462,11 @@ export class WakeClaudeAgent extends EventGraph {
   #requested(run: Run, thread: Thread, call: Call, toolUseId: string, name: string, args: unknown, server = false): void {
     const tool = this.#openTool(run, toolUseId, name, args, thread.agent, thread.span, server);
     tool.agent = thread.agent;
+    tool.instance = thread.instance;
+    tool.lineage = thread.lineage;
     tool.parents = unique([call.eventId, ...call.found]);
     this.#toolAgents.set(tool.eventId, thread.agent);
+    if (thread.instance) this.#toolInstances.set(tool.eventId, [thread.instance, thread.lineage]);
     this._rememberLineage(tool.eventId, tool.parents, [`tool:${name}`]);
   }
 
@@ -476,7 +502,7 @@ export class WakeClaudeAgent extends EventGraph {
     if (parts[0] === "mcp" && parts.length >= 3) attributes["wake.mcp.server"] = parts[1];
     const payload: Json = { input: tool.args ?? null, output: output ?? null };
     if (error) payload.error = tool.error ?? (text(output) || error);
-    this.#emit(tool.span, tool.eventId, events.TOOL_CALL, `execute_tool ${tool.name}`, tool.agent, tool.parents, [`tool:${tool.name}`], attributes, payload, error);
+    this.#emit(tool.span, tool.eventId, events.TOOL_CALL, `execute_tool ${tool.name}`, tool.agent, tool.parents, [`tool:${tool.name}`], attributes, payload, error, tool);
     this._rememberOutput(tool.span.spanContext().traceId, tool.eventId, text(output));
     tool.span.end(tool.endedAt ?? now());
     return tool;
@@ -488,6 +514,8 @@ export class WakeClaudeAgent extends EventGraph {
     const prompt = args.prompt;
     const eventId = randomUUID();
     const parents = unique([call.eventId, ...call.found]);
+    const given = typeof prompt === "string" ? [{ role: "user", content: prompt }] : [];
+    const sub = thread.started(target, `${target}#${block.id as string}`, undefined, [eventId], given);
     const name = `agent_message ${thread.agent} -> ${target}`;
     const span = this._recorder.tracer.startSpan(name, { startTime: now() }, under(thread.span));
     this.#emit(span, eventId, events.AGENT_MESSAGE, name, target, parents, [`agent:${thread.agent}`], { "gen_ai.agent.name": target }, {
@@ -495,15 +523,22 @@ export class WakeClaudeAgent extends EventGraph {
       to: target,
       description: args.description ?? null,
       prompt: prompt ?? null,
-    });
+    }, undefined, sub);
     span.end(now());
-    const subSpan = this._recorder.tracer.startSpan(
+    sub.span = this._recorder.tracer.startSpan(
       `invoke_agent ${target}`,
-      { attributes: { "gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": target, [events.AGENT_ID]: target }, startTime: now() },
+      {
+        attributes: {
+          "gen_ai.operation.name": "invoke_agent",
+          "gen_ai.agent.name": target,
+          [events.AGENT_ID]: target,
+          ...events.instanceAttributes(sub.instance, sub.lineage),
+        },
+        startTime: now(),
+      },
       under(thread.span),
     );
-    const given = typeof prompt === "string" ? [{ role: "user", content: prompt }] : [];
-    run.threads.set(block.id as string, new Thread(target, subSpan, [eventId], [], given));
+    run.threads.set(block.id as string, sub);
     run.handoffs.set(block.id as string, eventId);
   }
 
@@ -520,7 +555,7 @@ export class WakeClaudeAgent extends EventGraph {
       from: sub.agent,
       to: thread.agent,
       output: content ?? null,
-    });
+    }, undefined, thread);
     this._rememberOutput(span.spanContext().traceId, eventId, text(content));
     span.end(now());
     thread.parents.push(eventId);
@@ -537,6 +572,7 @@ export class WakeClaudeAgent extends EventGraph {
     attributes: Record<string, string | number>,
     payload: Json,
     error?: string,
+    who?: Thread | Tool,
   ): void {
     parents = unique(parents);
     this._rememberLineage(eventId, parents, origins);
@@ -548,6 +584,7 @@ export class WakeClaudeAgent extends EventGraph {
       [events.CAPTURE]: "sdk",
       [events.PARENTS]: parents,
       [events.ORIGINS]: origins,
+      ...(who !== undefined ? events.instanceAttributes(who.instance, who.lineage) : {}),
       ...attributes,
     });
     span.setAttributes(events.payloadAttributes(payload));
@@ -585,6 +622,19 @@ export class WakeClaudeAgent extends EventGraph {
   override _currentAgent(): string {
     const link = links.current();
     return (link !== undefined ? this.#toolAgents.get(link.eventId) : undefined) ?? this._recorder.agent;
+  }
+
+  override _currentInstance(): [string | undefined, readonly string[]] {
+    const link = links.current();
+    if (link === undefined) return [undefined, []];
+    const known = this.#toolInstances.get(link.eventId);
+    if (known !== undefined) return known;
+    const tool = [...this.#tools.values()].find((t) => t.eventId === link.eventId);
+    if (tool === undefined || tool.run === undefined || tool.agent === this._recorder.agent) return [undefined, []];
+    // The hook opened the tool before the stream said which subagent asked for it. With one
+    // instance of that agent running, it's that one; with more, it isn't guessed.
+    const running = [...tool.run.threads.values()].filter((t) => t.agent === tool.agent && t.instance);
+    return running.length === 1 ? [running[0].instance, running[0].lineage] : [undefined, []];
   }
 
   /** Under the tool call or message that started this run, if any. */

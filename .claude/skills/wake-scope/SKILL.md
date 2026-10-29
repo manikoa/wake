@@ -24,11 +24,11 @@ The roadmap also says to use no Microsoft devices, accounts or tools for Wake wo
 | Phase | Months | What ships | Gate to move on |
 |---|---|---|---|
 | Validate | 0 to 1 | Written release from Microsoft or an exit plan, 20 interviews, a game day on Clavr, a trademark check on Wake, 3 design partners chosen | Release in hand; 5 teams with a real incident or stalled deal; 3 design partners committed |
-| Record | 1 to 3 | Open source SDKs for the Claude Agent SDK, OpenAI Agents SDK and LangGraph; MCP and A2A proxy on agentgateway; memory adapter; signed log; provenance view | Live in 3 partners' staging; traces stitched across agents; one real issue caught |
-| Brake | 3 to 6 | Brake with three levers (proxy deny, token revocation at the top providers, sandbox freeze on E2B or Modal), downstream view, memory quarantine, first paid pilots | A partner's fleet stopped and verified in under a minute during a game day; 2 to 5 paid pilots |
-| Prove | 6 to 12 | Evidence packs (OWASP Agentic Top 10, EU AI Act, AIUC-1, AI questionnaires), trust pages, 10 or more levers, detection rules, self serve Team plan, SOC 2 Type II | 20 paying customers; about $500K ARR; a security review closed with an evidence pack |
-| Contain | 12 to 18 | Origin labels and flow policies that stop untrusted content triggering privileged actions; memory integrity with gated writes and rollback; blast radius replay; private deployment; SIEM export | 50 customers; about $3M ARR; an enterprise contract over $150K; a financial services customer through an AI vendor |
-| Platform | 18 to 36 | Policy compiled to each platform (Cedar, Agent 365, Google); consent and delegation for long running agents; insurer and auditor integrations; detection trained on incidents across customers | An insurer or auditor accepts the records as evidence; $10M or more ARR |
+| Record | 1 to 3 | Open source SDKs for the Claude Agent SDK, OpenAI Agents SDK and LangGraph; MCP and A2A proxy on agentgateway; memory adapter; signed log; provenance view; sub-agent instances and what started them; the agent behind a delegated token named; secrets stripped before signing | Live in 3 partners' staging; traces stitched across agents; one real issue caught |
+| Brake | 3 to 6 | Brake with three levers (proxy deny, token revocation at the top providers, sandbox freeze on E2B or Modal), downstream view, memory quarantine, first paid pilots; halting one sub-agent while its run goes on, saying so when it can't be stopped alone; an owner for every agent and a census of agents seen against the inventory | A partner's fleet stopped and verified in under a minute during a game day; 2 to 5 paid pilots |
+| Prove | 6 to 12 | Evidence packs (OWASP Agentic Top 10, EU AI Act, AIUC-1, AI questionnaires), trust pages, 10 or more levers, detection rules (including credentials used by the wrong agent and sensitive data in messages, tool calls and memory), a leak game day, self serve Team plan, SOC 2 Type II | 20 paying customers; about $500K ARR; a security review closed with an evidence pack |
+| Contain | 12 to 18 | Origin labels and flow policies that stop untrusted content triggering privileged actions, carried to the sub-agents an agent starts; memory integrity with gated writes and rollback; blast radius replay; run charters (never touch, budget, checks that say it's done, then credentials retired); separation of duty checks over observed influence; private deployment; SIEM export | 50 customers; about $3M ARR; an enterprise contract over $150K; a financial services customer through an AI vendor |
+| Platform | 18 to 36 | Policy compiled to each platform (Cedar, Agent 365, Google); consent and delegation for long running agents, with token lineage from the clouds' audit logs; limits on the authority an agent reaches through the agents it influences; insurer and auditor integrations; detection trained on incidents across customers | An insurer or auditor accepts the records as evidence; $10M or more ARR |
 
 Put the task in one of these buckets:
 
@@ -39,7 +39,7 @@ Put the task in one of these buckets:
 
 ## Things the roadmap says to skip
 
-The stack section says to skip Kafka, a graph database, your own identity provider and your own policy language for now, and never to let the brake run inside an agent's own process. It says to use the managed versions of ClickHouse and Temporal until customers need everything self hosted, and to rely on Postgres recursive queries for the provenance graph until a graph database is clearly needed.
+The stack section says to skip Kafka, a graph database, your own identity provider or token service, and your own policy language for now, and never to let the brake run inside an agent's own process. It says to use the managed versions of ClickHouse and Temporal until customers need everything self hosted, and to rely on Postgres recursive queries for the provenance graph until a graph database is clearly needed.
 
 "Clearly needed" means a design partner hit a measured limit, not that it might matter at scale. When someone reaches for a skipped item, answer with the roadmap's pick and its reason (see the `wake-architecture` skill).
 
@@ -50,7 +50,7 @@ These usually mean the work has drifted past what the phase needs:
 - Abstractions for frameworks, levers, memory stores or clouds nobody has asked for. Record ships three framework SDKs and Brake ships three levers; the fourth comes when a partner needs it.
 - Plugin systems, generic adapter layers or config languages built before there are three concrete cases to generalize from.
 - Multi-tenancy, multi-region, high availability or self hosting work before a customer asks for it.
-- Writing your own gateway, log, policy language, workflow engine or identity system. The stack table names a proven pick for each.
+- Writing your own gateway, log, policy language, workflow engine, identity system, token service or credential broker. The stack table names a proven pick for each; the customer's identity provider issues every agent's and sub-agent's credentials.
 - Screens beyond the one view the phase ships: the provenance view in Record and the downstream view in Brake.
 - Detection, risk scoring or machine learning before Prove.
 

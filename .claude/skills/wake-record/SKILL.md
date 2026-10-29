@@ -9,7 +9,7 @@ Read the `wake-architecture` skill first for the boundaries and principles. Chec
 
 ## What ships, and what counts as done
 
-**Ships (months 1 to 3):** open source SDKs for the Claude Agent SDK, OpenAI Agents SDK and LangGraph; an MCP and A2A proxy built on agentgateway; the memory adapter; the signed log; the provenance view.
+**Ships (months 1 to 3):** open source SDKs for the Claude Agent SDK, OpenAI Agents SDK and LangGraph; an MCP and A2A proxy built on agentgateway; the memory adapter; the signed log; the provenance view; each sub-agent recorded as an instance of its own, with what started it; the agent behind a delegated token named, not the user it acts for; secrets stripped before anything is signed.
 
 **Gate:** live in 3 partners' staging, traces stitched across agents, and one real issue caught.
 
@@ -34,10 +34,10 @@ Then add the proxy (it covers agents without an SDK and every MCP and A2A call),
 Capture every model call, tool call, message between agents, and memory read or write. Start each event with only the fields the provenance view and the gate need:
 
 - Event id, plus OpenTelemetry trace and span ids.
-- The agent's identity and which capture component recorded the event (SDK, proxy or memory adapter).
+- The agent's identity and which capture component recorded the event (SDK, proxy or memory adapter). Where several copies of an agent can run at once, such as sub-agents, also the instance and what started it (`wake.agent.instance`, `wake.agent.lineage`). Behind a delegated token, the agent acting (the token's `act`), never the user it acts for.
 - The kind of event: model call, tool call, agent message, memory read or memory write.
 - A timestamp.
-- The payload, or a digest of it with the raw content kept in ClickHouse.
+- The payload, or a digest of it with the raw content kept in ClickHouse. Secrets in it (tokens, keys) are replaced before the event is signed, since the log can never erase what it holds.
 - The origin label: where the content came from, such as an email, a web page, another agent or a memory entry.
 - Causal parents: the ids of the events whose output fed this one.
 

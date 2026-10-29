@@ -153,6 +153,39 @@ test("uninstall stops recording other runs", async () => {
   assert.equal(exporter.getFinishedSpans().filter((s) => s.attributes["wake.event.kind"] === "model_call").length, 1);
 });
 
+test("runs of one agent at once are instances of their own", async () => {
+  const { recorder, spans } = recorded("clavr");
+  const handler = new WakeCallbackHandler(recorder).install();
+  const step = (query: string) =>
+    handler.agent("email", { input: query }, async (run) => {
+      const found = await searchEmail.invoke({ query });
+      run.reply(found);
+    });
+  try {
+    await handler.agent("supervisor", { input: "Check both senders", origin: "user" }, () =>
+      Promise.all([step("from:acme-billing"), step("from:globex-billing")]),
+    );
+  } finally {
+    handler.uninstall();
+  }
+  const all = await spans();
+  const kinds = new Map<string, string[]>();
+  for (const e of wakeEvents(all)) {
+    if (attr(e, "wake.agent.id") === "email") {
+      assert.deepEqual(attr(e, "wake.agent.lineage"), ["supervisor"]);
+      const instance = attr(e, "wake.agent.instance") as string;
+      kinds.set(instance, [...(kinds.get(instance) ?? []), attr(e, "wake.event.kind") as string]);
+    } else {
+      assert.equal(attr(e, "wake.agent.instance"), undefined, "the supervisor and the replies it reads are its own");
+    }
+  }
+  assert.equal(kinds.size, 2);
+  for (const k of kinds.values()) assert.deepEqual(k.sort(), ["agent_message", "tool_call"]);
+  const runs = all.filter((s) => s.attributes["gen_ai.operation.name"] === "invoke_agent" && s.attributes["gen_ai.agent.name"] === "email");
+  assert.deepEqual(new Set(runs.map((r) => r.attributes["wake.agent.instance"])), new Set(kinds.keys()));
+  for (const r of runs) assert.equal(r.attributes["wake.agent.instance"], `email#${r.spanContext().spanId}`, "named for its run's span");
+});
+
 test("errors in the agent still reach the caller", async () => {
   const handler = new WakeCallbackHandler(recorded("clavr").recorder);
   assert.throws(() =>
