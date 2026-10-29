@@ -120,6 +120,8 @@ pub struct Exchange {
     message_emitted: bool,
     started_at: u64,
     response_seen: bool,
+    /// The reply's HTTP status, once its headers are in.
+    response_status: Option<u16>,
     response_streamed: bool,
     response_body: Vec<u8>,
     response_truncated: bool,
@@ -392,6 +394,7 @@ impl Exchange {
     fn response_headers(&mut self, h: &HttpHeaders) -> (HeadersResponse, Option<ProcessingMode>) {
         let headers = header_map(h);
         self.response_seen = true;
+        self.response_status = headers.get(":status").and_then(|s| s.parse().ok());
         let streamed = headers
             .get("content-type")
             .is_some_and(|c| c.starts_with("text/event-stream"));
@@ -521,6 +524,7 @@ impl Exchange {
             (self.reply_id.clone(), self.reply_span)
         };
         let reply = a2a::parse_reply(&self.response_body, self.response_streamed);
+        let (ok, state) = (reply.ok(self.response_status, self.response_truncated), reply.state);
         let request = self.request.as_ref();
         let answers_message = request
             .and_then(|r| r.method.as_deref())
@@ -542,6 +546,12 @@ impl Exchange {
             }
         }
         let mut e = self.base(&id, span, Some(self.message_span), self.started_at, nanos(now));
+        if let Some(ok) = ok {
+            e.set("wake.call.ok", Value::Bool(ok));
+        }
+        if let Some(state) = state {
+            e.set("wake.a2a.task_state", Value::Str(state.into()));
+        }
         e.name = format!("agent_message {} -> {}", self.receiver, self.sender);
         e.set("wake.agent.id", Value::Str(self.sender.clone()));
         e.set("gen_ai.agent.name", Value::Str(self.sender.clone()));
@@ -1152,6 +1162,39 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_with_an_error_status_didnt_go_well() {
+        let mut x = Exchange::default();
+        let send =
+            br#"{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{"messageId":"m1","parts":[]}}}"#;
+        let mut events = Vec::new();
+        events.extend(x.handle(first(&[(":method", "POST")]), t(0)).1);
+        events.extend(x.handle(phase(Phase::RequestBody(body(send, true))), t(1)).1);
+        events.extend(
+            x.handle(
+                phase(Phase::ResponseHeaders(headers(&[
+                    (":status", "503"),
+                    ("content-type", "application/json"),
+                ]))),
+                t(2),
+            )
+            .1,
+        );
+        let reply =
+            br#"{"jsonrpc":"2.0","id":"1","result":{"task":{"id":"t1","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+        events.extend(x.handle(phase(Phase::ResponseBody(body(reply, true))), t(3)).1);
+        events.extend(x.finish(t(4)));
+        let [message, answer] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        assert!(
+            !message.attributes.contains_key("wake.call.ok"),
+            "the message itself has no outcome"
+        );
+        assert_eq!(answer.attributes["wake.call.ok"], Value::Bool(false));
+        assert_eq!(s(answer, "wake.a2a.task_state"), "working");
+    }
+
+    #[test]
     fn records_version_1_messages_and_replies() {
         let send = br#"{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"Is Acme legit?"}]}}}"#;
         let reply = br#"{"jsonrpc":"2.0","id":"1","result":{"message":{"messageId":"r1","role":"ROLE_AGENT","parts":[{"text":"No."}],"metadata":{"dev.wake/parents":["research-step-2"]}}}}"#;
@@ -1186,6 +1229,9 @@ mod tests {
         };
         assert_eq!(s(reply, "wake.a2a.task_id"), "t1");
         assert_eq!(reply.attributes["wake.parents"], Value::Strs(vec![message_id]));
+        // The receiver says the task is done, and the call went well.
+        assert_eq!(s(reply, "wake.a2a.task_state"), "completed");
+        assert_eq!(reply.attributes["wake.call.ok"], Value::Bool(true));
 
         // The same in v0.3, and a task nobody saw start has no parent.
         let send =
