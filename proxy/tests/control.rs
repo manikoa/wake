@@ -431,7 +431,7 @@ async fn a_quarantine_reaches_the_memory_adapters() {
         c.halts.clone(),
         std::future::pending(),
     ));
-    let rules: serde_json::Value = reqwest::get(format!("{memory}/v1/memory?agent=billing"))
+    let rules: serde_json::Value = reqwest::get(format!("{memory}/v1/memory?agent=billing&process=7.a1b2c3"))
         .await
         .unwrap()
         .json()

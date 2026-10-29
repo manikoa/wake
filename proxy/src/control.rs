@@ -7,7 +7,8 @@
 //! GET    /v1/halts              the halts and quarantines in force
 //! PUT    /v1/quarantines/{id}   {"selection": {"lock": {...}, "agents": [...], "origins": [...], ...}}
 //! DELETE /v1/quarantines/{id}
-//! GET    /v1/memory/seen        each agent's memory adapter: the version it last fetched, and when
+//! GET    /v1/memory/seen        each agent's SDK: the lowest version any of its processes still
+//!                               fetching last got, and when
 //! GET    /v1/callers            each identity the deny lever has seen calling: its agent, the
 //!                               delegation chain and token ids it came with, and when;
 //!                               ?identity=<id> only that one, and the callers whose chain names it

@@ -247,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => Agents::none(),
             };
             let halts = Arc::new(Halts::load(&state_dir).with_agents(Arc::new(agents)));
+            tokio::spawn(halts.clone().keep_counts(stopping()));
             let policy = Arc::new(match policy_file.as_deref() {
                 Some(path) => Policy::from_file(path),
                 None => Policy::fixed(FlowPolicy::empty()),
@@ -350,6 +351,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let listener = wake_proxy::listen::bind_unix(&path)?;
                     pipeline::serve_unix(listener, svid, options, counters.clone(), shutdown).await?;
                 }
+            }
+            // The hooks have stopped, so nothing more is counted.
+            if let Err(e) = halts.save_counts() {
+                tracing::warn!(error = %e, "can't write what the charters' budgets used; a restart would count from what was last written");
             }
             tracing::info!(
                 sent = Counters::get(&counters.sent),

@@ -144,7 +144,7 @@ pub struct HaltRule {
     pub agents: Vec<String>,
 }
 
-/// When an agent's memory adapter last fetched its rules, and at which version.
+/// A fetch of an agent's memory rules: the version it got, and when.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Seen {
     pub version: u64,
@@ -212,20 +212,134 @@ pub struct Halts {
     seen: Mutex<Notes>,
     // The callers the deny lever has seen, kept in memory only, like seen.
     callers: Mutex<Callers>,
-    // Each charter's never, compiled, and what its budget has used, in memory only.
+    // Each charter's never, compiled, and what its budget has used.
     charters: charters::Runtime,
+    // Where what the budgets have used is written, apart from the state (save_counts).
+    counts: Mutex<CountsDisk>,
     // The version in force, sent on each change.
     changed: watch::Sender<u64>,
 }
 
-/// The most agents whose fetches are noted. Agents name themselves, so past it the oldest
-/// note goes, and the brake can't confirm that agent's adapter until it fetches again.
-pub const SEEN_LIMIT: usize = 10_000;
+/// The file what each charter's budget has used is kept in, in the state directory. Apart
+/// from the state, so counting a call never moves the version the brake confirms.
+pub const COUNTS_FILE: &str = "charter-counts.json";
 
+/// How often what the budgets have used is written, while it changes: a restart counts
+/// again at most the calls of this long.
+pub const COUNTS_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What each charter's budget has used, limit by limit, as written to COUNTS_FILE.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+struct Counts {
+    /// The state's epoch: counts from a state that started over are another state's.
+    epoch: String,
+    used: HashMap<String, Vec<u64>>,
+}
+
+struct CountsDisk {
+    path: Option<PathBuf>,
+    // The charters' changes() as last written.
+    written: u64,
+}
+
+/// The most fetches noted, one for each agent and process that fetched. Agents name
+/// themselves, so past it the oldest note goes, and the brake can't confirm that agent's
+/// SDK until it fetches again.
+pub const SEEN_LIMIT: usize = 10_000;
+/// The most processes noted for one agent. Past it the one that fetched longest ago goes.
+pub const PROCESSES_LIMIT: usize = 32;
+/// How long after its last fetch a process still holds its agent back, in nanoseconds. An
+/// SDK fetches every 2 seconds and refuses every call once its rules are 30 seconds old, so
+/// a process silent this long has stopped, or refuses everything.
+pub const PROCESS_LIVE: u64 = 60_000_000_000;
+
+/// Who has fetched the memory rules: each agent's processes, by the name each SDK gives its
+/// own (an SDK that names none is the process with no name).
 #[derive(Default)]
 struct Notes {
-    by_agent: HashMap<String, Seen>,
-    order: VecDeque<String>,
+    by_agent: HashMap<String, Fetches>,
+    // Each agent and process noted, oldest first.
+    order: VecDeque<(String, String)>,
+}
+
+/// One agent's processes and the last fetch of each.
+#[derive(Default)]
+struct Fetches {
+    by_process: HashMap<String, Seen>,
+    // The furthest behind of the notes that went while their process still held the agent
+    // back, so that a note going never makes the agent look further along than it is.
+    gone: Option<Seen>,
+}
+
+impl Notes {
+    fn note(&mut self, agent: &str, process: &str, seen: Seen) {
+        let Notes { by_agent, order } = self;
+        let fetches = by_agent.entry(agent.to_string()).or_default();
+        if fetches.by_process.insert(process.to_string(), seen).is_none() {
+            order.push_back((agent.to_string(), process.to_string()));
+            if fetches.by_process.len() > PROCESSES_LIMIT
+                && let Some(stalest) = fetches
+                    .by_process
+                    .iter()
+                    .min_by_key(|(_, s)| s.at)
+                    .map(|(p, _)| p.clone())
+            {
+                fetches.forget(&stalest, seen.at);
+                order.retain(|(a, p)| !(a == agent && *p == stalest));
+            }
+        }
+        while order.len() > SEEN_LIMIT {
+            let Some((agent, process)) = order.pop_front() else {
+                break;
+            };
+            if let Some(fetches) = by_agent.get_mut(&agent) {
+                fetches.forget(&process, seen.at);
+                if fetches.by_process.is_empty() {
+                    by_agent.remove(&agent);
+                }
+            }
+        }
+    }
+
+    /// For each agent, the version its SDKs have (Fetches::have).
+    fn have(&self, now: u64) -> HashMap<String, Seen> {
+        self.by_agent
+            .iter()
+            .filter_map(|(agent, f)| f.have(now).map(|seen| (agent.clone(), seen)))
+            .collect()
+    }
+}
+
+impl Fetches {
+    fn forget(&mut self, process: &str, now: u64) {
+        let Some(went) = self.by_process.remove(process) else {
+            return;
+        };
+        if holds_back(&went, now) {
+            self.gone = match self.gone {
+                Some(g) if holds_back(&g, now) && (g.version, g.at) <= (went.version, went.at) => Some(g),
+                _ => Some(went),
+            };
+        }
+    }
+
+    /// What the agent's SDKs have: the fetch furthest behind among its processes still
+    /// fetching, those that fetched in the last PROCESS_LIVE, so that one process having a
+    /// halt doesn't confirm it while another running the agent hasn't fetched it yet. When
+    /// none still is, its latest fetch.
+    fn have(&self, now: u64) -> Option<Seen> {
+        self.by_process
+            .values()
+            .chain(&self.gone)
+            .filter(|s| holds_back(s, now))
+            .min_by_key(|s| (s.version, s.at))
+            .or_else(|| self.by_process.values().max_by_key(|s| s.at))
+            .copied()
+    }
+}
+
+fn holds_back(seen: &Seen, now: u64) -> bool {
+    now.saturating_sub(seen.at) < PROCESS_LIVE
 }
 
 /// One identity the deny lever has seen calling, for the brake: under which agent the
@@ -247,6 +361,12 @@ pub struct Caller {
     /// Whether that chain went on past the actors kept (token.rs).
     #[serde(default, skip_serializing_if = "is_false")]
     pub actors_cut: bool,
+    /// Set when the agents file doesn't list it and its latest token names another agent
+    /// as the one acting: it can't be placed under the agent it acts for, so every agent
+    /// halt denies it as a caller nobody can place. Usually an mTLS caller whose identity
+    /// provider doesn't name it by its SPIFFE ID in the token's `act`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub token_names_another: bool,
     /// The ids of the latest tokens it presented, newest last, at most CALLER_TOKENS.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tokens: Vec<String>,
@@ -309,10 +429,13 @@ impl Halts {
             }
             Err(e) => (unreadable_state(&path, &e.to_string()), true),
         };
-        Halts::new(state, Some(path), unreadable)
+        let halts = Halts::new(state, Some(path), unreadable);
+        halts.take_up_counts();
+        halts
     }
 
     fn new(state: State, path: Option<PathBuf>, unreadable: bool) -> Self {
+        let counts = path.as_ref().map(|p| p.with_file_name(COUNTS_FILE));
         Halts {
             changed: watch::Sender::new(state.version),
             current: RwLock::new(Arc::new(state)),
@@ -321,6 +444,98 @@ impl Halts {
             seen: Mutex::new(Notes::default()),
             callers: Mutex::new(Callers::default()),
             charters: charters::Runtime::default(),
+            counts: Mutex::new(CountsDisk {
+                path: counts,
+                written: 0,
+            }),
+        }
+    }
+
+    /// Takes up what the budgets of the charters in force had used before the proxy
+    /// stopped, as last written (save_counts). Counts from another epoch, or of a charter
+    /// no longer in force, aren't. A file that can't be read is left, and the budgets
+    /// count from zero, as they would with no file: the monitor's check of the record is
+    /// the backstop.
+    fn take_up_counts(&self) {
+        let Some(path) = self.counts.lock().unwrap_or_else(|p| p.into_inner()).path.clone() else {
+            return;
+        };
+        let state = self.current();
+        if state.charters.is_empty() {
+            return;
+        }
+        let counts = match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Counts>(&bytes) {
+                Ok(counts) => counts,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "can't read what the charters' budgets used; counting from zero");
+                    return;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "can't read what the charters' budgets used; counting from zero");
+                return;
+            }
+        };
+        if counts.epoch != state.epoch {
+            return;
+        }
+        let mut used = counts.used;
+        used.retain(|id, _| state.charters.iter().any(|c| c.id == *id));
+        tracing::info!(charters = used.len(), "took up what the charters' budgets used");
+        self.charters.take_up(used);
+    }
+
+    /// Writes what each charter's budget has used next to the state, if it changed since it
+    /// was last written, so that a restart doesn't hand a run its budget again. Returns
+    /// whether it wrote. The proxy calls it every COUNTS_EVERY while running (keep_counts),
+    /// and once more when it stops.
+    pub fn save_counts(&self) -> std::io::Result<bool> {
+        let mut disk = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(path) = disk.path.clone() else {
+            return Ok(false);
+        };
+        // Read before the counts, so a call counted in between is written next time.
+        let changes = self.charters.changes();
+        if changes == disk.written {
+            return Ok(false);
+        }
+        let state = self.current();
+        if state.unreadable.is_some() || state.uninitialized {
+            // Its charters are unknown: what's on disk stays for the state that's replaced.
+            return Ok(false);
+        }
+        let mut used = self.charters.used();
+        used.retain(|id, _| state.charters.iter().any(|c| c.id == *id));
+        let counts = Counts {
+            epoch: state.epoch.clone(),
+            used,
+        };
+        write_atomically(&path, &serde_json::to_vec(&counts)?)?;
+        disk.written = changes;
+        Ok(true)
+    }
+
+    /// Writes what the budgets have used every COUNTS_EVERY, until shutdown resolves. The
+    /// last write is the caller's, once nothing more is counted.
+    pub async fn keep_counts(self: Arc<Self>, shutdown: impl std::future::Future<Output = ()>) {
+        let mut tick = tokio::time::interval(COUNTS_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = &mut shutdown => return,
+            }
+            let halts = self.clone();
+            match tokio::task::spawn_blocking(move || halts.save_counts()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "can't write what the charters' budgets used; a restart would count from what was last written")
+                }
+                Err(e) => tracing::warn!(error = %e, "writing what the charters' budgets used stopped"),
+            }
         }
     }
 
@@ -489,10 +704,11 @@ impl Halts {
         )
     }
 
-    /// The rules for one agent's memory adapter, noting that the agent has them now. A
-    /// state that can't be read, or was never initialized, refuses every write and serves
-    /// no entry: whatever it quarantined is unknown, so any entry might be.
-    pub fn memory_rules(&self, agent: &str) -> MemoryRules {
+    /// The rules for one agent's SDK, noting that this process of the agent has them now:
+    /// process is the name the SDK gives its process, empty if it gives none. A state that
+    /// can't be read, or was never initialized, refuses every write and serves no entry:
+    /// whatever it quarantined is unknown, so any entry might be.
+    pub fn memory_rules(&self, agent: &str, process: &str) -> MemoryRules {
         let state = self.current();
         let agent = self.agents.named(agent);
         let named = |scope: &Scope| {
@@ -513,19 +729,14 @@ impl Halts {
                 .map(|q| q.id.clone())
         });
         if !agent.is_empty() {
-            let mut notes = self.seen.lock().unwrap_or_else(|p| p.into_inner());
             let seen = Seen {
                 version: state.version,
                 at: now(),
             };
-            if notes.by_agent.insert(agent.to_string(), seen).is_none() {
-                notes.order.push_back(agent.to_string());
-            }
-            while notes.order.len() > SEEN_LIMIT {
-                if let Some(oldest) = notes.order.pop_front() {
-                    notes.by_agent.remove(&oldest);
-                }
-            }
+            self.seen
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .note(agent, process, seen);
         }
         let mut halts: Vec<HaltRule> = state
             .halts
@@ -553,9 +764,14 @@ impl Halts {
         }
     }
 
-    /// Each agent whose memory adapter has fetched its rules, with the version it got.
+    /// Each agent whose SDK has fetched its rules, with the version it has: the lowest that
+    /// any of its processes still fetching got, and when that process fetched it.
     pub fn seen(&self) -> HashMap<String, Seen> {
-        self.seen.lock().unwrap_or_else(|p| p.into_inner()).by_agent.clone()
+        self.seen_at(now())
+    }
+
+    fn seen_at(&self, now: u64) -> HashMap<String, Seen> {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).have(now)
     }
 
     /// Notes a call from identity, the one the gateway authenticated, with the token it
@@ -578,16 +794,33 @@ impl Halts {
                 subject: None,
                 actors: vec![],
                 actors_cut: false,
+                token_names_another: false,
                 tokens: vec![],
                 first_seen: at,
                 last_seen: at,
                 calls: 0,
             }
         });
+        // Named by the agents file, or there's no file to say (Agents::caller).
+        let named = self.agents.caller(Some(identity)).is_some();
         caller.agent = agent;
         caller.last_seen = at;
         caller.calls += 1;
         if let Some(token) = token {
+            // A caller the file doesn't name is placed under the agent it acts for only by a
+            // token naming it as the agent acting (Halts::who). One naming another is said
+            // once, in the log.
+            let another = token.actors.first().filter(|a| !named && *a != identity);
+            if let Some(actor) = another
+                && !caller.token_names_another
+            {
+                tracing::warn!(
+                    identity,
+                    actor = %actor,
+                    "a caller the agents file doesn't list presented a token naming another agent acting: it can't be placed under the agent it acts for, so every agent halt denies it"
+                );
+            }
+            caller.token_names_another = another.is_some();
             caller.subject = Some(token.subject.clone()).filter(|s| !s.is_empty());
             caller.actors = token.actors.clone();
             caller.actors_cut = token.cut;
@@ -1275,6 +1508,7 @@ mod tests {
                 subject: Some("0oa1support".into()),
                 actors: vec![CHILD_1.into()],
                 actors_cut: false,
+                token_names_another: false,
                 tokens: vec!["tok-2".into(), "tok-1".into()],
                 first_seen: 10,
                 last_seen: 30,
@@ -1378,17 +1612,17 @@ mod tests {
         let state = halts.quarantine("q1", selection, 5).unwrap();
         assert_eq!((state.version, state.quarantines.len()), (1, 1));
 
-        let billing = halts.memory_rules("billing");
+        let billing = halts.memory_rules("billing", "");
         assert_eq!(billing.locked_by.as_deref(), Some("q1"));
         assert_eq!(billing.quarantines[0].selection.origins, vec!["tool:fetch_page"]);
-        let support = halts.memory_rules("support");
+        let support = halts.memory_rules("support", "");
         assert_eq!(support.locked_by, None, "only billing's writes are refused");
         assert_eq!(
             support.quarantines.len(),
             1,
             "every agent hides the quarantined entries"
         );
-        assert_eq!(halts.memory_rules("").locked_by, None);
+        assert_eq!(halts.memory_rules("", "").locked_by, None);
 
         let seen = halts.seen();
         assert_eq!(seen["billing"].version, 1);
@@ -1404,23 +1638,160 @@ mod tests {
                 6,
             )
             .unwrap();
-        assert_eq!(halts.memory_rules("support").locked_by.as_deref(), Some("q2"));
+        assert_eq!(halts.memory_rules("support", "").locked_by.as_deref(), Some("q2"));
         halts.release("q1").unwrap();
         let state = halts.release("q2").unwrap();
         assert_eq!((state.version, state.quarantines.len()), (4, 0));
-        assert_eq!(halts.memory_rules("billing").locked_by, None);
+        assert_eq!(halts.memory_rules("billing", "").locked_by, None);
     }
 
     #[test]
     fn the_notes_of_who_fetched_are_bounded() {
         let halts = Halts::in_memory();
         for i in 0..SEEN_LIMIT + 10 {
-            halts.memory_rules(&format!("agent-{i}"));
+            halts.memory_rules(&format!("agent-{i}"), "");
         }
         let seen = halts.seen();
         assert_eq!(seen.len(), SEEN_LIMIT);
         assert!(!seen.contains_key("agent-0"), "the oldest note went");
         assert!(seen.contains_key(&format!("agent-{}", SEEN_LIMIT + 9)));
+    }
+
+    #[test]
+    fn a_halt_is_confirmed_once_every_process_of_its_agent_has_it() {
+        let halts = Halts::in_memory();
+        halts.memory_rules("support", "41.a1");
+        halts.memory_rules("support", "42.b2");
+        let state = halts.put("h1", agents(&["support"]), 1).unwrap();
+        halts.memory_rules("support", "41.a1");
+        assert!(
+            halts.seen()["support"].version < state.version,
+            "one process having the halt doesn't confirm it while another running support hasn't fetched it"
+        );
+        halts.memory_rules("support", "42.b2");
+        assert_eq!(halts.seen()["support"].version, state.version);
+    }
+
+    fn fetch(version: u64, at: u64) -> Seen {
+        Seen { version, at }
+    }
+
+    #[test]
+    fn a_process_silent_a_minute_no_longer_holds_its_agent_back() {
+        let mut notes = Notes::default();
+        let t = 1_000 * PROCESS_LIVE;
+        notes.note("support", "old", fetch(1, t));
+        notes.note("support", "new", fetch(2, t + 10));
+        assert_eq!(notes.have(t + 11)["support"], fetch(1, t));
+        // Stopped, or refusing every call on rules this old.
+        assert_eq!(notes.have(t + PROCESS_LIVE)["support"], fetch(2, t + 10));
+        // With none still fetching, the agent has what it last fetched.
+        assert_eq!(notes.have(t + 10 * PROCESS_LIVE)["support"], fetch(2, t + 10));
+    }
+
+    #[test]
+    fn a_note_going_never_makes_its_agent_look_further_along() {
+        let mut notes = Notes::default();
+        let t = 1_000 * PROCESS_LIVE;
+        notes.note("support", "p0", fetch(1, t));
+        for i in 1..=PROCESSES_LIMIT as u64 {
+            notes.note("support", &format!("p{i}"), fetch(2, t + i));
+        }
+        assert_eq!(notes.by_agent["support"].by_process.len(), PROCESSES_LIMIT);
+        assert!(
+            !notes.by_agent["support"].by_process.contains_key("p0"),
+            "the process that fetched longest ago went"
+        );
+        assert_eq!(notes.order.len(), PROCESSES_LIMIT, "and its place in line");
+        assert_eq!(notes.have(t + 100)["support"].version, 1, "it still held support back");
+        assert_eq!(notes.have(t + PROCESS_LIVE)["support"].version, 2);
+
+        // Past the bound on every note, the oldest goes, with the same care.
+        let mut notes = Notes::default();
+        notes.note("billing", "x", fetch(1, t));
+        notes.note("billing", "y", fetch(2, t + 1));
+        for i in 0..SEEN_LIMIT - 1 {
+            notes.note(&format!("agent-{i}"), "", fetch(2, t + 2));
+        }
+        assert!(!notes.by_agent["billing"].by_process.contains_key("x"));
+        assert_eq!(notes.have(t + 3)["billing"].version, 1);
+        assert_eq!(notes.order.len(), SEEN_LIMIT);
+    }
+
+    #[test]
+    fn a_caller_whose_token_names_another_agent_acting_is_marked() {
+        let map = br#"{"support": ["0oa1support"]}"#;
+        let halts = Halts::in_memory().with_agents(Arc::new(Agents::from_json(map).unwrap()));
+        let svid = "spiffe://wake.local/agent/support/refunder";
+        // Its identity provider named it otherwise in the token's act: it can't be placed.
+        halts.note_caller(Some(svid), Some(&token("0oa1support", &["refunder-7"], "tok-1")), 1);
+        assert!(halts.callers()[svid].token_names_another);
+        // Named by its SPIFFE ID, it is.
+        halts.note_caller(Some(svid), Some(&token("0oa1support", &[svid], "tok-2")), 2);
+        assert!(!halts.callers()[svid].token_names_another);
+        // An identity the file names is named by it, whatever its token says.
+        halts.note_caller(Some("0oa1support"), Some(&token("user-1", &["someone"], "tok-3")), 3);
+        assert!(!halts.callers()["0oa1support"].token_names_another);
+    }
+
+    fn budget_of(calls: u64) -> Vec<charters::Limit> {
+        vec![charters::Limit { tools: vec![], calls }]
+    }
+
+    fn call(halts: &Halts) -> Option<&'static str> {
+        halts
+            .charter_deciding(Some("support"), None, Some(Resource::Tool("refund")), now())
+            .map(|d| d.why)
+    }
+
+    #[test]
+    fn what_a_budget_used_survives_a_restart() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        Halts::init(&dir).unwrap();
+        let halts = Halts::load(&dir);
+        assert!(!halts.save_counts().unwrap(), "nothing counted, nothing written");
+        halts
+            .put_charter(charter("run-1", agents(&["support"]), "", budget_of(3)))
+            .unwrap();
+        assert_eq!((call(&halts), call(&halts)), (None, None));
+        assert!(halts.save_counts().unwrap());
+        assert!(!halts.save_counts().unwrap(), "nothing new to write");
+
+        let restarted = Halts::load(&dir);
+        assert_eq!(restarted.charters()[0].1, vec![2], "it counts on from what was written");
+        assert_eq!((call(&restarted), call(&restarted)), (None, Some("budget")));
+
+        // Ended, a charter's counts leave the file too.
+        restarted.end_charter("run-1").unwrap();
+        assert!(restarted.save_counts().unwrap());
+        restarted
+            .put_charter(charter("run-1", agents(&["support"]), "", budget_of(3)))
+            .unwrap();
+        assert_eq!(Halts::load(&dir).charters()[0].1, vec![0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn counts_from_another_state_or_unreadable_are_not_taken_up() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        Halts::init(&dir).unwrap();
+        let halts = Halts::load(&dir);
+        halts
+            .put_charter(charter("run-1", agents(&["support"]), "", budget_of(3)))
+            .unwrap();
+        let other = Counts {
+            epoch: "another-state".into(),
+            used: HashMap::from([("run-1".into(), vec![3])]),
+        };
+        std::fs::write(dir.join(COUNTS_FILE), serde_json::to_vec(&other).unwrap()).unwrap();
+        assert_eq!(Halts::load(&dir).charters()[0].1, vec![0], "another epoch's runs");
+        std::fs::write(dir.join(COUNTS_FILE), b"{not json").unwrap();
+        let again = Halts::load(&dir);
+        assert_eq!(again.charters()[0].1, vec![0], "counted from zero, as with no file");
+        assert_eq!(again.state().charters.len(), 1, "the state itself is untouched");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1440,7 +1811,7 @@ mod tests {
     #[test]
     fn the_memory_rules_say_which_agents_and_sub_agents_are_halted() {
         let halts = Halts::in_memory();
-        assert_eq!(halts.memory_rules("support").halts, [], "none, said");
+        assert_eq!(halts.memory_rules("support", "").halts, [], "none, said");
         halts.put("h-sub", agents(&[CHILD_1]), 1).unwrap();
         halts.put("h-fleet", fleet(), 2).unwrap();
         let tokens_only = Scope {
@@ -1448,7 +1819,7 @@ mod tests {
             ..Default::default()
         };
         halts.put("h-token", tokens_only, 3).unwrap();
-        let rules = halts.memory_rules("support");
+        let rules = halts.memory_rules("support", "");
         assert_eq!(
             rules.halts,
             [
@@ -1480,7 +1851,7 @@ mod tests {
         let halts = Halts::load(&dir);
         assert!(halts.state().uninitialized);
         assert_eq!(ids(halts.deciding(Some("anyone"), None)), [UNINITIALIZED]);
-        let rules = halts.memory_rules("billing");
+        let rules = halts.memory_rules("billing", "");
         assert_eq!(rules.locked_by.as_deref(), Some(UNINITIALIZED));
         assert_eq!(
             rules.halts,
@@ -1504,7 +1875,7 @@ mod tests {
         let state = restarted.lift(UNINITIALIZED).unwrap();
         assert!(!state.uninitialized && !state.epoch.is_empty());
         assert!(restarted.deciding(Some("support"), None).is_empty());
-        assert_eq!(restarted.memory_rules("billing").hidden_by, None);
+        assert_eq!(restarted.memory_rules("billing", "").hidden_by, None);
         assert!(!Halts::load(&dir).state().uninitialized);
         // Init refuses to write over a state.
         let err = Halts::init(&dir).unwrap_err();
@@ -1520,7 +1891,7 @@ mod tests {
         let halts = Halts::load(&dir);
         assert_eq!(ids(halts.deciding(None, None)), [UNREADABLE]);
         assert!(halts.state().unreadable.is_some());
-        let rules = halts.memory_rules("billing");
+        let rules = halts.memory_rules("billing", "");
         assert_eq!(rules.locked_by.as_deref(), Some(UNREADABLE), "memory writes too");
         assert_eq!(
             rules.hidden_by.as_deref(),
