@@ -424,6 +424,13 @@ impl Halts {
         })
     }
 
+    /// Whether a charter with this id would fit: the proxy holds at most MAX_CHARTERS, and
+    /// putting one again replaces it.
+    pub fn charter_fits(&self, id: &str) -> bool {
+        let state = self.current();
+        state.charters.len() < charters::MAX_CHARTERS || state.charters.iter().any(|c| c.id == id)
+    }
+
     /// Ends a run charter, and forgets what its budget used. Ending one that isn't in force
     /// changes nothing but the version.
     pub fn end_charter(&self, id: &str) -> Changed {
@@ -464,13 +471,22 @@ impl Halts {
         }
         let who = self.who(caller, token);
         let covering: Vec<&Charter> = state.charters.iter().filter(|c| self.covers(&c.scope, &who)).collect();
-        let principal = who.identity.map(|i| self.agents.record(i)).unwrap_or("unknown");
+        let caller = charters::Caller {
+            name: who.identity.map(|i| self.agents.record(i)).unwrap_or("unknown"),
+            under: who.chain.clone(),
+            unknown: who.unknown,
+        };
         let resource = resource.map(|r| match r {
             Resource::Agent(agent) => Resource::Agent(self.agents.named(agent)),
             tool => tool,
         });
-        self.charters
-            .decide(&covering, principal, resource, now / 1_000_000_000)
+        self.charters.decide(
+            &covering,
+            &caller,
+            |a| self.agents.named(a).to_string(),
+            resource,
+            now / 1_000_000_000,
+        )
     }
 
     /// The rules for one agent's memory adapter, noting that the agent has them now. A
@@ -910,6 +926,9 @@ mod tests {
             deciding(Some("spiffe://wake.local/agent/stranger"), None, "delete_customer"),
             run
         );
+        // But it isn't counted against the run's budget, so it can't use it up.
+        assert_eq!(deciding(None, None, "refund"), None);
+        assert_eq!(halts.charters()[0].1, vec![1]);
 
         // Put again, as the brake does when it can't confirm it, it keeps what it used.
         halts
@@ -950,6 +969,20 @@ mod tests {
             .put_charter(charter("run-1", agents(&[CHILD_1]), NO_DELETES, one_refund()))
             .unwrap();
         assert_eq!(deciding(Some(CHILD_1), Some(&child_1), "refund"), None);
+    }
+
+    #[test]
+    fn a_proxy_holds_so_many_charters() {
+        let halts = Halts::in_memory();
+        for i in 0..charters::MAX_CHARTERS {
+            halts
+                .put_charter(charter(&format!("run-{i}"), agents(&[CHILD_1]), "", vec![]))
+                .unwrap();
+        }
+        assert!(!halts.charter_fits("run-new"));
+        assert!(halts.charter_fits("run-7"), "put again, it replaces itself");
+        halts.end_charter("run-7").unwrap();
+        assert!(halts.charter_fits("run-new"));
     }
 
     #[test]

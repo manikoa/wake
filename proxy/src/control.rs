@@ -283,6 +283,17 @@ async fn put_charter(
     if let Err(why) = charter.check() {
         return (StatusCode::BAD_REQUEST, why).into_response();
     }
+    // Full is for now, not a charter the proxy refuses: one fits once another has ended.
+    if !halts.charter_fits(&charter.id) {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "the proxy holds {} charters already: one fits once another ends",
+                crate::charters::MAX_CHARTERS
+            ),
+        )
+            .into_response();
+    }
     stored(tokio::task::spawn_blocking(move || halts.put_charter(charter)).await)
 }
 

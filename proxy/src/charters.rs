@@ -9,23 +9,27 @@
 //! it, as an agent halt does (halts.rs). Within that scope:
 //! - `never` is Cedar: forbid policies over the Wake schema (SCHEMA). A call one of them
 //!   forbids is denied. So is a call one can't be evaluated for: Cedar skips a policy that
-//!   errors, and a skipped forbid would let the call through.
+//!   errors, and a skipped forbid would let the call through. The caller is `in` each agent
+//!   its call is made under, so `principal in Wake::Agent::"support"` covers support's
+//!   sub-agents. A caller nobody can name or place is held to a policy if it could be any
+//!   agent the charter names.
 //! - `budget` limits the MCP calls the run makes, all of them or those to the tools a limit
 //!   names. A call past a limit is denied, and a denied call isn't counted. Counts are kept
-//!   in memory, by each proxy for the calls through it.
+//!   in memory, by each proxy for the calls through it. A caller nobody can name or place
+//!   isn't counted, so one outside the run can't use the run's budget up.
 //! - From `expires_at` on, every call is denied.
 //!
 //! Charters are kept in the halts' state, so they're on disk and versioned, and the brake
 //! confirms a proxy holds one as it does a halt. A call a charter denies is denied under
 //! `charter:<id>`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Effect, Entities, EntityId, EntityTypeName, EntityUid, Policy, PolicyId, PolicySet,
-    Request, Schema, ValidationMode, Validator,
+    Authorizer, Context, Decision, Effect, Entities, Entity, EntityId, EntityTypeName, EntityUid, Policy, PolicyId,
+    PolicySet, Request, Schema, ValidationMode, Validator,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,8 +38,9 @@ use crate::halts::{Halt, Scope};
 /// The Wake schema a charter's `never` is written over and checked against: the entities and
 /// action of the dashboard's Cedar for flow policies, without their context.
 pub const SCHEMA: &str = r#"namespace Wake {
-  // An agent, under the name the proxy records it by.
-  entity Agent;
+  // An agent, under the name the proxy records it by. A caller is in each agent its call
+  // is made under: a sub-agent is in the agent it acts for.
+  entity Agent in [Agent];
   // An MCP call's target: a tool name, a resource URI or a prompt name.
   entity Tool;
   // A call through the proxy: an MCP call, whose resource is the Tool it calls, or an A2A
@@ -61,7 +66,16 @@ pub const MAX_POLICIES: usize = 100;
 pub const MAX_LIMITS: usize = 32;
 pub const MAX_NAMES: usize = 100;
 pub const MAX_NAME: usize = 1024;
-pub const MAX_NEVER: usize = 64 * 1024;
+pub const MAX_NEVER: usize = 16 * 1024;
+/// The deepest a `never` may nest brackets and if-then-else. Cedar's parser recurses once
+/// per level, and a couple of hundred levels overflow a hook's stack, aborting the proxy.
+pub const MAX_NESTING: usize = 32;
+/// The most charters a proxy holds at once. Each is in the state the brake reads back after
+/// every change, so they're bounded with it.
+pub const MAX_CHARTERS: usize = 256;
+/// The latest `expires_at` taken, in Unix seconds (in the year 2286): a later one is in
+/// milliseconds or nanoseconds by mistake, and would never come.
+pub const MAX_EXPIRES_AT: u64 = 10_000_000_000;
 
 /// One run's charter, as the brake puts it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -120,6 +134,12 @@ impl Charter {
         }
         if self.expires_at == 0 {
             return Err("a charter needs expires_at, in Unix seconds".into());
+        }
+        if self.expires_at > MAX_EXPIRES_AT {
+            return Err(format!(
+                "expires_at {} is past the year 2286: it's in Unix seconds, not milliseconds",
+                self.expires_at
+            ));
         }
         if self.budget.len() > MAX_LIMITS {
             return Err(format!("a charter's budget has at most {MAX_LIMITS} limits"));
@@ -192,6 +212,13 @@ pub fn compile(never: &str) -> Result<Compiled, String> {
     if never.len() > MAX_NEVER {
         return Err(format!("never is {} bytes, over {MAX_NEVER}", never.len()));
     }
+    // Checked before Cedar reads it: past the stack, Cedar's parser doesn't fail, it aborts.
+    let deepest = nesting(never);
+    if deepest > MAX_NESTING {
+        return Err(format!(
+            "never nests {deepest} levels of brackets and if-then-else, over {MAX_NESTING}"
+        ));
+    }
     let mut policies = PolicySet::from_str(never).map_err(|e| format!("never isn't Cedar: {e}"))?;
     if policies.templates().next().is_some() {
         return Err("never can't hold templates: write each policy out".into());
@@ -223,23 +250,70 @@ pub fn compile(never: &str) -> Result<Compiled, String> {
     Ok(Compiled { policies, names })
 }
 
+/// How deep never nests: its parentheses, brackets and braces, and its if-then-else, outside
+/// its strings and comments.
+fn nesting(never: &str) -> usize {
+    let text = never.as_bytes();
+    let (mut depth, mut deepest, mut i) = (0usize, 0usize, 0usize);
+    while i < text.len() {
+        match text[i] {
+            b'"' => {
+                i += 1;
+                while i < text.len() && text[i] != b'"' {
+                    i += if text[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'/' if text.get(i + 1) == Some(&b'/') => {
+                while i < text.len() && text[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < text.len() && (text[i].is_ascii_alphanumeric() || text[i] == b'_') {
+                    i += 1;
+                }
+                match &text[start..i] {
+                    b"if" => {
+                        depth += 1;
+                        deepest = deepest.max(depth);
+                    }
+                    b"else" => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    deepest
+}
+
 impl Compiled {
-    /// The forbids that deny principal calling resource, by name: none when it may go ahead.
-    /// An error when the policies couldn't be evaluated for it.
-    pub fn forbids(&self, principal: &str, resource: Resource<'_>) -> Result<Vec<String>, String> {
+    /// The forbids that deny principal, made under the agents in under, calling resource, by
+    /// name: none when it may go ahead. An error when the policies couldn't be evaluated for it.
+    pub fn forbids(&self, principal: &str, under: &[&str], resource: Resource<'_>) -> Result<Vec<String>, String> {
+        let principal = uid("Wake::Agent", principal);
+        let parents: HashSet<EntityUid> = under
+            .iter()
+            .map(|a| uid("Wake::Agent", a))
+            .filter(|a| *a != principal)
+            .collect();
+        let entities = Entities::from_entities([Entity::new_no_attrs(principal.clone(), parents)], Some(&WAKE))
+            .map_err(|e| e.to_string())?;
         let resource = match resource {
             Resource::Tool(tool) => uid("Wake::Tool", tool),
             Resource::Agent(agent) => uid("Wake::Agent", agent),
         };
-        let request = Request::new(
-            uid("Wake::Agent", principal),
-            CALL.clone(),
-            resource,
-            Context::empty(),
-            Some(&WAKE),
-        )
-        .map_err(|e| e.to_string())?;
-        let response = Authorizer::new().is_authorized(&request, &self.policies, &Entities::empty());
+        let request = Request::new(principal, CALL.clone(), resource, Context::empty(), Some(&WAKE))
+            .map_err(|e| e.to_string())?;
+        let response = Authorizer::new().is_authorized(&request, &self.policies, &entities);
         let errors: Vec<String> = response.diagnostics().errors().map(|e| e.to_string()).collect();
         if !errors.is_empty() {
             return Err(errors.join("; "));
@@ -265,6 +339,20 @@ pub enum Resource<'a> {
     Tool(&'a str),
     /// The agent an A2A route reaches: checked against never. ext_authz sees it.
     Agent(&'a str),
+}
+
+/// Who makes a call, as a charter holds it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Caller<'a> {
+    /// The caller's name, as the proxy records it, or `unknown` without one.
+    pub name: &'a str,
+    /// The agents the call is made under, by their names (Token::under): the caller is `in`
+    /// each of them.
+    pub under: Vec<&'a str>,
+    /// Nobody can name or place it, or its token's chain was cut: it could be any agent a
+    /// charter names. It's held to a charter's never as each of them, and to its expiry, but
+    /// its calls aren't counted against a budget.
+    pub unknown: bool,
 }
 
 /// Why a charter denied a call.
@@ -303,14 +391,15 @@ impl Runtime {
         compiled
     }
 
-    /// Whether the charters whose scope covers a call deny it, made by principal (the
-    /// caller's name) to resource, if the hook knows what the call reaches. Charters are
-    /// checked in the order they were put, and the first that denies is named. Only a call
-    /// none denies is counted, against every limit that counts it.
+    /// Whether the charters whose scope covers a call deny it, made by caller to resource, if
+    /// the hook knows what the call reaches. named gives the name an agent in a scope is
+    /// recorded by. Charters are checked in the order they were put, and the first that
+    /// denies is named. Only a call none denies is counted, against every limit that counts it.
     pub fn decide(
         &self,
         charters: &[&Charter],
-        principal: &str,
+        caller: &Caller<'_>,
+        named: impl Fn(&str) -> String,
         resource: Option<Resource<'_>>,
         now_secs: u64,
     ) -> Option<Denial> {
@@ -342,20 +431,33 @@ impl Runtime {
             }
             let Some(resource) = resource else { continue };
             if let Some(Ok(compiled)) = compiled.as_deref() {
-                match compiled.forbids(principal, resource) {
-                    Err(e) => {
-                        return deny(
-                            "never",
-                            format!("a never policy couldn't be evaluated for this call, so it's denied: {e}"),
-                        );
+                // A caller nobody can name or place could be any agent the charter names.
+                let as_any: Vec<String> = if caller.unknown {
+                    c.scope.agents.iter().map(|a| named(a)).collect()
+                } else {
+                    vec![]
+                };
+                for principal in std::iter::once(caller.name).chain(as_any.iter().map(String::as_str)) {
+                    match compiled.forbids(principal, &caller.under, resource) {
+                        Err(e) => {
+                            return deny(
+                                "never",
+                                format!("a never policy couldn't be evaluated for this call, so it's denied: {e}"),
+                            );
+                        }
+                        Ok(forbids) if !forbids.is_empty() => {
+                            return deny("never", format!("forbidden by {}", forbids.join(", ")));
+                        }
+                        Ok(_) => {}
                     }
-                    Ok(forbids) if !forbids.is_empty() => {
-                        return deny("never", format!("forbidden by {}", forbids.join(", ")));
-                    }
-                    Ok(_) => {}
                 }
             }
             let Resource::Tool(tool) = resource else { continue };
+            // Counting a caller nobody can name or place would let one outside the run use
+            // the run's budget up.
+            if caller.unknown {
+                continue;
+            }
             let counts = used.entry(c.id.clone()).or_default();
             counts.resize(c.budget.len(), 0);
             for (i, limit) in c.budget.iter().enumerate() {
@@ -409,6 +511,129 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
+    fn by(name: &str) -> Caller<'_> {
+        Caller {
+            name,
+            ..Default::default()
+        }
+    }
+
+    fn same(name: &str) -> String {
+        name.to_string()
+    }
+
+    #[test]
+    fn a_never_nested_too_deep_is_refused_before_cedar_reads_it() {
+        // Past a couple of hundred levels Cedar's parser overflows the stack, which aborts
+        // the proxy: each is refused first. On a thread with a hook's stack, 2 MiB.
+        let at = |n: usize| {
+            let set = format!("{}1{}", "[".repeat(n), "]".repeat(n));
+            let record = format!("{}1{}", "{a:".repeat(n), "}".repeat(n));
+            [
+                format!("{}true{}", "(".repeat(n), ")".repeat(n)),
+                format!("{set} == {set}"),
+                format!("{record} == {record}"),
+                format!("{}true{}", "if true then ".repeat(n), " else false".repeat(n)),
+            ]
+            .map(|body| format!("forbid(principal, action, resource) when {{ {body} }};"))
+        };
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                // when { } is a level, and each shape adds n.
+                for never in at(MAX_NESTING - 1) {
+                    compile(&never).unwrap_or_else(|e| panic!("{never}: {e}"));
+                }
+                for never in at(MAX_NESTING).into_iter().chain(at(600)) {
+                    let err = compile(&never).err().unwrap();
+                    assert!(err.contains("nests"), "{err}");
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // Strings and comments don't count, and a long chain isn't deep.
+        let flat = format!(
+            r#"forbid(principal, action, resource == Wake::Tool::"((((((((((((((((((((((((((((((((((") // [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[
+               when {{ {} }};"#,
+            vec!["true"; 1000].join(" && ")
+        );
+        compile(&flat).unwrap();
+    }
+
+    #[test]
+    fn principal_in_an_agent_covers_its_sub_agents() {
+        let c = charter(
+            r#"@id("support-never-pays") forbid(principal in Wake::Agent::"support", action, resource == Wake::Tool::"pay");"#,
+            vec![],
+        );
+        c.check().unwrap();
+        let rt = Runtime::default();
+        let pay = Some(Resource::Tool("pay"));
+        let sub_agent = Caller {
+            name: "support/refunder#toolu_1",
+            under: vec!["support/refunder#toolu_1", "support", "user-42"],
+            unknown: false,
+        };
+        assert_eq!(rt.decide(&[&c], &by("support"), same, pay, NOW).unwrap().why, "never");
+        assert_eq!(rt.decide(&[&c], &sub_agent, same, pay, NOW).unwrap().why, "never");
+        let billing = Caller {
+            name: "billing/payer#toolu_2",
+            under: vec!["billing/payer#toolu_2", "billing"],
+            unknown: false,
+        };
+        assert_eq!(rt.decide(&[&c], &billing, same, pay, NOW), None);
+    }
+
+    #[test]
+    fn a_caller_nobody_can_place_is_held_as_any_agent_named_but_not_counted() {
+        let c = charter(
+            r#"forbid(principal == Wake::Agent::"support/refunder#toolu_1", action, resource == Wake::Tool::"wire");"#,
+            vec![Limit {
+                tools: vec![],
+                calls: 1,
+            }],
+        );
+        c.check().unwrap();
+        let rt = Runtime::default();
+        let unknown = Caller {
+            name: "unknown",
+            under: vec![],
+            unknown: true,
+        };
+        // It could be the agent the policy names.
+        let d = rt
+            .decide(&[&c], &unknown, same, Some(Resource::Tool("wire")), NOW)
+            .unwrap();
+        assert_eq!(d.why, "never");
+        // But its calls don't use the run's budget up.
+        for _ in 0..3 {
+            assert_eq!(
+                rt.decide(&[&c], &unknown, same, Some(Resource::Tool("lookup")), NOW),
+                None
+            );
+        }
+        assert_eq!(
+            rt.used().get("refund-4711").cloned().unwrap_or_default(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            rt.decide(
+                &[&c],
+                &by("support/refunder#toolu_1"),
+                same,
+                Some(Resource::Tool("lookup")),
+                NOW
+            ),
+            None
+        );
+        // And it's held to the expiry.
+        assert_eq!(
+            rt.decide(&[&c], &unknown, same, None, c.expires_at).unwrap().why,
+            "expired"
+        );
+    }
+
     #[test]
     fn never_forbids_what_it_names_and_nothing_else() {
         let c = charter(
@@ -419,22 +644,37 @@ mod tests {
         c.check().unwrap();
         let rt = Runtime::default();
         let d = rt
-            .decide(&[&c], "support", Some(Resource::Tool("delete_customer")), NOW)
+            .decide(
+                &[&c],
+                &by("support"),
+                same,
+                Some(Resource::Tool("delete_customer")),
+                NOW,
+            )
             .unwrap();
         assert_eq!((d.halt.id.as_str(), d.why), ("charter:refund-4711", "never"));
         assert_eq!(d.detail, "forbidden by no-deletes");
         let d = rt
-            .decide(&[&c], "support", Some(Resource::Agent("payments")), NOW)
+            .decide(&[&c], &by("support"), same, Some(Resource::Agent("payments")), NOW)
             .unwrap();
         assert_eq!(d.detail, "forbidden by policy1");
         // A tool and an agent of the same name are different things.
         assert_eq!(
-            rt.decide(&[&c], "support", Some(Resource::Agent("delete_customer")), NOW),
+            rt.decide(
+                &[&c],
+                &by("support"),
+                same,
+                Some(Resource::Agent("delete_customer")),
+                NOW
+            ),
             None
         );
-        assert_eq!(rt.decide(&[&c], "support", Some(Resource::Tool("refund")), NOW), None);
+        assert_eq!(
+            rt.decide(&[&c], &by("support"), same, Some(Resource::Tool("refund")), NOW),
+            None
+        );
         // With nothing to check never against, only expiry decides.
-        assert_eq!(rt.decide(&[&c], "support", None, NOW), None);
+        assert_eq!(rt.decide(&[&c], &by("support"), same, None, NOW), None);
     }
 
     #[test]
@@ -446,11 +686,17 @@ mod tests {
         c.check().unwrap();
         let rt = Runtime::default();
         assert!(
-            rt.decide(&[&c], "support/refunder#toolu_1", Some(Resource::Tool("refund")), NOW)
-                .is_some()
+            rt.decide(
+                &[&c],
+                &by("support/refunder#toolu_1"),
+                same,
+                Some(Resource::Tool("refund")),
+                NOW
+            )
+            .is_some()
         );
         assert!(
-            rt.decide(&[&c], "support", Some(Resource::Tool("refund")), NOW)
+            rt.decide(&[&c], &by("support"), same, Some(Resource::Tool("refund")), NOW)
                 .is_none()
         );
     }
@@ -508,6 +754,9 @@ mod tests {
         let mut c = charter("", vec![]);
         c.expires_at = 0;
         assert!(c.check().unwrap_err().contains("expires_at"));
+        // In milliseconds by mistake, it would never come.
+        c.expires_at = 1_800_000_000_000;
+        assert!(c.check().unwrap_err().contains("not milliseconds"));
         let c = charter(
             "",
             vec![Limit {
@@ -535,7 +784,7 @@ mod tests {
         );
         c.check().unwrap();
         let rt = Runtime::default();
-        let call = |tool| rt.decide(&[&c], "support", Some(Resource::Tool(tool)), NOW);
+        let call = |tool| rt.decide(&[&c], &by("support"), same, Some(Resource::Tool(tool)), NOW);
         assert_eq!(call("refund"), None);
         // The second refund is past its limit, and isn't counted against the rest.
         let d = call("refund").unwrap();
@@ -552,7 +801,10 @@ mod tests {
         assert_eq!(d.detail, "its budget of 3 MCP calls is used up");
         assert_eq!(rt.used()["refund-4711"], vec![1, 3]);
         // An A2A request isn't counted: only MCP calls are.
-        assert_eq!(rt.decide(&[&c], "support", Some(Resource::Agent("billing")), NOW), None);
+        assert_eq!(
+            rt.decide(&[&c], &by("support"), same, Some(Resource::Agent("billing")), NOW),
+            None
+        );
 
         // A call two charters cover is counted by both only when neither denies it.
         let mut other = charter(
@@ -565,11 +817,11 @@ mod tests {
         other.id = "other".into();
         let rt = Runtime::default();
         assert_eq!(
-            rt.decide(&[&other, &c], "support", Some(Resource::Tool("refund")), NOW),
+            rt.decide(&[&other, &c], &by("support"), same, Some(Resource::Tool("refund")), NOW),
             None
         );
         assert_eq!(
-            rt.decide(&[&other, &c], "support", Some(Resource::Tool("refund")), NOW)
+            rt.decide(&[&other, &c], &by("support"), same, Some(Resource::Tool("refund")), NOW)
                 .unwrap()
                 .halt
                 .id,
@@ -584,9 +836,9 @@ mod tests {
     fn an_expired_charter_denies_everything_it_covers() {
         let c = charter("", vec![]);
         let rt = Runtime::default();
-        assert_eq!(rt.decide(&[&c], "support", None, c.expires_at - 1), None);
+        assert_eq!(rt.decide(&[&c], &by("support"), same, None, c.expires_at - 1), None);
         for resource in [None, Some(Resource::Tool("lookup")), Some(Resource::Agent("billing"))] {
-            let d = rt.decide(&[&c], "support", resource, c.expires_at).unwrap();
+            let d = rt.decide(&[&c], &by("support"), same, resource, c.expires_at).unwrap();
             assert_eq!(d.why, "expired");
         }
     }
@@ -595,7 +847,9 @@ mod tests {
     fn a_never_that_cant_be_read_denies_everything_it_covers() {
         // Only a state file edited by hand can hold one: PUT refuses it.
         let c = charter("forbid(", vec![]);
-        let d = Runtime::default().decide(&[&c], "support", None, NOW).unwrap();
+        let d = Runtime::default()
+            .decide(&[&c], &by("support"), same, None, NOW)
+            .unwrap();
         assert_eq!(d.why, "unreadable");
     }
 
@@ -609,15 +863,27 @@ mod tests {
         c.check().unwrap();
         let rt = Runtime::default();
         assert!(
-            rt.decide(&[&c], "sp\"iffe://x", Some(Resource::Tool("file:///etc/passwd")), NOW)
-                .is_some()
+            rt.decide(
+                &[&c],
+                &by("sp\"iffe://x"),
+                same,
+                Some(Resource::Tool("file:///etc/passwd")),
+                NOW
+            )
+            .is_some()
         );
         assert!(
-            rt.decide(&[&c], "x", Some(Resource::Tool(r#"weird "quoted" tool"#)), NOW)
-                .is_some()
+            rt.decide(
+                &[&c],
+                &by("x"),
+                same,
+                Some(Resource::Tool(r#"weird "quoted" tool"#)),
+                NOW
+            )
+            .is_some()
         );
         assert!(
-            rt.decide(&[&c], "x", Some(Resource::Tool("file:///etc/hosts")), NOW)
+            rt.decide(&[&c], &by("x"), same, Some(Resource::Tool("file:///etc/hosts")), NOW)
                 .is_none()
         );
     }

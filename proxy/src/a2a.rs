@@ -175,15 +175,14 @@ pub fn parse_reply(body: &[u8], streamed: bool) -> Reply {
             let messages = [Some(payload), payload.get("status").and_then(|s| s.get("message"))];
             for message in messages.into_iter().flatten() {
                 for p in parents_in(message.get("metadata")) {
-                    if !out.parents.contains(&p) {
+                    if out.parents.len() < crate::mcp::MAX_PARENTS && !out.parents.contains(&p) {
                         out.parents.push(p);
                     }
                 }
             }
         }
-        if out.parents.len() >= crate::mcp::MAX_PARENTS {
-            break;
-        }
+        // Past the parents it keeps, it reads on: a later update can still say the task
+        // failed, or an error.
     }
     out.parents.truncate(crate::mcp::MAX_PARENTS);
     out
@@ -293,6 +292,19 @@ mod outcome_tests {
         let failed = parse_reply(stream, true);
         assert_eq!(failed.state, Some("failed"));
         assert_eq!(failed.ok(Some(200), false), Some(false));
+
+        // Past the parents it keeps, it reads on to the state and any error.
+        let ids: Vec<String> = (0..80).map(|i| format!("\"p{i}\"")).collect();
+        let stream = r#"data: {"result":{"kind":"message","metadata":{"dev.wake/parents":[IDS]}}}
+
+data: {"result":{"statusUpdate":{"taskId":"t3","status":{"state":"failed"}}}}
+
+data: {"error":{"code":-32603,"message":"boom"}}
+"#
+        .replace("IDS", &ids.join(","));
+        let late = parse_reply(stream.as_bytes(), true);
+        assert_eq!(late.parents.len(), crate::mcp::MAX_PARENTS);
+        assert_eq!((late.state, late.error), (Some("failed"), true));
 
         let error = parse_reply(
             br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Task not found"}}"#,
