@@ -30,6 +30,30 @@
     ]
   },
   {
+    "name": "a jwt whose jti looks like a secret keeps no jti",
+    "in": "{\"token\":\"eyJhbGciOiJFUzI1NiJ9.eyJqdGkiOiJnaHBfUTdyOFM5dDBRN3I4Uzl0MFE3cjhTOXQwUTdyOFM5dDBVMXYyIn0.c2lnbmF0dXJlLW5vdC1yZWFsLWJ1dC1sb25nLWVub3VnaA\"}",
+    "out": "{\"token\":\"[redacted jwt sha256:f1844dfc7a49]\"}",
+    "kinds": [
+      "jwt"
+    ]
+  },
+  {
+    "name": "a jwt whose claims have stray bits keeps no jti",
+    "in": "{\"token\":\"eyJhbGciOiJFUzI1NiJ9.eyJqdGkiOiJ0b2stNzcifR.c2lnbmF0dXJlLW5vdC1yZWFsLWJ1dC1sb25nLWVub3VnaA\"}",
+    "out": "{\"token\":\"[redacted jwt sha256:516a91abf8fa]\"}",
+    "kinds": [
+      "jwt"
+    ]
+  },
+  {
+    "name": "a jwt whose claims aren't utf-8 keeps no jti",
+    "in": "{\"token\":\"eyJhbGciOiJFUzI1NiJ9.eyJqdGkiOiJ0b2stOSIsIngiOiL_In0.c2lnbmF0dXJlLW5vdC1yZWFsLWJ1dC1sb25nLWVub3VnaA\"}",
+    "out": "{\"token\":\"[redacted jwt sha256:b09678788ba0]\"}",
+    "kinds": [
+      "jwt"
+    ]
+  },
+  {
     "name": "a jwt after Bearer",
     "in": "{\"headers\": \"Authorization: Bearer eyJhbGciOiJFUzI1NiIsImtpZCI6ImsxIn0.eyJzdWIiOiJ1IiwianRpIjoidG9rLTgifQ.c2lnbmF0dXJlLW5vdC1yZWFsLWJ1dC1sb25nLWVub3VnaA\"}",
     "out": "{\"headers\": \"Authorization: Bearer [redacted jwt sha256:cb896161ac56 jti:tok-8]\"}",
@@ -52,6 +76,20 @@
     "kinds": []
   },
   {
+    "name": "basic credentials",
+    "in": "{\"headers\":\"Authorization: Basic dXNlcjpodW50ZXIyLXN1cGVyLXNlY3JldC1wYXNzd29yZA==\"}",
+    "out": "{\"headers\":\"Authorization: [redacted basic_auth sha256:170a5e977a83]\"}",
+    "kinds": [
+      "basic_auth"
+    ]
+  },
+  {
+    "name": "words after Basic aren't credentials",
+    "in": "{\"output\":\"Basic Authentication, basic usage, Basic Auth and Basic Settings\"}",
+    "out": "{\"output\":\"Basic Authentication, basic usage, Basic Auth and Basic Settings\"}",
+    "kinds": []
+  },
+  {
     "name": "a private key, whole",
     "in": "{\"output\": \"-----BEGIN PRIVATE KEY-----\\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg3kOkWG1fZqk5Pa\\nhRANCAAT8nYmJ1x0Y0RTo8U2d\\n-----END PRIVATE KEY-----\"}",
     "out": "{\"output\": \"[redacted private_key sha256:bfc99ee5e589]\"}",
@@ -71,6 +109,78 @@
     "name": "a private key inside a string inside a string",
     "in": "{\"output\": \"{\\\"key\\\": \\\"-----BEGIN PRIVATE KEY-----\\\\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg3kOkWG1fZqk5Pa\\\\nhRANCAAT8nYmJ1x0Y0RTo8U2d\\\\n-----END PRIVATE KEY-----\\\"}\"}",
     "out": "{\"output\": \"{\\\"key\\\": \\\"[redacted private_key sha256:2a1bde5c239d]\\\"}\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a private key one string deep",
+    "in": "{\"output\":\"-----BEGIN RSA PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\nMZ0zkgmV6KyD0jvKgOvGSyR3sbOlSCdcl+o/bHfgkL5yvd2bwcHOk7f4sY3qRkCl\\n-----END RSA PRIVATE KEY-----\\n\"}",
+    "out": "{\"output\":\"[redacted private_key sha256:f82bc951bfec]\\n\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a private key two strings deep",
+    "in": "{\"output\":\"{\\\"private_key\\\":\\\"-----BEGIN RSA PRIVATE KEY-----\\\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\\\nMZ0zkgmV6KyD0jvKgOvGSyR3sbOlSCdcl+o/bHfgkL5yvd2bwcHOk7f4sY3qRkCl\\\\n-----END RSA PRIVATE KEY-----\\\\n\\\"}\"}",
+    "out": "{\"output\":\"{\\\"private_key\\\":\\\"[redacted private_key sha256:ac427f11f03d]\\\\n\\\"}\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a private key three strings deep",
+    "in": "{\"output\":\"{\\\"SecretString\\\":\\\"{\\\\\\\"private_key\\\\\\\":\\\\\\\"-----BEGIN RSA PRIVATE KEY-----\\\\\\\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\\\\\\\nMZ0zkgmV6KyD0jvKgOvGSyR3sbOlSCdcl+o/bHfgkL5yvd2bwcHOk7f4sY3qRkCl\\\\\\\\n-----END RSA PRIVATE KEY-----\\\\\\\\n\\\\\\\"}\\\"}\"}",
+    "out": "{\"output\":\"{\\\"SecretString\\\":\\\"{\\\\\\\"private_key\\\\\\\":\\\\\\\"[redacted private_key sha256:420bb1132495]\\\\\\\\n\\\\\\\"}\\\"}\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a private key four strings deep",
+    "in": "{\"output\":\"{\\\"body\\\":\\\"{\\\\\\\"SecretString\\\\\\\":\\\\\\\"{\\\\\\\\\\\\\\\"private_key\\\\\\\\\\\\\\\":\\\\\\\\\\\\\\\"-----BEGIN RSA PRIVATE KEY-----\\\\\\\\\\\\\\\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\\\\\\\\\\\\\\\nMZ0zkgmV6KyD0jvKgOvGSyR3sbOlSCdcl+o/bHfgkL5yvd2bwcHOk7f4sY3qRkCl\\\\\\\\\\\\\\\\n-----END RSA PRIVATE KEY-----\\\\\\\\\\\\\\\\n\\\\\\\\\\\\\\\"}\\\\\\\"}\\\"}\"}",
+    "out": "{\"output\":\"{\\\"body\\\":\\\"{\\\\\\\"SecretString\\\\\\\":\\\\\\\"{\\\\\\\\\\\\\\\"private_key\\\\\\\\\\\\\\\":\\\\\\\\\\\\\\\"[redacted private_key sha256:92c3f96d07bb]\\\\\\\\\\\\\\\\n\\\\\\\\\\\\\\\"}\\\\\\\"}\\\"}\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a private key with CRLF line breaks, three strings deep",
+    "in": "{\"output\":\"{\\\"SecretString\\\":\\\"{\\\\\\\"private_key\\\\\\\":\\\\\\\"-----BEGIN RSA PRIVATE KEY-----\\\\\\\\r\\\\\\\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\\\\\\\r\\\\\\\\nMZ0zkgmV6KyD0jvKgOvGSyR3sbOlSCdcl+o/bHfgkL5yvd2bwcHOk7f4sY3qRkCl\\\\\\\\r\\\\\\\\n-----END RSA PRIVATE KEY-----\\\\\\\\r\\\\\\\\n\\\\\\\"}\\\"}\"}",
+    "out": "{\"output\":\"{\\\"SecretString\\\":\\\"{\\\\\\\"private_key\\\\\\\":\\\\\\\"[redacted private_key sha256:fc83783ef7e9]\\\\\\\\r\\\\\\\\n\\\\\\\"}\\\"}\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a private key two strings deep in a cut-short payload's prefix",
+    "in": "{\"truncated\":true,\"bytes\":5000000,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"prefix\":\"{\\\"output\\\":\\\"{\\\\\\\"private_key\\\\\\\":\\\\\\\"-----BEGIN RSA PRIVATE KEY-----\\\\\\\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\\\\\\\nMZ0zkgmV6KyD0jvKgOvGSyR3sbOlSCdcl+o/bHfgkL5yvd2bwcHOk7f4sY3qRkCl\\\\\\\\n-----END RSA PRIVATE KEY-----\\\\\\\\n\\\\\\\"}\\\",\\\"more\\\":\\\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
+    "out": "{\"truncated\":true,\"bytes\":5000000,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"prefix\":\"{\\\"output\\\":\\\"{\\\\\\\"private_key\\\\\\\":\\\\\\\"[redacted private_key sha256:420bb1132495]\\\\\\\\n\\\\\\\"}\\\",\\\"more\\\":\\\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a private key with + escaped as \\u002B, as .NET writes it",
+    "in": "{\"output\":\"{\\\"key\\\":\\\"-----BEGIN RSA PRIVATE KEY-----\\\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\\\nMZ0zkgmV6KyD0jvKgOvGSyR3sbOlSCdcl\\\\u002Bo/bHfgkL5yvd2bwcHOk7f4sY3qRkCl\\\\n-----END RSA PRIVATE KEY-----\\\\n\\\"}\"}",
+    "out": "{\"output\":\"{\\\"key\\\":\\\"[redacted private_key sha256:992af3a1f5ed]\\\\n\\\"}\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a private key with / escaped as \\/, as PHP writes it",
+    "in": "{\"output\":\"{\\\"key\\\":\\\"-----BEGIN RSA PRIVATE KEY-----\\\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\\\\nMZ0zkgmV6KyD0jvKgOvGSyR3sbOlSCdcl+o\\\\/bHfgkL5yvd2bwcHOk7f4sY3qRkCl\\\\n-----END RSA PRIVATE KEY-----\\\\n\\\"}\"}",
+    "out": "{\"output\":\"{\\\"key\\\":\\\"[redacted private_key sha256:0031f1d3375b]\\\\n\\\"}\"}",
+    "kinds": [
+      "private_key"
+    ]
+  },
+  {
+    "name": "a pgp private key block",
+    "in": "{\"output\":\"-----BEGIN PGP PRIVATE KEY BLOCK-----\\n\\nlQOYBF0123456789abcdefSECRETKEYMATERIALxyz+/0\\n=abcd\\n-----END PGP PRIVATE KEY BLOCK-----\\n\"}",
+    "out": "{\"output\":\"[redacted private_key sha256:f080d73826ca]\\n\"}",
     "kinds": [
       "private_key"
     ]
@@ -109,6 +219,14 @@
     ]
   },
   {
+    "name": "a slack app token",
+    "in": "{\"env\":\"SLACK_APP_TOKEN=xapp-1-A0123456789-1234567890123-abcdef0123456789abcdef0123456789\"}",
+    "out": "{\"env\":\"SLACK_APP_TOKEN=[redacted slack_token sha256:e879511fd24b]\"}",
+    "kinds": [
+      "slack_token"
+    ]
+  },
+  {
     "name": "llm keys",
     "in": "{\"anthropic\": \"sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123\", \"old\": \"sk-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8\", \"openai\": \"sk-proj-AbCdEfGhIjKlMnOpQrStUvWx\"}",
     "out": "{\"anthropic\": \"[redacted llm_api_key sha256:b8652ddcb08d]\", \"old\": \"[redacted llm_api_key sha256:d9d9d79ccb97]\", \"openai\": \"[redacted llm_api_key sha256:ccdb768b7eac]\"}",
@@ -117,12 +235,54 @@
     ]
   },
   {
+    "name": "openai admin and service account keys",
+    "in": "{\"admin\":\"sk-admin-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCd\",\"svcacct\":\"sk-svcacct-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCd\"}",
+    "out": "{\"admin\":\"[redacted llm_api_key sha256:0f0045aae89d]\",\"svcacct\":\"[redacted llm_api_key sha256:26b84a4853e2]\"}",
+    "kinds": [
+      "llm_api_key"
+    ]
+  },
+  {
+    "name": "sk- inside a word isn't a key",
+    "in": "{\"disk\":\"disk-0123456789abcdef0123456789abcdef\",\"task\":\"task-0123456789abcdef0123456789abcdef\"}",
+    "out": "{\"disk\":\"disk-0123456789abcdef0123456789abcdef\",\"task\":\"task-0123456789abcdef0123456789abcdef\"}",
+    "kinds": []
+  },
+  {
     "name": "a stripe key",
     "in": "{\"env\": \"STRIPE=sk\u005flive\u005f4eC39HqLyjWDarjtT1zdp7dc\"}",
     "out": "{\"env\": \"STRIPE=[redacted stripe_key sha256:78a08441f431]\"}",
     "kinds": [
       "stripe_key"
     ]
+  },
+  {
+    "name": "a password in a url",
+    "in": "{\"env\":\"DATABASE_URL=postgres://app:Sup3rS3cretPassw0rd@db.internal:5432/prod\"}",
+    "out": "{\"env\":\"DATABASE_URL=postgres://app:[redacted url_password sha256:ff4e03224bee]@db.internal:5432/prod\"}",
+    "kinds": [
+      "url_password"
+    ]
+  },
+  {
+    "name": "urls with no password stay",
+    "in": "{\"output\":\"https://user@example.com/a, git@github.com:org/repo.git and http://localhost:8080/x@y\"}",
+    "out": "{\"output\":\"https://user@example.com/a, git@github.com:org/repo.git and http://localhost:8080/x@y\"}",
+    "kinds": []
+  },
+  {
+    "name": "aws secret keys after their names",
+    "in": "{\"env\":\"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\",\"output\":\"{\\\"Credentials\\\":{\\\"AccessKeyId\\\":\\\"ASIAIOSFODNN7EXAMPLE\\\",\\\"SecretAccessKey\\\":\\\"je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY\\\"}}\",\"xml\":\"<SecretAccessKey>Xb4QHJ+Xe8dSgP2bWm0xXnLzVVFTqZt0kGjNlS7d</SecretAccessKey>\"}",
+    "out": "{\"env\":\"AWS_SECRET_ACCESS_KEY=[redacted aws_secret_key sha256:78314b11be2e]\",\"output\":\"{\\\"Credentials\\\":{\\\"AccessKeyId\\\":\\\"ASIAIOSFODNN7EXAMPLE\\\",\\\"SecretAccessKey\\\":\\\"[redacted aws_secret_key sha256:e21b597ba6b9]\\\"}}\",\"xml\":\"<SecretAccessKey>[redacted aws_secret_key sha256:290204ddfc8c]</SecretAccessKey>\"}",
+    "kinds": [
+      "aws_secret_key"
+    ]
+  },
+  {
+    "name": "aws secret keys without their names, or not 40 characters, stay",
+    "in": "{\"hash\":\"secret_access_key=n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg=\",\"output\":\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"}",
+    "out": "{\"hash\":\"secret_access_key=n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg=\",\"output\":\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"}",
+    "kinds": []
   },
   {
     "name": "look-alikes stay",
@@ -139,11 +299,17 @@
     ]
   },
   {
-    "name": "a placeholder already there is listed",
+    "name": "a placeholder already there isn't listed",
     "in": "{\"output\": \"earlier: [redacted jwt sha256:0123456789ab jti:tok-1]\"}",
     "out": "{\"output\": \"earlier: [redacted jwt sha256:0123456789ab jti:tok-1]\"}",
+    "kinds": []
+  },
+  {
+    "name": "a placeholder already there isn't listed beside a new one",
+    "in": "{\"output\":\"[redacted private_key sha256:000000000000] and ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8\"}",
+    "out": "{\"output\":\"[redacted private_key sha256:000000000000] and [redacted github_token sha256:e2cacc1dfe8d]\"}",
     "kinds": [
-      "jwt"
+      "github_token"
     ]
   },
   {
@@ -153,5 +319,39 @@
     "kinds": [
       "github_token"
     ]
+  },
+  {
+    "name": "secrets right after an escape",
+    "in": "{\"output\":\"keys:\\nghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8\\n\\u00absk-proj-AbCdEfGhIjKlMnOpQrStUvWx\\u00bb\\tAIzaSyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q\"}",
+    "out": "{\"output\":\"keys:\\n[redacted github_token sha256:e2cacc1dfe8d]\\n\\u00ab[redacted llm_api_key sha256:ccdb768b7eac]\\u00bb\\t[redacted google_api_key sha256:22172222591e]\"}",
+    "kinds": [
+      "github_token",
+      "google_api_key",
+      "llm_api_key"
+    ]
+  },
+  {
+    "name": "an escape's e isn't the start of a jwt",
+    "in": "{\"output\":\"\\u00aeyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJlLW5vdC1yZWFs\"}",
+    "out": "{\"output\":\"\\u00aeyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJlLW5vdC1yZWFs\"}",
+    "kinds": []
+  },
+  {
+    "name": "an escape's e two strings deep isn't the start of a jwt",
+    "in": "{\"output\":\"{\\\"t\\\":\\\"\\\\u00aeyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJlLW5vdC1yZWFs\\\"}\"}",
+    "out": "{\"output\":\"{\\\"t\\\":\\\"\\\\u00aeyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJlLW5vdC1yZWFs\\\"}\"}",
+    "kinds": []
+  },
+  {
+    "name": "an escape's b isn't the start of a bearer token",
+    "in": "{\"output\":\"\\u00abearer abcdefghijklmnopqrstuvwxyz0123\"}",
+    "out": "{\"output\":\"\\u00abearer abcdefghijklmnopqrstuvwxyz0123\"}",
+    "kinds": []
+  },
+  {
+    "name": "an escape's A isn't the start of a google key",
+    "in": "{\"output\":\"\\u00AAIzaSyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q\"}",
+    "out": "{\"output\":\"\\u00AAIzaSyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q\"}",
+    "kinds": []
   }
 ]

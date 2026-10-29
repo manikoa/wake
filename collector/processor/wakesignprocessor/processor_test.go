@@ -177,6 +177,120 @@ func TestRefusesRepeatedAttributeKeys(t *testing.T) {
 	}
 }
 
+// Every event the collector logs has its payload redacted first: those it signs, and those
+// it keeps as evidence without trusting them, which reach the log all the same.
+func TestRedactsEveryPayloadItLogs(t *testing.T) {
+	s, _, _ := setup(t)
+	token := "ghp_" + strings.Repeat("a", 36)
+	payload := `{"input": {"token": "` + token + `"}}`
+	type arrival struct {
+		td    ptrace.Traces
+		span  ptrace.Span
+		valid bool
+	}
+	arrive := func(valid bool, change func(ptrace.Span)) arrival {
+		td := ptrace.NewTraces()
+		td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+		span := addSpan(td, "sdk")
+		span.Attributes().PutStr(event.Payload, payload)
+		change(span)
+		return arrival{td, span, valid}
+	}
+	repeatedTD, repeated := spanFromWire(t, `{"key":"wake.event.kind","value":{"stringValue":"tool_call"}},
+		{"key":"wake.capture","value":{"stringValue":"sdk"}},
+		{"key":"wake.payload","value":{"stringValue":"{\"token\": \"`+token+`\"}"}},
+		{"key":"wake.capture","value":{"stringValue":"proxy"}}`)
+	for name, a := range map[string]arrival{
+		"signed by the collector": arrive(true, func(ptrace.Span) {}),
+		"sent as bytes": arrive(true, func(span ptrace.Span) {
+			span.Attributes().PutEmptyBytes(event.Payload).FromRaw([]byte(payload))
+		}),
+		"with a signature that fails": arrive(false, func(span ptrace.Span) {
+			span.Attributes().PutStr(event.Signature, "AAAA")
+		}),
+		"unsigned, from the proxy": arrive(false, func(span ptrace.Span) {
+			span.Attributes().PutStr(event.Capture, "proxy")
+		}),
+		"with a repeated key": {repeatedTD, repeated, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := s.processTraces(context.Background(), a.td); err != nil {
+				t.Fatal(err)
+			}
+			if valid(a.span) != a.valid {
+				t.Fatalf("valid %v: %s", valid(a.span), reason(a.span))
+			}
+			data, _, err := event.Entry(a.span)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(data), token) {
+				t.Fatalf("the log entry holds the token: %s", data)
+			}
+			// What's kept can still be read from the log, and checked against its digest.
+			entry, err := wakelog.ParseEntry(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logged, err := entry.ReadPayload(nil)
+			if err != nil || !strings.Contains(string(logged), "[redacted github_token sha256:") {
+				t.Errorf("payload %s, %v", logged, err)
+			}
+			ev, _ := entry.Decode()
+			if kinds := ev.Strings(event.Redacted); len(kinds) != 1 || kinds[0] != "github_token" {
+				t.Errorf("%s: %v", event.Redacted, kinds)
+			}
+		})
+	}
+
+	// A map shows bytes in it as base64, where nothing can be redacted, so a payload that
+	// isn't a string or bytes isn't logged at all.
+	td := ptrace.NewTraces()
+	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+	span := addSpan(td, "sdk")
+	span.Attributes().PutEmptyMap(event.Payload).PutEmptyBytes("token").FromRaw([]byte(token))
+	if _, err := s.processTraces(context.Background(), td); err != nil {
+		t.Fatal(err)
+	}
+	if valid(span) || !strings.Contains(reason(span), "must be a string or bytes") {
+		t.Errorf("a map payload: valid %v, reason %q", valid(span), reason(span))
+	}
+	if _, ok := span.Attributes().Get(event.Payload); ok {
+		t.Error("kept a map payload")
+	}
+}
+
+// The collector can't change an event the proxy validly signed without breaking its
+// signature, so its payload is logged as the proxy signed it: the proxy redacts its own.
+func TestLeavesAnEventValidlySignedElsewhereAsItIs(t *testing.T) {
+	s, proxySigner, _ := setup(t)
+	td := ptrace.NewTraces()
+	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+	span := addSpan(td, "proxy")
+	payload := `{"input": {"token": "ghp_` + strings.Repeat("a", 36) + `"}}`
+	span.Attributes().PutStr(event.Payload, payload)
+	// Signed as a proxy from before redaction signed it.
+	sum := sha256.Sum256([]byte(payload))
+	span.Attributes().PutStr(event.PayloadSHA256, hex.EncodeToString(sum[:]))
+	msg, err := event.Canonical(span)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := proxySigner.Sign(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	span.Attributes().PutStr(event.Signature, base64.StdEncoding.EncodeToString(sig))
+	span.Attributes().PutStr(event.Signer, proxySigner.Name())
+
+	if _, err := s.processTraces(context.Background(), td); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := event.PayloadOf(span); !valid(span) || string(got) != payload {
+		t.Errorf("valid %v (%s), payload %s", valid(span), reason(span), got)
+	}
+}
+
 // The collector signs an SDK event with its own key, so a certificate the sender attached
 // mustn't ride along into the entry.
 func TestDropsSignatureFieldsTheSenderSet(t *testing.T) {

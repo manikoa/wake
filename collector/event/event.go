@@ -100,13 +100,67 @@ func signed(key string) bool {
 }
 
 // PayloadOf returns span's payload, the bytes its digest is taken over, and whether it
-// has one.
+// has one. A payload is text, sent as a string or as bytes, which are read as the bytes
+// they hold: as text, pcommon gives them in base64, where no credential could be found to
+// redact. It does the same to bytes in a map or a list, so a value of any other type isn't
+// taken for a payload: Sign refuses an event that has one, and it never reaches the log.
 func PayloadOf(span ptrace.Span) ([]byte, bool) {
 	value, ok := span.Attributes().Get(Payload)
 	if !ok {
 		return nil, false
 	}
-	return []byte(value.AsString()), true
+	switch value.Type() {
+	case pcommon.ValueTypeStr:
+		return []byte(value.Str()), true
+	case pcommon.ValueTypeBytes:
+		return value.Bytes().AsRaw(), true
+	}
+	return nil, false
+}
+
+// notText says why span's payload isn't one, when it has a wake.payload of another type.
+func notText(span ptrace.Span) error {
+	value, ok := span.Attributes().Get(Payload)
+	if !ok || value.Type() == pcommon.ValueTypeStr || value.Type() == pcommon.ValueTypeBytes {
+		return nil
+	}
+	return fmt.Errorf("%s must be a string or bytes, not %s", Payload, value.Type())
+}
+
+// redactPayload replaces the secrets in span's payload, given as read. When it replaces
+// any, it puts the payload back on span, as a string, and lists their kinds in
+// wake.payload.redacted. It returns the payload as kept, and whether it changed.
+func redactPayload(span ptrace.Span, payload []byte) ([]byte, bool) {
+	redacted, kinds := Redact(string(payload))
+	if len(kinds) == 0 {
+		return payload, false
+	}
+	span.Attributes().PutStr(Payload, redacted)
+	list := span.Attributes().PutEmptySlice(Redacted)
+	for _, k := range kinds {
+		list.AppendEmpty().SetStr(k)
+	}
+	return []byte(redacted), true
+}
+
+// RedactInvalid redacts the payload of an event the collector neither signed nor found
+// validly signed, since it's logged all the same, as evidence. As signing would, it lists
+// the kinds it replaced in wake.payload.redacted and sets wake.payload.sha256 from the
+// payload kept, so the payload can still be read from the log and checked against its
+// digest; the event stays invalid, and a signature it came with no longer covers it. An
+// event with nothing to redact is left as it came, and a payload that isn't text, which
+// can't be redacted, is dropped. An event validly signed elsewhere, such as the proxy's,
+// can't be changed without breaking its signature: its signer redacts it.
+func RedactInvalid(span ptrace.Span) {
+	if notText(span) != nil {
+		span.Attributes().Remove(Payload)
+		return
+	}
+	if payload, ok := PayloadOf(span); ok {
+		if payload, changed := redactPayload(span, payload); changed {
+			span.Attributes().PutStr(PayloadSHA256, digest(payload))
+		}
+	}
 }
 
 func digest(payload []byte) string {
@@ -120,23 +174,18 @@ func digest(payload []byte) string {
 // gets no digest. Any signature fields the sender set, such as a certificate, are dropped
 // first, so the entry carries only what this signer adds. Before any of that, the payload's
 // secrets are replaced (redact.go), so they never reach the log, and wake.payload.redacted
-// lists their kinds; a list the sender set is dropped.
+// lists the kinds replaced; a list the sender set is dropped. It refuses an event whose
+// payload isn't text (see PayloadOf).
 func Sign(span ptrace.Span, signer note.Signer) error {
 	span.Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
 		return key == Signer || strings.HasPrefix(key, Signature) || key == Redacted
 	})
+	if err := notText(span); err != nil {
+		return err
+	}
 	if payload, ok := PayloadOf(span); ok {
-		redacted, kinds := Redact(string(payload))
-		if redacted != string(payload) {
-			span.Attributes().PutStr(Payload, redacted)
-		}
-		if len(kinds) > 0 {
-			list := span.Attributes().PutEmptySlice(Redacted)
-			for _, k := range kinds {
-				list.AppendEmpty().SetStr(k)
-			}
-		}
-		span.Attributes().PutStr(PayloadSHA256, digest([]byte(redacted)))
+		payload, _ = redactPayload(span, payload)
+		span.Attributes().PutStr(PayloadSHA256, digest(payload))
 	} else {
 		span.Attributes().Remove(PayloadSHA256)
 	}
