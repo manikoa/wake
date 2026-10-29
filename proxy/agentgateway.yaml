@@ -28,7 +28,7 @@ gateways:
             # Who's calling: the agent's SPIFFE ID from mTLS, else the agent a delegated JWT
             # names as acting (act.sub), else its subject.
             # wake-proxy's --agents map turns it into the name the brake halts by.
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ""), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ""), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
 routes:
 # An A2A agent. Add one route like this per agent.
 - matches:
@@ -46,7 +46,7 @@ routes:
           context:
             receiver: research
           metadata:
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ""), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ""), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
     extProc:
       host: "localhost:9001"
       # Calls that start while wake-proxy is down go through unrecorded. One that's in
@@ -69,7 +69,7 @@ routes:
         sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : "")'
         # What the sender's JWT says, never the token: whom it acts for, the agents
         # acting, its id and expiry, and whether it's bound to a key. wake-proxy records it.
-        sender_token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
+        sender_token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
         # Who's receiving: the agent behind this route.
         receiver: '"research"'
   backends:
@@ -99,7 +99,7 @@ routes:
           agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : "")'
           # What the caller's JWT says, never the token: whom it acts for, the agents
           # acting, its id and expiry, and whether it's bound to a key. wake-proxy records it.
-          token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
+          token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
           # The event id wake-proxy handed back from the request hook, so the response
           # hook can say which call it belongs to.
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'

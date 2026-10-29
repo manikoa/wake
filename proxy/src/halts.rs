@@ -50,8 +50,9 @@ pub struct Scope {
     /// it came with: halting an agent halts the sub-agents acting under it.
     #[serde(default)]
     pub agents: Vec<String>,
-    /// Calls made with these tokens, by their id (a JWT's jti, token.rs), whoever presents
-    /// them: one sub-agent's credential, stopped without its parent's.
+    /// Calls made with these tokens, by their id (a JWT's jti, or its uti without one,
+    /// token.rs), whoever presents them: one sub-agent's credential, stopped without its
+    /// parent's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tokens: Vec<String>,
 }
@@ -139,16 +140,59 @@ pub struct HaltRule {
     pub id: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fleet: bool,
-    /// The agents, their identities and the sub-agents it names.
+    /// The agents and sub-agents it names, as it names them, and the name of each agent it
+    /// names by an identity the agents file lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
 }
 
-/// A fetch of an agent's memory rules: the version it got, and when.
+/// What an agent's SDKs have of its memory rules, as the brake reads it: the version, and
+/// when the process that has it fetched it.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Seen {
     pub version: u64,
     pub at: u64,
+    /// Set when every process still holding the agent back said, with its last fetch, that
+    /// its integration refuses the calls of halted instances (`stops=1`). The brake needs
+    /// it before it counts a stop in the agent's own process as confirmed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stops: bool,
+}
+
+/// What an SDK says of the process fetching its agent's rules.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fetcher {
+    /// How long after this fetch the process still holds its agent back, in nanoseconds.
+    pub hold: u64,
+    /// Whether its integration refuses the calls of halted instances (`stops=1`).
+    pub stops: bool,
+}
+
+impl Default for Fetcher {
+    /// An SDK that says nothing of its process: one that acts on rules for 30 seconds.
+    fn default() -> Self {
+        Fetcher {
+            hold: PROCESS_LIVE,
+            stops: false,
+        }
+    }
+}
+
+impl Fetcher {
+    /// A process whose SDK acts on the rules it has for ttl seconds after it fetched them
+    /// (its stale-after setting), if it says so: held back 10 seconds past that, at least
+    /// PROCESS_LIVE and at most PROCESS_LIVE_MAX. A ttl that can't be read could be
+    /// anything, so it's held back the longest.
+    pub fn new(ttl: Option<&str>, stops: bool) -> Self {
+        let hold = match ttl.map(str::parse::<f64>) {
+            None => PROCESS_LIVE,
+            Some(Ok(secs)) if secs.is_finite() && secs >= 0.0 => ((secs * 1e9) as u64)
+                .saturating_add(PAST_TTL)
+                .clamp(PROCESS_LIVE, PROCESS_LIVE_MAX),
+            Some(_) => PROCESS_LIVE_MAX,
+        };
+        Fetcher { hold, stops }
+    }
 }
 
 /// Every halt and quarantine in force, and a version that moves on with each change, so
@@ -243,103 +287,203 @@ struct CountsDisk {
 }
 
 /// The most fetches noted, one for each agent and process that fetched. Agents name
-/// themselves, so past it the oldest note goes, and the brake can't confirm that agent's
-/// SDK until it fetches again.
+/// themselves, so past it the oldest note goes. One whose process still holds its agent back
+/// is held back, until the process fetches again or its hold ends.
 pub const SEEN_LIMIT: usize = 10_000;
-/// The most processes noted for one agent. Past it the one that fetched longest ago goes.
-pub const PROCESSES_LIMIT: usize = 32;
-/// How long after its last fetch a process still holds its agent back, in nanoseconds. An
-/// SDK fetches every 2 seconds and refuses every call once its rules are 30 seconds old, so
-/// a process silent this long has stopped, or refuses everything.
+/// The most processes noted for one agent, well above the workers one agent runs. Past it
+/// the one whose hold ends first goes, held back like any other.
+pub const PROCESSES_LIMIT: usize = 256;
+/// The most notes held back at once, across agents. Past it, a note whose process still
+/// holds its agent back goes into a floor that holds every agent back to its version until
+/// its hold ends, since which agent's it was isn't kept: the brake confirms nothing newer in
+/// an agent's own process until then, rather than too soon.
+pub const HELD_LIMIT: usize = 10_000;
+/// The least time after its last fetch a process still holds its agent back, in
+/// nanoseconds. An SDK fetches every 2 seconds and refuses every call once its rules are
+/// stale, 30 seconds old unless it's set otherwise, so a process silent this long has
+/// stopped, or refuses everything. One whose SDK says it acts on its rules for longer (its
+/// `ttl`) holds its agent back for 10 seconds past that, up to PROCESS_LIVE_MAX.
 pub const PROCESS_LIVE: u64 = 60_000_000_000;
+/// The longest a process holds its agent back after its last fetch, in nanoseconds.
+pub const PROCESS_LIVE_MAX: u64 = 600_000_000_000;
+/// How long past its SDK's ttl a process still holds its agent back, in nanoseconds: room
+/// for the time between the proxy answering a fetch and the SDK taking the rules up.
+const PAST_TTL: u64 = 10_000_000_000;
+
+/// One process's last fetch: the version it got and when, how long it holds its agent back
+/// from then, and whether its integration stops halted instances.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Note {
+    version: u64,
+    at: u64,
+    hold: u64,
+    stops: bool,
+}
+
+impl Note {
+    fn holds(&self, now: u64) -> bool {
+        now.saturating_sub(self.at) < self.hold
+    }
+
+    fn until(&self) -> u64 {
+        self.at.saturating_add(self.hold)
+    }
+
+    /// The note this and other make as one: the version of the one further behind, until
+    /// the later of their holds ends, stopping halted instances only if both do.
+    fn lower(self, other: Note) -> Note {
+        let behind = if (other.version, other.at) < (self.version, self.at) {
+            other
+        } else {
+            self
+        };
+        let until = self.until().max(other.until());
+        Note {
+            hold: until - behind.at,
+            stops: self.stops && other.stops,
+            ..behind
+        }
+    }
+}
 
 /// Who has fetched the memory rules: each agent's processes, by the name each SDK gives its
 /// own (an SDK that names none is the process with no name).
 #[derive(Default)]
 struct Notes {
     by_agent: HashMap<String, Fetches>,
-    // Each agent and process noted, oldest first.
+    // Each agent and process with a note in by_process, oldest first.
     order: VecDeque<(String, String)>,
+    // How many notes are held back, across agents.
+    held: usize,
+    // The notes past HELD_LIMIT that still held their agents back, as one: it holds every
+    // agent back while it holds.
+    floor: Option<Note>,
 }
 
 /// One agent's processes and the last fetch of each.
 #[derive(Default)]
 struct Fetches {
-    by_process: HashMap<String, Seen>,
-    // The furthest behind of the notes that went while their process still held the agent
-    // back, so that a note going never makes the agent look further along than it is.
-    gone: Option<Seen>,
+    by_process: HashMap<String, Note>,
+    // The notes that went from by_process, to keep within the bounds, while their processes
+    // still held the agent back, by process. Each goes when its process fetches again or its
+    // hold ends, so a note going never makes the agent look further along than it is.
+    held: HashMap<String, Note>,
 }
 
 impl Notes {
-    fn note(&mut self, agent: &str, process: &str, seen: Seen) {
-        let Notes { by_agent, order } = self;
+    fn note(&mut self, agent: &str, process: &str, note: Note) {
+        let mut went = vec![];
+        let Notes {
+            by_agent, order, held, ..
+        } = self;
         let fetches = by_agent.entry(agent.to_string()).or_default();
-        if fetches.by_process.insert(process.to_string(), seen).is_none() {
+        // Fetching again, the process holds its agent back by this fetch alone.
+        if fetches.held.remove(process).is_some() {
+            *held -= 1;
+        }
+        if fetches.by_process.insert(process.to_string(), note).is_none() {
             order.push_back((agent.to_string(), process.to_string()));
             if fetches.by_process.len() > PROCESSES_LIMIT
-                && let Some(stalest) = fetches
+                && let Some(first) = fetches
                     .by_process
                     .iter()
-                    .min_by_key(|(_, s)| s.at)
+                    .min_by_key(|(_, n)| n.until())
                     .map(|(p, _)| p.clone())
+                && let Some(n) = fetches.by_process.remove(&first)
             {
-                fetches.forget(&stalest, seen.at);
-                order.retain(|(a, p)| !(a == agent && *p == stalest));
+                order.retain(|(a, p)| !(a == agent && *p == first));
+                went.push((agent.to_string(), first, n));
             }
         }
         while order.len() > SEEN_LIMIT {
             let Some((agent, process)) = order.pop_front() else {
                 break;
             };
-            if let Some(fetches) = by_agent.get_mut(&agent) {
-                fetches.forget(&process, seen.at);
-                if fetches.by_process.is_empty() {
-                    by_agent.remove(&agent);
-                }
+            if let Some(n) = by_agent.get_mut(&agent).and_then(|f| f.by_process.remove(&process)) {
+                went.push((agent, process, n));
             }
+        }
+        for (agent, process, n) in went {
+            self.hold_back(&agent, &process, n, note.at);
         }
     }
 
+    /// Holds back a note that went to keep within the bounds, while its process still holds
+    /// its agent back. An agent left with no note goes.
+    fn hold_back(&mut self, agent: &str, process: &str, note: Note, now: u64) {
+        if note.holds(now) {
+            if self.held >= HELD_LIMIT {
+                self.prune(now);
+            }
+            if self.held < HELD_LIMIT {
+                let fetches = self.by_agent.entry(agent.to_string()).or_default();
+                if fetches.held.insert(process.to_string(), note).is_none() {
+                    self.held += 1;
+                }
+            } else {
+                self.floor = Some(match self.floor.filter(|f| f.holds(now)) {
+                    Some(floor) => floor.lower(note),
+                    None => note,
+                });
+            }
+        }
+        if self
+            .by_agent
+            .get(agent)
+            .is_some_and(|f| f.by_process.is_empty() && f.held.is_empty())
+        {
+            self.by_agent.remove(agent);
+        }
+    }
+
+    /// Lets go of the held-back notes, and the floor, whose holds have ended, and of agents
+    /// left with no note.
+    fn prune(&mut self, now: u64) {
+        let mut held = 0;
+        self.by_agent.retain(|_, f| {
+            f.held.retain(|_, n| n.holds(now));
+            held += f.held.len();
+            !f.by_process.is_empty() || !f.held.is_empty()
+        });
+        self.held = held;
+        self.floor = self.floor.filter(|f| f.holds(now));
+    }
+
     /// For each agent, the version its SDKs have (Fetches::have).
-    fn have(&self, now: u64) -> HashMap<String, Seen> {
+    fn have(&mut self, now: u64) -> HashMap<String, Seen> {
+        self.prune(now);
+        let floor = self.floor;
         self.by_agent
             .iter()
-            .filter_map(|(agent, f)| f.have(now).map(|seen| (agent.clone(), seen)))
+            .filter_map(|(agent, f)| f.have(now, floor).map(|seen| (agent.clone(), seen)))
             .collect()
     }
 }
 
 impl Fetches {
-    fn forget(&mut self, process: &str, now: u64) {
-        let Some(went) = self.by_process.remove(process) else {
-            return;
+    /// What the agent's SDKs have: the fetch furthest behind among its processes still
+    /// holding it back, those that fetched within their hold, held back or not, and the
+    /// floor while it holds, so that one process having a halt doesn't confirm it while
+    /// another running the agent hasn't fetched it yet. It stops halted instances when each
+    /// of those does. When none still holds it back, its latest fetch.
+    fn have(&self, now: u64, floor: Option<Note>) -> Option<Seen> {
+        let holding = || {
+            self.by_process
+                .values()
+                .chain(self.held.values())
+                .chain(floor.as_ref())
+                .filter(move |n| n.holds(now))
         };
-        if holds_back(&went, now) {
-            self.gone = match self.gone {
-                Some(g) if holds_back(&g, now) && (g.version, g.at) <= (went.version, went.at) => Some(g),
-                _ => Some(went),
-            };
+        let seen = |n: &Note, stops: bool| Seen {
+            version: n.version,
+            at: n.at,
+            stops,
+        };
+        match holding().min_by_key(|n| (n.version, n.at)) {
+            Some(behind) => Some(seen(behind, holding().all(|n| n.stops))),
+            None => self.by_process.values().max_by_key(|n| n.at).map(|n| seen(n, n.stops)),
         }
     }
-
-    /// What the agent's SDKs have: the fetch furthest behind among its processes still
-    /// fetching, those that fetched in the last PROCESS_LIVE, so that one process having a
-    /// halt doesn't confirm it while another running the agent hasn't fetched it yet. When
-    /// none still is, its latest fetch.
-    fn have(&self, now: u64) -> Option<Seen> {
-        self.by_process
-            .values()
-            .chain(&self.gone)
-            .filter(|s| holds_back(s, now))
-            .min_by_key(|s| (s.version, s.at))
-            .or_else(|| self.by_process.values().max_by_key(|s| s.at))
-            .copied()
-    }
-}
-
-fn holds_back(seen: &Seen, now: u64) -> bool {
-    now.saturating_sub(seen.at) < PROCESS_LIVE
 }
 
 /// One identity the deny lever has seen calling, for the brake: under which agent the
@@ -704,11 +848,18 @@ impl Halts {
         )
     }
 
-    /// The rules for one agent's SDK, noting that this process of the agent has them now:
-    /// process is the name the SDK gives its process, empty if it gives none. A state that
-    /// can't be read, or was never initialized, refuses every write and serves no entry:
-    /// whatever it quarantined is unknown, so any entry might be.
+    /// The rules for one agent's SDK, fetched by a process that says nothing of itself
+    /// (memory_rules_for).
     pub fn memory_rules(&self, agent: &str, process: &str) -> MemoryRules {
+        self.memory_rules_for(agent, process, Fetcher::default())
+    }
+
+    /// The rules for one agent's SDK, noting that this process of the agent has them now:
+    /// process is the name the SDK gives its process, empty if it gives none, and fetcher
+    /// what the SDK says of it. A state that can't be read, or was never initialized,
+    /// refuses every write and serves no entry: whatever it quarantined is unknown, so any
+    /// entry might be.
+    pub fn memory_rules_for(&self, agent: &str, process: &str, fetcher: Fetcher) -> MemoryRules {
         let state = self.current();
         let agent = self.agents.named(agent);
         let named = |scope: &Scope| {
@@ -729,14 +880,16 @@ impl Halts {
                 .map(|q| q.id.clone())
         });
         if !agent.is_empty() {
-            let seen = Seen {
+            let note = Note {
                 version: state.version,
                 at: now(),
+                hold: fetcher.hold,
+                stops: fetcher.stops,
             };
             self.seen
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .note(agent, process, seen);
+                .note(agent, process, note);
         }
         let mut halts: Vec<HaltRule> = state
             .halts
@@ -745,7 +898,7 @@ impl Halts {
             .map(|h| HaltRule {
                 id: h.id.clone(),
                 fleet: h.scope.fleet,
-                agents: h.scope.agents.clone(),
+                agents: self.told(&h.scope.agents),
             })
             .collect();
         if let Some(id) = &unknown {
@@ -764,8 +917,24 @@ impl Halts {
         }
     }
 
+    /// The agents a halt names, as an SDK is told them: as the halt names them, and, for an
+    /// identity the agents file lists, its agent's name too, which is what an SDK knows its
+    /// agent by.
+    fn told(&self, agents: &[String]) -> Vec<String> {
+        let mut told: Vec<String> = vec![];
+        for named in agents {
+            for name in [named.as_str(), self.agents.named(named)] {
+                if !told.iter().any(|t| t == name) {
+                    told.push(name.to_string());
+                }
+            }
+        }
+        told
+    }
+
     /// Each agent whose SDK has fetched its rules, with the version it has: the lowest that
-    /// any of its processes still fetching got, and when that process fetched it.
+    /// any of its processes still holding it back got, when that process fetched it, and
+    /// whether each of them stops halted instances.
     pub fn seen(&self) -> HashMap<String, Seen> {
         self.seen_at(now())
     }
@@ -1647,14 +1816,30 @@ mod tests {
 
     #[test]
     fn the_notes_of_who_fetched_are_bounded() {
-        let halts = Halts::in_memory();
-        for i in 0..SEEN_LIMIT + 10 {
-            halts.memory_rules(&format!("agent-{i}"), "");
+        let mut notes = Notes::default();
+        let t = 1_000 * PROCESS_LIVE;
+        let last = SEEN_LIMIT + HELD_LIMIT;
+        // Every agent fetched just now. Past SEEN_LIMIT the oldest notes are held back, and
+        // past HELD_LIMIT, the next goes into the floor, which holds every agent back to it.
+        for i in 0..=last {
+            let version = if i == HELD_LIMIT { 1 } else { 2 };
+            notes.note(&format!("agent-{i}"), "", fetch(version, t));
         }
-        let seen = halts.seen();
+        assert_eq!(notes.order.len(), SEEN_LIMIT);
+        assert_eq!(notes.held, HELD_LIMIT);
+        assert_eq!(notes.by_agent.len(), last, "the agent behind the floor went");
+        let seen = notes.have(t + 1);
+        assert_eq!(seen.len(), last);
+        assert!(
+            seen.values().all(|s| s.version == 1),
+            "the floor holds every agent back"
+        );
+        // Once their holds end, the notes held back and the floor go.
+        let seen = notes.have(t + PROCESS_LIVE);
         assert_eq!(seen.len(), SEEN_LIMIT);
-        assert!(!seen.contains_key("agent-0"), "the oldest note went");
-        assert!(seen.contains_key(&format!("agent-{}", SEEN_LIMIT + 9)));
+        assert!(seen.values().all(|s| s.version == 2));
+        assert!(seen.contains_key(&format!("agent-{last}")) && !seen.contains_key("agent-0"));
+        assert_eq!((notes.held, notes.floor), (0, None));
     }
 
     #[test]
@@ -1672,8 +1857,22 @@ mod tests {
         assert_eq!(halts.seen()["support"].version, state.version);
     }
 
-    fn fetch(version: u64, at: u64) -> Seen {
-        Seen { version, at }
+    /// A fetch by an SDK that says nothing of its process.
+    fn fetch(version: u64, at: u64) -> Note {
+        Note {
+            version,
+            at,
+            hold: PROCESS_LIVE,
+            stops: false,
+        }
+    }
+
+    fn seen(version: u64, at: u64) -> Seen {
+        Seen {
+            version,
+            at,
+            stops: false,
+        }
     }
 
     #[test]
@@ -1682,11 +1881,100 @@ mod tests {
         let t = 1_000 * PROCESS_LIVE;
         notes.note("support", "old", fetch(1, t));
         notes.note("support", "new", fetch(2, t + 10));
-        assert_eq!(notes.have(t + 11)["support"], fetch(1, t));
+        assert_eq!(notes.have(t + 11)["support"], seen(1, t));
         // Stopped, or refusing every call on rules this old.
-        assert_eq!(notes.have(t + PROCESS_LIVE)["support"], fetch(2, t + 10));
+        assert_eq!(notes.have(t + PROCESS_LIVE)["support"], seen(2, t + 10));
         // With none still fetching, the agent has what it last fetched.
-        assert_eq!(notes.have(t + 10 * PROCESS_LIVE)["support"], fetch(2, t + 10));
+        assert_eq!(notes.have(t + 10 * PROCESS_LIVE)["support"], seen(2, t + 10));
+    }
+
+    #[test]
+    fn a_process_holds_its_agent_back_while_its_sdk_acts_on_its_rules() {
+        let secs = 1_000_000_000;
+        let hold = |ttl: Option<&str>| Fetcher::new(ttl, false).hold / secs;
+        assert_eq!(
+            hold(None),
+            60,
+            "an SDK that doesn't say acts on its rules for 30 seconds"
+        );
+        assert_eq!(hold(Some("30")), 60);
+        assert_eq!(hold(Some("75.5")), 85);
+        assert_eq!(hold(Some("120")), 130);
+        assert_eq!(hold(Some("3600")), 600, "at most");
+        for unreadable in ["", "soon", "-1", "NaN", "inf"] {
+            assert_eq!(hold(Some(unreadable)), 600, "{unreadable:?} could be anything");
+        }
+        // A process that acts on its rules for two minutes holds its agent back past one.
+        let mut notes = Notes::default();
+        let t = 1_000 * PROCESS_LIVE;
+        let slow = Note {
+            hold: Fetcher::new(Some("120"), false).hold,
+            ..fetch(1, t)
+        };
+        notes.note("support", "slow", slow);
+        notes.note("support", "fast", fetch(2, t + 1));
+        assert_eq!(notes.have(t + 129 * secs)["support"].version, 1);
+        assert_eq!(notes.have(t + 130 * secs)["support"].version, 2);
+    }
+
+    #[test]
+    fn an_agent_stops_halted_instances_once_each_process_holding_it_back_does() {
+        let mut notes = Notes::default();
+        let t = 1_000 * PROCESS_LIVE;
+        let stopping = |version, at| Note {
+            stops: true,
+            ..fetch(version, at)
+        };
+        notes.note("support", "a", stopping(1, t));
+        notes.note("support", "b", fetch(2, t + 1));
+        assert!(!notes.have(t + 2)["support"].stops, "b doesn't say it stops them");
+        notes.note("support", "b", stopping(2, t + 3));
+        let both = notes.have(t + 4)["support"];
+        assert_eq!(
+            serde_json::to_value(both).unwrap(),
+            serde_json::json!({"version": 1, "at": t, "stops": true})
+        );
+        // Said with each fetch: a process whose integration no longer says so doesn't.
+        notes.note("support", "a", fetch(2, t + 5));
+        let one = notes.have(t + 6)["support"];
+        assert_eq!(
+            serde_json::to_value(one).unwrap(),
+            serde_json::json!({"version": 2, "at": t + 3}),
+            "left out when not"
+        );
+        // With none holding it back, what its latest fetch said.
+        assert!(!notes.have(t + 10 * PROCESS_LIVE)["support"].stops);
+    }
+
+    /// Seconds from a halt until support's version reaches it, with processes of support each
+    /// fetching every 2 seconds, spread over each round, and the halt landing after two
+    /// minutes of them.
+    fn confirmed_after(processes: u64) -> Option<u64> {
+        let secs = 1_000_000_000;
+        let t = 1_000 * PROCESS_LIVE;
+        let halted = 60;
+        let mut notes = Notes::default();
+        for round in 0..200 {
+            let version = if round >= halted { 2 } else { 1 };
+            let start = t + round * 2 * secs;
+            for p in 0..processes {
+                let at = start + p * (2 * secs / processes);
+                notes.note("support", &format!("p{p}"), fetch(version, at));
+            }
+            let end = start + 2 * secs - 1;
+            if round >= halted && notes.have(end)["support"].version == 2 {
+                return Some((end - (t + halted * 2 * secs)) / secs);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn more_processes_than_an_agent_keeps_confirm_a_halt_once_each_has_it() {
+        let limit = PROCESSES_LIMIT as u64;
+        for processes in [limit, limit + 1, 2 * limit] {
+            assert_eq!(confirmed_after(processes), Some(1), "{processes} processes");
+        }
     }
 
     #[test]
@@ -1700,11 +1988,14 @@ mod tests {
         assert_eq!(notes.by_agent["support"].by_process.len(), PROCESSES_LIMIT);
         assert!(
             !notes.by_agent["support"].by_process.contains_key("p0"),
-            "the process that fetched longest ago went"
+            "the process whose hold ends first went"
         );
         assert_eq!(notes.order.len(), PROCESSES_LIMIT, "and its place in line");
-        assert_eq!(notes.have(t + 100)["support"].version, 1, "it still held support back");
-        assert_eq!(notes.have(t + PROCESS_LIVE)["support"].version, 2);
+        assert_eq!(notes.have(t + 100)["support"].version, 1, "it still holds support back");
+        // Fetching again, it holds support back by that fetch alone, and another goes.
+        notes.note("support", "p0", fetch(2, t + 200));
+        assert_eq!(notes.have(t + 201)["support"].version, 2);
+        assert_eq!((notes.held, notes.by_agent["support"].held.len()), (1, 1));
 
         // Past the bound on every note, the oldest goes, with the same care.
         let mut notes = Notes::default();
@@ -1716,6 +2007,13 @@ mod tests {
         assert!(!notes.by_agent["billing"].by_process.contains_key("x"));
         assert_eq!(notes.have(t + 3)["billing"].version, 1);
         assert_eq!(notes.order.len(), SEEN_LIMIT);
+        // Billing's last note goes too, and billing stays while x still holds it back: y
+        // fetching again doesn't make it look as if every process of billing had version 2.
+        notes.note("other", "z", fetch(2, t + 3));
+        assert!(notes.by_agent["billing"].by_process.is_empty());
+        notes.note("billing", "y", fetch(2, t + 4));
+        assert_eq!(notes.have(t + 5)["billing"], seen(1, t));
+        assert_eq!(notes.have(t + PROCESS_LIVE)["billing"], seen(2, t + 4));
     }
 
     #[test]
@@ -1843,6 +2141,27 @@ mod tests {
         );
         assert_eq!(json["halts"][1], serde_json::json!({"id": "h-fleet", "fleet": true}));
         assert!(!json.to_string().contains("tok-1"));
+    }
+
+    #[test]
+    fn the_memory_rules_name_an_agent_a_halt_names_by_identity_as_its_sdk_knows_it() {
+        let map = br#"{"billing": ["spiffe://wake.local/agent/billing"]}"#;
+        let halts = Halts::in_memory().with_agents(Arc::new(Agents::from_json(map).unwrap()));
+        halts
+            .put("h1", agents(&["spiffe://wake.local/agent/billing", CHILD_1]), 1)
+            .unwrap();
+        assert_eq!(
+            halts.memory_rules("billing", "").halts[0].agents,
+            ["spiffe://wake.local/agent/billing", "billing", CHILD_1]
+        );
+        halts
+            .put("h1", agents(&["billing", "spiffe://wake.local/agent/billing"]), 2)
+            .unwrap();
+        assert_eq!(
+            halts.memory_rules("billing", "").halts[0].agents,
+            ["billing", "spiffe://wake.local/agent/billing"],
+            "each once"
+        );
     }
 
     #[test]

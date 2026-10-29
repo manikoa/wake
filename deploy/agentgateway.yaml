@@ -26,7 +26,7 @@ gateways:
       protocol:
         grpc:
           metadata:
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ""), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ""), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
 routes:
 # An A2A agent. Add one route like this per agent, with its own path and receiver name.
 - matches:
@@ -47,7 +47,7 @@ routes:
           context:
             receiver: research
           metadata:
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ""), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ""), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
     extProc:
       host: "unix:/run/wake/proxy.sock"
       # Calls that start while wake-proxy is down go through unrecorded; one in progress
@@ -65,7 +65,7 @@ routes:
         sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : "")'
         # What the sender's JWT says, never the token: whom it acts for, the agents
         # acting, its id and expiry, and whether it's bound to a key. wake-proxy records it.
-        sender_token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
+        sender_token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
         receiver: '"research"'
   backends:
   - host: host.docker.internal:9999
@@ -87,7 +87,7 @@ routes:
           agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : "")'
           # What the caller's JWT says, never the token: whom it acts for, the agents
           # acting, its id and expiry, and whether it's bound to a key. wake-proxy records it.
-          token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
+          token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
           # The caller's MCP session, in both phases, so a response whose event id didn't come
           # back is paired in order only within its own session.

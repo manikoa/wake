@@ -23,7 +23,10 @@
 //! what the exchange carried before it as usual.
 //!
 //! With a flow policy (policy.rs), a message is noted as the sender entering the receiver,
-//! and a reply as the receiver entering the sender (origins.rs), before either is answered.
+//! and a reply as the receiver entering the sender (origins.rs), each carrying whatever had
+//! entered the agent it comes from. Each is noted before its headers are answered, and
+//! again before each part of its body is, so content that entered the agent it comes from
+//! while a reply streams goes with it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -159,8 +162,9 @@ impl Exchange {
     }
 
     /// Notes in observed that the sender entered the receiver when a message goes on, and
-    /// the receiver the sender when a reply comes back: before either is answered, so
-    /// neither agent gets the content ahead of the note.
+    /// the receiver the sender when a reply comes back, each with whatever had entered the
+    /// agent it comes from: before any of either is answered, so neither agent gets the
+    /// content ahead of the note.
     pub fn with_observed(mut self, observed: Option<Arc<Observed>>) -> Self {
         self.observed = observed;
         self
@@ -169,24 +173,40 @@ impl Exchange {
     fn note_delivery(&self, to_receiver: bool, now: SystemTime) {
         let Some(observed) = &self.observed else { return };
         let at = nanos(now);
+        let agents = &*self.agents;
+        let sender = Who::of(agents, self.call.caller.as_deref());
+        let token = self.call.token.as_ref();
+        // A route names the agent it reaches.
+        let receiver = self
+            .call
+            .receiver
+            .as_deref()
+            .map(|r| Who::Agent(agents.named(r)))
+            .unwrap_or(Who::Nobody);
         if to_receiver {
-            // A route names the agent it reaches. The message comes from the agents the
-            // sender acts under too: a sub-agent speaks for them.
-            let receiver = self.call.receiver.as_deref().map(|r| self.agents.named(r));
-            let who = receiver.map(Who::Agent).unwrap_or(Who::Nobody);
-            observed.note(who, &format!("agent:{}", self.sender), at);
-            for under in origins::under(&self.agents, self.call.token.as_ref()) {
+            // The message comes from the agents the sender acts under too: a sub-agent speaks
+            // for them. It carries whatever had entered any of them, and every origin from a
+            // sender that could be any agent.
+            observed.note(receiver, &format!("agent:{}", self.sender), at);
+            for under in origins::under(agents, token) {
                 if let Some(agent) = under.key().filter(|a| *a != self.sender) {
-                    observed.note(who, &format!("agent:{agent}"), at);
+                    observed.note(receiver, &format!("agent:{agent}"), at);
                 }
             }
-        } else {
-            // The reply reaches the agents the sender acts under too.
-            let origin = format!("agent:{}", self.receiver);
-            observed.note(Who::of(&self.agents, self.call.caller.as_deref()), &origin, at);
-            for under in origins::under(&self.agents, self.call.token.as_ref()) {
-                observed.note(under, &origin, at);
+            match origins::behind(agents, sender, token) {
+                Ok(from) => observed.carry(&from, &[receiver], at),
+                Err(_) => observed.saturate(&[receiver], at),
             }
+        } else {
+            // The reply reaches the agents the sender acts under too, and carries whatever
+            // had entered the receiver.
+            let mut to = origins::under(agents, token);
+            to.insert(0, sender);
+            let origin = format!("agent:{}", self.receiver);
+            for who in &to {
+                observed.note(*who, &origin, at);
+            }
+            observed.carry(&[receiver], &to, at);
         }
     }
 
@@ -246,6 +266,8 @@ impl Exchange {
             Some(Phase::RequestBody(b)) => {
                 let full_duplex = self.request_mode == BodySendMode::FullDuplexStreamed as i32;
                 if self.recorded {
+                    // Again for each part, with what entered the sender since the last.
+                    self.note_delivery(true, now);
                     self.capture(false, &b.body);
                     if b.end_of_stream {
                         events.extend(self.finish_request(now));
@@ -289,6 +311,8 @@ impl Exchange {
                 let full_duplex = self.response_mode == BodySendMode::FullDuplexStreamed as i32;
                 self.ended |= b.end_of_stream;
                 if self.recorded {
+                    // Again for each part: a receiver can call a tool while its reply streams.
+                    self.note_delivery(false, now);
                     self.capture(true, &b.body);
                     if b.end_of_stream {
                         events.extend(self.finish(now));
@@ -831,20 +855,22 @@ mod tests {
     }
 
     fn first(pairs: &[(&str, &str)]) -> ProcessingRequest {
-        let fields = [
-            (ATTR_SENDER, "spiffe://wake.local/agent/planner"),
-            (ATTR_RECEIVER, "research"),
-        ]
-        .into_iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                prost_types::Value {
-                    kind: Some(Kind::StringValue(v.into())),
-                },
-            )
-        })
-        .collect();
+        first_from("spiffe://wake.local/agent/planner", "research", pairs)
+    }
+
+    /// The first message of an exchange from sender to the agent a route reaches.
+    fn first_from(sender: &str, receiver: &str, pairs: &[(&str, &str)]) -> ProcessingRequest {
+        let fields = [(ATTR_SENDER, sender), (ATTR_RECEIVER, receiver)]
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    prost_types::Value {
+                        kind: Some(Kind::StringValue(v.into())),
+                    },
+                )
+            })
+            .collect();
         ProcessingRequest {
             request: Some(Phase::RequestHeaders(headers(pairs))),
             attributes: [(ATTRIBUTES.to_string(), prost_types::Struct { fields })].into(),
@@ -991,6 +1017,127 @@ mod tests {
                 "agent:user-42"
             ]
         );
+    }
+
+    const BILLING: &str = "spiffe://wake.local/agent/billing";
+    const RESEARCH: &str = "spiffe://wake.local/agent/research";
+
+    /// An identity map with billing and research, and nothing entered either yet.
+    fn billing_and_research() -> (Arc<Agents>, Arc<Observed>) {
+        let map = format!(r#"{{"billing": ["{BILLING}"], "research": ["{RESEARCH}"]}}"#);
+        (
+            Arc::new(Agents::from_json(map.as_bytes()).unwrap()),
+            Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS)),
+        )
+    }
+
+    /// Whether the agent with this identity may pay, under a rule that a fetched page keeps
+    /// billing's and research's payments from.
+    fn may_pay(agents: &Agents, observed: &Observed, identity: &str, at: SystemTime) -> bool {
+        use crate::policy::{At, FlowPolicy, Target};
+        let policy = FlowPolicy::parse(
+            br#"{"rules": [{"id": "no-pay-after-web", "callers": ["billing", "research"], "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}]}"#,
+        )
+        .unwrap();
+        let target = Target {
+            caller: Who::of(agents, Some(identity)),
+            token: None,
+            receiver: None,
+            path: None,
+            tool: Some("pay"),
+        };
+        authz::check_policy(&policy, observed, agents, At::Mcp, &target, nanos(at)).is_none()
+    }
+
+    #[test]
+    fn a_reply_carries_what_entered_the_agent_that_sent_it() {
+        use crate::origins::Seen;
+        let (agents, observed) = billing_and_research();
+        // Research fetched a page through the proxy.
+        observed.note(Who::of(&agents, Some(RESEARCH)), "tool:fetch_page", nanos(t(0)));
+        assert!(may_pay(&agents, &observed, BILLING, t(1)));
+        // Billing asks research, which answers with what the page says.
+        let mut x = Exchange::default()
+            .with_agents(agents.clone())
+            .with_observed(Some(observed.clone()));
+        x.handle(first_from(BILLING, "research", &[(":method", "POST")]), t(1));
+        x.handle(phase(Phase::RequestBody(body(SEND, true))), t(2));
+        assert!(may_pay(&agents, &observed, BILLING, t(2)), "asking brings nothing back");
+        x.handle(phase(Phase::ResponseHeaders(headers(&[(":status", "200")]))), t(3));
+        x.handle(phase(Phase::ResponseBody(body(REPLY, true))), t(4));
+        assert_eq!(
+            observed.seen(Who::Agent("billing"), nanos(t(10)), 900),
+            Seen::These(vec!["agent:research".into(), "tool:fetch_page".into()])
+        );
+        assert!(
+            !may_pay(&agents, &observed, BILLING, t(10)),
+            "billing can't pay on the page research passed it, as it couldn't on one it fetched"
+        );
+    }
+
+    #[test]
+    fn a_message_carries_what_entered_the_agent_that_sent_it() {
+        use crate::origins::Seen;
+        let (agents, observed) = billing_and_research();
+        // Billing fetched a page, then tells research what it says.
+        observed.note(Who::of(&agents, Some(BILLING)), "tool:fetch_page", nanos(t(0)));
+        let mut x = Exchange::default()
+            .with_agents(agents.clone())
+            .with_observed(Some(observed.clone()));
+        x.handle(first_from(BILLING, "research", &[(":method", "POST")]), t(1));
+        assert_eq!(
+            observed.seen(Who::Agent("research"), nanos(t(10)), 900),
+            Seen::These(vec!["agent:billing".into(), "tool:fetch_page".into()])
+        );
+        assert!(!may_pay(&agents, &observed, RESEARCH, t(10)));
+    }
+
+    #[test]
+    fn a_message_from_a_sender_nobody_can_place_carries_every_origin() {
+        use crate::origins::{CARRIED, Seen};
+        let (agents, observed) = billing_and_research();
+        // Research's child, under an SVID of its own that the agents file doesn't list, and
+        // with no token to place it: it could be any agent, with anything in it.
+        let mut x = Exchange::default()
+            .with_agents(agents.clone())
+            .with_observed(Some(observed.clone()));
+        let child = "spiffe://wake.local/agent/research/child";
+        x.handle(first_from(child, "billing", &[(":method", "POST")]), t(1));
+        assert_eq!(
+            observed.seen(Who::Agent("billing"), nanos(t(10)), 900),
+            Seen::Every(CARRIED)
+        );
+        assert!(!may_pay(&agents, &observed, BILLING, t(10)));
+    }
+
+    #[test]
+    fn a_streamed_reply_carries_what_entered_the_receiver_while_it_streams() {
+        let (agents, observed) = billing_and_research();
+        let mut x = Exchange::default()
+            .with_agents(agents.clone())
+            .with_observed(Some(observed.clone()));
+        x.handle(first_from(BILLING, "research", &[(":method", "POST")]), t(0));
+        x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        let streamed = headers(&[(":status", "200"), ("content-type", "text/event-stream")]);
+        x.handle(phase(Phase::ResponseHeaders(streamed)), t(2));
+        x.handle(
+            phase(Phase::ResponseBody(body(
+                b"data: {\"result\":{\"kind\":\"status-update\"}}\n\n",
+                false,
+            ))),
+            t(3),
+        );
+        assert!(may_pay(&agents, &observed, BILLING, t(3)));
+        // Research fetches a page halfway through its reply, and streams what it says.
+        observed.note(Who::Agent("research"), "tool:fetch_page", nanos(t(4)));
+        x.handle(
+            phase(Phase::ResponseBody(body(
+                b"data: {\"result\":{\"kind\":\"message\"}}\n\n",
+                true,
+            ))),
+            t(5),
+        );
+        assert!(!may_pay(&agents, &observed, BILLING, t(6)));
     }
 
     #[test]

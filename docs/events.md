@@ -17,7 +17,7 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.token.subject` | string | Set by the proxy when the caller presented a JWT whose `sub` it could read: whom the token acts for. For a delegated token, often a user or the agent that delegated, while `wake.agent.id` names the agent acting. See Tokens |
 | `wake.token.actors` | string[] | With a delegated token: the agents acting under it, the one acting now first, then each before it (its nested `act` claims) |
 | `wake.token.actors_cut` | bool | Set, to true, when the chain went on past what `wake.token.actors` keeps: its earliest actors are unknown |
-| `wake.token.id` | string | The token's `jti`, when it has one |
+| `wake.token.id` | string | The token's `jti`, or, for a token without one, its `uti`, which Microsoft Entra access tokens carry instead. Left out when it has neither |
 | `wake.token.expires_unix` | int | The token's `exp`, in Unix seconds |
 | `wake.token.bound` | bool | Whether the token is bound to its holder's key (it has a `cnf` claim, as DPoP and mTLS-bound tokens do), rather than usable by whoever holds a copy. Set on every event that records a token, so it, not `wake.token.subject`, says whether the caller presented one |
 | `wake.call.ok` | bool | Set by the proxy on a call it saw answered: whether it went well. On an MCP `tool_call`, a result came back that doesn't say `isError`; a call with no response seen didn't (agentgateway skips the response hook on a JSON-RPC error). On an A2A reply, the receiver answered with a 2xx, a result, no JSON-RPC error and no task that failed, was rejected or was canceled. Left out when the answer was cut short or can't be read. A run charter's checks that it's done count only calls that went well |
@@ -156,7 +156,7 @@ Each credential becomes a placeholder naming its kind and the first 12 hex digit
 | Kind | What it matches |
 |---|---|
 | `private_key` | A PEM private key block, `-----BEGIN … PRIVATE KEY-----`, or an OpenPGP `-----BEGIN PGP PRIVATE KEY BLOCK-----`, to its END line, or as far as its body runs if it's cut short. Its line breaks can be raw or escaped for JSON at any depth, as in a key in JSON held in a string in the payload, and so can the `+`, `/` and `=` some encoders escape: .NET writes `+` as `\u002B`, PHP `/` as `\/` |
-| `jwt` | A signed JWT: three base64url parts, the first two JSON objects (`eyJ…`). Its placeholder keeps the token's `jti` when that's a plain id (up to 128 of `A-Z a-z 0-9 . _ : -`) that doesn't itself look like a credential, so it can be matched to `wake.token.id` |
+| `jwt` | A signed JWT: three base64url parts, the first two JSON objects (`eyJ…`). Its placeholder keeps the token's `jti` when that's a plain id (up to 128 of `A-Z a-z 0-9 . _ : -`) that doesn't itself look like a credential, so it can be matched to `wake.token.id`. A token with no `jti`, such as an Entra access token, whose `wake.token.id` is its `uti`, keeps none |
 | `github_token` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` tokens and `github_pat_` tokens |
 | `google_api_key`, `google_oauth_token` | `AIza…` keys and `ya29.…` access tokens |
 | `slack_token` | `xoxa-`, `xoxb-`, `xoxp-`, `xoxo-`, `xoxs-`, `xoxr-` tokens and `xapp-` app tokens |

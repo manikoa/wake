@@ -292,17 +292,11 @@ impl FlowRule {
             who.key()
                 .is_some_and(|k| self.callers.iter().any(|c| agents.named(c) == k))
         };
-        // A caller's own token places it under the agents its chain names, by the identity
-        // provider's word, unless the chain was cut (halts.rs decides the same way).
-        let placed = |identity: &str| {
-            target.token.is_some_and(|t| {
-                !t.cut && t.actors.first().is_some_and(|a| a == identity) && t.under().any(|a| agents.knows(a))
-            })
-        };
         let callers = match target.caller {
-            // A caller the identity map doesn't name, or place, could be any agent.
+            // A caller the identity map doesn't name, and its own token doesn't place under an
+            // agent the map lists (origins::placed), could be any agent.
             Who::Nobody => true,
-            Who::Unlisted(identity) if !placed(identity) => true,
+            Who::Unlisted(identity) if !origins::placed(agents, identity, target.token) => true,
             // A rule for an agent covers the calls made under it, a sub-agent's included,
             // and a chain that was cut could be under any agent.
             Who::Unlisted(_) | Who::Agent(_) => {
