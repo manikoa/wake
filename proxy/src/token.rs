@@ -12,7 +12,8 @@
 //! a value too long to be an identifier is left out rather than cut, and a chain longer
 //! than MAX_ACTORS is cut there. A chain that goes on past what's kept, past MAX_ACTORS or
 //! an actor that can't be read, is marked cut: its earliest actors are unknown, and a halt
-//! decides on it as on a caller it can't name (halts.rs).
+//! decides on it as on a caller it can't name (halts.rs). So is a JWT whose subject can't
+//! be read, since whom it acts for is unknown.
 
 use prost_types::value::Kind;
 use prost_types::{Struct, Value as PbValue};
@@ -53,9 +54,17 @@ impl Token {
     }
 
     /// The token the gateway config described in these fields: `sub`, `jti`, `exp`, `act`
-    /// and `cnf`. None when there's no subject, as when the caller presented no JWT.
+    /// and `cnf`. None when the caller presented no JWT, which the config describes with
+    /// every claim empty. A JWT whose `sub` can't be read, missing or too long, keeps its
+    /// other claims, and its chain is marked cut: whom it acts for is unknown.
     pub fn from_struct(s: &Struct) -> Option<Token> {
-        let subject = identifier(s.fields.get("sub"))?;
+        if !["sub", "jti", "exp", "act", "cnf"]
+            .iter()
+            .any(|k| claimed(s.fields.get(*k)))
+        {
+            return None;
+        }
+        let subject = identifier(s.fields.get("sub"));
         let mut actors = vec![];
         let mut act = s.fields.get("act");
         while actors.len() < MAX_ACTORS {
@@ -68,9 +77,10 @@ impl Token {
             actors.push(actor);
             act = a.fields.get("act");
         }
-        // Where the walk stopped, an actor with any claims at all is one it didn't keep. The
+        // Where the walk stopped, anything left is an actor it didn't keep: one past
+        // MAX_ACTORS, one whose `sub` it couldn't read, or an `act` that isn't an object. The
         // gateway sends an empty object for a token without a chain.
-        let cut = matches!(act.and_then(|a| a.kind.as_ref()), Some(Kind::StructValue(a)) if !a.fields.is_empty());
+        let cut = subject.is_none() || claimed(act);
         let expires = match s.fields.get("exp").and_then(|e| e.kind.as_ref()) {
             Some(Kind::NumberValue(n)) if n.is_finite() && *n > 0.0 && n.fract() == 0.0 && *n < i64::MAX as f64 => {
                 Some(*n as i64)
@@ -82,7 +92,7 @@ impl Token {
             Some(Kind::BoolValue(true))
         );
         Some(Token {
-            subject,
+            subject: subject.unwrap_or_default(),
             actors,
             id: identifier(s.fields.get("jti")),
             expires,
@@ -95,14 +105,20 @@ impl Token {
     /// the one acting now first, then whom they act for, its subject. Without a chain the
     /// subject is the agent the token was issued to.
     pub fn under(&self) -> impl Iterator<Item = &str> {
-        self.actors.iter().chain([&self.subject]).map(String::as_str)
+        self.actors
+            .iter()
+            .chain([&self.subject])
+            .map(String::as_str)
+            .filter(|a| !a.is_empty())
     }
 
     /// Records the token on an event: `wake.token.subject`, `wake.token.actors`,
     /// `wake.token.actors_cut`, `wake.token.id`, `wake.token.expires_unix` and
     /// `wake.token.bound` (docs/events.md).
     pub fn record(&self, e: &mut Event) {
-        e.set("wake.token.subject", Value::Str(self.subject.clone()));
+        if !self.subject.is_empty() {
+            e.set("wake.token.subject", Value::Str(self.subject.clone()));
+        }
         if !self.actors.is_empty() {
             e.set("wake.token.actors", Value::Strs(self.actors.clone()));
         }
@@ -116,6 +132,19 @@ impl Token {
             e.set("wake.token.expires_unix", Value::Int(expires));
         }
         e.set("wake.token.bound", Value::Bool(self.bound));
+    }
+}
+
+/// Whether the gateway passed anything for a claim: for one the JWT doesn't have, it passes
+/// an empty string, zero, false or an empty object.
+fn claimed(v: Option<&PbValue>) -> bool {
+    match v.and_then(|v| v.kind.as_ref()) {
+        None | Some(Kind::NullValue(_)) => false,
+        Some(Kind::StringValue(s)) => !s.is_empty(),
+        Some(Kind::NumberValue(n)) => *n != 0.0,
+        Some(Kind::BoolValue(b)) => *b,
+        Some(Kind::StructValue(s)) => !s.fields.is_empty(),
+        Some(Kind::ListValue(l)) => !l.values.is_empty(),
     }
 }
 
@@ -233,10 +262,16 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!((t.actors, t.cut), (vec!["child".to_string()], true));
-        // An act that isn't an object is no chain.
+        // An act that isn't an object is an actor it can't read, at the top or deeper.
         let t = Token::from_value(&facts(&[("sub", text("u")), ("act", text("support"))])).unwrap();
         assert!(t.actors.is_empty());
-        assert!(!t.cut);
+        assert!(t.cut);
+        let t = Token::from_value(&facts(&[
+            ("sub", text("u")),
+            ("act", facts(&[("sub", text("child")), ("act", text("support"))])),
+        ]))
+        .unwrap();
+        assert_eq!((t.actors, t.cut), (vec!["child".to_string()], true));
         // A long chain is cut at MAX_ACTORS.
         let mut act = facts(&[("sub", text("a0"))]);
         for i in 1..20 {
@@ -256,9 +291,36 @@ mod tests {
     }
 
     #[test]
+    fn a_jwt_whose_subject_cant_be_read_is_cut() {
+        // Missing or too long, whom it acts for is unknown, and could be a halted agent; the
+        // rest of the JWT is kept.
+        for sub in [text(""), text(&"x".repeat(MAX_LEN + 1))] {
+            let t = Token::from_value(&facts(&[
+                ("sub", sub),
+                ("jti", text("tok-1")),
+                ("exp", number(0.0)),
+                ("act", facts(&[("sub", text("support"))])),
+                ("cnf", boolean(false)),
+            ]))
+            .unwrap();
+            assert_eq!(t.subject, "");
+            assert_eq!(t.actors, ["support"]);
+            assert_eq!(t.id.as_deref(), Some("tok-1"));
+            assert!(t.cut);
+            assert_eq!(t.under().collect::<Vec<_>>(), ["support"]);
+            let mut e = Event::default();
+            t.record(&mut e);
+            assert!(!e.attributes.contains_key("wake.token.subject"));
+            assert_eq!(e.attributes["wake.token.actors_cut"], Value::Bool(true));
+            assert_eq!(e.attributes["wake.token.bound"], Value::Bool(false));
+        }
+        let t = Token::from_value(&facts(&[("sub", text(&"x".repeat(MAX_LEN + 1)))])).unwrap();
+        assert!(t.cut, "a subject too long, with nothing else");
+    }
+
+    #[test]
     fn odd_claims_are_left_out_not_cut() {
         let long = "x".repeat(MAX_LEN + 1);
-        assert_eq!(Token::from_value(&facts(&[("sub", text(&long))])), None);
         let t = Token::from_value(&facts(&[
             ("sub", text("u")),
             ("jti", text(&long)),

@@ -67,10 +67,21 @@ impl<'a> Who<'a> {
 }
 
 /// The agents a call made with token is made under, besides its caller, as the identity
-/// map names them (Token::under).
+/// map names them (Token::under). Its subject counts only when the map lists it, or when
+/// there's no map to say: a user a token acts for isn't an agent, and keying origins under
+/// one would tie together every agent acting for that user.
 pub fn under<'a>(agents: &'a Agents, token: Option<&'a Token>) -> Vec<Who<'a>> {
     token
-        .map(|t| t.under().map(|id| Who::of(agents, Some(id))).collect())
+        .map(|t| {
+            let subject = Some(t.subject.as_str()).filter(|s| agents.is_empty() || agents.knows(s));
+            t.actors
+                .iter()
+                .map(String::as_str)
+                .chain(subject)
+                .map(|id| Who::of(agents, Some(id)))
+                .filter(|who| *who != Who::Nobody)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -315,6 +326,19 @@ mod tests {
             [Who::Unlisted("support/researcher#toolu_1"), Who::Agent("support")]
         );
         assert!(under(&agents, None).is_empty());
+        // A user a token acts for isn't an agent: what entered one agent acting for that
+        // user isn't kept under the user, for every other agent acting for them to inherit.
+        let for_user = Token {
+            subject: "user-42".into(),
+            actors: vec!["support/researcher#toolu_1".into(), "0oa1support".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            under(&agents, Some(&for_user)),
+            [Who::Unlisted("support/researcher#toolu_1"), Who::Agent("support")]
+        );
+        // Without a map there's no telling, so it counts.
+        assert_eq!(under(&Agents::default(), Some(&for_user)).len(), 3);
     }
 
     #[test]

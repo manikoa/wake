@@ -217,6 +217,16 @@ async fn put_quarantine(
     if body.selection.is_empty() {
         return (StatusCode::BAD_REQUEST, "a quarantine needs something to lock or hide").into_response();
     }
+    // An agent's memory adapter refuses its writes by the agent's name; it never sees a
+    // token, so a lock by token, or by a blank name, would be acknowledged and lock nothing.
+    let lock = &body.selection.lock;
+    if !lock.tokens.is_empty() || lock.agents.iter().any(|n| n.trim().is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a quarantine locks the fleet or agents by name, not tokens",
+        )
+            .into_response();
+    }
     let issued_at = body.issued_at.unwrap_or_else(halts::now);
     stored(tokio::task::spawn_blocking(move || halts.quarantine(&id, body.selection, issued_at)).await)
 }

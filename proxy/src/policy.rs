@@ -292,12 +292,20 @@ impl FlowRule {
             who.key()
                 .is_some_and(|k| self.callers.iter().any(|c| agents.named(c) == k))
         };
+        // A caller's own token places it under the agents its chain names, by the identity
+        // provider's word, unless the chain was cut (halts.rs decides the same way).
+        let placed = |identity: &str| {
+            target.token.is_some_and(|t| {
+                !t.cut && t.actors.first().is_some_and(|a| a == identity) && t.under().any(|a| agents.knows(a))
+            })
+        };
         let callers = match target.caller {
-            // A caller the identity map doesn't name could be any agent.
-            Who::Unlisted(_) | Who::Nobody => true,
+            // A caller the identity map doesn't name, or place, could be any agent.
+            Who::Nobody => true,
+            Who::Unlisted(identity) if !placed(identity) => true,
             // A rule for an agent covers the calls made under it, a sub-agent's included,
             // and a chain that was cut could be under any agent.
-            Who::Agent(_) => {
+            Who::Unlisted(_) | Who::Agent(_) => {
                 self.callers.is_empty()
                     || names(&target.caller)
                     || origins::under(agents, target.token).iter().any(names)
@@ -618,6 +626,52 @@ mod tests {
             p.deciding(At::Mcp, &under_a_cut_chain, &web, &none).is_some(),
             "support could be in the part that was cut"
         );
+    }
+
+    #[test]
+    fn a_sub_agent_its_own_token_places_is_held_to_the_rules_for_its_chain() {
+        let p = policy(PAY);
+        let agents = Agents::from_json(br#"{"support": ["0oa1support"], "billing": ["0oa1billing"]}"#).unwrap();
+        let web = seen(&["tool:fetch_page"]);
+        let own = Token {
+            subject: "user-42".into(),
+            actors: vec!["support/researcher#toolu_1".into(), "0oa1support".into()],
+            ..Default::default()
+        };
+        let sub_agent = Target {
+            caller: Who::Unlisted("support/researcher#toolu_1"),
+            token: Some(&own),
+            receiver: None,
+            path: None,
+            tool: Some("pay"),
+        };
+        assert!(
+            p.deciding(At::Mcp, &sub_agent, &web, &agents).is_none(),
+            "billing's rule isn't for support's sub-agent"
+        );
+        let under_billing = Token {
+            actors: vec!["support/researcher#toolu_1".into(), "0oa1billing".into()],
+            ..own.clone()
+        };
+        let not_its_own = Token {
+            actors: vec!["support/other#toolu_2".into(), "0oa1support".into()],
+            ..own.clone()
+        };
+        let cut = Token {
+            cut: true,
+            ..own.clone()
+        };
+        for (token, why) in [
+            (&under_billing, "under billing, it is"),
+            (&not_its_own, "a token that isn't its own places it nowhere"),
+            (&cut, "nor does a chain that was cut"),
+        ] {
+            let target = Target {
+                token: Some(token),
+                ..sub_agent
+            };
+            assert!(p.deciding(At::Mcp, &target, &web, &agents).is_some(), "{why}");
+        }
     }
 
     #[test]

@@ -289,6 +289,14 @@ async fn the_brake_halts_a_token_and_sees_who_has_called() {
             .unwrap();
         assert_eq!(blank.status(), 400, "{scope}: it would stop nothing");
     }
+    // A field the scope doesn't know is refused, not dropped: it would cover less than asked.
+    let misspelled = brake
+        .put(format!("{}/v1/halts/halt-2", c.url))
+        .json(&serde_json::json!({"scope": {"agents": ["billing"], "token": ["tok-8"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(misspelled.status().is_client_error(), "{}", misspelled.status());
     assert_eq!(c.halts.state().halts.len(), 1, "only the token halt");
     // Only the brake reads the callers.
     assert!(
@@ -349,6 +357,19 @@ async fn a_quarantine_reaches_the_memory_adapters() {
         .await
         .unwrap();
     assert_eq!(empty.status(), 400);
+    // A memory adapter never sees a token: a lock by one would lock nothing.
+    for lock in [
+        serde_json::json!({"tokens": ["tok-7"]}),
+        serde_json::json!({"agents": [" "]}),
+    ] {
+        let refused = brake
+            .put(format!("{}/v1/quarantines/q2", c.url))
+            .json(&serde_json::json!({"selection": {"lock": lock}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400, "{lock}");
+    }
     let released = brake
         .delete(format!("{}/v1/quarantines/q1", c.url))
         .send()

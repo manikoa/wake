@@ -35,9 +35,10 @@ use tokio::sync::watch;
 use crate::agents::Agents;
 use crate::token::Token;
 
-/// What a halt covers.
+/// What a halt covers. A field it doesn't know is refused, not dropped: a scope misspelled
+/// would be acknowledged and cover less than the brake asked.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Scope {
     /// Every call, whoever makes it.
     #[serde(default)]
@@ -504,7 +505,7 @@ impl Halts {
         caller.last_seen = at;
         caller.calls += 1;
         if let Some(token) = token {
-            caller.subject = Some(token.subject.clone());
+            caller.subject = Some(token.subject.clone()).filter(|s| !s.is_empty());
             caller.actors = token.actors.clone();
             caller.actors_cut = token.cut;
             if let Some(id) = &token.id {

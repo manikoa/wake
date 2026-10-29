@@ -168,10 +168,16 @@ impl Exchange {
         let Some(observed) = &self.observed else { return };
         let at = nanos(now);
         if to_receiver {
-            // A route names the agent it reaches.
+            // A route names the agent it reaches. The message comes from the agents the
+            // sender acts under too: a sub-agent speaks for them.
             let receiver = self.call.receiver.as_deref().map(|r| self.agents.named(r));
             let who = receiver.map(Who::Agent).unwrap_or(Who::Nobody);
             observed.note(who, &format!("agent:{}", self.sender), at);
+            for under in origins::under(&self.agents, self.call.token.as_ref()) {
+                if let Some(agent) = under.key().filter(|a| *a != self.sender) {
+                    observed.note(who, &format!("agent:{agent}"), at);
+                }
+            }
         } else {
             // The reply reaches the agents the sender acts under too.
             let origin = format!("agent:{}", self.receiver);
@@ -959,10 +965,21 @@ mod tests {
         assert_eq!(seen("spiffe://wake.local/agent/planner"), reply, "the sender");
         assert_eq!(seen("planner/scout#toolu_3"), reply);
         assert_eq!(seen("planner"), reply, "what the scout heard goes back to planner");
-        // The message reaches research alone: its route says nothing of a chain.
+        // The message reaches research alone, its route says nothing of a chain, but it comes
+        // from the agents the scout acts under too: a rule forbidding agent:planner covers it.
+        // Without a map, whom the token acts for could be an agent as well.
+        let Seen::These(mut from) = seen("research") else {
+            panic!("research has known origins")
+        };
+        from.sort();
         assert_eq!(
-            seen("research"),
-            Seen::These(vec!["agent:spiffe://wake.local/agent/planner".into()])
+            from,
+            [
+                "agent:planner",
+                "agent:planner/scout#toolu_3",
+                "agent:spiffe://wake.local/agent/planner",
+                "agent:user-42"
+            ]
         );
     }
 
