@@ -140,9 +140,15 @@ func TestRedactionTakesLinearTime(t *testing.T) {
 		// Every pattern's literals, so none is skipped.
 		"every pattern": strings.Repeat(` eyJ ghp_ AIza ya29. xoxb- sk- _live_ Bearer Basic \\u00ab ://a:b secretAccessKey=`, 1<<14),
 	} {
+		// The budget catches a pattern that backtracks, which would take hours on a payload this
+		// size, not a slow machine or the race detector.
+		budget := 5 * time.Second
+		if raceDetector {
+			budget = 60 * time.Second
+		}
 		start := time.Now()
 		Redact(payload)
-		if took := time.Since(start); took > 5*time.Second {
+		if took := time.Since(start); took > budget {
 			t.Errorf("%s: %v for %d bytes", name, took, len(payload))
 		}
 	}
