@@ -9,6 +9,22 @@ import { PassThrough } from "node:stream";
 
 type Json = Record<string, unknown>;
 
+/**
+ * Who makes a tool call, and how the call comes: parent is the Agent tool use whose subagent
+ * makes it, agent its type and agentId the id its hooks name it by; ask, as for allowed().
+ */
+export interface Called {
+  parent?: string;
+  agent?: string;
+  agentId?: string;
+  ask?: () => Promise<void> | void;
+}
+
+/** What a hook says of the subagent making a call: nothing, for the main agent. */
+export function caller(options: Called): Json {
+  return options.agent ? { agent_id: options.agentId ?? `agent-${options.agent}`, agent_type: options.agent } : {};
+}
+
 export class FakeClaudeCode {
   readonly #out: PassThrough;
   readonly #waiting = new Map<string, (response: Json) => void>();
@@ -80,39 +96,91 @@ export class FakeClaudeCode {
     }
   }
 
-  user(blocks: Json[], parent: string | null = null): void {
-    this.emit({ type: "user", parent_tool_use_id: parent, session_id: this.sessionId, message: { role: "user", content: blocks } });
+  /** result is the tool's own output, beside the text the model reads. */
+  user(blocks: Json[], parent: string | null = null, result?: Json): void {
+    const message: Json = { type: "user", parent_tool_use_id: parent, session_id: this.sessionId, message: { role: "user", content: blocks } };
+    if (result !== undefined) message.tool_use_result = result;
+    this.emit(message);
   }
 
-  async useTool(
-    toolUseId: string,
-    name: string,
-    args: Json,
-    run: () => Promise<string>,
-    options: { parent?: string; agent?: string; agentId?: string } = {},
-  ): Promise<void> {
-    const context = options.agent ? { agent_id: options.agentId ?? `agent-${options.agent}`, agent_type: options.agent } : {};
+  /**
+   * Asks the PreToolUse hooks whether a tool may run. With ask, the message asking for it is
+   * read only after they have answered, as when the code reading the stream lags behind the
+   * hooks.
+   */
+  async allowed(toolUseId: string, name: string, args: Json, context: Json, options: Called = {}): Promise<boolean> {
     const answers = await this.hook("PreToolUse", toolUseId, { tool_name: name, tool_input: args, ...context });
+    await options.ask?.();
     const refused = answers
       .map((a) => (a.hookSpecificOutput ?? {}) as Json)
       .filter((o) => o.permissionDecision === "deny")
       .map((o) => o.permissionDecisionReason as string);
-    if (refused.length) {
-      // As Claude Code does: the tool doesn't run, and the model is told why.
-      this.refused.push(toolUseId);
-      this.user([{ type: "tool_result", tool_use_id: toolUseId, content: refused[0], is_error: true }], options.parent ?? null);
-      return;
-    }
+    if (!refused.length) return true;
+    // As Claude Code does: the tool doesn't run, and the model is told why.
+    this.refused.push(toolUseId);
+    this.user([{ type: "tool_result", tool_use_id: toolUseId, content: refused[0], is_error: true }], options.parent ?? null);
+    return false;
+  }
+
+  async useTool(toolUseId: string, name: string, args: Json, run: () => Promise<string>, options: Called = {}): Promise<void> {
+    const context = caller(options);
+    if (!(await this.allowed(toolUseId, name, args, context, options))) return;
     const output = await run();
     await this.hook("PostToolUse", toolUseId, { tool_name: name, tool_input: args, tool_response: output, ...context });
     this.user([{ type: "tool_result", tool_use_id: toolUseId, content: output }], options.parent ?? null);
   }
 
-  /** Calls an in-process MCP tool the way Claude Code does, and returns its text. */
-  async callTool(server: string, name: string, args: Json): Promise<string> {
-    await this.mcp(server, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-code", version: "2" } }, 1);
-    await this.mcp(server, "notifications/initialized", {});
-    const response = await this.mcp(server, "tools/call", { name, arguments: args }, 2);
+  /**
+   * Starts a subagent with the Agent tool, unless a hook refuses it. work plays the subagent, its
+   * hooks naming it subagentId, and returns its answer, the tool's result. In the background, the
+   * result says it was launched, and a task_notification says when it has finished.
+   */
+  async spawn(
+    toolUseId: string,
+    args: { description: string; prompt: string; subagent_type?: string },
+    work: () => Promise<string>,
+    options: Called & { subagentId: string; background?: boolean },
+  ): Promise<void> {
+    const context = caller(options);
+    if (!(await this.allowed(toolUseId, "Agent", args, context, options))) return;
+    const parent = options.parent ?? null;
+    if (!options.background) {
+      const answer = await work();
+      const done = { status: "completed", agentId: options.subagentId, content: [{ type: "text", text: answer }], prompt: args.prompt };
+      await this.hook("PostToolUse", toolUseId, { tool_name: "Agent", tool_input: args, tool_response: done, ...context });
+      this.user([{ type: "tool_result", tool_use_id: toolUseId, content: [{ type: "text", text: answer }] }], parent, done);
+      return;
+    }
+    const launched = {
+      status: "async_launched",
+      agentId: options.subagentId,
+      description: args.description,
+      prompt: args.prompt,
+      outputFile: `/tmp/${options.subagentId}.output`,
+    };
+    await this.hook("PostToolUse", toolUseId, { tool_name: "Agent", tool_input: args, tool_response: launched, ...context });
+    this.user([{ type: "tool_result", tool_use_id: toolUseId, content: [{ type: "text", text: `Async agent launched successfully. agentId: ${options.subagentId}` }] }], parent, launched);
+    await work();
+    this.emit({
+      type: "system",
+      subtype: "task_notification",
+      task_id: options.subagentId,
+      tool_use_id: toolUseId,
+      status: "completed",
+      output_file: launched.outputFile,
+      summary: `Agent "${args.description}" completed`,
+      uuid: `${toolUseId}-done`,
+      session_id: this.sessionId,
+    });
+  }
+
+  /** Calls an in-process MCP tool the way Claude Code does, and returns its text. Only the first call initializes. */
+  async callTool(server: string, name: string, args: Json, first = true): Promise<string> {
+    if (first) {
+      await this.mcp(server, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-code", version: "2" } }, 1);
+      await this.mcp(server, "notifications/initialized", {});
+    }
+    const response = await this.mcp(server, "tools/call", { name, arguments: args }, first ? 2 : 3);
     return ((response.result as { content: { text: string }[] }).content ?? []).map((c) => c.text).join("\n");
   }
 }
