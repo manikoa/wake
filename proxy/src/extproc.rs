@@ -210,13 +210,18 @@ impl Exchange {
         }
     }
 
-    /// Keeps what of chunk fits, under MAX_CAPTURE and the shared budget.
+    /// Keeps what of chunk fits, under MAX_CAPTURE and the shared budget. Once a body is cut,
+    /// nothing after the cut is kept, even when the budget has room again: the body stays a
+    /// prefix, whose end is where redact.rs looks for a credential the cut went through.
     fn capture(&mut self, response: bool, chunk: &[u8]) {
         let (into, truncated) = if response {
             (&mut self.response_body, &mut self.response_truncated)
         } else {
             (&mut self.request_body, &mut self.request_truncated)
         };
+        if *truncated {
+            return;
+        }
         let mut room = MAX_CAPTURE.saturating_sub(into.len()).min(chunk.len());
         if room > 0
             && let Some(budget) = &self.bodies
@@ -1533,6 +1538,32 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(s(reply, "wake.payload")).unwrap();
         assert_eq!(payload["truncated"], true);
         assert_eq!(payload["content"].as_str().unwrap().len(), MAX_CAPTURE);
+    }
+
+    #[test]
+    fn a_body_the_budget_cuts_is_kept_only_to_the_cut() {
+        let budget = Budget::new(100);
+        let mut x = Exchange::default().with_budget(budget.clone());
+        x.handle(first(&[(":method", "POST")]), t(0));
+        let read = br#"{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"t1"}}"#;
+        x.handle(phase(Phase::RequestBody(body(read, true))), t(1));
+        x.handle(
+            phase(Phase::ResponseHeaders(headers(&[("content-type", "application/json")]))),
+            t(2),
+        );
+        x.handle(phase(Phase::ResponseBody(body(br#"{"a":"ghp_"#, false))), t(3));
+        // Other exchanges hold the rest of the budget for one chunk, then give it back.
+        let others = budget.take(100 - budget.used()).unwrap();
+        x.handle(phase(Phase::ResponseBody(body(b"abc", false))), t(4));
+        drop(others);
+        let (_, events) = x.handle(phase(Phase::ResponseBody(body(br#""}"#, true))), t(5));
+        let [reply] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        let payload: serde_json::Value = serde_json::from_str(s(reply, "wake.payload")).unwrap();
+        assert_eq!(payload["truncated"], true);
+        // The cut is the end, where a credential it went through is redacted, not inside.
+        assert_eq!(payload["content"], r#"{"a":"ghp_"#);
     }
 
     #[test]

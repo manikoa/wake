@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"iter"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -27,11 +28,14 @@ const Redacted = "wake.payload.redacted"
 // Only formats that identify themselves are recognized, so ordinary text is never taken for
 // a secret: private key blocks, JWTs, GitHub, Google, Slack, LLM provider and Stripe keys,
 // bearer tokens, Basic credentials, passwords in URLs, and AWS secret keys right after a
-// name that says so. A JWT's placeholder keeps its jti, when that's a plain id, so the token
-// can be matched to wake.token.id on the proxy's events. What's replaced never holds a quote
-// or part of an escape, so a JSON payload stays JSON, however deep its strings nest JSON.
-// wake-proxy does the same for the events it signs, and testdata/redaction.json holds both
-// to the same output. See docs/events.md.
+// name that says so. A credential in any other form is signed and logged as it came. A
+// JWT's placeholder keeps its jti, when that's a plain id, so the token can be matched to
+// wake.token.id on the proxy's events. A password in a URL and Basic credentials get no
+// digest (see placeholder). Where a payload was cut short, a credential the cut went
+// through is replaced too (see cutShort). What's replaced never holds a quote or part of an
+// escape, so a JSON payload stays JSON, however deep its strings nest JSON. wake-proxy does
+// the same for the events it signs, and testdata/redaction.json holds both to the same
+// output. See docs/events.md.
 //
 // Each pattern captures the secret it replaces; the rest of a match is context, kept as it
 // is.
@@ -58,7 +62,7 @@ var redactions = []redaction{
 		secret{{lit("Basic", "basic", "BASIC"), atLeast(space, 1), atLeast(b64, 1), upTo(equals, 2)}}},
 	// The password in scheme://user:password@host.
 	{"url_password", nil, regexp.MustCompile(`://[^ \t\r\n/?#@:"\\]*:([^ \t\r\n/?#@"\\]+)@`), nil},
-	{"aws_secret_key", []string{"secret_access_key", "SECRET_ACCESS_KEY", "SecretAccessKey", "secretAccessKey"}, regexp.MustCompile(awsSecretKey), nil},
+	{"aws_secret_key", awsNames, regexp.MustCompile(awsSecretKey), nil},
 }
 
 // A redaction finds one kind of secret. Go's regexp runs in time linear in the payload,
@@ -96,6 +100,9 @@ const (
 // between, and with no more base64 after it.
 const awsSecretKey = `(?:secret_access_key|SECRET_ACCESS_KEY|SecretAccessKey|secretAccessKey)` +
 	`(?:\\*["'])?[ \t]*[:=>][ \t]*(?:\\*["'])?([A-Za-z0-9/+]{40})(?:[^A-Za-z0-9/+=]|$)`
+
+// The names awsSecretKey starts with.
+var awsNames = []string{"secret_access_key", "SECRET_ACCESS_KEY", "SecretAccessKey", "secretAccessKey"}
 
 // word compiles a pattern for a secret that starts a word: at the start of the payload,
 // after a character that can't be part of one, or after a whole JSON escape such as \n or
@@ -135,6 +142,16 @@ var (
 	space      = class(` `)
 	equals     = class(`=`)
 	hexDigit   = class(`[0-9A-Fa-f]`)
+	blank      = class(`[ \t]`)
+	backslash  = class(`\\`)
+	// A password in a URL, which may be any character but these.
+	urlChar = func() *[256]bool {
+		var c [256]bool
+		for b := range c {
+			c[b] = strings.IndexByte(" \t\r\n/?#@\"\\", byte(b)) < 0
+		}
+		return &c
+	}()
 )
 
 // class is the bytes a regexp class of ASCII characters matches.
@@ -173,6 +190,7 @@ func Redact(payload string) (string, []string) {
 		payload = out.String()
 		kinds = append(kinds, r.kind)
 	}
+	payload, kinds = redactCuts(payload, kinds)
 	sort.Strings(kinds)
 	return payload, kinds
 }
@@ -346,9 +364,282 @@ func holdsAny(s string, literals []string) bool {
 	return false
 }
 
+// A payload too large to send whole is cut short and marked "truncated": true. The SDKs
+// send its start as a string, "prefix", and the proxy keeps the start of a body, as a
+// string, in "input", "output" or "content". A credential the cut goes through keeps its
+// start, which can be too short for its pattern: sk_live_ and 20 characters isn't a Stripe
+// key. So at the end of each such string, a credential cut short is replaced too: the start
+// of one, followed only by the characters its kind is made of, up to the cut. These are the
+// starts by kind, in the order the patterns run; the first found at a cut is replaced. A
+// private key cut short is its own pattern's.
+var cutShort = []struct {
+	kind string
+	// start returns where a credential of the kind cut short at cut in text starts, or -1.
+	start func(text string, cut int) int
+}{
+	{"jwt", startsWith(class(`[A-Za-z0-9_.-]`), "eyJ")},
+	{"github_token", startsWith(wordChar, "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")},
+	{"google_api_key", startsWith(b64url, "AIza")},
+	{"google_oauth_token", startsWith(b64url, "ya29.")},
+	{"slack_token", startsWith(slackChar, "xoxa-", "xoxb-", "xoxp-", "xoxo-", "xoxs-", "xoxr-", "xapp-")},
+	{"llm_api_key", startsWith(b64url, "sk-")},
+	{"stripe_key", startsWith(alnum, "sk_live_", "rk_live_")},
+	{"bearer_token", afterSpaces(class(`[A-Za-z0-9._~+/=-]`), "Bearer", "bearer", "BEARER")},
+	// Not checked for user:password, since what's left of it may not decode.
+	{"basic_auth", afterSpaces(class(`[A-Za-z0-9+/=]`), "Basic", "basic", "BASIC")},
+	{"url_password", urlPasswordCut},
+	{"aws_secret_key", awsSecretKeyCut},
+}
+
+// redactCuts replaces a credential cut short at each of payload's cuts, and adds the kinds
+// it replaced to kinds.
+func redactCuts(payload string, kinds []string) (string, []string) {
+	var out strings.Builder
+	last := 0
+	for _, cut := range cuts(payload) {
+		for _, c := range cutShort {
+			start := c.start(payload, cut)
+			if start < 0 {
+				continue
+			}
+			out.WriteString(payload[last:start])
+			out.WriteString(placeholder(c.kind, payload[start:cut]))
+			last = cut
+			if !slices.Contains(kinds, c.kind) {
+				kinds = append(kinds, c.kind)
+			}
+			break
+		}
+	}
+	if last == 0 {
+		return payload, kinds // nothing replaced
+	}
+	out.WriteString(payload[last:])
+	return out.String(), kinds
+}
+
+// cuts returns where the strings a payload was cut short in end, at their closing quotes:
+// in a JSON object whose "truncated" is true, its "prefix", "input", "output" and "content"
+// that are strings. The proxy says a payload was truncated, not which part it cut, so a part
+// it kept whole as a string, because it isn't JSON, is taken for cut too. The object is read
+// only as far as finding those strings; what it holds isn't checked.
+func cuts(payload string) []int {
+	if !strings.Contains(payload, `"truncated"`) {
+		return nil
+	}
+	truncated := false
+	var ends []int
+	i := jsonSpace(payload, 0)
+	if i == len(payload) || payload[i] != '{' {
+		return nil
+	}
+	for {
+		i = jsonSpace(payload, i+1)
+		keyEnd := stringEnd(payload, i)
+		if keyEnd < 0 {
+			return nil
+		}
+		key := payload[i+1 : keyEnd]
+		i = jsonSpace(payload, keyEnd+1)
+		if i == len(payload) || payload[i] != ':' {
+			return nil
+		}
+		i = jsonSpace(payload, i+1)
+		end := valueEnd(payload, i)
+		if end < 0 {
+			return nil
+		}
+		switch key {
+		case "truncated":
+			truncated = payload[i:end] == "true"
+		case "prefix", "input", "output", "content":
+			if payload[i] == '"' {
+				ends = append(ends, end-1)
+			}
+		}
+		i = jsonSpace(payload, end)
+		if i < len(payload) && payload[i] == '}' {
+			break
+		}
+		if i == len(payload) || payload[i] != ',' {
+			return nil
+		}
+	}
+	if !truncated {
+		return nil
+	}
+	return ends
+}
+
+// jsonSpace returns where the JSON whitespace from i in text ends.
+func jsonSpace(text string, i int) int {
+	for i < len(text) && strings.IndexByte(" \t\r\n", text[i]) >= 0 {
+		i++
+	}
+	return i
+}
+
+// stringEnd returns where the JSON string at i in text ends, at its closing quote, or -1.
+func stringEnd(text string, i int) int {
+	if i >= len(text) || text[i] != '"' {
+		return -1
+	}
+	for j := i + 1; j < len(text); j++ {
+		switch text[j] {
+		case '\\':
+			j++
+		case '"':
+			return j
+		}
+	}
+	return -1
+}
+
+// valueEnd returns where the JSON value at i in text ends, or -1: past a string's closing
+// quote, the bracket that closes what opens at i, or a number or a literal. Only its end is
+// found.
+func valueEnd(text string, i int) int {
+	if i >= len(text) {
+		return -1
+	}
+	switch text[i] {
+	case '"':
+		if end := stringEnd(text, i); end >= 0 {
+			return end + 1
+		}
+		return -1
+	case '{', '[':
+		depth := 0
+		for j := i; j < len(text); j++ {
+			switch text[j] {
+			case '"':
+				if j = stringEnd(text, j); j < 0 {
+					return -1
+				}
+			case '{', '[':
+				depth++
+			case '}', ']':
+				if depth--; depth == 0 {
+					return j + 1
+				}
+			}
+		}
+		return -1
+	}
+	j := i
+	for j < len(text) && strings.IndexByte(",}] \t\r\n", text[j]) < 0 {
+		j++
+	}
+	if j == i {
+		return -1
+	}
+	return j
+}
+
+// startsWith finds a credential cut short that starts a word with one of literals, then
+// holds only bytes of class up to the cut. It takes the first such start, so all of what may
+// be the credential is replaced.
+func startsWith(class *[256]bool, literals ...string) func(string, int) int {
+	return func(text string, cut int) int {
+		run := runStart(text, cut, class)
+		first := -1
+		for _, l := range literals {
+			// The literal ends in the run of class, or where it starts.
+			for from := max(run-len(l), 0); ; {
+				j := strings.Index(text[from:cut], l)
+				if j < 0 || (first >= 0 && from+j >= first) {
+					break
+				}
+				if wordStart(text, from+j, 0) {
+					first = from + j
+					break
+				}
+				from += j + 1
+			}
+		}
+		return first
+	}
+}
+
+// afterSpaces finds a credential cut short that starts a word with one of literals and
+// spaces, then holds only bytes of class up to the cut, as a Bearer token or Basic
+// credentials do.
+func afterSpaces(class *[256]bool, literals ...string) func(string, int) int {
+	return func(text string, cut int) int {
+		run := runStart(text, cut, class)
+		spaces := runStart(text, run, space)
+		if spaces == run {
+			return -1
+		}
+		for _, l := range literals {
+			if start := spaces - len(l); strings.HasSuffix(text[:spaces], l) && wordStart(text, start, 0) {
+				return start
+			}
+		}
+		return -1
+	}
+}
+
+// urlPasswordCut finds a password in scheme://user:password@ cut short before its @. As
+// with the whole pattern, only the password is replaced.
+func urlPasswordCut(text string, cut int) int {
+	run := runStart(text, cut, urlChar)
+	if !strings.HasSuffix(text[:run], "://") {
+		return -1
+	}
+	colon := strings.IndexByte(text[run:cut], ':')
+	if colon < 0 || run+colon+1 == cut {
+		return -1
+	}
+	return run + colon + 1
+}
+
+// awsSecretKeyCut finds an AWS secret access key cut short, fewer than its 40 characters,
+// after its name and what awsSecretKey allows between, read back from the key. As with the
+// whole pattern, only the key is replaced.
+func awsSecretKeyCut(text string, cut int) int {
+	key := runStart(text, cut, b64)
+	if key == cut || cut-key >= 40 {
+		return -1
+	}
+	i := runStart(text, quoteStart(text, key), blank)
+	if i == 0 || strings.IndexByte(":=>", text[i-1]) < 0 {
+		return -1
+	}
+	i = quoteStart(text, runStart(text, i-1, blank))
+	for _, name := range awsNames {
+		if strings.HasSuffix(text[:i], name) {
+			return key
+		}
+	}
+	return -1
+}
+
+// quoteStart returns where a quote that ends at i in text starts, with the backslashes
+// escaping it, or i when there's none.
+func quoteStart(text string, i int) int {
+	if i > 0 && (text[i-1] == '"' || text[i-1] == '\'') {
+		return runStart(text, i-1, backslash)
+	}
+	return i
+}
+
+// runStart returns where the run of bytes of class that ends at end in text starts.
+func runStart(text string, end int, class *[256]bool) int {
+	for end > 0 && class[text[end-1]] {
+		end--
+	}
+	return end
+}
+
 // placeholder is what a secret of kind becomes: its kind, the first 12 hex digits of its
-// SHA-256, and a JWT's jti when it has one fit to keep.
+// SHA-256, and a JWT's jti when it has one fit to keep. A password in a URL and Basic
+// credentials get no digest: a person often chooses them, and an unsalted digest of one
+// could be checked against a list of likely passwords.
 func placeholder(kind, secret string) string {
+	if kind == "url_password" || kind == "basic_auth" {
+		return "[redacted " + kind + "]"
+	}
 	sum := sha256.Sum256([]byte(secret))
 	out := "[redacted " + kind + " sha256:" + hex.EncodeToString(sum[:])[:12]
 	if kind == "jwt" {
@@ -372,6 +663,9 @@ func basicCredentials(secret string) bool {
 // stray bits in its last character, and UTF-8.
 func jwtID(token string) string {
 	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return "" // cut short before its claims
+	}
 	claims, err := base64.RawURLEncoding.Strict().DecodeString(parts[1])
 	if err != nil || !utf8.Valid(claims) {
 		return ""

@@ -1,7 +1,8 @@
-//! Secrets never reach the log. A payload is kept in an append only log that nothing can
-//! erase, so a credential an agent passed in a message or a tool call would be readable there
-//! for as long as the log is kept. Before the proxy signs an event, `redact` replaces every
-//! credential it recognizes in the payload with a placeholder naming its kind and a digest:
+//! Keeps the credentials it recognizes out of the log. A payload is kept in an append only
+//! log that nothing can erase, so a credential an agent passed in a message or a tool call
+//! would be readable there for as long as the log is kept. Before the proxy signs an event,
+//! `redact` replaces every credential it recognizes in the payload with a placeholder naming
+//! its kind and a digest:
 //!
 //! ```text
 //! [redacted jwt sha256:56aec5e5c6aa jti:tok-7]
@@ -10,10 +11,13 @@
 //! Only formats that identify themselves are recognized, so ordinary text is never taken
 //! for a secret: private key blocks, JWTs, GitHub, Google, Slack, LLM provider and Stripe
 //! keys, bearer tokens, Basic credentials, passwords in URLs, and AWS secret keys right
-//! after a name that says so. A JWT's placeholder keeps its jti, when that's a plain id, so
-//! the token can be matched to `wake.token.id` (token.rs). What's replaced never holds a
-//! quote or part of an escape, so a JSON payload stays JSON, however deep its strings nest
-//! JSON. The collector does the same for the events it signs, and
+//! after a name that says so. A credential in any other form is signed and logged as it
+//! came. A JWT's placeholder keeps its jti, when that's a plain id, so the token can be
+//! matched to `wake.token.id` (token.rs). A password in a URL and Basic credentials get no
+//! digest (see `placeholder`). Where a payload was cut short, a credential the cut went
+//! through is replaced too (see CUT_SHORT). What's replaced never holds a quote or part of
+//! an escape, so a JSON payload stays JSON, however deep its strings nest JSON. The
+//! collector does the same for the events it signs, and
 //! collector/event/testdata/redaction.json holds both to the same output. See
 //! docs/events.md.
 //!
@@ -56,6 +60,14 @@ const AWS_SECRET_KEY: &str = concat!(
     r"(?:secret_access_key|SECRET_ACCESS_KEY|SecretAccessKey|secretAccessKey)",
     r#"(?:\\*["'])?[ \t]*[:=>][ \t]*(?:\\*["'])?([A-Za-z0-9/+]{40})(?:[^A-Za-z0-9/+=]|$)"#,
 );
+
+/// The names AWS_SECRET_KEY starts with.
+const AWS_NAMES: [&str; 4] = [
+    "secret_access_key",
+    "SECRET_ACCESS_KEY",
+    "SecretAccessKey",
+    "secretAccessKey",
+];
 
 static REDACTIONS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     let word = |secret: &str| format!("{WORD}({secret})");
@@ -125,6 +137,9 @@ pub fn redact(payload: &str) -> (String, Vec<String>) {
             kinds.push(kind.to_string());
         }
     }
+    if let Some(redacted) = replace_cut_short(&text, &mut kinds) {
+        text = redacted;
+    }
     kinds.sort();
     (text, kinds)
 }
@@ -150,8 +165,13 @@ fn replace(kind: &str, pattern: &Regex, text: &str) -> Option<String> {
 }
 
 /// What a secret of a kind becomes: its kind, the first 12 hex digits of its SHA-256, and a
-/// JWT's jti when it has one fit to keep.
+/// JWT's jti when it has one fit to keep. A password in a URL and Basic credentials get no
+/// digest: a person often chooses them, and an unsalted digest of one could be checked
+/// against a list of likely passwords.
 fn placeholder(kind: &str, secret: &str) -> String {
+    if matches!(kind, "url_password" | "basic_auth") {
+        return format!("[redacted {kind}]");
+    }
     let digest = hex::encode(Sha256::digest(secret.as_bytes()));
     let mut out = format!("[redacted {kind} sha256:{}", &digest[..12]);
     if kind == "jwt"
@@ -182,6 +202,281 @@ fn jwt_id(token: &str) -> Option<String> {
     (PLAIN_ID.is_match(jti) && !secret).then(|| jti.to_string())
 }
 
+/// A payload too large to send whole is cut short and marked `"truncated": true`. The SDKs
+/// send its start as a string, `prefix`, and the proxy keeps the start of a body, as a
+/// string, in `input`, `output` or `content` (mcp.rs, extproc.rs). A credential the cut goes
+/// through keeps its start, which can be too short for its pattern: sk_live_ and 20
+/// characters isn't a Stripe key. So at the end of each such string, a credential cut short
+/// is replaced too: the start of one, followed only by the characters its kind is made of,
+/// up to the cut. These are the starts by kind, in the order the patterns run; the first
+/// found at a cut is replaced. A private key cut short is its own pattern's.
+const CUT_SHORT: [(&str, CutShort); 11] = [
+    ("jwt", CutShort::StartsWith("_.-", &["eyJ"])),
+    (
+        "github_token",
+        CutShort::StartsWith("_", &["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]),
+    ),
+    ("google_api_key", CutShort::StartsWith("_-", &["AIza"])),
+    ("google_oauth_token", CutShort::StartsWith("_-", &["ya29."])),
+    (
+        "slack_token",
+        CutShort::StartsWith("-", &["xoxa-", "xoxb-", "xoxp-", "xoxo-", "xoxs-", "xoxr-", "xapp-"]),
+    ),
+    ("llm_api_key", CutShort::StartsWith("_-", &["sk-"])),
+    ("stripe_key", CutShort::StartsWith("", &["sk_live_", "rk_live_"])),
+    (
+        "bearer_token",
+        CutShort::AfterSpaces("._~+/=-", &["Bearer", "bearer", "BEARER"]),
+    ),
+    // Not checked for user:password, since what's left of it may not decode.
+    ("basic_auth", CutShort::AfterSpaces("+/=", &["Basic", "basic", "BASIC"])),
+    ("url_password", CutShort::UrlPassword),
+    ("aws_secret_key", CutShort::AwsSecretKey),
+];
+
+/// How a credential cut short is found, back from the cut. A class is the ASCII letters and
+/// digits and the bytes of its string.
+enum CutShort {
+    /// One of the literals, starting a word, then only bytes of the class up to the cut. The
+    /// first such start is taken, so all of what may be the credential is replaced.
+    StartsWith(&'static str, &'static [&'static str]),
+    /// One of the literals, starting a word, and spaces, then only bytes of the class up to
+    /// the cut, as a Bearer token or Basic credentials.
+    AfterSpaces(&'static str, &'static [&'static str]),
+    /// A password in scheme://user:password@ cut short before its @. As with the whole
+    /// pattern, only the password is replaced.
+    UrlPassword,
+    /// An AWS secret access key, fewer than its 40 characters, after its name and what
+    /// AWS_SECRET_KEY allows between, read back from the key. As with the whole pattern,
+    /// only the key is replaced.
+    AwsSecretKey,
+}
+
+impl CutShort {
+    /// Where a credential cut short at cut in text starts, if one is.
+    fn start(&self, text: &str, cut: usize) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let class = |extra: &'static str| move |b: u8| b.is_ascii_alphanumeric() || extra.as_bytes().contains(&b);
+        match *self {
+            CutShort::StartsWith(extra, literals) => {
+                let run = run_start(bytes, cut, class(extra));
+                literals
+                    .iter()
+                    .filter_map(|literal| {
+                        // The literal ends in the run of the class, or where it starts. It's
+                        // ASCII, so it starts on a character.
+                        let mut from = run.saturating_sub(literal.len());
+                        while !text.is_char_boundary(from) {
+                            from += 1;
+                        }
+                        text[from..cut]
+                            .match_indices(*literal)
+                            .map(|(at, _)| from + at)
+                            .find(|&at| word_start(bytes, at))
+                    })
+                    .min()
+            }
+            CutShort::AfterSpaces(extra, literals) => {
+                let run = run_start(bytes, cut, class(extra));
+                let spaces = run_start(bytes, run, |b| b == b' ');
+                if spaces == run {
+                    return None;
+                }
+                literals.iter().find_map(|literal| {
+                    let start = spaces.checked_sub(literal.len())?;
+                    (bytes[..spaces].ends_with(literal.as_bytes()) && word_start(bytes, start)).then_some(start)
+                })
+            }
+            CutShort::UrlPassword => {
+                let run = run_start(bytes, cut, |b| !b" \t\r\n/?#@\"\\".contains(&b));
+                if !bytes[..run].ends_with(b"://") {
+                    return None;
+                }
+                let colon = run + bytes[run..cut].iter().position(|&b| b == b':')?;
+                (colon + 1 < cut).then_some(colon + 1)
+            }
+            CutShort::AwsSecretKey => {
+                let blank = |b: u8| b == b' ' || b == b'\t';
+                let key = run_start(bytes, cut, |b| b.is_ascii_alphanumeric() || b == b'/' || b == b'+');
+                if key == cut || cut - key >= 40 {
+                    return None;
+                }
+                let i = run_start(bytes, quote_start(bytes, key), blank);
+                if i == 0 || !b":=>".contains(&bytes[i - 1]) {
+                    return None;
+                }
+                let i = quote_start(bytes, run_start(bytes, i - 1, blank));
+                AWS_NAMES
+                    .iter()
+                    .any(|name| bytes[..i].ends_with(name.as_bytes()))
+                    .then_some(key)
+            }
+        }
+    }
+}
+
+/// The text with a credential cut short at each of its cuts replaced, adding the kinds it
+/// replaced to kinds, or None when it replaces none.
+fn replace_cut_short(text: &str, kinds: &mut Vec<String>) -> Option<String> {
+    let mut out = String::new();
+    let mut last = 0;
+    for cut in cuts(text) {
+        let found = CUT_SHORT
+            .iter()
+            .find_map(|(kind, shape)| shape.start(text, cut).map(|start| (*kind, start)));
+        let Some((kind, start)) = found else { continue };
+        out.push_str(&text[last..start]);
+        out.push_str(&placeholder(kind, &text[start..cut]));
+        last = cut;
+        if !kinds.iter().any(|k| k == kind) {
+            kinds.push(kind.to_string());
+        }
+    }
+    if last == 0 {
+        return None;
+    }
+    out.push_str(&text[last..]);
+    Some(out)
+}
+
+/// Where the strings a payload was cut short in end, at their closing quotes: in a JSON
+/// object whose "truncated" is true, its "prefix", "input", "output" and "content" that are
+/// strings. The proxy says a payload was truncated, not which part it cut, so a part it kept
+/// whole as a string, because it isn't JSON, is taken for cut too. The object is read only
+/// as far as finding those strings; what it holds isn't checked.
+fn cuts(payload: &str) -> Vec<usize> {
+    if !payload.contains(r#""truncated""#) {
+        return Vec::new();
+    }
+    let text = payload.as_bytes();
+    let mut truncated = false;
+    let mut ends = Vec::new();
+    let mut i = json_space(text, 0);
+    if text.get(i) != Some(&b'{') {
+        return Vec::new();
+    }
+    loop {
+        i = json_space(text, i + 1);
+        let Some(key_end) = string_end(text, i) else {
+            return Vec::new();
+        };
+        let key = &text[i + 1..key_end];
+        i = json_space(text, key_end + 1);
+        if text.get(i) != Some(&b':') {
+            return Vec::new();
+        }
+        i = json_space(text, i + 1);
+        let Some(end) = value_end(text, i) else {
+            return Vec::new();
+        };
+        match key {
+            b"truncated" => truncated = text[i..end] == *b"true",
+            b"prefix" | b"input" | b"output" | b"content" if text[i] == b'"' => ends.push(end - 1),
+            _ => {}
+        }
+        i = json_space(text, end);
+        match text.get(i) {
+            Some(b'}') => break,
+            Some(b',') => {}
+            _ => return Vec::new(),
+        }
+    }
+    if truncated { ends } else { Vec::new() }
+}
+
+/// Where the JSON whitespace from i in text ends.
+fn json_space(text: &[u8], mut i: usize) -> usize {
+    while i < text.len() && b" \t\r\n".contains(&text[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Where the JSON string at i in text ends, at its closing quote.
+fn string_end(text: &[u8], i: usize) -> Option<usize> {
+    if text.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < text.len() {
+        match text[j] {
+            b'\\' => j += 1,
+            b'"' => return Some(j),
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Where the JSON value at i in text ends: past a string's closing quote, the bracket that
+/// closes what opens at i, or a number or a literal. Only its end is found.
+fn value_end(text: &[u8], i: usize) -> Option<usize> {
+    match *text.get(i)? {
+        b'"' => string_end(text, i).map(|end| end + 1),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < text.len() {
+                match text[j] {
+                    b'"' => j = string_end(text, j)?,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            let end = text[i..]
+                .iter()
+                .position(|b| b",}] \t\r\n".contains(b))
+                .map_or(text.len(), |n| i + n);
+            (end > i).then_some(end)
+        }
+    }
+}
+
+/// Whether a secret can start at i in text, as WORD says: at the start, after a byte that
+/// can't be part of a word, or after a whole JSON escape.
+fn word_start(text: &[u8], i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let c = text[i - 1];
+    if !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'\\' | b']')) {
+        return true;
+    }
+    if i >= 2 && text[i - 2] == b'\\' && b"bfnrt".contains(&c) {
+        return true;
+    }
+    i >= 6 && text[i - 6] == b'\\' && text[i - 5] == b'u' && text[i - 4..i].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Where the run of bytes of a class that ends at end in text starts.
+fn run_start(text: &[u8], mut end: usize, class: impl Fn(u8) -> bool) -> usize {
+    while end > 0 && class(text[end - 1]) {
+        end -= 1;
+    }
+    end
+}
+
+/// Where a quote that ends at i in text starts, with the backslashes escaping it, or i when
+/// there's none.
+fn quote_start(text: &[u8], i: usize) -> usize {
+    if i > 0 && matches!(text[i - 1], b'"' | b'\'') {
+        run_start(text, i - 1, |b| b == b'\\')
+    } else {
+        i
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +500,10 @@ mod tests {
         "«",
         "yJhbGciOiJFUzI1NiJ9.eyJqdGkiOiJ0b2stNyJ9.c2lnbmF0dXJlLW5vdC1yZWFs",
         "earer abcdefghijklmnopqrstuvwxyz",
+        // Credentials cut short, which a payload marked truncated may end with.
+        "sk-proj-AbCd",
+        "://app:hunt",
+        "SecretAccessKey=je7Mt",
     ];
 
     /// JSON's non-ASCII escaped as \uXXXX, as Python's json.dumps writes it by default, and
@@ -225,7 +524,7 @@ mod tests {
 
     // The fuzz target's properties (fuzz/fuzz_targets/redact.rs), on stable Rust, with
     // inputs that mix secret-shaped pieces into JSON so the patterns are exercised, written
-    // as serde_json writes it and as the SDKs do.
+    // as serde_json writes it and as the SDKs do, and marked truncated or not.
     proptest! {
         #[test]
         fn json_stays_json_and_redacting_twice_changes_nothing(
@@ -239,31 +538,44 @@ mod tests {
         ) {
             let text: String = pieces.concat();
             let nested = serde_json::json!({"text": text}).to_string();
-            let plain = serde_json::json!({"output": text, "nested": nested}).to_string();
-            let escaped = ascii(&serde_json::json!({"output": text, "nested": ascii(&nested)}).to_string());
-            for payload in [plain, escaped] {
-                let (out, kinds) = redact(&payload);
-                let doc: serde_json::Value = serde_json::from_str(&out)
-                    .map_err(|e| TestCaseError::fail(format!("not JSON, {e}: {out}")))?;
-                let nested = doc["nested"].as_str().unwrap_or_default();
-                prop_assert!(
-                    serde_json::from_str::<serde_json::Value>(nested).is_ok(),
-                    "the JSON in it isn't JSON: {out}"
-                );
-                prop_assert_eq!(&redact(&out).0, &out);
-                for kind in &kinds {
-                    let placeholder = format!("[redacted {kind} sha256:");
-                    prop_assert!(out.contains(&placeholder));
-                }
-                // Running only the patterns the set finds in the payload as it came misses
-                // nothing that running every pattern would replace.
-                let mut every = payload.clone();
-                for (kind, pattern) in REDACTIONS.iter() {
-                    if let Some(redacted) = replace(kind, pattern, &every) {
+            for truncated in [false, true] {
+                let doc = |nested: String| {
+                    let mut doc = serde_json::json!({"output": text, "nested": nested});
+                    if truncated {
+                        doc["truncated"] = true.into(); // so the output is taken for cut short
+                    }
+                    doc.to_string()
+                };
+                let plain = doc(nested.clone());
+                let escaped = ascii(&doc(ascii(&nested)));
+                for payload in [plain, escaped] {
+                    let (out, kinds) = redact(&payload);
+                    let doc: serde_json::Value = serde_json::from_str(&out)
+                        .map_err(|e| TestCaseError::fail(format!("not JSON, {e}: {out}")))?;
+                    let nested = doc["nested"].as_str().unwrap_or_default();
+                    prop_assert!(
+                        serde_json::from_str::<serde_json::Value>(nested).is_ok(),
+                        "the JSON in it isn't JSON: {out}"
+                    );
+                    prop_assert_eq!(&redact(&out).0, &out);
+                    for kind in &kinds {
+                        let digested = format!("[redacted {kind} sha256:");
+                        let bare = format!("[redacted {kind}]");
+                        prop_assert!(out.contains(&digested) || out.contains(&bare));
+                    }
+                    // Running only the patterns the set finds in the payload as it came misses
+                    // nothing that running every pattern would replace.
+                    let mut every = payload.clone();
+                    for (kind, pattern) in REDACTIONS.iter() {
+                        if let Some(redacted) = replace(kind, pattern, &every) {
+                            every = redacted;
+                        }
+                    }
+                    if let Some(redacted) = replace_cut_short(&every, &mut Vec::new()) {
                         every = redacted;
                     }
+                    prop_assert_eq!(&every, &out);
                 }
-                prop_assert_eq!(&every, &out);
             }
         }
     }
@@ -311,6 +623,16 @@ mod tests {
             (
                 "every pattern",
                 r" eyJ ghp_ AIza ya29. xoxb- sk- _live_ Bearer Basic \\u00ab ://a:b secretAccessKey=".repeat(1 << 14),
+            ),
+            // A cut at the end of a run that holds a literal everywhere, but never where a
+            // word starts, and a cut, with a credential cut short at it, many times over.
+            (
+                "a cut through a run",
+                format!(r#"{{"truncated":true,"prefix":"{}"}}"#, "aeyJ".repeat(1 << 20)),
+            ),
+            (
+                "many cuts",
+                format!(r#"{{"truncated":true{}}}"#, r#","input":"sk-""#.repeat(1 << 18)),
             ),
         ] {
             let start = Instant::now();

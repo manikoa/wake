@@ -153,6 +153,8 @@ Each credential becomes a placeholder naming its kind and the first 12 hex digit
 [redacted jwt sha256:56aec5e5c6aa jti:tok-7]
 ```
 
+A password in a URL and Basic credentials get no digest, as `[redacted url_password]` and `[redacted basic_auth]`: a person often chooses them, and the digest of one could be checked against a list of likely passwords.
+
 | Kind | What it matches |
 |---|---|
 | `private_key` | A PEM private key block, `-----BEGIN … PRIVATE KEY-----`, or an OpenPGP `-----BEGIN PGP PRIVATE KEY BLOCK-----`, to its END line, or as far as its body runs if it's cut short. Its line breaks can be raw or escaped for JSON at any depth, as in a key in JSON held in a string in the payload, and so can the `+`, `/` and `=` some encoders escape: .NET writes `+` as `\u002B`, PHP `/` as `\/` |
@@ -168,6 +170,23 @@ Each credential becomes a placeholder naming its kind and the first 12 hex digit
 | `aws_secret_key` | An AWS secret access key, 40 characters of base64, right after `aws_secret_access_key`, `AWS_SECRET_ACCESS_KEY`, `SecretAccessKey` or `secretAccessKey` and then `=`, `:` or `>` (STS's XML), with any quotes and spaces between |
 
 Only formats that name themselves are matched, so ordinary text is never taken for a secret. Not caught: a password or key in a form nothing identifies, and an AWS secret access key on its own or under another name, since 40 characters of base64 could be anything. A secret is matched only where a word starts: at the start of the payload, after a whole JSON escape such as `\n` or `\u00e9`, or after a character that can't be part of a word, other than the `]` that ends a placeholder. So `task-` followed by an MD5 isn't taken for an `sk-` key, and a match never starts inside an escape: the SDKs send `®yJ…` as `\u00aeyJ…`, which holds no JWT. What's replaced never holds a quote or part of an escape, so a JSON payload stays JSON, however deep its strings nest JSON, and redacting twice changes nothing more. `wake.payload.redacted` lists only what the signer replaced: a placeholder already in the payload, whatever put it there, isn't counted. The patterns run in order, in time linear in the payload whatever an agent sends: Rust's regex crate in the proxy, and Go's regexp in the collector, which matches a secret that starts a word by hand, only where one of its literals is, since Go's regexp would step through every byte to find a word start. A test holds those to the regexps. `collector/event/testdata/redaction.json` holds both to the same output, byte for byte, and both are fuzzed, with non-ASCII as it is and escaped, as the SDKs send it.
+
+**A payload cut short.** A payload too large to send whole keeps its start, as a string, and says `"truncated": true` (see `wake.payload`): the SDKs' `prefix`, and the proxy's `input`, `output` or `content`. A credential the cut goes through keeps its own start, which can be too short to match: `sk_live_` and 20 characters isn't a Stripe key, though the rest of one may have been cut off. So at the end of each of those strings, in a JSON object whose `truncated` is `true`, a credential cut short is replaced too. It's one of these starts, where a whole one could start, followed only by the characters its kind is made of, up to the cut:
+
+| Kind | Starts with | Then only |
+|---|---|---|
+| `jwt` | `eyJ` | base64url (`A-Z a-z 0-9 _ -`) and `.` |
+| `github_token` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or `github_pat_` | `A-Z a-z 0-9 _` |
+| `google_api_key`, `google_oauth_token` | `AIza`, `ya29.` | base64url |
+| `slack_token` | `xoxa-`, `xoxb-`, `xoxp-`, `xoxo-`, `xoxs-`, `xoxr-` or `xapp-` | `A-Z a-z 0-9 -` |
+| `llm_api_key` | `sk-` | base64url |
+| `stripe_key` | `sk_live_` or `rk_live_` | `A-Z a-z 0-9` |
+| `bearer_token` | `Bearer` (or `bearer`, `BEARER`) and spaces | a token's characters, `A-Z a-z 0-9 . _ ~ + / -`, and `=` |
+| `basic_auth` | `Basic` (or `basic`, `BASIC`) and spaces | base64 and `=`. What's left isn't checked for a colon, since it may not decode |
+| `url_password` | `scheme://user:` | a password's characters. Only those are replaced |
+| `aws_secret_key` | one of its names, then what may come before the key, as above | base64, fewer than 40 characters. Only those are replaced |
+
+The kinds are tried in the order the patterns run, and the first found is replaced, with the digest of what's left of it. A private key cut short is matched by its own pattern, as far as its body runs. The proxy says a payload was truncated, not which part it cut, so an `input` or `output` it kept whole as a string, because it isn't JSON, is read as cut too. Both signers find these by hand, back from the cut, and the same vectors hold them to the same output.
 
 A payload is text: a string, or bytes, which the collector reads as the bytes they hold, so they're redacted, digested and logged like a string. A value of any other type has no text to redact, since a map or a list shows bytes inside it as base64: the collector won't sign an event that has one, and never logs it.
 

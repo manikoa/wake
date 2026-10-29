@@ -16,6 +16,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 use crate::budget::MAX_CAPTURE;
 use crate::canonical::{Event, Value};
 use crate::mcp;
@@ -337,8 +339,11 @@ fn build(id: &str, p: &Pending, result: Option<(&[u8], bool)>, end: SystemTime, 
     } else {
         p.session.clone()
     };
+    // As a digest: MCP lets a server make a session id a JWT, and nothing redacts a signed
+    // attribute. Pairing keeps the id itself, in memory.
     if !session.is_empty() {
-        event.set("wake.mcp.session", Value::Str(session));
+        let digest = hex::encode(Sha256::digest(session.as_bytes()));
+        event.set("wake.mcp.session_sha256", Value::Str(digest));
     }
     if let Some(token) = &p.token {
         token.record(&mut event);
@@ -650,7 +655,12 @@ mod tests {
             Value::Strs(vec!["tool:file:///inbox/1.eml".into()])
         );
         assert_eq!(e.str("wake.agent.id"), Some("unknown"));
-        assert_eq!(e.str("wake.mcp.session"), Some("s9"));
+        // The session as a digest, never the id, which may be a JWT.
+        assert_eq!(
+            e.str("wake.mcp.session_sha256"),
+            Some(hex::encode(Sha256::digest(b"s9")).as_str())
+        );
+        assert!(!e.attributes.contains_key("wake.mcp.session"));
         assert_eq!(e.str("gen_ai.tool.name"), None);
     }
 }
