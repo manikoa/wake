@@ -44,8 +44,9 @@ use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp::{self, TraceParent};
-use crate::origins::{Observed, Who};
+use crate::origins::{self, Observed, Who};
 use crate::policy::{FlowPolicy, Policy};
+use crate::token::Token;
 
 // Generated from Envoy's protos, doc comments and all.
 #[allow(clippy::all)]
@@ -83,6 +84,8 @@ pub const ATTRIBUTES: &str = "envoy.filters.http.ext_proc";
 /// requestAttributes keys the gateway config fills from CEL.
 pub const ATTR_SENDER: &str = "sender";
 pub const ATTR_RECEIVER: &str = "receiver";
+/// What the gateway says about the token the sender presented, if a JWT (token.rs).
+pub const ATTR_SENDER_TOKEN: &str = "sender_token";
 
 /// How much of each body is kept for the event's payload.
 pub use crate::budget::MAX_CAPTURE;
@@ -165,13 +168,23 @@ impl Exchange {
         let Some(observed) = &self.observed else { return };
         let at = nanos(now);
         if to_receiver {
-            // A route names the agent it reaches.
+            // A route names the agent it reaches. The message comes from the agents the
+            // sender acts under too: a sub-agent speaks for them.
             let receiver = self.call.receiver.as_deref().map(|r| self.agents.named(r));
             let who = receiver.map(Who::Agent).unwrap_or(Who::Nobody);
             observed.note(who, &format!("agent:{}", self.sender), at);
+            for under in origins::under(&self.agents, self.call.token.as_ref()) {
+                if let Some(agent) = under.key().filter(|a| *a != self.sender) {
+                    observed.note(who, &format!("agent:{agent}"), at);
+                }
+            }
         } else {
-            let who = Who::of(&self.agents, self.call.caller.as_deref());
-            observed.note(who, &format!("agent:{}", self.receiver), at);
+            // The reply reaches the agents the sender acts under too.
+            let origin = format!("agent:{}", self.receiver);
+            observed.note(Who::of(&self.agents, self.call.caller.as_deref()), &origin, at);
+            for under in origins::under(&self.agents, self.call.token.as_ref()) {
+                observed.note(under, &origin, at);
+            }
         }
     }
 
@@ -219,6 +232,11 @@ impl Exchange {
             let raw = |key: &str| attrs.get(key).filter(|s| !s.is_empty()).cloned();
             self.call.caller = raw(ATTR_SENDER);
             self.call.receiver = raw(ATTR_RECEIVER);
+            self.call.token = request
+                .attributes
+                .get(ATTRIBUTES)
+                .and_then(|s| s.fields.get(ATTR_SENDER_TOKEN))
+                .and_then(Token::from_value);
         }
         let mut events = Vec::new();
         let answer = match request.request {
@@ -311,7 +329,11 @@ impl Exchange {
         if !self.started || self.ended {
             return vec![];
         }
-        halts.deciding(self.call.caller.as_deref(), self.call.receiver.as_deref())
+        halts.deciding_with(
+            self.call.caller.as_deref(),
+            self.call.receiver.as_deref(),
+            self.call.token.as_ref(),
+        )
     }
 
     /// The signed record of cutting this exchange under these halts, which names the
@@ -439,6 +461,10 @@ impl Exchange {
         e.set("wake.event.id", Value::Str(id.into()));
         e.set("wake.event.kind", Value::Str("agent_message".into()));
         e.set("wake.capture", Value::Str("proxy".into()));
+        // The token the sender presented, on the message and on the reply alike.
+        if let Some(token) = &self.call.token {
+            token.record(&mut e);
+        }
         if let Some(r) = &self.request {
             for (key, value) in [
                 ("wake.a2a.method", &r.method),
@@ -860,6 +886,42 @@ mod tests {
     }
 
     #[test]
+    fn the_message_and_the_reply_record_the_senders_token() {
+        use crate::token::{facts, text};
+        let mut request = first(&[(":method", "POST")]);
+        let chain = facts(&[
+            ("sub", text("planner/scout#toolu_3")),
+            ("act", facts(&[("sub", text("planner"))])),
+        ]);
+        request.attributes.get_mut(ATTRIBUTES).unwrap().fields.insert(
+            ATTR_SENDER_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("jti", text("tok-9")), ("act", chain)]),
+        );
+        let mut x = Exchange::default();
+        x.handle(request, t(0));
+        let (_, mut events) = x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        x.handle(phase(Phase::ResponseHeaders(headers(&[(":status", "200")]))), t(2));
+        let (_, reply) = x.handle(phase(Phase::ResponseBody(body(REPLY, true))), t(3));
+        events.extend(reply);
+        let [message, reply] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        for e in [message, reply] {
+            assert_eq!(s(e, "wake.token.subject"), "user-42");
+            assert_eq!(s(e, "wake.token.id"), "tok-9");
+            assert_eq!(
+                e.attributes["wake.token.actors"],
+                Value::Strs(vec!["planner/scout#toolu_3".into(), "planner".into()])
+            );
+        }
+        // Without a sender_token, as with an SVID, nothing is recorded.
+        let mut x = Exchange::default();
+        x.handle(first(&[(":method", "POST")]), t(0));
+        let (_, events) = x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        assert!(events.iter().all(|e| !e.attributes.contains_key("wake.token.subject")));
+    }
+
+    #[test]
     fn notes_the_message_and_the_reply_before_answering_either() {
         use crate::origins::Seen;
         let agents = Arc::new(Agents::from_json(br#"{"planner": ["spiffe://wake.local/agent/planner"]}"#).unwrap());
@@ -877,6 +939,48 @@ mod tests {
         // So does the reply reach planner.
         x.handle(phase(Phase::ResponseHeaders(headers(&[(":status", "200")]))), t(2));
         assert_eq!(seen("planner"), Seen::These(vec!["agent:research".into()]));
+    }
+
+    #[test]
+    fn a_reply_reaches_the_agents_the_sender_acts_under() {
+        use crate::origins::Seen;
+        use crate::token::{facts, text};
+        let observed = Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS));
+        let mut x = Exchange::default().with_observed(Some(observed.clone()));
+        let seen = |agent: &str| observed.seen(Who::Agent(agent), nanos(t(10)), 900);
+        // Planner's scout, acting under planner, asks research.
+        let mut request = first(&[(":method", "POST")]);
+        let chain = facts(&[
+            ("sub", text("planner/scout#toolu_3")),
+            ("act", facts(&[("sub", text("planner"))])),
+        ]);
+        request.attributes.get_mut(ATTRIBUTES).unwrap().fields.insert(
+            ATTR_SENDER_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("act", chain)]),
+        );
+        x.handle(request, t(0));
+        x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        x.handle(phase(Phase::ResponseHeaders(headers(&[(":status", "200")]))), t(2));
+        let reply = Seen::These(vec!["agent:research".into()]);
+        assert_eq!(seen("spiffe://wake.local/agent/planner"), reply, "the sender");
+        assert_eq!(seen("planner/scout#toolu_3"), reply);
+        assert_eq!(seen("planner"), reply, "what the scout heard goes back to planner");
+        // The message reaches research alone, its route says nothing of a chain, but it comes
+        // from the agents the scout acts under too: a rule forbidding agent:planner covers it.
+        // Without a map, whom the token acts for could be an agent as well.
+        let Seen::These(mut from) = seen("research") else {
+            panic!("research has known origins")
+        };
+        from.sort();
+        assert_eq!(
+            from,
+            [
+                "agent:planner",
+                "agent:planner/scout#toolu_3",
+                "agent:spiffe://wake.local/agent/planner",
+                "agent:user-42"
+            ]
+        );
     }
 
     #[test]

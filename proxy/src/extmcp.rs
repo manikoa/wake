@@ -30,8 +30,9 @@ use crate::capture::{Hook, META_AGENT, META_EVENT_ID};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts, now};
 use crate::mcp;
-use crate::origins::{Observed, Who};
+use crate::origins::{self, Observed, Who};
 use crate::policy::{At, FlowPolicy, Policy, Target};
+use crate::token::{self, Token};
 
 pub mod pb {
     tonic::include_proto!("agentgateway.dev.ext_mcp");
@@ -91,20 +92,24 @@ impl Processor {
     }
 
     /// The string values in the metadata, with the caller named through the identity map,
-    /// and the identity the caller authenticated as.
-    fn metadata(&self, s: Option<Struct>) -> (HashMap<String, String>, Option<String>) {
+    /// the identity the caller authenticated as, and the token it presented, if a JWT.
+    fn metadata(&self, s: Option<Struct>) -> (HashMap<String, String>, Option<String>, Option<Token>) {
+        let token = s
+            .as_ref()
+            .and_then(|s| s.fields.get(token::META_TOKEN))
+            .and_then(Token::from_value);
         let mut metadata = strings(s);
         let identity = metadata.get(META_AGENT).filter(|a| !a.is_empty()).cloned();
         if let Some(agent) = &identity {
             let named = self.agents().record(agent).to_string();
             metadata.insert(META_AGENT.into(), named);
         }
-        (metadata, identity)
+        (metadata, identity, token)
     }
 
     /// The halts that cover a call from this caller now.
-    fn covering(&self, caller: Option<&str>) -> Vec<Halt> {
-        self.halts.deciding(caller, None)
+    fn covering(&self, caller: Option<&str>, token: Option<&Token>) -> Vec<Halt> {
+        self.halts.deciding_with(caller, None, token)
     }
 
     pub fn server(self) -> pb::ext_mcp_server::ExtMcpServer<Self> {
@@ -175,11 +180,11 @@ fn strings(s: Option<Struct>) -> HashMap<String, String> {
 impl ExtMcp for Processor {
     async fn check_request(&self, request: Request<McpRequest>) -> Result<Response<McpRequestResult>, Status> {
         let r = request.into_inner();
-        let (metadata, caller) = self.metadata(r.metadata_context);
+        let (metadata, caller, token) = self.metadata(r.metadata_context);
         let server = r.service_names.into_iter().next().unwrap_or_default();
         let headers: Vec<(String, Vec<u8>)> = r.headers.into_iter().map(|h| (h.key, h.value)).collect();
         // A halt that landed after ext_authz let the call in: it isn't forwarded.
-        let covering = self.covering(caller.as_deref());
+        let covering = self.covering(caller.as_deref(), token.as_ref());
         if !covering.is_empty() {
             let call = Call {
                 caller,
@@ -188,6 +193,7 @@ impl ExtMcp for Processor {
                 host: server,
                 path: String::new(),
                 headers: link_headers(&headers),
+                token: token.clone(),
             };
             self.counters.denied.fetch_add(1, Ordering::Relaxed);
             self.events
@@ -211,6 +217,7 @@ impl ExtMcp for Processor {
             let policy = self.policy.current();
             let checked = Target {
                 caller: who,
+                token: token.as_ref(),
                 receiver: None,
                 path: None,
                 tool: Some(&tool),
@@ -223,6 +230,7 @@ impl ExtMcp for Processor {
                     host: server,
                     path: String::new(),
                     headers: link_headers(&headers),
+                    token: token.clone(),
                 };
                 self.counters.denied.fetch_add(1, Ordering::Relaxed);
                 self.events
@@ -235,7 +243,12 @@ impl ExtMcp for Processor {
                     metadata: None,
                 }));
             }
-            self.observed.note(who, &format!("tool:{tool}"), at);
+            // What the tool returns reaches the agents the caller acts under too.
+            let origin = format!("tool:{tool}");
+            self.observed.note(who, &origin, at);
+            for under in origins::under(self.agents(), token.as_ref()) {
+                self.observed.note(under, &origin, at);
+            }
         }
         self.counters.mcp_calls.fetch_add(1, Ordering::Relaxed);
         let event_id = uuid::Uuid::new_v4().to_string();
@@ -244,6 +257,7 @@ impl ExtMcp for Processor {
             method: r.method,
             server,
             metadata,
+            token,
             params: r.mcp_request,
             headers,
             at: SystemTime::now(),
@@ -263,10 +277,10 @@ impl ExtMcp for Processor {
 
     async fn check_response(&self, request: Request<McpResponse>) -> Result<Response<McpResponseResult>, Status> {
         let r = request.into_inner();
-        let (metadata, caller) = self.metadata(r.metadata_context);
+        let (metadata, caller, token) = self.metadata(r.metadata_context);
         let server = r.service_names.into_iter().next().unwrap_or_default();
         let event_id = metadata.get(META_EVENT_ID).filter(|id| !id.is_empty()).cloned();
-        let covering = self.covering(caller.as_deref());
+        let covering = self.covering(caller.as_deref(), token.as_ref());
         let method = r.method.clone();
         // What came back is recorded either way: it's what the tool did.
         if mcp::captured(&r.method) {
@@ -292,6 +306,7 @@ impl ExtMcp for Processor {
                 .iter()
                 .map(|id| (mcp::HEADER_PARENTS.to_string(), id.clone()))
                 .collect(),
+            token,
         };
         self.counters.cut.fetch_add(1, Ordering::Relaxed);
         self.events.send(authz::cut_event(
@@ -378,6 +393,100 @@ mod tests {
         assert_eq!(refused(r.get_ref()), None);
     }
 
+    /// A call from a sub-agent with a token support delegated to it for a user. A cut one's
+    /// chain goes on past an actor that can't be read.
+    fn delegated(child: &str, tool: &str, cut: bool) -> Request<McpRequest> {
+        use crate::token::{facts, text};
+        let mut request = call(child, tool);
+        let support = if cut {
+            facts(&[("sub", text("support")), ("act", facts(&[("iss", text("idp"))]))])
+        } else {
+            facts(&[("sub", text("support"))])
+        };
+        let chain = facts(&[("sub", text(child)), ("act", support)]);
+        request.get_mut().metadata_context.as_mut().unwrap().fields.insert(
+            token::META_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("jti", text("tok-1")), ("act", chain)]),
+        );
+        request
+    }
+
+    fn no_pay_after_web() -> (Processor, Arc<Observed>, mpsc::Receiver<crate::budget::Queued>) {
+        let counters = Arc::new(Counters::default());
+        let (hooks, _hooks_rx) = mpsc::channel(16);
+        let (events, events_rx) = Events::channel(16, Budget::new(1 << 20), counters.clone());
+        let policy = FlowPolicy::parse(
+            br#"{"rules": [{"id": "no-pay-after-web", "callers": ["support"], "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}]}"#,
+        )
+        .unwrap();
+        let observed = Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS));
+        let p = Processor::new(
+            hooks,
+            Budget::new(1 << 20),
+            counters,
+            Arc::new(Halts::in_memory()),
+            events,
+        )
+        .with_policy(Arc::new(Policy::fixed(policy)), observed.clone());
+        (p, observed, events_rx)
+    }
+
+    const CHILD: &str = "support/researcher#toolu_1";
+
+    #[tokio::test]
+    async fn a_sub_agent_cant_act_on_what_entered_its_parent() {
+        let (p, _observed, mut events_rx) = no_pay_after_web();
+        let r = p.check_request(delegated(CHILD, "pay", false)).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None, "nothing has entered either yet");
+        // Support fetches a page, and hands the job to a sub-agent: it can't pay either.
+        p.check_request(call("support", "fetch_page")).await.unwrap();
+        let r = p.check_request(delegated(CHILD, "pay", false)).await.unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+        let event = events_rx.try_recv().unwrap().event;
+        assert_eq!(event.str("wake.agent.id"), Some(CHILD));
+        assert_eq!(event.str("wake.token.id"), Some("tok-1"));
+        let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["origins"], serde_json::json!(["tool:fetch_page"]));
+        // Without the token, it's a caller of its own: the token is what puts it under support.
+        let r = p.check_request(call(CHILD, "pay")).await.unwrap();
+        assert_eq!(refused(r.get_ref()), None);
+    }
+
+    #[tokio::test]
+    async fn a_parent_cant_act_on_what_entered_its_sub_agent() {
+        let (p, observed, _events_rx) = no_pay_after_web();
+        // A sub-agent fetches a page; what it found goes back to support.
+        p.check_request(delegated(CHILD, "fetch_page", false)).await.unwrap();
+        for agent in [CHILD, "support"] {
+            assert!(
+                matches!(observed.seen(Who::Agent(agent), now(), 900), Seen::These(o) if o == ["tool:fetch_page"]),
+                "{agent}"
+            );
+        }
+        let r = p.check_request(call("support", "pay")).await.unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+        // A sibling under support acts on what support has now.
+        let r = p
+            .check_request(delegated("support/researcher#toolu_2", "pay", false))
+            .await
+            .unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+    }
+
+    #[tokio::test]
+    async fn a_cut_chain_counts_as_every_origin() {
+        let (p, _observed, mut events_rx) = no_pay_after_web();
+        let r = p.check_request(delegated(CHILD, "pay", true)).await.unwrap();
+        assert!(refused(r.get_ref()).unwrap().contains("policy:no-pay-after-web"));
+        let event = events_rx.try_recv().unwrap().event;
+        let payload: serde_json::Value = serde_json::from_str(event.str("wake.payload").unwrap()).unwrap();
+        assert_eq!(payload["every_origin"], origins::CUT_CHAIN);
+        assert_eq!(
+            event.attributes["wake.token.actors_cut"],
+            crate::canonical::Value::Bool(true)
+        );
+    }
+
     #[tokio::test]
     async fn without_a_policy_nothing_is_checked_or_noted() {
         let counters = Arc::new(Counters::default());
@@ -395,5 +504,54 @@ mod tests {
         let r = p.check_request(call("billing", "fetch_page")).await.unwrap();
         assert_eq!(refused(r.get_ref()), None);
         assert_eq!(observed.seen(Who::Agent("billing"), now(), 900), Seen::These(vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_captured_call_records_the_token_it_came_with() {
+        use crate::canonical::Value;
+        use crate::capture::Capture;
+        use crate::token::{facts, text};
+        use std::time::Duration;
+
+        let counters = Arc::new(Counters::default());
+        let (hooks, mut hooks_rx) = mpsc::channel(16);
+        let (events, _events_rx) = Events::channel(16, Budget::new(1 << 20), counters.clone());
+        let p = Processor::new(
+            hooks,
+            Budget::new(1 << 20),
+            counters,
+            Arc::new(Halts::in_memory()),
+            events,
+        );
+        let mut request = call("support/researcher#toolu_1", "lookup_order");
+        let chain = facts(&[("sub", text("support/researcher#toolu_1"))]);
+        request.get_mut().metadata_context.as_mut().unwrap().fields.insert(
+            token::META_TOKEN.into(),
+            facts(&[("sub", text("user-42")), ("jti", text("tok-7")), ("act", chain)]),
+        );
+        assert_eq!(refused(p.check_request(request).await.unwrap().get_ref()), None);
+
+        let (hook, _permit) = hooks_rx.try_recv().unwrap();
+        let mut capture = Capture::new(Duration::from_secs(30), 16);
+        assert!(capture.handle(hook).is_empty(), "it waits for its response");
+        let events = capture.expire(SystemTime::now() + Duration::from_secs(60));
+        let [event] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        assert_eq!(event.str("wake.event.kind"), Some("tool_call"));
+        assert_eq!(event.str("wake.agent.id"), Some("support/researcher#toolu_1"));
+        assert_eq!(event.str("wake.token.subject"), Some("user-42"));
+        assert_eq!(event.str("wake.token.id"), Some("tok-7"));
+        assert_eq!(
+            event.attributes["wake.token.actors"],
+            Value::Strs(vec!["support/researcher#toolu_1".into()])
+        );
+
+        // A caller with an SVID presented no token, and none is recorded.
+        p.check_request(call("support", "lookup_order")).await.unwrap();
+        let (hook, _permit) = hooks_rx.try_recv().unwrap();
+        capture.handle(hook);
+        let events = capture.expire(SystemTime::now() + Duration::from_secs(60));
+        assert!(events.iter().all(|e| !e.attributes.contains_key("wake.token.subject")));
     }
 }

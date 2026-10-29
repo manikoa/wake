@@ -14,6 +14,12 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.agent.instance` | string | The running instance of the agent that did it, for an agent that can run as several at once, such as a subagent. Absent otherwise. See Instances |
 | `wake.agent.lineage` | string[] | With `wake.agent.instance`: the agent and instances that started it, outermost first |
 | `wake.capture` | string | What recorded it: `sdk`, `proxy` or `memory_adapter` |
+| `wake.token.subject` | string | Set by the proxy when the caller presented a JWT whose `sub` it could read: whom the token acts for. For a delegated token, often a user or the agent that delegated, while `wake.agent.id` names the agent acting. See Tokens |
+| `wake.token.actors` | string[] | With a delegated token: the agents acting under it, the one acting now first, then each before it (its nested `act` claims) |
+| `wake.token.actors_cut` | bool | Set, to true, when the chain went on past what `wake.token.actors` keeps: its earliest actors are unknown |
+| `wake.token.id` | string | The token's `jti`, when it has one |
+| `wake.token.expires_unix` | int | The token's `exp`, in Unix seconds |
+| `wake.token.bound` | bool | Whether the token is bound to its holder's key (it has a `cnf` claim, as DPoP and mTLS-bound tokens do), rather than usable by whoever holds a copy. Set on every event that records a token, so it, not `wake.token.subject`, says whether the caller presented one |
 | `wake.parents` | string[] | Ids of the events whose output fed this one |
 | `wake.origins` | string[] | Sources of content that entered the system at this event: `user`, `tool:<name>`, `agent:<id>`, `memory:<entry id>` |
 | `wake.payload` | string (JSON) | What was seen and said: the event's inputs and outputs. Not signed; the signed digest commits to it. A payload too large to send whole is cut short and says so: the proxy keeps 1 MiB of each body, as a string, and adds `"truncated": true`. The SDKs send `{"truncated": true, "bytes", "sha256", "prefix"}` in place of one over 4 MiB, with the whole payload's size and hex SHA-256, and its first 2 MiB as a string. The collector reads a payload sent as bytes as the bytes it holds, and refuses one of any other type (see Secrets) |
@@ -61,6 +67,12 @@ What makes an instance, by integration:
 - **LangChain and LangGraph:** a named run (`handler.agent(name)`) started inside another agent's run, `<name>#<its invoke_agent span id>`, started by that run. A LangGraph node is a step of the agent running the graph, not an agent of its own, so a node run several times at once isn't an instance.
 
 These come from the SDK, inside the agent's process, so they say what the agent reported, like the rest of an SDK event. Instances of one agent share its process and credentials, so the proxy sees them as that agent.
+
+## Tokens
+
+When a caller presents a JWT at the gateway, the proxy records what the token says on the events it captures for that call: its `tool_call`, both `agent_message`s of an A2A exchange (the sender's token, on the message and on the reply), and any `denied` event, cut calls included. It never records the token itself: the gateway computes these facts from the claims of the token it verified and passes only them (see "Who's calling" in [proxy.md](proxy.md)). A caller that authenticates with an X.509-SVID presents no token, and its events have none of these attributes.
+
+A token from OAuth token exchange ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)) acts for its `sub` and is held by the agent its `act.sub` names, with earlier actors nested deeper in `act`. The gateway names the caller, `wake.agent.id`, by the agent acting; `wake.token.subject` and `wake.token.actors` keep whom it acts for and the chain the delegation passed through, so the record shows which user a sub-agent acted for, and through which agents. A chain is kept to its first 8 actors, and a claim too long to be an identifier (over 1,024 bytes) is left out rather than cut. A chain that goes on past what's kept, past 8 actors or past an actor whose claim was left out, is marked with `wake.token.actors_cut`, and so is a token whose `sub` is missing or left out, since whom it acts for is unknown. The deny lever treats its call as one from a caller it can't name (see "A halt" in [proxy.md](proxy.md)).
 
 ## Messages between agents
 

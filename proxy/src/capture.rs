@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::budget::MAX_CAPTURE;
 use crate::canonical::{Event, Value};
 use crate::mcp;
+use crate::token::Token;
 
 /// A call into the processor, already read off the wire.
 #[derive(Clone, Debug)]
@@ -28,6 +29,8 @@ pub enum Hook {
         method: String,
         server: String,
         metadata: HashMap<String, String>,
+        /// What the gateway says about the token the caller presented, if a JWT.
+        token: Option<Token>,
         params: Option<Vec<u8>>,
         /// The request headers the gateway forwarded.
         headers: Vec<(String, Vec<u8>)>,
@@ -75,6 +78,7 @@ struct Pending {
     server: String,
     agent: String,
     session: String,
+    token: Option<Token>,
     params: Option<Vec<u8>>,
     params_cut: bool,
     request: mcp::Request,
@@ -137,6 +141,7 @@ impl Capture {
                 method,
                 server,
                 metadata,
+                token,
                 params,
                 headers,
                 at,
@@ -167,6 +172,7 @@ impl Capture {
                         server,
                         agent,
                         session,
+                        token,
                         params,
                         params_cut,
                         request,
@@ -334,6 +340,9 @@ fn build(id: &str, p: &Pending, result: Option<(&[u8], bool)>, end: SystemTime, 
     if !session.is_empty() {
         event.set("wake.mcp.session", Value::Str(session));
     }
+    if let Some(token) = &p.token {
+        token.record(&mut event);
+    }
     event.set(
         "wake.payload",
         Value::Str(mcp::capped_payload(
@@ -361,6 +370,7 @@ fn orphan(
             .cloned()
             .unwrap_or_else(|| "unknown".into()),
         session: metadata.get(META_SESSION).cloned().unwrap_or_default(),
+        token: None,
         params: None,
         params_cut: false,
         request: mcp::Request::default(),
@@ -393,6 +403,7 @@ mod tests {
             method: "tools/call".into(),
             server: "inbox".into(),
             metadata: meta(&[(META_AGENT, "spiffe://wake.local/agent/email"), (META_SESSION, session)]),
+            token: None,
             params: Some(format!(r#"{{"name":"{tool}","arguments":{{}}}}"#).into_bytes()),
             headers: vec![],
             at,
@@ -525,6 +536,7 @@ mod tests {
             method: "tools/call".into(),
             server: "files".into(),
             metadata: HashMap::new(),
+            token: None,
             params: Some(big.into_bytes()),
             headers: vec![],
             at: t(0),
@@ -549,6 +561,7 @@ mod tests {
             method: "tools/call".into(),
             server: "s".into(),
             metadata: HashMap::new(),
+            token: None,
             params: Some(vec![b'1'; size]),
             headers: vec![],
             at: t(0),
@@ -568,6 +581,7 @@ mod tests {
             method: "resources/read".into(),
             server: "files".into(),
             metadata: HashMap::new(),
+            token: None,
             params: Some(br#"{"uri":"file:///inbox/1.eml","_meta":{"traceparent":"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01","dev.wake/parents":["model-call-1"]}}"#.to_vec()),
             headers: vec![("mcp-session-id".into(), b"s9".to_vec())],
             at: t(0),

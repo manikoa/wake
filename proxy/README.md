@@ -20,7 +20,7 @@ A call already under way when a halt lands is cut, and recorded as a `denied` ev
 - **A2A:** an exchange the proxy is carrying, such as a streamed reply, ends with an error, and agentgateway fails it.
 - **MCP:** a result on its way back is kept from the caller, which gets the gateway's error. The tool already ran.
 
-`--agents` maps each agent's SPIFFE IDs and JWT subjects to the name the brake halts it by. The brake puts and lifts halts over the control API, which serves only the brake's SVID. Halts are kept on disk, and the deny fails closed: until the state is initialized with `wake-proxy init`, every call is denied. See "The deny lever" in [docs/proxy.md](../docs/proxy.md).
+`--agents` maps each agent's SPIFFE IDs and JWT subjects (for a delegated token, the `act.sub` of the agent acting) to the name the brake halts it by. The brake puts and lifts halts over the control API, which serves only the brake's SVID. Halts are kept on disk, and the deny fails closed: until the state is initialized with `wake-proxy init`, every call is denied. See "The deny lever" in [docs/proxy.md](../docs/proxy.md).
 
 ```bash
 # The brake's side, with its SVID (dev-identity --brake-id writes keys/brake.pem and .key):

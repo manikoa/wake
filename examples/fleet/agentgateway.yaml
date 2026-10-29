@@ -3,8 +3,8 @@
 # agentgateway for the reference fleet: an A2A route per agent and the fleet's MCP server,
 # every call recorded by wake-proxy, and denied when the brake has halted it.
 #
-# Who's calling comes from the caller's SPIFFE ID or JWT subject, as in production, and
-# failing those from the x-fleet-agent header the fleet's agents send. That header is a
+# Who's calling comes from the caller's SPIFFE ID or JWT (the agent a delegated token names
+# as acting, act.sub, else its subject), as in production, and failing those from the x-fleet-agent header the fleet's agents send. That header is a
 # stand-in so the example needs no identity provider; any caller can set it, so never
 # trust it outside the example. deploy/agentgateway.yaml requires mTLS instead. wake-proxy's
 # hooks are a Unix socket only agentgateway shares (deploy/compose.yaml).
@@ -21,7 +21,7 @@ gateways:
       protocol:
         grpc:
           metadata:
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : "")), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
 routes:
 - name: research
   matches:
@@ -42,7 +42,7 @@ routes:
           context:
             receiver: research
           metadata:
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : "")), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
     extProc:
       host: "unix:/run/wake/proxy.sock"
       failureMode: failOpen
@@ -55,7 +55,10 @@ routes:
         responseTrailerMode: skip
         allowModeOverride: true
       requestAttributes:
-        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        # What the sender's JWT says, never the token: whom it acts for, the agents
+        # acting, its id and expiry, and whether it's bound to a key. wake-proxy records it.
+        sender_token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
         receiver: '"research"'
   backends:
   - host: research:9101
@@ -78,7 +81,7 @@ routes:
           context:
             receiver: billing
           metadata:
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : "")), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
     extProc:
       host: "unix:/run/wake/proxy.sock"
       failureMode: failOpen
@@ -91,7 +94,10 @@ routes:
         responseTrailerMode: skip
         allowModeOverride: true
       requestAttributes:
-        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        # What the sender's JWT says, never the token: whom it acts for, the agents
+        # acting, its id and expiry, and whether it's bound to a key. wake-proxy records it.
+        sender_token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
         receiver: '"billing"'
   backends:
   - host: billing:9102
@@ -114,7 +120,7 @@ routes:
           context:
             receiver: notify
           metadata:
-            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))}'
+            wake: '{"agent": has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : "")), "token": {"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}}'
     extProc:
       host: "unix:/run/wake/proxy.sock"
       failureMode: failOpen
@@ -127,7 +133,10 @@ routes:
         responseTrailerMode: skip
         allowModeOverride: true
       requestAttributes:
-        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        sender: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+        # What the sender's JWT says, never the token: whom it acts for, the agents
+        # acting, its id and expiry, and whether it's bound to a key. wake-proxy records it.
+        sender_token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
         receiver: '"notify"'
   backends:
   - host: notify:9103
@@ -145,7 +154,10 @@ routes:
         requestHeaders:
           allowed: [traceparent, wake-parents, mcp-session-id]
         metadata:
-          agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+          agent: 'has(source.spiffeId) ? source.spiffeId : (has(jwt.act) && has(jwt.act.sub) ? jwt.act.sub : has(jwt.sub) ? jwt.sub : ("x-fleet-agent" in request.headers ? request.headers["x-fleet-agent"] : ""))'
+          # What the caller's JWT says, never the token: whom it acts for, the agents
+          # acting, its id and expiry, and whether it's bound to a key. wake-proxy records it.
+          token: '{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}'
           wake_event_id: 'has(mcpGuardrails.wake_event_id) ? mcpGuardrails.wake_event_id : ""'
           # The caller's MCP session, in both phases, so a response whose event id didn't come
           # back is paired in order only within its own session.

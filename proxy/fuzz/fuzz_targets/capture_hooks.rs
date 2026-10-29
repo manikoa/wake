@@ -23,6 +23,7 @@ fuzz_target!(|data: &[u8]| {
                 method,
                 server: "s".into(),
                 metadata,
+                token: None,
                 params: Some(chunk.to_vec()),
                 headers: vec![
                     ("wake-parents".into(), chunk.to_vec()),

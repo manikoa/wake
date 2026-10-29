@@ -751,6 +751,7 @@ async fn a_halt_cuts_a_streamed_a2a_reply_under_way_and_only_that() {
             Scope {
                 fleet: false,
                 agents: vec!["spiffe://wake.local/agent/billing".into()],
+                tokens: vec![],
             },
             1,
         )
@@ -833,6 +834,7 @@ async fn a_halt_keeps_an_mcp_result_from_its_caller_and_refuses_a_late_request()
             Scope {
                 fleet: true,
                 agents: vec![],
+                tokens: vec![],
             },
             1,
         )
