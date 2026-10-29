@@ -122,6 +122,23 @@ pub struct MemoryRules {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_by: Option<String>,
     pub quarantines: Vec<Quarantine>,
+    /// The halts in force that name agents, for an SDK to stop the agent, or one instance of
+    /// it, in its own process: what each covers, never which tokens. A state that can't be
+    /// read, or isn't initialized, is a halt of the fleet, as the deny makes it. Always
+    /// sent, so an SDK can tell none from a proxy that doesn't say.
+    #[serde(default)]
+    pub halts: Vec<HaltRule>,
+}
+
+/// A halt as an agent's SDK is told of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HaltRule {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fleet: bool,
+    /// The agents, their identities and the sub-agents it names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
 }
 
 /// When an agent's memory adapter last fetched its rules, and at which version.
@@ -426,11 +443,29 @@ impl Halts {
                 }
             }
         }
+        let mut halts: Vec<HaltRule> = state
+            .halts
+            .iter()
+            .filter(|h| h.scope.fleet || !h.scope.agents.is_empty())
+            .map(|h| HaltRule {
+                id: h.id.clone(),
+                fleet: h.scope.fleet,
+                agents: h.scope.agents.clone(),
+            })
+            .collect();
+        if let Some(id) = &unknown {
+            halts.push(HaltRule {
+                id: id.clone(),
+                fleet: true,
+                agents: vec![],
+            });
+        }
         MemoryRules {
             version: state.version,
             locked_by,
             hidden_by: unknown,
             quarantines: state.quarantines.clone(),
+            halts,
         }
     }
 
@@ -1146,6 +1181,43 @@ mod tests {
     }
 
     #[test]
+    fn the_memory_rules_say_which_agents_and_sub_agents_are_halted() {
+        let halts = Halts::in_memory();
+        assert_eq!(halts.memory_rules("support").halts, [], "none, said");
+        halts.put("h-sub", agents(&[CHILD_1]), 1).unwrap();
+        halts.put("h-fleet", fleet(), 2).unwrap();
+        let tokens_only = Scope {
+            tokens: vec!["tok-1".into()],
+            ..Default::default()
+        };
+        halts.put("h-token", tokens_only, 3).unwrap();
+        let rules = halts.memory_rules("support");
+        assert_eq!(
+            rules.halts,
+            [
+                HaltRule {
+                    id: "h-sub".into(),
+                    fleet: false,
+                    agents: vec![CHILD_1.into()]
+                },
+                HaltRule {
+                    id: "h-fleet".into(),
+                    fleet: true,
+                    agents: vec![]
+                },
+            ],
+            "a token halt names no agent, and no token is told"
+        );
+        let json = serde_json::to_value(&rules).unwrap();
+        assert_eq!(
+            json["halts"][0],
+            serde_json::json!({"id": "h-sub", "agents": [CHILD_1]})
+        );
+        assert_eq!(json["halts"][1], serde_json::json!({"id": "h-fleet", "fleet": true}));
+        assert!(!json.to_string().contains("tok-1"));
+    }
+
+    #[test]
     fn a_state_never_initialized_or_lost_halts_everything() {
         let dir = temp_dir();
         let halts = Halts::load(&dir);
@@ -1153,6 +1225,15 @@ mod tests {
         assert_eq!(ids(halts.deciding(Some("anyone"), None)), [UNINITIALIZED]);
         let rules = halts.memory_rules("billing");
         assert_eq!(rules.locked_by.as_deref(), Some(UNINITIALIZED));
+        assert_eq!(
+            rules.halts,
+            [HaltRule {
+                id: UNINITIALIZED.into(),
+                fleet: true,
+                agents: vec![]
+            }],
+            "an SDK stops every agent in its process too"
+        );
         assert_eq!(
             rules.hidden_by.as_deref(),
             Some(UNINITIALIZED),
