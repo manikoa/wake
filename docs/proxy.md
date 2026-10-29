@@ -170,6 +170,36 @@ Contain's first control (October 28, 2026): rules that keep content from untrust
   - The window counts from when a tool call was made, not from when its result came back.
   - The rules are a small JSON format of Wake's own, not Cedar, which the roadmap's stack names for policies in the proxy.
 
+### Run charters
+
+Contain (October 28, 2026): a run's stop conditions, written before it starts, which the proxy holds the run's calls to. The brake puts a charter over the control API (`PUT /v1/charters/{id}`) and ends it there; it decides when the run is done from the signed record and retires the run's credentials (wake-platform's `docs/brake.md`). The proxy keeps charters in the halts' state, on disk and versioned like halts, and the brake confirms one by the state's version.
+
+```json
+{"scope": {"agents": ["support/refunder#toolu_01A9"], "tokens": ["jti-7f3a"]},
+ "expires_at": 1793232000,
+ "never": "@id(\"no-deletes\") forbid(principal, action, resource == Wake::Tool::\"delete_customer\");\nforbid(principal, action, resource == Wake::Agent::\"payments\");",
+ "budget": [{"tools": ["refund"], "calls": 1}, {"calls": 200}],
+ "issued_at": 1793228400000000000}
+```
+
+- **Which calls are the run's.** Those its scope names, as a halt's does: made under the identities in `agents` (an agent, or a sub-agent calling under an identity of its own, and the sub-agents acting under it), or presenting a token in `tokens`. Never anything the caller sends, such as its trace, so a run can't step out of its charter by leaving a header out. A caller nobody can name or place, or whose token's chain was cut, could be the run's, so a charter naming agents covers it, as an agent halt does. A charter can't name the fleet. A run with no identity or token of its own is named by its agent, and its charter then holds every call that agent makes; the brake says so.
+- **`never`** is Cedar: `forbid` policies over the Wake schema below, the entities and action of the dashboard's Cedar for flow policies without their context. A call one forbids is denied. Policies are checked when the charter is put, and refused unless every one is a `forbid` (what isn't forbidden is allowed already), none is a template, and Cedar's validator passes them strictly against the schema, so a misspelled entity type, which would match no call, is refused rather than kept. A call a policy can't be evaluated for is denied: Cedar skips a policy that errors, and a skipped forbid would let the call through. The principal is the caller, as `Wake::Agent::"<name>"`; the resource is the tool, resource URI or prompt an MCP call reaches, as `Wake::Tool::"<name>"`, checked at the MCP hook, or the agent an A2A route reaches, as `Wake::Agent::"<name>"`, checked by ext_authz. A denial names each forbid by its `@id`, or by its place (`policy0` on).
+
+  ```cedar
+  namespace Wake {
+    entity Agent;
+    entity Tool;
+    action "call" appliesTo { principal: [Agent], resource: [Agent, Tool] };
+  }
+  ```
+- **`budget`** limits the run's MCP calls (`tools/call`, `resources/read`, `prompts/get`): every one, or those to the `tools` a limit names, each exact or a prefix ending in `*`. A call past any limit is denied, and a denied call, by a halt, a flow policy or a charter, isn't counted. A call two charters cover is counted by both only when neither denies it.
+- **`expires_at`**, in Unix seconds: from then on, every call the run makes is denied by ext_authz and the MCP hook, whatever it reaches.
+- **Denied** calls get a 403 from ext_authz, or the gateway's error from the MCP hook, naming `charter:<id>`, and a signed `denied` event whose payload says which charter, why and what it found ([events.md](events.md)).
+- **The control API.** `PUT /v1/charters/{id}` refuses a charter that couldn't be enforced as written: a field it doesn't know, no scope or the fleet, a blank name, no `expires_at`, a `never` as above, over 64 KiB or over 100 policies, over 32 limits, or a tool pattern with `*` anywhere but at the end. `POST /v1/charters/check` checks one without putting it. `GET /v1/charters` lists those in force, each with what its budget has `used`, limit by limit. Put again, as the brake does when it can't confirm one, a charter keeps what it used; `DELETE` ends it and forgets that.
+- **Not yet.**
+  - Budgets are counted by each proxy, in memory, for the calls through it: several replicas each count their own, and a restart counts from zero. The brake's monitor counts the run's calls in the signed record as well.
+  - A2A requests aren't counted against a budget. ext_authz can't tell a message from a task poll, and the A2A processor, which can, doesn't deny yet.
+
 ### Metrics
 
 With `--metrics-listen`, wake-proxy serves its counters for Prometheus at `/metrics` (`deploy/compose.yaml` publishes it on the host's loopback, at 9464):

@@ -78,6 +78,8 @@ A call a **flow policy** denies (see [proxy.md](proxy.md)) is recorded the same 
 - **Payload:** it adds `origins`, the origins that entered the caller and that the rule keeps from the call. When the caller counted as having every origin, it's `*`, and `every_origin` says why.
 - **No `wake.origins`:** no content entered at the denial.
 
+A call a **run charter** denies (see [proxy.md](proxy.md), "Run charters") is recorded the same way, under `wake.brake.halt_id` `charter:<charter id>`. Its payload adds `charter`, the charter's id; `why`: `never`, `budget`, `expired`, or `unreadable` for a `never` that can't be read; and `detail`, in words: the forbids that deny the call, the limit it's past, or when the charter expired.
+
 A call already under way when a halt lands is **cut**, and recorded the same way: an A2A exchange the proxy is carrying, such as a streamed reply, or an MCP call whose result was on its way back to the caller.
 - **Payload:** it adds `"cut": true`, and `recorded_as`, the id of the event that recorded the call, when there is one.
 - **Its MCP form:** the `method` is the MCP method and the `host` the MCP server. The event's parent is the call's own `tool_call`, which records what the tool returned, though the caller never got it.

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["json", "query"] }
 base64 = "0.23.1"
+cedar-policy = "4.13"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 hex = "0.4.3"
 hyper-util = { version = "0.1.21", features = ["server-auto", "service", "tokio"] }
