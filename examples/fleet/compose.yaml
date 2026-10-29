@@ -31,6 +31,8 @@ x-fleet: &fleet
     FLEET_E2B: http://e2b:8080
     WAKE_MEMORY_RULES: http://memory-rules:9003
     FLEET_MODELS: ${FLEET_MODELS:-scripted}
+    # Set by a leak game day: a canary the CRM holds, which should never leave it.
+    FLEET_CANARY: ${FLEET_CANARY:-}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   # Agents get the CA certificate to reach the collector over TLS, and nothing else from
