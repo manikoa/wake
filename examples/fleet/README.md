@@ -37,7 +37,7 @@ By default each agent runs on a scripted model, so the fleet needs no API keys a
 
 With `FLEET_MODELS=real`, research runs on the OpenAI Agents SDK's default model when `OPENAI_API_KEY` is set, and billing runs on Claude Code when `ANTHROPIC_API_KEY` is set. Support and notify stay scripted, so every run walks the same steps.
 
-With `FLEET_CANARY` set to a canary (`WAKE-CANARY-` and hex digits), the CRM's order record also holds a test card number and that canary, which should never leave it. Support hands billing the whole record when it asks for the refund, as agents pass their context along, so wake-platform's leak game day (`gameday/leak.sh`) can show where it went: into a tool's arguments and a message between agents, never into the answer the customer sees.
+With `FLEET_CANARY` set to a canary (`WAKE-CANARY-` and hex digits), the CRM's order record also holds a test card number and that canary, which should never leave it. Support hands billing the whole record when it asks for the refund, as agents pass their context along, so wake-platform's leak game day (`gameday/leak.sh`) can show where it went: into a tool's arguments and a message between agents, never into the answer the customer sees. With `FLEET_CREDENTIAL` set to a credential, such as a fake payment processor key, the record holds that too: the recorders replace it before signing, so the game day checks the log never holds it and that Wake still sees it go from support to billing.
 
 ## Something for every lever
 

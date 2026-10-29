@@ -33,6 +33,8 @@ x-fleet: &fleet
     FLEET_MODELS: ${FLEET_MODELS:-scripted}
     # Set by a leak game day: a canary the CRM holds, which should never leave it.
     FLEET_CANARY: ${FLEET_CANARY:-}
+    # And a credential it holds beside the canary, which the recorders must replace.
+    FLEET_CREDENTIAL: ${FLEET_CREDENTIAL:-}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   # Agents get the CA certificate to reach the collector over TLS, and nothing else from
