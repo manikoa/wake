@@ -6,7 +6,12 @@
 //!
 //! It's coarse on purpose. The proxy sees what reached an agent, not which of it feeds a
 //! given call, so a policy treats everything that entered an agent within its window as
-//! behind each call it makes. Where it doesn't know, it assumes the worst: for one window
+//! behind each call it makes. It's coarse across delegation too: content crosses one both
+//! ways where the proxy can't see it, a parent's task into the sub-agent it delegates to,
+//! and the sub-agent's result back. So what enters a caller is noted under every agent its
+//! token says the call is made under, and a call is checked against what entered any of
+//! them: a sub-agent can't take an action its parent is kept from, with the parent's
+//! content, or hand its parent content to take one with. Where it doesn't know, it assumes the worst: for one window
 //! after the proxy starts or the window grows, for an agent past its bound of origins, and
 //! once too many agents are tracked to remember another, an agent counts as having every
 //! origin.
@@ -15,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::agents::Agents;
+use crate::token::Token;
 
 /// The most distinct origins remembered for one agent within a window. Past it, the agent
 /// counts as having every origin until the window passes.
@@ -51,7 +57,7 @@ impl<'a> Who<'a> {
     }
 
     /// What origins are remembered under: the agent's name, or an unlisted identity.
-    fn key(&self) -> Option<&'a str> {
+    pub(crate) fn key(&self) -> Option<&'a str> {
         match self {
             Who::Agent(name) => Some(name),
             Who::Unlisted(identity) => Some(identity),
@@ -59,6 +65,29 @@ impl<'a> Who<'a> {
         }
     }
 }
+
+/// The agents a call made with token is made under, besides its caller, as the identity
+/// map names them (Token::under). Its subject counts only when the map lists it, or when
+/// there's no map to say: a user a token acts for isn't an agent, and keying origins under
+/// one would tie together every agent acting for that user.
+pub fn under<'a>(agents: &'a Agents, token: Option<&'a Token>) -> Vec<Who<'a>> {
+    token
+        .map(|t| {
+            let subject = Some(t.subject.as_str()).filter(|s| agents.is_empty() || agents.knows(s));
+            t.actors
+                .iter()
+                .map(String::as_str)
+                .chain(subject)
+                .map(|id| Who::of(agents, Some(id)))
+                .filter(|who| *who != Who::Nobody)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Why a call whose token's chain was cut counts as having every origin: what entered
+/// the agents it didn't keep isn't known.
+pub const CUT_CHAIN: &str = "the caller's token acts under more agents than wake-proxy keeps";
 
 /// What entered an agent within a window.
 #[derive(Clone, Debug, PartialEq)]
@@ -164,31 +193,39 @@ impl Observed {
 
     /// What entered who in the window_secs up to at.
     pub fn seen(&self, who: Who<'_>, at: u64, window_secs: u64) -> Seen {
+        self.seen_by(&[who], at, window_secs)
+    }
+
+    /// What entered any of whos in the window_secs up to at: a caller and the agents it
+    /// acts under. Each origin once, newest first; every origin when that's so for any.
+    pub fn seen_by(&self, whos: &[Who<'_>], at: u64, window_secs: u64) -> Seen {
         let since = at.saturating_sub(window_secs.clamp(1, MAX_WINDOW_SECS) * NANOS);
         let inner = self.lock();
         if inner.known_since > since {
             return Seen::Every("wake-proxy hasn't watched for a whole window yet");
         }
-        let Some(key) = who.key() else {
-            return Seen::Every("the caller has no identity");
-        };
-        let Some(agent) = inner.agents.get(key) else {
-            if inner.overflowed_at.is_some_and(|t| t >= since) {
-                return Seen::Every("too many agents to remember this one");
+        let mut newest: HashMap<&str, u64> = HashMap::new();
+        for who in whos {
+            let Some(key) = who.key() else {
+                return Seen::Every("the caller has no identity");
+            };
+            let Some(agent) = inner.agents.get(key) else {
+                if inner.overflowed_at.is_some_and(|t| t >= since) {
+                    return Seen::Every("too many agents to remember this one");
+                }
+                continue;
+            };
+            if agent.saturated_at.is_some_and(|t| t >= since) {
+                return Seen::Every("more origins entered the agent than wake-proxy keeps");
             }
-            return Seen::These(vec![]);
-        };
-        if agent.saturated_at.is_some_and(|t| t >= since) {
-            return Seen::Every("more origins entered the agent than wake-proxy keeps");
+            for (origin, seen) in agent.origins.iter().filter(|(_, seen)| **seen >= since) {
+                let at = newest.entry(origin).or_default();
+                *at = (*at).max(*seen);
+            }
         }
-        let mut origins: Vec<(&String, u64)> = agent
-            .origins
-            .iter()
-            .filter(|(_, seen)| **seen >= since)
-            .map(|(o, seen)| (o, *seen))
-            .collect();
+        let mut origins: Vec<(&str, u64)> = newest.into_iter().collect();
         origins.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        Seen::These(origins.into_iter().map(|(o, _)| o.clone()).collect())
+        Seen::These(origins.into_iter().map(|(o, _)| o.to_string()).collect())
     }
 }
 
@@ -230,6 +267,78 @@ mod tests {
             o.seen(Who::Agent("support"), after_start(20), WINDOW),
             Seen::These(vec![])
         );
+    }
+
+    #[test]
+    fn what_entered_several_agents_is_what_entered_any_of_them() {
+        let o = Observed::starting(START, WINDOW);
+        let child = Who::Unlisted("support/researcher#toolu_1");
+        let support = Who::Agent("support");
+        o.note(support, "tool:fetch_page", after_start(0));
+        o.note(child, "tool:search", after_start(5));
+        o.note(child, "tool:fetch_page", after_start(10));
+        assert_eq!(
+            o.seen_by(&[child, support], after_start(20), WINDOW),
+            Seen::These(vec!["tool:fetch_page".into(), "tool:search".into()]),
+            "each origin once, by when it last entered any of them"
+        );
+        assert_eq!(
+            o.seen_by(&[support], after_start(20), WINDOW),
+            Seen::These(vec!["tool:fetch_page".into()])
+        );
+        assert_eq!(
+            o.seen_by(
+                &[Who::Agent("billing"), Who::Agent("research")],
+                after_start(20),
+                WINDOW
+            ),
+            Seen::These(vec![])
+        );
+        // Every origin, when that's so for any of them.
+        for i in 0..MAX_ORIGINS {
+            o.note(support, &format!("tool:t{i}"), after_start(30));
+        }
+        assert_eq!(
+            o.seen_by(&[child, support], after_start(31), WINDOW),
+            Seen::Every("more origins entered the agent than wake-proxy keeps")
+        );
+        assert_eq!(
+            o.seen_by(&[child, Who::Nobody], after_start(31), WINDOW),
+            Seen::Every("the caller has no identity")
+        );
+        assert_eq!(
+            o.seen(child, after_start(31), WINDOW),
+            Seen::These(vec!["tool:fetch_page".into(), "tool:search".into()]),
+            "on its own, the child has only what entered it"
+        );
+    }
+
+    #[test]
+    fn a_call_is_made_under_the_chain_of_its_token() {
+        let agents = Agents::from_json(br#"{"support": ["0oa1support"]}"#).unwrap();
+        let token = Token {
+            subject: "0oa1support".into(),
+            actors: vec!["support/researcher#toolu_1".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            under(&agents, Some(&token)),
+            [Who::Unlisted("support/researcher#toolu_1"), Who::Agent("support")]
+        );
+        assert!(under(&agents, None).is_empty());
+        // A user a token acts for isn't an agent: what entered one agent acting for that
+        // user isn't kept under the user, for every other agent acting for them to inherit.
+        let for_user = Token {
+            subject: "user-42".into(),
+            actors: vec!["support/researcher#toolu_1".into(), "0oa1support".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            under(&agents, Some(&for_user)),
+            [Who::Unlisted("support/researcher#toolu_1"), Who::Agent("support")]
+        );
+        // Without a map there's no telling, so it counts.
+        assert_eq!(under(&Agents::default(), Some(&for_user)).len(), 3);
     }
 
     #[test]

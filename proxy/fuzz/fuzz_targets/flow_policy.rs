@@ -1,5 +1,6 @@
 //! Fuzz target for flow policies: parsing any policy file, deciding on any origins that
-//! entered the caller, at ext_authz and at the MCP hook, and recording the denial.
+//! entered the caller, at ext_authz and at the MCP hook, with and without a delegated token,
+//! and recording the denial. A token only ever puts a call under more rules, never fewer.
 #![no_main]
 use std::collections::HashMap;
 
@@ -8,6 +9,7 @@ use wake_proxy::agents::Agents;
 use wake_proxy::authz::{self, Call};
 use wake_proxy::origins::{Seen, Who};
 use wake_proxy::policy::{At, FlowPolicy, Target};
+use wake_proxy::token::Token;
 
 fuzz_target!(|data: &[u8]| {
     // The first line is the policy, and each later one an origin that entered the caller.
@@ -26,23 +28,41 @@ fuzz_target!(|data: &[u8]| {
         headers: HashMap::new(),
         token: None,
     };
+    let delegated = Token {
+        subject: "user-42".into(),
+        actors: vec!["billing".into(), "support".into()],
+        ..Default::default()
+    };
+    let cut = Token {
+        cut: true,
+        ..delegated.clone()
+    };
     for (at, receiver, path, tool) in [
         (At::Authz, Some("payments"), Some("/a2a/payments"), None),
         (At::Mcp, None, None, Some("pay")),
     ] {
         for caller in [Who::Agent("billing"), Who::Unlisted("spiffe://x/other"), Who::Nobody] {
-            let target = Target {
-                caller,
-                receiver,
-                path,
-                tool,
-            };
             for seen in [&seen, &Seen::Every("fuzz")] {
-                if let Some(denial) = policy.deciding(at, &target, seen, &agents) {
-                    assert!(denial.halt.id.starts_with("policy:"));
-                    assert!(!denial.origins.is_empty());
-                    let event = authz::policy_denied_event(&call, &denial, &agents, 1);
-                    assert!(serde_json::from_str::<serde_json::Value>(event.str("wake.payload").unwrap()).is_ok());
+                let mut without_token = None;
+                for token in [None, Some(&delegated), Some(&cut)] {
+                    let target = Target {
+                        caller,
+                        token,
+                        receiver,
+                        path,
+                        tool,
+                    };
+                    let denial = policy.deciding(at, &target, seen, &agents);
+                    if let Some(denial) = &denial {
+                        assert!(denial.halt.id.starts_with("policy:"));
+                        assert!(!denial.origins.is_empty());
+                        let event = authz::policy_denied_event(&call, denial, &agents, 1);
+                        assert!(serde_json::from_str::<serde_json::Value>(event.str("wake.payload").unwrap()).is_ok());
+                    }
+                    match token {
+                        None => without_token = Some(denial.is_some()),
+                        Some(_) => assert!(denial.is_some() || without_token == Some(false)),
+                    }
                 }
             }
         }

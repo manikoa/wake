@@ -3,8 +3,12 @@
 //! can reach it without reaching the control API.
 //!
 //! ```text
-//! GET /v1/memory?agent=<id>   {"version", "locked_by", "hidden_by", "quarantines": [...]}
+//! GET /v1/memory?agent=<id>   {"version", "locked_by", "hidden_by", "quarantines": [...], "halts": [...]}
 //! ```
+//!
+//! The halts let an SDK stop its agent, or one instance of it such as an in-process
+//! sub-agent, in its own process: the calls that never reach the proxy, and the sub-agents
+//! the proxy can't tell from their parent because they share its credentials.
 //!
 //! Each fetch is noted, and the brake reads the notes from the control API to confirm an
 //! agent's adapter has the quarantine. The agent names itself, so that confirmation trusts

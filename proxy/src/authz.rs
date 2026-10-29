@@ -22,7 +22,7 @@ use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp;
-use crate::origins::{Observed, Who};
+use crate::origins::{self, Observed, Seen, Who};
 use crate::policy::{At, Denial, FlowPolicy, Policy, Target};
 use crate::token::{self, Token};
 
@@ -246,7 +246,8 @@ pub fn policy_denied_event(call: &Call, denial: &Denial, agents: &Agents, at: u6
     e
 }
 
-/// What a policy decides on for a call from caller: what entered it within the window.
+/// What a policy decides on for a call from caller: what entered it, or any agent the call
+/// is made under, within the window.
 pub fn check_policy(
     policy: &FlowPolicy,
     observed: &Observed,
@@ -255,7 +256,13 @@ pub fn check_policy(
     target: &Target<'_>,
     now: u64,
 ) -> Option<Denial> {
-    let seen = observed.seen(target.caller, now, policy.window_seconds);
+    let seen = if target.token.is_some_and(|t| t.cut) {
+        Seen::Every(origins::CUT_CHAIN)
+    } else {
+        let mut whos = origins::under(agents, target.token);
+        whos.insert(0, target.caller);
+        observed.seen_by(&whos, now, policy.window_seconds)
+    };
     policy.deciding(at_hook, target, &seen, agents)
 }
 
@@ -313,7 +320,10 @@ impl Authorization for Authorizer {
         let call = read_call(request.get_ref());
         let now = crate::halts::now();
         let agents = self.halts.agents();
-        let halts = self.halts.deciding(call.caller.as_deref(), call.receiver.as_deref());
+        self.halts.note_caller(call.caller.as_deref(), call.token.as_ref(), now);
+        let halts = self
+            .halts
+            .deciding_with(call.caller.as_deref(), call.receiver.as_deref(), call.token.as_ref());
         if !halts.is_empty() {
             self.counters.denied.fetch_add(1, Ordering::Relaxed);
             self.events.send(denied_event(&call, &halts, agents, now));
@@ -321,6 +331,7 @@ impl Authorization for Authorizer {
         }
         let target = Target {
             caller: Who::of(agents, call.caller.as_deref()),
+            token: call.token.as_ref(),
             receiver: call.receiver.as_deref(),
             path: Some(&call.path),
             tool: None,
@@ -439,6 +450,7 @@ mod tests {
                 Scope {
                     fleet: false,
                     agents: vec!["support/researcher#toolu_1".into()],
+                    tokens: vec![],
                 },
                 1,
             )
@@ -463,6 +475,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_halt_on_the_parent_denies_its_sub_agents_and_each_caller_is_noted() {
+        let halts = Arc::new(Halts::in_memory());
+        let counters = Arc::new(Counters::default());
+        let (tx, mut rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let authz = Authorizer::new(halts.clone(), tx, counters);
+        halts.put("halt-support", halted(&["support"]), 1).unwrap();
+        let denied = authz
+            .check(Request::new(delegated("support/researcher#toolu_1")))
+            .await
+            .unwrap();
+        assert_eq!(denied_by(denied.get_ref()).unwrap().0, "halt-support");
+        let event = rx.try_recv().unwrap().event;
+        assert_eq!(event.str("wake.agent.id"), Some("support/researcher#toolu_1"));
+        assert_eq!(event.str("wake.brake.halt_id"), Some("halt-support"));
+        let allowed = authz
+            .check(Request::new(check(Some("research"), "", None, &[])))
+            .await
+            .unwrap();
+        assert_eq!(allowed.get_ref().status.as_ref().unwrap().code, 0);
+
+        // Allowed or not, each caller is noted for the brake, with what its token said.
+        let callers = halts.callers();
+        let child = &callers["support/researcher#toolu_1"];
+        assert_eq!(child.subject.as_deref(), Some("user-42"));
+        assert_eq!(child.actors, ["support/researcher#toolu_1", "support"]);
+        assert_eq!(child.tokens, ["tok-7"]);
+        assert_eq!(child.calls, 1);
+        assert!(callers["research"].tokens.is_empty());
+        assert_eq!(callers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_halt_by_token_denies_only_calls_with_it() {
+        let halts = Arc::new(Halts::in_memory());
+        let counters = Arc::new(Counters::default());
+        let (tx, _rx) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+        let authz = Authorizer::new(halts.clone(), tx, counters);
+        let scope = Scope {
+            tokens: vec!["tok-7".into()],
+            ..Default::default()
+        };
+        halts.put("halt-token", scope, 1).unwrap();
+        let denied = authz
+            .check(Request::new(delegated("support/researcher#toolu_1")))
+            .await
+            .unwrap();
+        assert_eq!(denied_by(denied.get_ref()).unwrap().0, "halt-token");
+        // The same caller with no token, and a caller nobody can name, go on.
+        for request in [
+            check(Some("support/researcher#toolu_1"), "", None, &[]),
+            check(None, "", None, &[]),
+        ] {
+            let allowed = authz.check(Request::new(request)).await.unwrap();
+            assert_eq!(allowed.get_ref().status.as_ref().unwrap().code, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn denies_in_scope_records_it_and_allows_the_rest() {
         let halts = Arc::new(Halts::in_memory());
         let counters = Arc::new(Counters::default());
@@ -482,6 +552,7 @@ mod tests {
                 Scope {
                     fleet: false,
                     agents: vec!["billing".into()],
+                    tokens: vec![],
                 },
                 1,
             )
@@ -543,6 +614,7 @@ mod tests {
         Scope {
             fleet: agents.is_empty(),
             agents: agents.iter().map(|a| a.to_string()).collect(),
+            tokens: vec![],
         }
     }
 

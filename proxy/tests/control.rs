@@ -209,6 +209,106 @@ async fn what_the_brake_puts_is_what_ext_authz_enforces() {
 }
 
 #[tokio::test]
+async fn the_brake_halts_a_token_and_sees_who_has_called() {
+    let c = control().await;
+    let brake = client(&c, &c.brake);
+    let counters = Arc::new(Counters::default());
+    let (events, _recorded) = Events::channel(8, Budget::new(1 << 20), counters.clone());
+    let authz = Authorizer::new(c.halts.clone(), events, counters);
+    let billing = Request::new(CheckRequest {
+        attributes: Some(AttributeContext {
+            source: Some(Peer {
+                principal: "spiffe://wake.local/agent/billing".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    });
+    authz.check(billing).await.unwrap();
+
+    // Whom the deny lever has seen, so the brake can tell what a halt can stop alone.
+    let callers: serde_json::Value = brake
+        .get(format!("{}/v1/callers", c.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let seen = &callers["spiffe://wake.local/agent/billing"];
+    assert_eq!(seen["calls"], 1);
+    assert!(seen["first_seen"].as_u64().unwrap() > 0);
+    assert_eq!(callers.as_object().unwrap().len(), 1);
+    // Or just one identity's.
+    for (identity, n) in [
+        ("spiffe://wake.local/agent/billing", 1),
+        ("spiffe://wake.local/agent/support", 0),
+    ] {
+        let named: serde_json::Value = brake
+            .get(reqwest::Url::parse_with_params(&format!("{}/v1/callers", c.url), [("identity", identity)]).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(named.as_object().unwrap().len(), n, "{identity}");
+    }
+
+    // A halt may name tokens alone.
+    let put = brake
+        .put(format!("{}/v1/halts/halt-token", c.url))
+        .json(&serde_json::json!({"scope": {"tokens": ["tok-7"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200);
+    let state: serde_json::Value = put.json().await.unwrap();
+    assert_eq!(state["halts"][0]["scope"]["tokens"][0], "tok-7");
+    assert!(c.halts.deciding(Some("billing"), None).is_empty(), "it covers no agent");
+    let empty = brake
+        .put(format!("{}/v1/halts/halt-2", c.url))
+        .json(&serde_json::json!({"scope": {"agents": [], "tokens": []}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), 400);
+    assert_eq!(
+        empty.text().await.unwrap(),
+        "a halt needs a scope: the fleet, agents or tokens"
+    );
+    for scope in [
+        serde_json::json!({"tokens": [""]}),
+        serde_json::json!({"agents": ["billing", " "]}),
+    ] {
+        let blank = brake
+            .put(format!("{}/v1/halts/halt-2", c.url))
+            .json(&serde_json::json!({ "scope": scope }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blank.status(), 400, "{scope}: it would stop nothing");
+    }
+    // A field the scope doesn't know is refused, not dropped: it would cover less than asked.
+    let misspelled = brake
+        .put(format!("{}/v1/halts/halt-2", c.url))
+        .json(&serde_json::json!({"scope": {"agents": ["billing"], "token": ["tok-8"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(misspelled.status().is_client_error(), "{}", misspelled.status());
+    assert_eq!(c.halts.state().halts.len(), 1, "only the token halt");
+    // Only the brake reads the callers.
+    assert!(
+        client(&c, &c.proxy)
+            .get(format!("{}/v1/callers", c.url))
+            .send()
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn a_quarantine_reaches_the_memory_adapters() {
     let c = control().await;
     let brake = client(&c, &c.brake);
@@ -257,6 +357,19 @@ async fn a_quarantine_reaches_the_memory_adapters() {
         .await
         .unwrap();
     assert_eq!(empty.status(), 400);
+    // A memory adapter never sees a token: a lock by one would lock nothing.
+    for lock in [
+        serde_json::json!({"tokens": ["tok-7"]}),
+        serde_json::json!({"agents": [" "]}),
+    ] {
+        let refused = brake
+            .put(format!("{}/v1/quarantines/q2", c.url))
+            .json(&serde_json::json!({"selection": {"lock": lock}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400, "{lock}");
+    }
     let released = brake
         .delete(format!("{}/v1/quarantines/q1", c.url))
         .send()

@@ -190,6 +190,7 @@ mod tests {
                 Scope {
                     fleet: true,
                     agents: vec![],
+                    tokens: vec![],
                 },
                 1,
             )
