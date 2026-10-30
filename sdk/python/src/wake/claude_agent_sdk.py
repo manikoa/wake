@@ -31,7 +31,8 @@ but can't carry the link.
 Given the brake's rules (WakeClaudeAgent(recorder, quarantine=Quarantine(...))), the
 hooks also stop the agent, or one subagent instance of it, in its own process: a tool
 call a halt covers is refused before it runs, and recorded as denied, an Agent tool call
-too, which then starts no subagent. That reaches what the proxy deny can't, such as Bash,
+too, which then starts no subagent, and so is an Agent tool call that would start a
+subagent of a type a halt covers. That reaches what the proxy deny can't, such as Bash,
 and subagents that call with their parent's credentials, which the proxy can't tell from
 their parent. It's a cooperative stop: it holds only while the agent's code does, and a
 compromised agent can leave it out.
@@ -101,6 +102,12 @@ def _text(content: Any) -> str:
 
 def _context(span) -> Any:
     return trace.set_span_in_context(span) if span is not None else None
+
+
+def _subagent(agent: str, arguments: Any) -> str:
+    """The agent an Agent tool call starts: <agent>/<its subagent type>."""
+    subagent_type = arguments.get("subagent_type") if isinstance(arguments, dict) else None
+    return f"{agent}/{subagent_type or 'general-purpose'}"
 
 
 class _Thread:
@@ -197,6 +204,7 @@ class WakeClaudeAgent(EventGraph):
         the README."""
         super().__init__(recorder)
         self._quarantine = quarantine
+        stop.stops_with(quarantine)
         self._tools: dict[str, _Tool] = _Recent()  # tool use id -> its open tool call
         self._waiting = _Recent()  # (tool name, arguments) -> tool use ids an in-process tool may be
         self._tool_agents = _Recent()  # tool call event id -> the agent making it
@@ -290,7 +298,8 @@ class WakeClaudeAgent(EventGraph):
         or the Agent tool's result. Before that, Wake can't tell which instance is calling: it
         could be any the session started, or one started by any of them that the stream hasn't
         shown yet, since hooks can run ahead of the code reading it. So the call is refused if a
-        halt covers any of them. A check that fails refuses the call too."""
+        halt covers any of them. An Agent tool call is refused too when a halt covers the
+        subagent type it would start. A check that fails refuses the call too."""
         if self._quarantine is None:
             return None
         who = self._recorder.agent
@@ -307,6 +316,10 @@ class WakeClaudeAgent(EventGraph):
                 who = known[0]
             unplaced = self._instances(hook_input.get("session_id")) if agent_id and not known else ()
             refused = stop.refusal(self._quarantine, who, names, unplaced=unplaced)
+            if refused is None and hook_input.get("tool_name") in SUBAGENT_TOOLS:
+                # What it would start: a new instance of that type, which no halt can name yet.
+                target = _subagent(self._recorder.agent, hook_input.get("tool_input"))
+                refused = stop.refusal(self._quarantine, target, {target})
         except Exception:
             log.warning("wake: couldn't check the halts for a tool call; refusing it", exc_info=True)
             refused = stop.unchecked()
@@ -645,7 +658,7 @@ class WakeClaudeAgent(EventGraph):
             self._requested(run, thread, parents, block.id, block.name, block.input)
             return
         arguments = block.input if isinstance(block.input, dict) else {}
-        target = f"{self._recorder.agent}/{arguments.get('subagent_type') or 'general-purpose'}"
+        target = _subagent(self._recorder.agent, arguments)
         prompt = arguments.get("prompt")
         spawn = _Spawn(thread, block.name, block.input, parents)
         given = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else []

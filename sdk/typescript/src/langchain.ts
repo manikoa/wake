@@ -20,9 +20,10 @@
  *
  * Causal edges follow the messages: a model call's parents are the events that produced the
  * AI and tool messages in its context, and a tool call's parent is the model call that
- * requested it. When an app builds its prompts from strings, so no message ids link them, an
- * event's parents are the earlier events in the same trace whose output appears in its
- * input. See docs/events.md.
+ * requested it. A message from one run to another descends from the sender's latest event,
+ * however the app words it. When an app builds its prompts from strings, so no message ids
+ * link them, an event's parents are the earlier events in the same trace whose output appears
+ * in its input. See docs/events.md.
  *
  * A tool made with LangChain's tool() runs with its event current, so an MCP or A2A call it
  * makes, or a memory write, links back to it, and so does a run it starts.
@@ -30,8 +31,13 @@
  * Given the brake's rules (new WakeCallbackHandler(recorder, { quarantine })), the handler also
  * stops an agent, or one run of it, in its own process: agent() refuses to start a run a halt
  * covers, throwing AgentHalted, and a LangGraph WakeToolNode (wake-sdk/langgraph) refuses a tool
- * call a halt covers before it runs, telling the model why. Both are recorded as denied. It's a
- * cooperative stop: it holds only while the agent's code does.
+ * call a halt covers before it runs, telling the model why. Any other tool call a halt covers,
+ * as from createReactAgent's ToolNode, a node of the app's own or a direct invoke, is refused
+ * as it starts: the handler throws AgentHalted from its tool start callback, and its raiseError
+ * has LangChain pass that on, so the tool never runs. A ToolNode answers the model with it as
+ * an error message, as it does any error by default; with handleToolErrors off it throws,
+ * ending the graph's run. Each refusal is recorded as denied, once. It's a cooperative stop: it
+ * holds only while the agent's code does.
  */
 
 import { randomUUID } from "node:crypto";
@@ -50,7 +56,7 @@ import * as links from "./links.ts";
 import { log } from "./log.ts";
 import type { Recorder } from "./recorder.ts";
 import { registerToolCall, unregisterToolCall } from "./registry.ts";
-import { AgentHalted, refusal, unchecked, type Halts, type Refusal } from "./stop.ts";
+import { AgentHalted, refusal, stopsWith, unchecked, type Halts, type Refusal } from "./stop.ts";
 
 export { AgentHalted } from "./stop.ts";
 
@@ -95,13 +101,15 @@ export class AgentRun {
   // Started inside another agent's run, it's an instance of its own, started by that one.
   readonly instance: string | undefined;
   readonly lineage: readonly string[] = [];
-  readonly #handler: WakeCallbackHandler;
+  readonly _handler: WakeCallbackHandler;
   // The message that started this run feeds its next event.
   _nextParents: string[] = [];
   _nextOrigins: string[] = [];
+  // The latest event recorded in this run, which a message it sends descends from.
+  _latest: string | undefined;
 
   constructor(handler: WakeCallbackHandler, agent: string, span: Span | undefined, parent: AgentRun | undefined) {
-    this.#handler = handler;
+    this._handler = handler;
     this.agent = agent;
     this._span = span;
     this._parent = parent;
@@ -115,10 +123,10 @@ export class AgentRun {
   reply(content: unknown): void {
     if (this._parent === undefined) return;
     try {
-      this.#handler._recordMessage(this, this._parent, content);
+      this._handler._recordMessage(this, this._parent, content);
     } catch (error) {
       log.warn("failed to record reply", error);
-      failed(this.#handler._recorder, "reply");
+      failed(this._handler._recorder, "reply");
     }
   }
 
@@ -147,7 +155,8 @@ class Installed extends BaseCallbackHandler {
   handler: WakeCallbackHandler | undefined;
 
   constructor(handler: WakeCallbackHandler) {
-    super({ _awaitHandler: true });
+    // It passes on a refused tool call's AgentHalted, as the handler does.
+    super({ _awaitHandler: true, raiseError: true });
     this.handler = handler;
   }
 
@@ -189,16 +198,18 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
   #installed: Installed | undefined;
 
   /**
-   * With quarantine, the brake's rules for the agent (Quarantine), agent() and WakeToolNode
-   * stop what a halt covers.
+   * With quarantine, the brake's rules for the agent (Quarantine), agent(), WakeToolNode and
+   * every tool call stop what a halt covers.
    */
   constructor(recorder: Recorder, { quarantine }: { quarantine?: Halts } = {}) {
     // Callbacks are awaited, in order, so a tool call finds the model call that requested
     // it and is recorded before the tool runs. The work done here is small and never waits
-    // on the network.
-    super({ _awaitHandler: true });
+    // on the network. LangChain passes on what a callback throws: recording never throws, so
+    // the only error that reaches it is a refused tool call's AgentHalted.
+    super({ _awaitHandler: true, raiseError: true });
     this._recorder = recorder;
     this.#quarantine = quarantine;
+    stopsWith(quarantine);
   }
 
   override copy(): this {
@@ -389,9 +400,13 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
     runName?: string,
     toolCallId?: string,
   ): void {
+    const serialized = (tool ?? {}) as { name?: string; kwargs?: { name?: string } };
+    const name = runName || serialized?.name || serialized?.kwargs?.name || "tool";
+    // The stop for any tool call a WakeToolNode didn't refuse: thrown here, before the tool's
+    // run is opened, it never runs, and nothing but the refusal is recorded.
+    const refused = this.#refuseTool({ name, id: toolCallId, args: parsed(input) });
+    if (refused !== undefined) throw new AgentHalted(refused);
     this.#safely("handleToolStart", () => {
-      const serialized = (tool ?? {}) as { name?: string; kwargs?: { name?: string } };
-      const name = runName || serialized.name || serialized.kwargs?.name || "tool";
       parentRuns.set(runId, parentRunId);
       const requestedBy = toolCallId ? this.#eventByToolCall.get(toolCallId) : undefined;
       const attributes: Record<string, string> = { "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name };
@@ -429,11 +444,21 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
   // Cooperative stops.
 
   /**
-   * The answer to a tool call a halt covers, by the agent making it, the run it's in and what
-   * started that run, recorded as denied; undefined for a call to run. WakeToolNode
-   * (wake-sdk/langgraph) asks before each call.
+   * The answer to a tool call a halt covers, recorded as denied; undefined for a call to run.
+   * WakeToolNode (wake-sdk/langgraph) asks before each call.
    */
   _toolRefusal(call: { name?: string; args?: unknown; id?: string }): ToolMessage | undefined {
+    const refused = this.#refuseTool(call);
+    if (refused === undefined) return undefined;
+    return new ToolMessage({ content: refused[1], tool_call_id: call.id ?? "", name: call.name || "tool", status: "error" });
+  }
+
+  /**
+   * The refusal of a tool call about to run, if a halt covers the agent making it, the run it's
+   * in or what started that run, recorded as denied; undefined for a call to run. Never throws:
+   * a check that fails refuses.
+   */
+  #refuseTool(call: { name?: string; args?: unknown; id?: string }): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
     const run = currentRun.getStore();
     let who = this._recorder.agent;
@@ -455,7 +480,7 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
     const [halt, reason] = refused;
     this.#safely("refused tool call", () => this.#refusedCall(run, name, call, halt, reason));
     log.warn(`refused a ${name} call of ${who}: ${halt}`);
-    return new ToolMessage({ content: reason, tool_call_id: call.id ?? "", name, status: "error" });
+    return refused;
   }
 
   /** Throws AgentHalted, recording the attempt, if a halt covers the run of name about to start here. */
@@ -500,12 +525,13 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
 
   /**
    * Records a run a halt refused to start: the attempt to hand it its task, in the name of what
-   * tried. Nothing entered the run, so it has no origins.
+   * tried, descending from what tried's latest event. Nothing entered the run, so it has no
+   * origins.
    */
   #refusedStart(sender: AgentRun | undefined, name: string, content: unknown, halt: string): void {
     const context = sender?._span !== undefined ? trace.setSpan(ROOT_CONTEXT, sender._span) : this._eventContext();
     const traceId = traceIdOf(context);
-    const parents = traceId && content !== undefined && content !== null ? this._matchingOutputs(traceId, text(content)) : [];
+    const parents = [...this.#latestOf(sender), ...(traceId && content !== undefined && content !== null ? this._matchingOutputs(traceId, text(content)) : [])];
     const agent = sender?.agent ?? this._recorder.agent;
     this.#denied(
       `agent_message ${agent} -> ${name}`,
@@ -529,7 +555,9 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
     context: Context | undefined,
   ): string {
     const eventId = randomUUID();
+    parents = unique(parents);
     this._rememberLineage(eventId, parents, origins);
+    this.#latestIn(run, eventId);
     const span = this._recorder.tracer.startSpan(
       name,
       {
@@ -594,17 +622,19 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
   }
 
   /**
-   * Records a message from one agent to another as an event in the receiver's run. Its
-   * parents are the sender's events whose output it carries, and its origin is the sender:
-   * this is where the content enters the receiver.
+   * Records a message from one agent to another as an event in the receiver's run. Its parents
+   * are the sender's latest event, since an app may word the message its own way, and the
+   * events whose output it carries. Its origin is the sender: this is where the content enters
+   * the receiver.
    */
   _recordMessage(sender: AgentRun, receiver: AgentRun, content: unknown): string | undefined {
     if (receiver._span === undefined) return undefined;
     const body = text(content);
     const traceId = receiver._span.spanContext().traceId;
     const eventId = randomUUID();
-    const parents = this._matchingOutputs(traceId, body);
+    const parents = unique([...this.#latestOf(sender), ...this._matchingOutputs(traceId, body)]);
     this._rememberLineage(eventId, parents, [`agent:${sender.agent}`]);
+    this.#latestIn(receiver, eventId);
     const span = this._recorder.tracer.startSpan(
       `agent_message ${sender.agent} -> ${receiver.agent}`,
       {
@@ -670,6 +700,7 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
     const eventId = randomUUID();
     parents = unique(parents);
     this._rememberLineage(eventId, parents, origins);
+    this.#latestIn(run, eventId);
     const attributes: Record<string, string | string[]> = {
       [events.EVENT_ID]: eventId,
       [events.EVENT_KIND]: event.kind,
@@ -743,6 +774,16 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
     if (context !== undefined) return context;
     const run = currentRun.getStore();
     return run?._span !== undefined ? trace.setSpan(ROOT_CONTEXT, run._span) : undefined;
+  }
+
+  /** Notes the run's latest event, if it's one of this handler's runs: another handler recording the same calls keeps its own. */
+  #latestIn(run: AgentRun | undefined, eventId: string): void {
+    if (run?._handler === this) run._latest = eventId;
+  }
+
+  /** The run's latest event, as a parent, if it's one of this handler's runs. */
+  #latestOf(run: AgentRun | undefined): string[] {
+    return run?._handler === this && run._latest !== undefined ? [run._latest] : [];
   }
 
   override _currentAgent(): string {
@@ -851,6 +892,16 @@ export function text(content: unknown): string {
       .join("\n");
   }
   return typeof content === "object" ? events.dumps(content, { ensureAscii: false }) : String(content);
+}
+
+/** A tool call's input as LangChain passes it to a callback, JSON as the arguments it holds. */
+function parsed(input: unknown): unknown {
+  if (typeof input !== "string") return input;
+  try {
+    return JSON.parse(input);
+  } catch {
+    return input;
+  }
 }
 
 /** The string arguments of a tool call long enough to be matched against model output. */

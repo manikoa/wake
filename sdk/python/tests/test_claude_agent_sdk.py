@@ -630,44 +630,57 @@ def test_a_halt_check_that_fails_refuses_the_call_as_the_brake_fails_closed():
         UNCHECKED, "Wake couldn't check its halts, so this tool call wasn't run.")
 
 
+@pytest.mark.parametrize("halted", ["support", "support/researcher"], ids=["agent", "subagent_type"])
 @pytest.mark.parametrize("hook_first", [False, True], ids=["stream_first", "hook_first"])
-def test_a_spawn_a_halt_refuses_is_recorded_as_a_denied_call_whichever_comes_first(hook_first):
+def test_a_spawn_a_halt_refuses_is_recorded_as_a_denied_call_whichever_comes_first(hook_first, halted):
+    # A halt on the agent stops it starting anything; one on a subagent type stops any agent
+    # starting one of that type, though the agent itself goes on.
     exporter = InMemorySpanExporter()
     recorder = Recorder(agent="support", exporter=exporter)
     halts = Halts()
-    halts.halts = [{"id": "halt-support", "agents": ["support"]}]
-    ask, read = research("Check the refund window"), []
+    halts.halts = [{"id": "halt-support", "agents": [halted]}]
+    ask, read, seen, started = research("Check the refund window"), [], [], []
 
     async def script(cli: FakeClaudeCode) -> None:
+        seen.append(cli)
         await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
 
         async def asked():
             await cli.assistant("msg_1", {"type": "tool_use", "id": "toolu_agent", "name": "Agent", "input": ask})
 
         async def never():
-            raise AssertionError("a refused subagent never starts")
+            started.append("researcher")  # noted, not raised, so the run still ends if it does start
+            return "Started."
 
         if not hook_first:
             await asked()
             await until(lambda: any(isinstance(m, AssistantMessage) for m in read), "the Agent call is read")
         await cli.spawn("toolu_agent", ask, never, subagent_id="agent-researcher", ask=asked if hook_first else None)
-        await cli.assistant("msg_2", {"type": "text", "text": "I was stopped."})
+        await cli.assistant("msg_2", {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {"command": "date"}})
+        await cli.use_tool("toolu_bash", "Bash", {"command": "date"}, ok)
+        await cli.assistant("msg_3", {"type": "text", "text": "I was stopped."})
         await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
-                        "is_error": False, "num_turns": 2, "session_id": "session-1", "result": "I was stopped."})
+                        "is_error": False, "num_turns": 3, "session_id": "session-1", "result": "I was stopped."})
 
     asyncio.run(run_support(WakeClaudeAgent(recorder, quarantine=halts), script=script, read=read))
     recorder.flush()
     spans = exporter.get_finished_spans()
+    assert started == [], "a refused subagent never starts"
+    agent_halted = halted == "support"
     assert summary(spans) == [
         ("model_call", "support", "chat claude-opus-5-5"),
         ("denied", "support", "execute_tool Agent"),
         ("model_call", "support", "chat claude-opus-5-5"),
+        ("denied" if agent_halted else "tool_call", "support", "execute_tool Bash"),
+        ("model_call", "support", "chat claude-opus-5-5"),
     ]
+    assert seen[0].refused == ["toolu_agent", "toolu_bash"] if agent_halted else ["toolu_agent"]
     calls = [e for e in wake_events(spans) if e.attributes["wake.event.kind"] == "model_call"]
     refused = by_name(spans, "execute_tool Agent")
     assert refused.attributes["wake.brake.halt_id"] == "halt-support"
     assert refused.attributes["wake.parents"] == (event_id(calls[0]),), "the call that asked for it"
     assert json.loads(refused.attributes["wake.payload"])["input"] == ask
+    assert json.loads(refused.attributes["wake.payload"])["output"] == f"Wake halted {halted} (halt-support), so this tool call wasn't run."
     assert event_id(refused) in calls[1].attributes["wake.parents"], "the model read the refusal"
     assert not [s for s in spans if s.name.startswith("invoke_agent support/")]
 

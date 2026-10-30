@@ -246,6 +246,42 @@ def test_the_rules_say_who_is_halted(rules):
         assert q.halted({"billing"}) == "h-fleet"
 
 
+def test_each_fetch_gives_the_ttl_and_says_once_an_integration_stops_instances(rules):
+    from agents import Agent
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from wake import Recorder
+    from wake.claude_agent_sdk import WakeClaudeAgent
+    from wake.langchain import WakeCallbackHandler
+    from wake.openai_agents import WakeTracingProcessor
+
+    def fetched(q):
+        rules.fetched_by.clear()
+        assert q.fetch()
+        (query,) = rules.queries()
+        return query
+
+    recorder = Recorder(agent="support", exporter=InMemorySpanExporter())
+    q = Quarantine(rules.url, "support", start=False, ttl=2.5)
+    Memory(Session("support").handler, quarantine=q)
+    query = fetched(q)
+    assert query["ttl"] == ["3"], "in whole seconds, rounded up: the proxy holds the process back that long"
+    assert "stops" not in query, "a memory adapter stops no instance"
+    stopping = {
+        "claude": lambda q: WakeClaudeAgent(recorder, quarantine=q),
+        "langchain": lambda q: WakeCallbackHandler(recorder, quarantine=q),
+        "openai_agents": lambda q: WakeTracingProcessor(recorder, quarantine=q).guard(Agent(name="support")),
+    }
+    for name, uses in stopping.items():
+        q = Quarantine(rules.url, "support", start=False)
+        uses(q)
+        assert fetched(q) == {"agent": ["support"], "process": [q._process], "ttl": ["30"], "stops": ["1"]}, name
+    # Installed, OpenAI Agents stops nothing until guard() runs.
+    q = Quarantine(rules.url, "support", start=False)
+    WakeTracingProcessor(recorder, quarantine=q)
+    assert "stops" not in fetched(q)
+
+
 def test_stale_rules_halt_everyone(rules):
     q = Quarantine(rules.url, "support", start=False, ttl=0.2)
     assert q.fetch()

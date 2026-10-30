@@ -263,7 +263,8 @@ pub fn charter_denied_event(call: &Call, denial: &charters::Denial, agents: &Age
 }
 
 /// What a policy decides on for a call from caller: what entered it, or any agent the call
-/// is made under, within the window.
+/// is made under, within the window. Every origin when the caller could be any agent
+/// (origins::behind).
 pub fn check_policy(
     policy: &FlowPolicy,
     observed: &Observed,
@@ -272,12 +273,9 @@ pub fn check_policy(
     target: &Target<'_>,
     now: u64,
 ) -> Option<Denial> {
-    let seen = if target.token.is_some_and(|t| t.cut) {
-        Seen::Every(origins::CUT_CHAIN)
-    } else {
-        let mut whos = origins::under(agents, target.token);
-        whos.insert(0, target.caller);
-        observed.seen_by(&whos, now, policy.window_seconds)
+    let seen = match origins::behind(agents, target.caller, target.token) {
+        Ok(whos) => observed.seen_by(&whos, now, policy.window_seconds),
+        Err(why) => Seen::Every(why),
     };
     policy.deciding(at_hook, target, &seen, agents)
 }
@@ -737,6 +735,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.get_ref().status.as_ref().unwrap().code, 0);
+    }
+
+    #[test]
+    fn a_caller_the_agents_file_doesnt_list_or_place_has_every_origin() {
+        let agents =
+            Agents::from_json(br#"{"support": ["spiffe://wake.local/agent/support", "0oa1support"]}"#).unwrap();
+        let observed = Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS);
+        let now = crate::halts::now();
+        let pay = |policy: &str, agents: &Agents, caller: &str, token: Option<&Token>| {
+            let target = Target {
+                caller: Who::of(agents, Some(caller)),
+                token,
+                receiver: None,
+                path: None,
+                tool: Some("pay"),
+            };
+            let policy = FlowPolicy::parse(policy.as_bytes()).unwrap();
+            check_policy(&policy, &observed, agents, At::Mcp, &target, now)
+        };
+        let for_support = r#"{"rules": [{"id": "no-pay-after-web", "callers": ["support"], "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}]}"#;
+        // Support fetched a page, and starts a sub-agent under an SVID of its own, which the
+        // file doesn't list, with no token: nothing places it under support, so it could be
+        // support, page and all.
+        observed.note(
+            Who::of(&agents, Some("spiffe://wake.local/agent/support")),
+            "tool:fetch_page",
+            now,
+        );
+        let child = "spiffe://wake.local/agent/support/researcher";
+        let denial = pay(for_support, &agents, child, None).unwrap();
+        assert_eq!(
+            (denial.origins, denial.every),
+            (vec!["*".to_string()], Some(origins::UNPLACED))
+        );
+        // Its own token places it under support, and it's held to what entered support.
+        let own = Token {
+            subject: "0oa1support".into(),
+            actors: vec![child.into()],
+            ..Default::default()
+        };
+        let denial = pay(for_support, &agents, child, Some(&own)).unwrap();
+        assert_eq!(
+            (denial.origins, denial.every),
+            (vec!["tool:fetch_page".to_string()], None)
+        );
+        // Without an agents file, an identity is its own agent, and nothing entered this one.
+        let any_caller =
+            r#"{"rules": [{"id": "no-pay-after-web", "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}]}"#;
+        assert!(pay(any_caller, &agents, child, None).is_some());
+        assert_eq!(pay(any_caller, &Agents::none(), child, None), None);
     }
 
     #[tokio::test]

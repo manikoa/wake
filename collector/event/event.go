@@ -172,10 +172,10 @@ func digest(payload []byte) string {
 // payload's digest first, from the bytes received, so the signature commits to the
 // payload that arrived and not to a digest the sender claimed. An event with no payload
 // gets no digest. Any signature fields the sender set, such as a certificate, are dropped
-// first, so the entry carries only what this signer adds. Before any of that, the payload's
-// secrets are replaced (redact.go), so they never reach the log, and wake.payload.redacted
-// lists the kinds replaced; a list the sender set is dropped. It refuses an event whose
-// payload isn't text (see PayloadOf).
+// first, so the entry carries only what this signer adds. Before any of that, the
+// credentials Redact recognizes in the payload are replaced (redact.go), so those never
+// reach the log, and wake.payload.redacted lists the kinds replaced; a list the sender set
+// is dropped. It refuses an event whose payload isn't text (see PayloadOf).
 func Sign(span ptrace.Span, signer note.Signer) error {
 	span.Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
 		return key == Signer || strings.HasPrefix(key, Signature) || key == Redacted

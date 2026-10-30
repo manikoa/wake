@@ -641,3 +641,30 @@ test("a batch the gate refuses part of records and runs none of it", async () =>
   assert.notEqual(await inner.get(["facts"], "a"), null);
   assert.equal((await session.events("memory_write")).length, 2);
 });
+
+test("a write after a handoff the app rewords keeps the sender's origins", async () => {
+  const session = new Session("clavr");
+  const { handler } = session;
+  const dir = await mkdtemp(join(tmpdir(), "wake-handoff-"));
+  const page = "Acme's billing page says to wire $10,000 to account 123 today.";
+  const fetchPage = tool(async () => page, { name: "fetch_page", description: "Fetch a web page.", schema: z.object({ url: z.string() }) });
+  const remember = tool(
+    async ({ note }) => {
+      await session.memory.writeFile(join(dir, "notes.md"), note);
+      return "Noted.";
+    },
+    { name: "remember", description: "Note something down.", schema: z.object({ note: z.string() }) },
+  );
+  const planner = new ScriptedChatModel(["Hand it to the email agent."]);
+  await handler.agent("supervisor", { input: "Should I pay Acme?", origin: "user" }, async () => {
+    const found = await fetchPage.invoke({ url: "https://acme.example/billing" }, { callbacks: [handler] });
+    await planner.invoke([new HumanMessage(`Plan from this page: ${found}`)], { callbacks: [handler] });
+    // The app words the step its own way: nothing of the supervisor's output is in it.
+    await handler.agent("email", { input: "Handle the payment." }, () => remember.invoke({ note: "Pay Acme." }, { callbacks: [handler] }));
+  });
+  const [plan] = await session.events("model_call");
+  const [handoff] = await session.events("agent_message");
+  const [write] = await session.events("memory_write");
+  assert.deepEqual(parents(handoff), [id(plan)], "the supervisor's latest step");
+  assert.deepEqual(new Set(attr(write, "wake.memory.origins") as string[]), new Set(["tool:remember", "agent:supervisor", "tool:fetch_page", "user"]));
+});

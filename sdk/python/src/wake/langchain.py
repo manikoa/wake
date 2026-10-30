@@ -21,16 +21,22 @@ started by that run (docs/events.md), so two runs of one agent at once can be to
 
 Causal edges follow the messages: a model call's parents are the events that
 produced the AI and tool messages in its context, and a tool call's parent is
-the model call that requested it. When an app builds its prompts from strings,
-so no message ids link them, an event's parents are the earlier events in the
+the model call that requested it. A message from one run to another descends from the
+sender's latest event, however the app words it. When an app builds its prompts from
+strings, so no message ids link them, an event's parents are the earlier events in the
 same trace whose output appears in its input. See docs/events.md.
 
 Given the brake's rules (WakeCallbackHandler(recorder, quarantine=Quarantine(...))), the
 handler also stops an agent, or one run of it, in its own process: agent() refuses to
 start a run a halt covers, raising AgentHalted, and a LangGraph ToolNode given the
 handler's wrap_tool_call and awrap_tool_call refuses a tool call a halt covers before it
-runs, telling the model why. Both are recorded as denied. It's a cooperative stop: it
-holds only while the agent's code does.
+runs, telling the model why. Any other tool call a halt covers, as from
+create_react_agent's ToolNode, a node of the app's own or a direct invoke, is refused as
+it starts: the handler raises AgentHalted from its tool start callback, and its
+raise_error has LangChain pass that on, so the tool never runs. A ToolNode then raises it,
+ending the graph's run, unless its handle_tool_errors catches every error, when the model
+gets it as an error message. Each refusal is recorded as denied, once. It's a cooperative
+stop: it holds only while the agent's code does.
 """
 
 import asyncio
@@ -96,6 +102,8 @@ class AgentRun:
         # The message that started this run feeds its next event.
         self._next_parents: list[str] = []
         self._next_origins: list[str] = []
+        # The latest event recorded in this run, which a message it sends descends from.
+        self._latest: str | None = None
 
     def reply(self, content: Any) -> None:
         """Record this agent's answer going back to the agent that handed off to it."""
@@ -119,12 +127,17 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
     # the model call that requested it. The work done here is small and
     # never waits on the network.
     run_inline = True
+    # LangChain passes on what a callback raises. Recording never raises, so the only
+    # error that reaches it is a refused tool call's AgentHalted. The callbacks are
+    # synchronous, so it reaches sync and async runs alike.
+    raise_error = True
 
     def __init__(self, recorder: Recorder, quarantine: "Quarantine | None" = None) -> None:
-        """With quarantine, the brake's rules for the agent (wake.quarantine), agent() and the
-        ToolNode wrappers stop what a halt covers."""
+        """With quarantine, the brake's rules for the agent (wake.quarantine), agent(), the
+        ToolNode wrappers and every tool call stop what a halt covers."""
         EventGraph.__init__(self, recorder)
         self._quarantine = quarantine
+        stop.stops_with(quarantine)
         self._call_context = _Recent()  # tool call id -> the span context of the model call that requested it
         self._parent_run = _Recent()  # run id -> parent run id
         self._spans = _Recent()  # open spans by run id
@@ -322,6 +335,11 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         **kwargs,
     ) -> None:
         name = (serialized or {}).get("name") or kwargs.get("name") or "tool"
+        # The stop for any tool call a ToolNode's wrappers didn't refuse: raised here, before
+        # the tool's run is opened, it never runs, and nothing but the refusal is recorded.
+        refused = self._refuse_tool({"name": name, "id": tool_call_id, "args": inputs if inputs is not None else input_str})
+        if refused is not None:
+            raise AgentHalted(refused)
         with self._lock:
             self._parent_run[run_id] = parent_run_id
             requested_by = self._event_by_tool_call.get(tool_call_id) if tool_call_id else None
@@ -397,13 +415,23 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         return await execute(request) if refused is None else refused
 
     def _tool_refusal(self, request) -> ToolMessage | None:
-        """The answer to a tool call a halt covers, by the agent making it, the run it's in and
-        what started that run; None for a call to run."""
+        """The answer to a tool call a halt covers, recorded as denied; None for a call to run."""
+        call = getattr(request, "tool_call", None)
+        call = call if isinstance(call, dict) else {}
+        refused = self._refuse_tool(call)
+        if refused is None:
+            return None
+        return ToolMessage(content=refused.reason, tool_call_id=call.get("id") or "", name=call.get("name") or "tool",
+                           status="error")
+
+    def _refuse_tool(self, call: dict) -> "stop.Refusal | None":
+        """The refusal of a tool call about to run, if a halt covers the agent making it, the
+        run it's in or what started that run, recorded as denied; None for a call to run. Never
+        raises: a check that fails refuses."""
         if self._quarantine is None:
             return None
-        run, who, call = _current_run.get(), self._recorder.agent, {}
+        run, who = _current_run.get(), self._recorder.agent
         try:
-            call = request.tool_call if isinstance(request.tool_call, dict) else {}
             names = {self._recorder.agent}
             if run is not None:
                 names.update((run.agent, *run.lineage))
@@ -419,7 +447,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         name = call.get("name") or "tool"
         self._refused_call(run, name, call, refused)
         log.warning("wake: refused a %s call of %s: %s", name, who, refused.halt)
-        return ToolMessage(content=refused.reason, tool_call_id=call.get("id") or "", name=name, status="error")
+        return refused
 
     def _refuse_start(self, name: str, input: Any) -> None:
         """Raises AgentHalted, recording the attempt, if a halt covers the run of name about
@@ -467,13 +495,15 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
     @never_raise
     def _refused_start(self, sender: AgentRun | None, name: str, content: Any, refused: stop.Refusal) -> None:
         """Records a run a halt refused to start: the attempt to hand it its task, in the name
-        of what tried. Nothing entered the run, so it has no origins."""
+        of what tried, descending from what tried's latest event. Nothing entered the run, so
+        it has no origins."""
         if sender is not None and sender._span is not None:
             context = trace.set_span_in_context(sender._span)
         else:
             context = EventGraph._event_context(self)
         trace_id = trace.get_current_span(context).get_span_context().trace_id if context is not None else 0
-        parents = self._matching_outputs(trace_id, _text(content)) if trace_id and content is not None else []
+        parents = self._latest_of(sender)
+        parents += self._matching_outputs(trace_id, _text(content)) if trace_id and content is not None else []
         agent = sender.agent if sender is not None else self._recorder.agent
         self._denied(f"agent_message {agent} -> {name}", sender, parents, [],
                      {"gen_ai.agent.name": name, "wake.brake.halt_id": refused.halt, "wake.brake.receiver": name},
@@ -483,7 +513,9 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                 attributes: dict[str, Any], payload: Any, context) -> str:
         """Records a denied event, ended as soon as it starts, and returns its id."""
         event_id = str(uuid.uuid4())
+        parents = list(dict.fromkeys(parents))
         self._remember_lineage(event_id, parents, origins)
+        self._latest_in(run, event_id)
         span = self._recorder.tracer.start_span(span_name, context=context, attributes={
             events.EVENT_ID: event_id,
             events.EVENT_KIND: events.DENIED,
@@ -543,16 +575,18 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
     def _record_message(self, *, sender: AgentRun, receiver: AgentRun, content: Any) -> str | None:
         """Record a message from one agent to another as an event in the receiver's run.
 
-        Its parents are the sender's events whose output it carries, and its
-        origin is the sender: this is where the content enters the receiver.
+        Its parents are the sender's latest event, since an app may word the message
+        its own way, and the events whose output it carries. Its origin is the sender:
+        this is where the content enters the receiver.
         """
         if receiver._span is None:
             return None
         text = _text(content)
         trace_id = receiver._span.get_span_context().trace_id
         event_id = str(uuid.uuid4())
-        parents = self._matching_outputs(trace_id, text)
+        parents = list(dict.fromkeys(self._latest_of(sender) + self._matching_outputs(trace_id, text)))
         self._remember_lineage(event_id, parents, [f"agent:{sender.agent}"])
+        self._latest_in(receiver, event_id)
         attributes = {
             events.EVENT_ID: event_id,
             events.EVENT_KIND: events.AGENT_MESSAGE,
@@ -617,6 +651,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         event_id = str(uuid.uuid4())
         parents = list(dict.fromkeys(parents))
         self._remember_lineage(event_id, parents, origins)
+        self._latest_in(run, event_id)
         attributes = {
             events.EVENT_ID: event_id,
             events.EVENT_KIND: kind,
@@ -698,6 +733,16 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         if run is not None and run._span is not None:
             return trace.set_span_in_context(run._span)
         return None
+
+    def _latest_in(self, run: AgentRun | None, event_id: str) -> None:
+        """Notes the run's latest event, if it's one of this handler's runs: another handler
+        recording the same calls keeps its own."""
+        if run is not None and run._handler is self:
+            run._latest = event_id
+
+    def _latest_of(self, run: AgentRun | None) -> list[str]:
+        """The run's latest event, as a parent, if it's one of this handler's runs."""
+        return [run._latest] if run is not None and run._handler is self and run._latest else []
 
     def _current_agent(self) -> str:
         run = _current_run.get()

@@ -78,7 +78,7 @@
   {
     "name": "basic credentials",
     "in": "{\"headers\":\"Authorization: Basic dXNlcjpodW50ZXIyLXN1cGVyLXNlY3JldC1wYXNzd29yZA==\"}",
-    "out": "{\"headers\":\"Authorization: [redacted basic_auth sha256:170a5e977a83]\"}",
+    "out": "{\"headers\":\"Authorization: [redacted basic_auth]\"}",
     "kinds": [
       "basic_auth"
     ]
@@ -259,7 +259,7 @@
   {
     "name": "a password in a url",
     "in": "{\"env\":\"DATABASE_URL=postgres://app:Sup3rS3cretPassw0rd@db.internal:5432/prod\"}",
-    "out": "{\"env\":\"DATABASE_URL=postgres://app:[redacted url_password sha256:ff4e03224bee]@db.internal:5432/prod\"}",
+    "out": "{\"env\":\"DATABASE_URL=postgres://app:[redacted url_password]@db.internal:5432/prod\"}",
     "kinds": [
       "url_password"
     ]
@@ -353,5 +353,110 @@
     "in": "{\"output\":\"\\u00AAIzaSyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q\"}",
     "out": "{\"output\":\"\\u00AAIzaSyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q\"}",
     "kinds": []
+  },
+  {
+    "name": "a stripe key cut short at the end of an sdk's prefix",
+    "in": "{\"bytes\": 5000000, \"prefix\": \"{\\\"input\\\": {\\\"env\\\": \\\"STRIPE=sk\u005flive\u005f4eC39HqLyjWDarjtT1zd\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "out": "{\"bytes\": 5000000, \"prefix\": \"{\\\"input\\\": {\\\"env\\\": \\\"STRIPE=[redacted stripe_key sha256:7a71cbb0e2eb]\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "kinds": [
+      "stripe_key"
+    ]
+  },
+  {
+    "name": "a jwt cut short in the proxy's output keeps its jti",
+    "in": "{\"input\":{\"name\":\"read_token\",\"arguments\":{}},\"output\":\"{\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"eyJhbGciOiJFUzI1NiJ9.eyJqdGkiOiJ0b2stNyJ9.c2lnbmF0\",\"truncated\":true}",
+    "out": "{\"input\":{\"name\":\"read_token\",\"arguments\":{}},\"output\":\"{\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"[redacted jwt sha256:3fed0e4a1c8c jti:tok-7]\",\"truncated\":true}",
+    "kinds": [
+      "jwt"
+    ]
+  },
+  {
+    "name": "a github token cut short in a message between agents",
+    "in": "{\"from\":\"billing\",\"to\":\"support\",\"content\":\"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"method\\\":\\\"message/send\\\",\\\"params\\\":{\\\"message\\\":{\\\"parts\\\":[{\\\"text\\\":\\\"use ghp_a1B2c3D4e5F6g7H8i9\",\"truncated\":true}",
+    "out": "{\"from\":\"billing\",\"to\":\"support\",\"content\":\"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"method\\\":\\\"message/send\\\",\\\"params\\\":{\\\"message\\\":{\\\"parts\\\":[{\\\"text\\\":\\\"use [redacted github_token sha256:5dc1686dbcc3]\",\"truncated\":true}",
+    "kinds": [
+      "github_token"
+    ]
+  },
+  {
+    "name": "credentials cut short at the end of both the proxy's input and output",
+    "in": "{\"input\":\"{\\\"token\\\":\\\"sk-proj-AbCdEf\",\"output\":\"{\\\"note\\\":\\\"keys:\\\\nAIzaSyA1b2C3d4\",\"truncated\":true}",
+    "out": "{\"input\":\"{\\\"token\\\":\\\"[redacted llm_api_key sha256:3c3e0442c4a7]\",\"output\":\"{\\\"note\\\":\\\"keys:\\\\n[redacted google_api_key sha256:ac87e0f4f4c3]\",\"truncated\":true}",
+    "kinds": [
+      "google_api_key",
+      "llm_api_key"
+    ]
+  },
+  {
+    "name": "a bearer token cut short",
+    "in": "{\"input\":\"{\\\"headers\\\":{\\\"Authorization\\\":\\\"Bearer 2YotnFZFEjr1zC\",\"output\":null,\"truncated\":true}",
+    "out": "{\"input\":\"{\\\"headers\\\":{\\\"Authorization\\\":\\\"[redacted bearer_token sha256:60a05f6ae5c1]\",\"output\":null,\"truncated\":true}",
+    "kinds": [
+      "bearer_token"
+    ]
+  },
+  {
+    "name": "basic credentials cut short, which no longer decode",
+    "in": "{\"bytes\": 5000000, \"prefix\": \"{\\\"headers\\\": \\\"Authorization: Basic dXNlcjpodW50ZXIyLXN\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "out": "{\"bytes\": 5000000, \"prefix\": \"{\\\"headers\\\": \\\"Authorization: [redacted basic_auth]\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "kinds": [
+      "basic_auth"
+    ]
+  },
+  {
+    "name": "a password in a url cut short",
+    "in": "{\"bytes\": 5000000, \"prefix\": \"{\\\"env\\\": \\\"DATABASE_URL=postgres://app:Sup3rS3cr\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "out": "{\"bytes\": 5000000, \"prefix\": \"{\\\"env\\\": \\\"DATABASE_URL=postgres://app:[redacted url_password]\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "kinds": [
+      "url_password"
+    ]
+  },
+  {
+    "name": "an aws secret key cut short after its name, two strings deep",
+    "in": "{\"bytes\": 5000000, \"prefix\": \"{\\\"output\\\": \\\"{\\\\\\\"Credentials\\\\\\\":{\\\\\\\"AccessKeyId\\\\\\\":\\\\\\\"ASIAIOSFODNN7EXAMPLE\\\\\\\",\\\\\\\"SecretAccessKey\\\\\\\":\\\\\\\"je7MtGbClwBF/2Zp9Utk\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "out": "{\"bytes\": 5000000, \"prefix\": \"{\\\"output\\\": \\\"{\\\\\\\"Credentials\\\\\\\":{\\\\\\\"AccessKeyId\\\\\\\":\\\\\\\"ASIAIOSFODNN7EXAMPLE\\\\\\\",\\\\\\\"SecretAccessKey\\\\\\\":\\\\\\\"[redacted aws_secret_key sha256:43a6dc744df4]\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "kinds": [
+      "aws_secret_key"
+    ]
+  },
+  {
+    "name": "a key's start alone at the cut",
+    "in": "{\"bytes\": 5000000, \"prefix\": \"{\\\"input\\\": {\\\"key\\\": \\\"sk-\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "out": "{\"bytes\": 5000000, \"prefix\": \"{\\\"input\\\": {\\\"key\\\": \\\"[redacted llm_api_key sha256:449b11820b0f]\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "kinds": [
+      "llm_api_key"
+    ]
+  },
+  {
+    "name": "only a credential cut short at the very end is replaced",
+    "in": "{\"bytes\": 5000000, \"prefix\": \"{\\\"output\\\": \\\"the key sk\u005flive\u005f4eC39 was revoked, and the bearer\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "out": "{\"bytes\": 5000000, \"prefix\": \"{\\\"output\\\": \\\"the key sk\u005flive\u005f4eC39 was revoked, and the bearer\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": true}",
+    "kinds": []
+  },
+  {
+    "name": "a payload not marked truncated isn't read as cut",
+    "in": "{\"bytes\": 5000000, \"prefix\": \"{\\\"input\\\": {\\\"env\\\": \\\"STRIPE=sk\u005flive\u005f4eC39HqLyjWDarjtT1zd\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": false}",
+    "out": "{\"bytes\": 5000000, \"prefix\": \"{\\\"input\\\": {\\\"env\\\": \\\"STRIPE=sk\u005flive\u005f4eC39HqLyjWDarjtT1zd\", \"sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"truncated\": false}",
+    "kinds": []
+  },
+  {
+    "name": "truncated inside another object isn't a cut",
+    "in": "{\"output\":{\"truncated\":true,\"prefix\":\"STRIPE=sk\u005flive\u005f4eC39HqLyjWDarjtT1zd\"}}",
+    "out": "{\"output\":{\"truncated\":true,\"prefix\":\"STRIPE=sk\u005flive\u005f4eC39HqLyjWDarjtT1zd\"}}",
+    "kinds": []
+  },
+  {
+    "name": "only the strings a cut can end are read as cut",
+    "in": "{\"from\":\"sk-agent\",\"to\":\"support\",\"content\":{\"text\":\"use ghp_a1B2c3D4\"},\"truncated\":true}",
+    "out": "{\"from\":\"sk-agent\",\"to\":\"support\",\"content\":{\"text\":\"use ghp_a1B2c3D4\"},\"truncated\":true}",
+    "kinds": []
+  },
+  {
+    "name": "a cut past values that hold brackets and quotes",
+    "in": "{\"input\":{\"a\":\"x\\\"}]\",\"b\":[1,{\"c\":\"]\"}]},\"output\":\"use sk-abc\",\"truncated\":true}",
+    "out": "{\"input\":{\"a\":\"x\\\"}]\",\"b\":[1,{\"c\":\"]\"}]},\"output\":\"use [redacted llm_api_key sha256:1460db1b6902]\",\"truncated\":true}",
+    "kinds": [
+      "llm_api_key"
+    ]
   }
 ]

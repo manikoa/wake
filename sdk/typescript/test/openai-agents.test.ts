@@ -11,7 +11,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 
-import { Agent, Runner, run, setTraceProcessors, tool, Usage, withGenerationSpan, withResponseSpan, type ModelRequest, type ModelResponse } from "@openai/agents";
+import {
+  Agent,
+  applyPatchTool,
+  computerTool,
+  Runner,
+  run,
+  setTraceProcessors,
+  shellTool,
+  tool,
+  Usage,
+  webSearchTool,
+  withGenerationSpan,
+  withResponseSpan,
+  withTrace,
+  type Model,
+  type ModelRequest,
+  type ModelResponse,
+} from "@openai/agents";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace";
 import { z } from "zod";
 
@@ -19,7 +36,7 @@ import { links, Recorder } from "../src/index.ts";
 import { Memory } from "../src/memory.ts";
 import { WakeTracingProcessor } from "../src/openai-agents.ts";
 import { Quarantine } from "../src/quarantine.ts";
-import { UNCHECKED } from "../src/stop.ts";
+import { AgentHalted, UNCHECKED } from "../src/stop.ts";
 import { attr, id, ids, origins, parents, recorded, wakeEvents } from "./helpers.ts";
 import { asItems, call, FakeModel, say, type ApiItem } from "./openai-fakes.ts";
 
@@ -293,8 +310,11 @@ async function withResponseSpanFor(request: ModelRequest, output: ApiItem[], ans
   });
 }
 
-for (const sensitive of [true, false]) {
-  test(`an agent called twice as a tool is two instances that never cross (sensitive data ${sensitive ? "on" : "off"})`, async () => {
+/** Long enough that content matching would link two copies' steps, as their answers match. */
+const LONG_QUESTION = "What is the refund window for damaged items?";
+
+for (const [sensitive, question] of [true, false].flatMap((s) => ["refund window", LONG_QUESTION].map((q) => [s, q] as const))) {
+  test(`an agent called twice as a tool is two instances that never cross (sensitive data ${sensitive ? "on" : "off"}, ${question.length > 20 ? "long" : "short"} question)`, async () => {
     const { recorder, spans } = recorded("support");
     const processor = new WakeTracingProcessor(recorder);
     const memory = new Memory(processor);
@@ -315,7 +335,7 @@ for (const sensitive of [true, false]) {
       tools: [researcher.asTool({ toolName: "research", toolDescription: "Research one question." })],
       model: new FakeModel([
         // The same question twice: nothing in the arguments tells the copies apart.
-        [call("research", JSON.stringify({ input: "refund window" }), "call_a"), call("research", JSON.stringify({ input: "refund window" }), "call_b")],
+        [call("research", JSON.stringify({ input: question }), "call_a"), call("research", JSON.stringify({ input: question }), "call_b")],
         [say("Both answered.")],
       ]),
     });
@@ -522,4 +542,275 @@ test("guard reaches handed-off agents and guards each tool once", () => {
   assert.equal(pay.inputGuardrails?.length, 1, "the agent handed off to");
   assert.equal(research.inputGuardrails?.length, 1, "the agent tool itself: a spawn");
   assert.throws(() => new WakeTracingProcessor(recorded("support").recorder).guard(triage), /needs the brake's rules/);
+});
+
+// Tools the agent runs in its own process.
+
+/** Answers each turn with the SDK's own items as they are, and reports them as the SDK's Responses model does. */
+class ItemModel implements Model {
+  readonly #turns: unknown[][];
+
+  constructor(turns: unknown[][]) {
+    this.#turns = turns;
+  }
+
+  async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    const output = this.#turns.shift()!;
+    const responseId = `resp_${randomUUID().slice(0, 8)}`;
+    const answer = { output, usage: new Usage(), responseId } as unknown as ModelResponse;
+    return withResponseSpan(async (span) => {
+      if (request.tracing === true) {
+        span.spanData.response_id = responseId;
+        span.spanData._input = request.input as never;
+        span.spanData._response = { id: responseId, model: "fake-model", output, object: "response" };
+      }
+      return answer;
+    });
+  }
+
+  async *getStreamedResponse(): AsyncIterable<never> {
+    throw new Error("not streamed");
+  }
+}
+
+const DONE = asItems([say("Done.")]);
+
+function localTool(kind: "shell" | "apply_patch", ran: unknown[]) {
+  if (kind === "shell") {
+    const shell = shellTool({ shell: { run: async (action) => (ran.push(action.commands), { output: [{ stdout: "ok", stderr: "", outcome: { type: "exit", exitCode: 0 } }] }) } });
+    return [shell, { type: "shell_call", id: "sh_1", callId: "call_x", status: "completed", action: { commands: ["rm -rf /srv/orders"] } }] as const;
+  }
+  const done = async (operation: { path: string }) => (ran.push(operation.path), { status: "completed" as const, output: "done" });
+  const editor = applyPatchTool({ editor: { createFile: done, updateFile: done, deleteFile: done } });
+  return [editor, { type: "apply_patch_call", id: "ap_1", callId: "call_x", status: "completed", operation: { type: "delete_file", path: "orders.db" } }] as const;
+}
+
+for (const kind of ["shell", "apply_patch"] as const) {
+  test(`a halted agent's own ${kind} tool is refused as it starts`, async () => {
+    const ran: unknown[] = [];
+    const [tool, requested] = localTool(kind, ran);
+    const triage = new Agent({ name: "triage", tools: [tool], model: new ItemModel([[requested], DONE]) });
+    const { result, events } = await guardedRun(new Halts({ id: "halt-triage", agents: ["triage"] }), triage);
+    assert.deepEqual(ran, [], "the tool never ran");
+    assert.equal(result.finalOutput, "Done.");
+    const [first, denied, second, ...rest] = events;
+    assert.equal(rest.length, 0);
+    assert.deepEqual(kinds([first, denied, second]), ["model_call", "denied", "model_call"]);
+    assert.equal(attr(denied, "wake.brake.halt_id"), "halt-triage");
+    assert.equal(attr(denied, "gen_ai.tool.name"), kind);
+    assert.equal(attr(denied, "wake.agent.id"), "triage");
+    assert.deepEqual(origins(denied), [], "the tool never ran: nothing of it entered");
+    assert.deepEqual(parents(denied), [id(first)], "the response that asked for it");
+    assert.ok(parents(second).includes(id(denied)), "the model read the refusal");
+    assert.ok((attr(second, "wake.payload") as string).includes("Wake halted triage (halt-triage), so this tool call wasn't run."), "the refusal is the tool's output");
+    // Without a halt the tool runs.
+    const [again, asked] = localTool(kind, ran);
+    const running = await guardedRun(new Halts(), new Agent({ name: "triage", tools: [again], model: new ItemModel([[asked], DONE]) }));
+    assert.equal(ran.length, 1);
+    assert.ok(!kinds(running.events).includes("denied"));
+  });
+}
+
+/** A computer that notes each action it carries out. */
+function screen(did: string[]) {
+  const note = (action: string) => async () => void did.push(action);
+  return {
+    environment: "browser" as const,
+    dimensions: [1024, 768] as [number, number],
+    screenshot: async () => (did.push("screenshot"), "iVBORw0KGgo="),
+    click: note("click"),
+    doubleClick: note("doubleClick"),
+    scroll: note("scroll"),
+    type: note("type"),
+    wait: note("wait"),
+    move: note("move"),
+    keypress: note("keypress"),
+    drag: note("drag"),
+  };
+}
+
+for (const made of [false, true]) {
+  test(`a halted agent's computer does nothing (${made ? "made for each run" : "given"})`, async () => {
+    const did: string[] = [];
+    const computer = screen(did);
+    const tool = computerTool({ computer: made ? async () => computer : computer });
+    const clicked = { type: "computer_call", id: "cu_1", callId: "call_x", status: "completed", action: { type: "click", x: 1, y: 2, button: "left" } };
+    const triage = new Agent({ name: "triage", tools: [tool], model: new ItemModel([[clicked], DONE]) });
+    const { events } = await guardedRun(new Halts({ id: "halt-triage", agents: ["triage"] }), triage);
+    assert.deepEqual(did, [], "the computer did nothing");
+    const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+    assert.equal(denied.length, 1);
+    assert.equal(attr(denied[0], "wake.brake.halt_id"), "halt-triage");
+    assert.deepEqual(origins(denied[0]), []);
+  });
+}
+
+test("guard throws rather than leave a tool it can't refuse, and leaves hosted tools be", () => {
+  const search = webSearchTool();
+  const triage = new Agent({ name: "triage", tools: [search] });
+  const processor = new WakeTracingProcessor(recorded("support").recorder, { quarantine: new Halts() });
+  processor.guard(triage);
+  assert.equal(triage.tools[0], search, "a hosted tool runs at OpenAI: nothing here to refuse");
+  const ops = new Agent({ name: "ops" });
+  ops.tools.push({ type: "gadget", name: "gadget" } as never); // a kind of tool this version of Wake doesn't know
+  assert.throws(() => processor.guard(ops), (error: unknown) => error instanceof TypeError && /gadget/.test(error.message));
+});
+
+test("a guardrail run before a call's approval records the call it refuses", async () => {
+  const paid: string[] = [];
+  const pay = tool({ name: "pay", description: "Pay an order.", parameters: z.object({ order: z.string() }), needsApproval: true, execute: async ({ order }) => (paid.push(order), "Paid.") });
+  const payer = new Agent({ name: "payer", tools: [pay], model: new FakeModel([[call("pay", JSON.stringify({ order: "1234" }), "call_pay")], [say("Done.")]]) });
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine: new Halts({ id: "halt-payer", agents: ["payer"] }) });
+  setTraceProcessors([processor]);
+  const result = await new Runner({ toolExecution: { preApprovalInputGuardrails: true } }).run(processor.guard(payer), "Pay order 1234.");
+  assert.equal(result.interruptions?.length ?? 0, 0, "refused before anyone was asked to approve it");
+  assert.deepEqual(paid, []);
+  const [first, denied, second, ...rest] = wakeEvents(await spans());
+  assert.equal(rest.length, 0);
+  assert.deepEqual(kinds([first, denied, second]), ["model_call", "denied", "model_call"]);
+  assert.equal(attr(denied, "gen_ai.tool.name"), "pay");
+  assert.equal(attr(denied, "wake.brake.halt_id"), "halt-payer");
+  assert.equal(attr(denied, "wake.agent.id"), "payer");
+  assert.deepEqual(parents(denied), [id(first)], "the response that asked for it");
+  assert.ok(parents(second).includes(id(denied)), "the model read the refusal");
+  assert.equal(denied.spanContext().traceId, first.spanContext().traceId);
+});
+
+// Handoffs.
+
+for (const halted of ["triage", "billing"]) {
+  test(`a handoff from or to a halted agent isn't offered (${halted} halted)`, async () => {
+    const model = new OfferedModel();
+    const billing = new Agent({ name: "billing", model: new FakeModel([[say("Paid.")]]) });
+    const triage = new Agent({ name: "triage", handoffs: [billing], model });
+    await guardedRun(new Halts({ id: `halt-${halted}`, agents: [halted] }), triage);
+    assert.deepEqual(model.offered, []);
+  });
+}
+
+/** The halt lands while the model is answering the turn that hands off. */
+class HaltDuringTurn extends FakeModel {
+  readonly #halts: Halts;
+  readonly #halt: Halt;
+
+  constructor(turns: ApiItem[][], halts: Halts, halt: Halt) {
+    super(turns);
+    this.#halts = halts;
+    this.#halt = halt;
+  }
+
+  override async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.#halts.halts.push(this.#halt);
+    return super.getResponse(request);
+  }
+}
+
+for (const halted of ["triage", "billing"]) {
+  test(`a handoff picked before a halt landed is refused as it starts (${halted} halted)`, async () => {
+    const paid: string[] = [];
+    const pay = tool({ name: "pay", description: "Pay an order.", parameters: z.object({ order: z.string() }), execute: async ({ order }) => (paid.push(order), "Paid.") });
+    const billing = new Agent({ name: "billing", tools: [pay], model: new FakeModel([[call("pay", JSON.stringify({ order: "1234" }), "call_pay")], [say("Paid.")]]) });
+    const halts = new Halts();
+    const triage = new Agent({ name: "triage", handoffs: [billing], model: new HaltDuringTurn([[call("transfer_to_billing", "{}", "call_h")]], halts, { id: `halt-${halted}`, agents: [halted] }) });
+    const { recorder, spans } = recorded("support");
+    const processor = new WakeTracingProcessor(recorder, { quarantine: halts });
+    setTraceProcessors([processor]);
+    await assert.rejects(new Runner().run(processor.guard(triage), "Refund 1234."), (error: unknown) => {
+      assert.ok(error instanceof AgentHalted, String(error));
+      assert.equal(error.halt, `halt-${halted}`);
+      assert.match(error.message, /so the handoff to billing wasn't made\.$/);
+      return true;
+    });
+    assert.deepEqual(paid, [], "billing never ran");
+    const [response, denied, ...rest] = wakeEvents(await spans());
+    assert.equal(rest.length, 0);
+    assert.deepEqual(kinds([response, denied]), ["model_call", "denied"]);
+    assert.equal(denied.name, "agent_message triage -> billing");
+    assert.equal(attr(denied, "wake.agent.id"), "triage", "recorded as what tried to hand off");
+    assert.equal(attr(denied, "wake.brake.receiver"), "billing");
+    assert.equal(attr(denied, "wake.brake.halt_id"), `halt-${halted}`);
+    assert.deepEqual(parents(denied), [id(response)]);
+    assert.deepEqual(origins(denied), [], "nothing reached billing");
+  });
+}
+
+// Runs of one agent at once.
+
+function researcherAgent() {
+  const lookup = tool({
+    name: "lookup",
+    description: "Look a question up.",
+    parameters: z.object({ q: z.string() }),
+    execute: async ({ q }) => {
+      await new Promise((resolve) => setImmediate(resolve));
+      return `Found: ${q}`;
+    },
+  });
+  return new Agent({ name: "researcher", tools: [lookup], model: new ResearcherModel() });
+}
+
+test("two runs of one agent inside one tool call are two instances that never cross", async () => {
+  const agent = researcherAgent();
+  const researchTwice = tool({
+    name: "research_twice",
+    description: "Research a question twice over.",
+    parameters: z.object({ question: z.string() }),
+    execute: async ({ question }) => (await Promise.all([run(agent, question), run(agent, question)])).map((r) => r.finalOutput).join("\n"),
+  });
+  const triage = new Agent({
+    name: "triage",
+    tools: [researchTwice],
+    model: new FakeModel([[call("research_twice", JSON.stringify({ question: LONG_QUESTION }), "call_twice")], [say("Both answered.")]]),
+  });
+  const events = wakeEvents((await runWith(triage)).spans);
+  const byInstance = new Map<string, ReadableSpan[]>();
+  for (const e of events.filter((e) => attr(e, "wake.agent.id") === "researcher")) {
+    assert.deepEqual(attr(e, "wake.agent.lineage"), ["triage"]);
+    const instance = attr(e, "wake.agent.instance") as string;
+    byInstance.set(instance, [...(byInstance.get(instance) ?? []), e]);
+  }
+  assert.equal(byInstance.size, 2, [...byInstance.keys()].join(", "));
+  const toolCall = events.find((e) => attr(e, "gen_ai.tool.name") === "research_twice")!;
+  const triageIds = ids(...events.filter((e) => attr(e, "wake.agent.id") === "triage"));
+  const lastAnswers: string[] = [];
+  for (const [instance, own] of byInstance) {
+    assert.deepEqual(kinds(own).sort(), ["model_call", "model_call", "tool_call"], instance);
+    const ownIds = ids(...own);
+    for (const e of own) {
+      const crossed = parents(e).filter((p) => !ownIds.has(p) && !triageIds.has(p));
+      assert.deepEqual(crossed, [], `${instance} ${String(attr(e, "wake.event.kind"))} links to the other copy`);
+    }
+    const [first, last] = own.filter((e) => attr(e, "wake.event.kind") === "model_call");
+    assert.ok(parents(first).includes(id(toolCall)), "each run descends from the tool call");
+    lastAnswers.push(id(last));
+  }
+  // What both runs said last is what the tool returned, which triage's next response read.
+  const answer = events.filter((e) => attr(e, "wake.agent.id") === "triage" && attr(e, "wake.event.kind") === "model_call").at(-1)!;
+  assert.ok(lastAnswers.every((a) => parents(answer).includes(a)));
+});
+
+test("two runs of one agent at the top of one trace never cross", async () => {
+  const { recorder, spans } = recorded("support");
+  setTraceProcessors([new WakeTracingProcessor(recorder)]);
+  await withTrace("research", () => Promise.all([run(researcherAgent(), LONG_QUESTION), run(researcherAgent(), LONG_QUESTION)]));
+  const all = await spans();
+  const bySpan = new Map<string, ReadableSpan>(all.map((s) => [s.spanContext().spanId, s]));
+  const runOf = (e: ReadableSpan) => {
+    let s = e;
+    while (s.attributes["gen_ai.operation.name"] !== "invoke_agent") s = bySpan.get(s.parentSpanContext!.spanId)!;
+    return s.spanContext().spanId;
+  };
+  const runs = new Map<string, ReadableSpan[]>();
+  for (const e of wakeEvents(all)) {
+    assert.equal(attr(e, "wake.agent.instance"), undefined, "the workflow's own runs aren't instances");
+    runs.set(runOf(e), [...(runs.get(runOf(e)) ?? []), e]);
+  }
+  assert.equal(runs.size, 2);
+  for (const own of runs.values()) {
+    const ownIds = ids(...own);
+    assert.ok(own.every((e) => parents(e).every((p) => ownIds.has(p))), "each run links only within itself");
+    const [first] = own.filter((e) => attr(e, "wake.event.kind") === "model_call");
+    assert.deepEqual(origins(first), ["user"], "each run's question enters at its first response");
+  }
 });

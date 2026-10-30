@@ -239,7 +239,7 @@ fn a_delegated_token_names_the_agent_acting() {
 /// who can read the log.
 #[test]
 fn every_hook_is_told_what_the_token_says_and_never_the_token() {
-    const TOKEN: &str = r#"{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}"#;
+    const TOKEN: &str = r#"{"sub": has(jwt.sub) ? jwt.sub : "", "jti": has(jwt.jti) ? jwt.jti : "", "uti": has(jwt.uti) ? jwt.uti : "", "exp": has(jwt.exp) ? jwt.exp : 0, "act": has(jwt.act) ? jwt.act : {}, "cnf": has(jwt.cnf)}"#;
     for (path, _) in CONFIGS {
         for hook in hooks(path, &load(path)) {
             assert_eq!(hook.token, TOKEN, "{path}: {}'s token", hook.at);
