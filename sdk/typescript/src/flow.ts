@@ -332,22 +332,23 @@ export class Entered {
    * Notes that content from one agent reached another, such as a message, a handoff or a
    * sub-agent's result: what had entered from within the window entered to too, each origin
    * keeping when it entered, so passing content on never makes it newer. When from has every
-   * origin, so does to, from when from did. to's own name isn't carried back to it as an
-   * origin.
+   * origin, so does to, for as long as from does, and what entered from after that time enters
+   * to as well, so it still counts once every origin no longer does. to's own name isn't
+   * carried back to it as an origin.
    */
   carry(from: string, to: string): void {
     try {
       const at = this.#clock();
       const since = at - this.#window;
-      const entered = this.#entered(from, since);
-      if (entered instanceof Map) {
-        entered.delete(`agent:${to}`);
-        if (entered.size === 0) return;
-        const agent = this.#agent(to, at);
-        for (const [origin, seen] of entered) agent?.note(origin, seen, since);
-      } else {
-        this.#agent(to, at)?.saturate(entered.since, CARRIED);
-      }
+      const every = this.#every(from, since);
+      // What entered by the time every origin did counts no longer than every origin does.
+      const carried = [...this.#recorded(from, since)].filter(
+        ([origin, seen]) => origin !== `agent:${to}` && (every === undefined || seen > every.since),
+      );
+      if (every === undefined && carried.length === 0) return;
+      const agent = this.#agent(to, at);
+      if (every !== undefined) agent?.saturate(every.since, CARRIED);
+      for (const [origin, seen] of carried) agent?.note(origin, seen, since);
     } catch (error) {
       log.warn(`couldn't note what reached ${to} from ${from}`, error);
     }
@@ -389,15 +390,25 @@ export class Entered {
     return agent;
   }
 
-  /** What entered name since since, each origin with when it last entered, or why it's every origin and since when. */
-  #entered(name: string, since: number): Map<string, number> | { why: string; since: number } {
+  /** Why name has had every origin since since, and since when, if it has: an agent not kept could be one that couldn't be, while that's happened within the window. */
+  #every(name: string, since: number): { why: string; since: number } | undefined {
     const agent = this.#agents.get(name);
     if (agent === undefined) {
       if (this.#overflowedAt !== undefined && this.#overflowedAt >= since) return { why: OVERFLOWED, since: this.#overflowedAt };
-      return new Map();
+      return undefined;
     }
     if (agent.saturated !== undefined && agent.saturated[0] >= since) return { why: agent.saturated[1], since: agent.saturated[0] };
-    return new Map([...agent.origins].filter(([, at]) => at >= since));
+    return undefined;
+  }
+
+  /** Each origin noted for name since since, with when it last entered, whether or not it has every origin. */
+  #recorded(name: string, since: number): Map<string, number> {
+    return new Map([...(this.#agents.get(name)?.origins ?? [])].filter(([, at]) => at >= since));
+  }
+
+  /** What entered name since since, each origin with when it last entered, or why it's every origin and since when. */
+  #entered(name: string, since: number): Map<string, number> | { why: string; since: number } {
+    return this.#every(name, since) ?? this.#recorded(name, since);
   }
 }
 

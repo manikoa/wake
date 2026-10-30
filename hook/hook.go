@@ -104,6 +104,9 @@ func Answer(host *Host, in []byte, o Options) (stdout []byte, stderr string) {
 		return nil, ""
 	}
 	a.Rest = f
+	if host.conversations {
+		o.place(host, &a)
+	}
 	w := identify(o.Agent, a)
 	by := flowAgent(host, o.Agent, a)
 	if a.Gate && o.Stop {
@@ -112,7 +115,7 @@ func Answer(host *Host, in []byte, o Options) (stdout []byte, stderr string) {
 			return host.refuse(a, r.reason), ""
 		}
 	}
-	o.entered(host, a, by)
+	o.entered(host, a, w, by)
 	if a.Kind != "" {
 		o.record(host, a, w, nil)
 	}
@@ -170,7 +173,8 @@ type who struct {
 }
 
 // identify names the agent behind an action. Each session is an instance of the agent,
-// and a subagent the host names is an instance started by its session.
+// and a subagent the host names is an instance started by its session, or by the
+// subagent that started it, when wake-hook placed it (place, in flow.go).
 func identify(agent string, a Action) who {
 	w := who{agent: agent, names: []string{agent}}
 	if a.Session == "" {
@@ -181,6 +185,9 @@ func identify(agent string, a Action) who {
 	if a.Subagent != "" {
 		kind := agent + "/" + a.SubagentType
 		w.instance, w.lineage = kind+"#"+a.Subagent, []string{agent, session}
+		if len(a.lineage) > 1 {
+			w.lineage = a.lineage
+		}
 		w.names = append(w.names, kind)
 	}
 	w.names = append(w.names, w.lineage[1:]...)

@@ -22,11 +22,13 @@ import {
   setTraceProcessors,
   shellTool,
   tool,
+  toolSearchTool,
   Usage,
   webSearchTool,
   withGenerationSpan,
   withResponseSpan,
   withTrace,
+  type CallModelInputFilter,
   type Model,
   type ModelRequest,
   type ModelResponse,
@@ -37,6 +39,7 @@ import { z } from "zod";
 
 import { entered, parsePolicy, UNREADABLE, type FlowPolicy } from "../src/flow.ts";
 import { links, Recorder } from "../src/index.ts";
+import { log } from "../src/log.ts";
 import { Memory, MemoryLocked } from "../src/memory.ts";
 import { RESPONSE_WAIT_MILLIS, WakeTracingProcessor } from "../src/openai-agents.ts";
 import { Quarantine } from "../src/quarantine.ts";
@@ -1289,4 +1292,223 @@ test("a memory write in a tool waits to see what the response before it brought 
   assert.ok(refused[0] instanceof MemoryLocked && refused[0].quarantine === "policy:no-search-into-facts", String(refused[0]));
   const [denied] = wakeEvents(await spans(), "denied");
   assert.deepEqual(payload(denied).origins, ["tool:web_search"]);
+});
+
+// Hosted MCP calls the app approves itself: OpenAI runs each inside the model call whose input
+// carries the approval, which checkApprovals() checks first, as the run's callModelInputFilter.
+
+const UNFOUND = "Wake couldn't find the request this approves, so this tool call wasn't run.";
+const FETCH_TERMS = call("fetch_page", JSON.stringify({ url: "https://acme.example/terms" }), "call_fetch_terms");
+
+/** The answers to hosted MCP tools' requests in the input of each model call, as sent. */
+function answers(model: NotingModel): Record<string, unknown>[][] {
+  return model.inputs.map((input) =>
+    (Array.isArray(input) ? (input as Record<string, unknown>[]) : [])
+      .filter((i) => i.type === "hosted_tool_call" && i.name === "mcp_approval_response")
+      .map((i) => JSON.parse(JSON.stringify(i.providerData)) as Record<string, unknown>),
+  );
+}
+
+/**
+ * Runs the guarded agent, with checkApprovals() as the run's filter, until a hosted MCP call
+ * waits on the app, approves it as the app would, through the run's interruptions, and runs on.
+ * A halt given lands while the app decides.
+ */
+async function approvedByTheApp(
+  quarantine: Halts,
+  agent: Agent<any, any>,
+  { always = false, halt, previousResponseId, own, ...config }: { always?: boolean; halt?: Halt; previousResponseId?: string; own?: CallModelInputFilter; traceIncludeSensitiveData?: boolean } = {},
+) {
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine });
+  setTraceProcessors([processor]);
+  const runner = new Runner({ ...config, callModelInputFilter: processor.checkApprovals(own) });
+  const options = previousResponseId !== undefined ? { previousResponseId } : {};
+  const asked = await runner.run(processor.guard(agent), "Check order 1234.", options);
+  assert.equal(asked.interruptions.length, 1, "the app is asked");
+  if (halt !== undefined) quarantine.halts.push(halt);
+  asked.state.approve(asked.interruptions[0], { alwaysApprove: always });
+  const result = await runner.run(agent, asked.state, options);
+  return { result, events: wakeEvents(await spans()), processor };
+}
+
+const NO_CRM_AFTER_WEB = { rules: [{ id: "no-crm-after-web", tools: ["lookup_order"], forbid_origins: ["tool:fetch_page"] }] };
+
+test("a hosted MCP call the app approves that the flow policy holds back is turned down before the model call that runs it", async () => {
+  const [fetchPage] = webTools([]);
+  const name = "oa-app-crm-after-web";
+  const model = new NotingModel([[FETCH_BILLING_PAGE], [LOOKUP], [FETCH_TERMS], [say("Couldn't look it up.")]]);
+  const agent = new Agent({ name, tools: [fetchPage, crm({ requireApproval: "always" })], model });
+  const { result, events } = await approvedByTheApp(serving(NO_CRM_AFTER_WEB), agent);
+  assert.equal(result.finalOutput, "Couldn't look it up.");
+  const reason = `Wake's flow policy (policy:no-crm-after-web) holds ${name} back after tool:fetch_page, so this tool call wasn't run.`;
+  const rejected = { approve: false, approval_request_id: "mcpr_1", reason };
+  assert.deepEqual(answers(model), [[], [], [rejected], [rejected]], "turned down in the input sent, and again in each that carries it after");
+  const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1, "recorded once");
+  assert.equal(denied[0].name, "execute_tool lookup_order");
+  assert.equal(attr(denied[0], "gen_ai.tool.name"), "lookup_order");
+  assert.equal(attr(denied[0], "wake.mcp.server"), "crm");
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "policy:no-crm-after-web");
+  assert.equal(attr(denied[0], "wake.agent.id"), name);
+  assert.deepEqual(origins(denied[0]), []);
+  assert.deepEqual([payload(denied[0]).input, payload(denied[0]).output, payload(denied[0]).origins], [JSON.stringify({ order: "1234" }), reason, ["tool:fetch_page"]]);
+  const asked = events.filter((e) => attr(e, "wake.event.kind") === "model_call")[1];
+  assert.deepEqual(parents(denied[0]), [id(asked)], "the response that asked, before the run resumed");
+  assert.ok(!seenBy(name).includes("tool:lookup_order"), "it never ran");
+});
+
+test("a hosted MCP call the app approves that a halt covers is turned down", async () => {
+  const model = new NotingModel([[LOOKUP], [say("Couldn't look it up.")]]);
+  const agent = new Agent({ name: "oa-app-crm-halted", tools: [crm({ requireApproval: "always" })], model });
+  const { events } = await approvedByTheApp(new Halts(), agent, { halt: { id: "halt-crm", agents: ["oa-app-crm-halted"] } });
+  assert.deepEqual(answers(model).at(-1), [{ approve: false, approval_request_id: "mcpr_1", reason: "Wake halted oa-app-crm-halted (halt-crm), so this tool call wasn't run." }]);
+  const [denied] = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.deepEqual([attr(denied, "gen_ai.tool.name"), attr(denied, "wake.brake.halt_id")], ["lookup_order", "halt-crm"]);
+});
+
+test("a hosted MCP call the app approves that Wake lets through enters the agent before the model call that runs it", async () => {
+  const name = "oa-app-crm-open";
+  const seen: string[][] = [];
+  class Seeing extends NotingModel {
+    override async getResponse(request: ModelRequest): Promise<ModelResponse> {
+      seen.push(seenBy(name));
+      return super.getResponse(request);
+    }
+  }
+  const model = new Seeing([[LOOKUP], [mcpCall("crm", "lookup_order", "Order 1234: paid in full."), say("Paid in full.")]]);
+  const agent = new Agent({ name, tools: [crm({ requireApproval: "always" })], model });
+  const { result, events } = await approvedByTheApp(serving(NO_CRM_AFTER_WEB), agent, { traceIncludeSensitiveData: false });
+  assert.equal(result.finalOutput, "Paid in full.");
+  assert.deepEqual(answers(model), [[], [{ approve: true, approval_request_id: "mcpr_1" }]], "approved, as the app said");
+  assert.deepEqual(seen, [[], ["tool:lookup_order"]], "noted before the model call that runs it, the trace or not");
+  assert.ok(!kinds(events).includes("denied"));
+});
+
+test("each hosted MCP call the app approves for good is checked before the model call that runs it", async () => {
+  const name = "oa-app-crm-for-good";
+  const second = mcpRequest("crm", "lookup_order", JSON.stringify({ order: "5678" }), "mcpr_2");
+  const model = new NotingModel([[LOOKUP], [mcpCall("crm", "lookup_order", "Order 1234: paid."), second], [say("Looked one up.")]]);
+  const agent = new Agent({ name, tools: [crm({ requireApproval: "always" })], model });
+  const oneLookup = serving({ rules: [{ id: "one-lookup", tools: ["lookup_order"], forbid_origins: ["tool:lookup_order"] }] });
+  const { result, events } = await approvedByTheApp(oneLookup, agent, { always: true });
+  assert.equal(result.interruptions.length, 0, "the second wasn't asked about: the app approved the tool for good");
+  const reason = `Wake's flow policy (policy:one-lookup) holds ${name} back after tool:lookup_order, so this tool call wasn't run.`;
+  assert.deepEqual(answers(model).at(-1), [
+    { approve: true, approval_request_id: "mcpr_1" },
+    { approve: false, approval_request_id: "mcpr_2", reason },
+  ], "the first ran, and what it brought back holds the second back");
+  const [denied, ...rest] = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(rest.length, 0);
+  assert.deepEqual([payload(denied).input, payload(denied).origins], [JSON.stringify({ order: "5678" }), ["tool:lookup_order"]]);
+});
+
+test("with the conversation kept at OpenAI, the request is the one the trace showed asked, and one it didn't show is turned down", async () => {
+  for (const sensitive of [true, false]) {
+    const name = `oa-app-crm-at-openai-${sensitive}`;
+    const [fetchPage] = webTools([]);
+    const model = new NotingModel([[FETCH_BILLING_PAGE], [LOOKUP], [say("Couldn't look it up.")]]);
+    const agent = new Agent({ name, tools: [fetchPage, crm({ requireApproval: "always" })], model });
+    const { events } = await approvedByTheApp(serving(NO_CRM_AFTER_WEB), agent, { previousResponseId: "resp_0", traceIncludeSensitiveData: sensitive });
+    const input = model.inputs.at(-1) as Record<string, unknown>[];
+    assert.deepEqual(input.map((i) => i.name), ["mcp_approval_response"], "the input holds the approval alone");
+    const [denied, ...rest] = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+    assert.equal(rest.length, 0);
+    if (sensitive) {
+      const reason = `Wake's flow policy (policy:no-crm-after-web) holds ${name} back after tool:fetch_page, so this tool call wasn't run.`;
+      assert.deepEqual(answers(model).at(-1), [{ approve: false, approval_request_id: "mcpr_1", reason }]);
+      assert.deepEqual([attr(denied, "gen_ai.tool.name"), attr(denied, "wake.mcp.server")], ["lookup_order", "crm"]);
+    } else {
+      // The trace left the response out, and the input doesn't hold the request: Wake can't check it.
+      assert.deepEqual(answers(model).at(-1), [{ approve: false, approval_request_id: "mcpr_1", reason: UNFOUND }]);
+      assert.deepEqual([attr(denied, "gen_ai.tool.name"), attr(denied, "wake.brake.halt_id"), payload(denied).output], ["mcp", UNCHECKED, UNFOUND]);
+    }
+  }
+});
+
+test("an approval whose call the input shows ran, or that guard()'s own callback answered, is left as it is", async () => {
+  // Its call ran in an earlier model call, whose response the input holds: nothing more runs.
+  const history = [
+    { type: "message", role: "user", content: "Check order 1234." },
+    { type: "hosted_tool_call", id: "mcpr_1", name: "mcp_approval_request", status: "completed", providerData: { type: "mcp_approval_request", id: "mcpr_1", server_label: "crm", name: "lookup_order", arguments: "{}" } },
+    { type: "hosted_tool_call", name: "mcp_approval_response", providerData: { approve: true, approval_request_id: "mcpr_1" } },
+    { type: "hosted_tool_call", id: "mcp_1", name: "mcp_call", status: "completed", output: "Paid.", providerData: { type: "mcp_call", id: "mcp_1", server_label: "crm", name: "lookup_order", arguments: "{}", approval_request_id: "mcpr_1" } },
+  ];
+  const model = new NotingModel([[say("Paid in full.")]]);
+  const agent = new Agent({ name: "oa-app-crm-ran", tools: [crm({ requireApproval: "always" })], model });
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine: new Halts({ id: "halt-crm", agents: ["oa-app-crm-ran"] }) });
+  setTraceProcessors([processor]);
+  await new Runner({ callModelInputFilter: processor.checkApprovals() }).run(processor.guard(agent), history as never);
+  assert.deepEqual(answers(model), [[{ approve: true, approval_request_id: "mcpr_1" }]]);
+  assert.ok(!kinds(wakeEvents(await spans())).includes("denied"));
+
+  // guard()'s own answer is decided once: what the call it let through brought back doesn't hold it back after.
+  const answered = new NotingModel([[LOOKUP], [mcpCall("crm", "lookup_order", "Paid."), say("Paid in full.")]]);
+  const own = new Agent({ name: "oa-app-crm-wake-answered", tools: [crm()], model: answered });
+  const oneLookup = serving({ rules: [{ id: "one-lookup", tools: ["lookup_order"], forbid_origins: ["tool:lookup_order"] }] });
+  const second = recorded("support");
+  const guarding = new WakeTracingProcessor(second.recorder, { quarantine: oneLookup });
+  setTraceProcessors([guarding]);
+  await new Runner({ callModelInputFilter: guarding.checkApprovals() }).run(guarding.guard(own), "Check order 1234.");
+  assert.deepEqual(answers(answered).at(-1), [{ approve: true, approval_request_id: "mcpr_1" }]);
+  assert.ok(!kinds(wakeEvents(await second.spans())).includes("denied"));
+});
+
+test("a call to a hosted MCP server deferred tool search found, which guard() never sees, is checked as the app approves it", async () => {
+  const name = "oa-app-docs-found";
+  const read = { type: "hosted_tool_call", id: "mcpr_9", name: "mcp_approval_request", status: "completed", providerData: { type: "mcp_approval_request", id: "mcpr_9", server_label: "docs", name: "read_doc", arguments: "{}" } };
+  const found = [
+    { type: "tool_search_call", id: "ts_1", callId: "call_ts", execution: "server", status: "completed", arguments: { query: "docs" } },
+    { type: "tool_search_output", id: "tso_1", callId: "call_ts", execution: "server", status: "completed", tools: [{ type: "mcp", server_label: "docs", server_url: "https://docs.example/mcp", require_approval: "always" }] },
+    read,
+  ];
+  const inputs: unknown[] = [];
+  class Noting extends ItemModel {
+    override async getResponse(request: ModelRequest): Promise<ModelResponse> {
+      inputs.push(request.input);
+      return super.getResponse(request);
+    }
+  }
+  const [fetchPage] = webTools([]);
+  const agent = new Agent({ name, tools: [fetchPage, toolSearchTool()], model: new Noting([asItems([FETCH_BILLING_PAGE]), found, DONE]) });
+  const { events } = await approvedByTheApp(serving({ rules: [{ id: "no-docs-after-web", tools: ["read_doc"], forbid_origins: ["tool:fetch_page"] }] }), agent);
+  const sent = (inputs.at(-1) as Record<string, unknown>[]).filter((i) => i.name === "mcp_approval_response").map((i) => JSON.parse(JSON.stringify(i.providerData)));
+  const reason = `Wake's flow policy (policy:no-docs-after-web) holds ${name} back after tool:fetch_page, so this tool call wasn't run.`;
+  assert.deepEqual(sent, [{ approve: false, approval_request_id: "mcpr_9", reason }]);
+  const [denied] = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.deepEqual([attr(denied, "gen_ai.tool.name"), attr(denied, "wake.mcp.server")], ["read_doc", "docs"]);
+});
+
+test("given the app's own filter, checkApprovals() checks the input it returns, and never changes the SDK's own items", async () => {
+  const own: CallModelInputFilter = Object.assign(async ({ modelData }: { modelData: { input: unknown[]; instructions?: string } }) => ({ ...modelData, instructions: "Be brief." }) as never, {
+    preserveInputIdentity: true,
+  });
+  const name = "oa-app-crm-own-filter";
+  const model = new NotingModel([[LOOKUP], [say("Couldn't look it up.")]]);
+  const agent = new Agent({ name, tools: [crm({ requireApproval: "always" })], model });
+  const { result } = await approvedByTheApp(new Halts(), agent, { own, halt: { id: "halt-crm", agents: [name] } });
+  assert.equal(model.instructions.at(-1), "Be brief.", "the app's own filter ran");
+  assert.deepEqual(answers(model).at(-1), [{ approve: false, approval_request_id: "mcpr_1", reason: `Wake halted ${name} (halt-crm), so this tool call wasn't run.` }]);
+  const kept = result.history.find((i) => i.type === "hosted_tool_call" && i.name === "mcp_approval_response") as { providerData: { approve: boolean } } | undefined;
+  assert.equal(kept?.providerData.approve, true, "the run's own item, given to the filters as it is, is left as it was");
+});
+
+test("guard() says once for each hosted MCP tool it leaves to the app that checkApprovals() checks the calls the app approves", () => {
+  const warned: string[] = [];
+  const warn = log.warn;
+  log.warn = (message: string) => void warned.push(message);
+  try {
+    const tool = crm({ requireApproval: "always" });
+    const processor = new WakeTracingProcessor(recorded("support").recorder, { quarantine: new Halts() });
+    processor.guard(new Agent({ name: "oa-left-one", tools: [tool] }));
+    processor.guard(new Agent({ name: "oa-left-two", tools: [tool] }));
+    processor.guard(new Agent({ name: "oa-answered", tools: [crm()] }));
+    assert.deepEqual(warned, [
+      "guard() leaves hosted MCP server crm to the app, which approves its calls through run interruptions: give the run checkApprovals() as its callModelInputFilter, or the calls the app approves run unchecked",
+    ]);
+  } finally {
+    log.warn = warn;
+  }
+  assert.throws(() => new WakeTracingProcessor(recorded("support").recorder).checkApprovals(), /checkApprovals\(\) needs the brake's rules/);
 });

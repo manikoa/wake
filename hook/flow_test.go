@@ -296,8 +296,7 @@ func TestCodexHoldsASessionAndItsSubagentsAsOne(t *testing.T) {
 	}
 }
 
-// Cursor's subagents run in a conversation of their own, which nothing ties to the one
-// that started them, so only the start is checked.
+// A Cursor subagent's start is checked as reaching it.
 func TestCursorChecksASubagentsStart(t *testing.T) {
 	o := options(t)
 	o.Stop = true
@@ -314,6 +313,202 @@ func TestCursorChecksASubagentsStart(t *testing.T) {
 	}
 	if s, _ := denied(t, o); s.Name != "denied subagent" {
 		t.Errorf("recorded %s", s.Name)
+	}
+}
+
+// cursorEvent is a Cursor hook event in conversation, with these fields.
+func cursorEvent(event, conversation string, kv ...any) []byte {
+	e := map[string]any{"hook_event_name": event, "conversation_id": conversation, "cursor_version": "3.27.0"}
+	for i := 0; i+1 < len(kv); i += 2 {
+		e[kv[i].(string)] = kv[i+1]
+	}
+	data, _ := json.Marshal(e)
+	return data
+}
+
+var (
+	// The agent's own call, and calls by the explore subagent the fixtures start, which
+	// runs in conversation conv-5b7e and names the Task call that started it, tool_a17.
+	cursorPaying   = cursorEvent("preToolUse", "conv-8f2a", "tool_name", "MCP:pay", "tool_input", map[string]any{}, "tool_use_id", "tool_p0")
+	exploreFetch   = cursorEvent("postToolUse", "conv-5b7e", "parent_tool_call_id", "tool_a17", "tool_name", "MCP:fetch_page", "tool_input", map[string]any{}, "tool_output", "{}", "tool_use_id", "tool_f1")
+	explorePaying  = cursorEvent("preToolUse", "conv-5b7e", "parent_tool_call_id", "tool_a17", "tool_name", "MCP:pay", "tool_input", map[string]any{}, "tool_use_id", "tool_p1")
+	exploreAnswers = cursorEvent("postToolUse", "conv-8f2a", "tool_name", "Task", "tool_input", map[string]any{}, "tool_output", `{"summary":"It asks for a wire."}`, "tool_use_id", "tool_a17")
+)
+
+func cursorReason(t *testing.T, out string) string {
+	t.Helper()
+	var told struct {
+		Permission  string `json:"permission"`
+		UserMessage string `json:"user_message"`
+	}
+	if err := json.Unmarshal([]byte(out), &told); err != nil || told.Permission != "deny" {
+		t.Fatalf("told the host %q, want a refusal", out)
+	}
+	return told.UserMessage
+}
+
+// A Cursor subagent runs in a conversation of its own, but its tool hooks name the Task
+// call that started it, which ties it to the agent that did: it starts with what had
+// entered that agent, as an instance of its own started by that agent's session.
+func TestACursorSubagentStartsWithWhatEnteredTheAgentStartingIt(t *testing.T) {
+	o := options(t)
+	o.Stop = true
+	serveFlow(t, o, "cursor", payPolicy("cursor"))
+	host := Hosts["cursor"]
+	Handle(host, cursorEvent("postToolUse", "conv-8f2a", "tool_name", "MCP:fetch_page", "tool_input", map[string]any{}, "tool_output", "{}"), o)
+	if out := handle(t, o, "cursor", "subagent_start"); out != "{}" {
+		t.Fatalf("told the host %q starting a subagent no rule names", out)
+	}
+	want := "Wake's flow policy (policy:no-pay-after-web) holds cursor/explore back after agent:cursor, tool:fetch_page, so this tool call wasn't run."
+	if got := cursorReason(t, string(Handle(host, explorePaying, o))); got != want {
+		t.Errorf("told the subagent %q, want %q: a rule for the agent holds its subagents", got, want)
+	}
+	s, p := denied(t, o)
+	if s.get("wake.agent.instance") != "cursor/explore#tool_a17" || !reflect.DeepEqual(s.list("wake.agent.lineage"), []string{"cursor", "cursor#conv-8f2a"}) {
+		t.Errorf("recorded the refusal as %s under %v", s.get("wake.agent.instance"), s.list("wake.agent.lineage"))
+	}
+	if s.TraceID != traceID("cursor", "conv-8f2a", nil) {
+		t.Error("the subagent's refusal isn't in the trace of the session that started it")
+	}
+	if hook, _ := p["hook"].(map[string]any); hook["conversation_id"] != "conv-5b7e" || hook["parent_tool_call_id"] != "tool_a17" {
+		t.Errorf("kept %v of what the host said", hook)
+	}
+	// Once one of its events is placed, so is the rest of its conversation: the shell hooks,
+	// which name no call, and a subagent it starts, which starts with what had entered it,
+	// whether its subagentStart is in that conversation or names it.
+	Handle(host, cursorEvent("afterShellExecution", "conv-5b7e", "command", "npm test", "output", "ok"), o)
+	if spans := spooled(t, o); spans[len(spans)-1].get("wake.agent.instance") != "cursor/explore#tool_a17" {
+		t.Errorf("recorded its shell call as %s", spans[len(spans)-1].get("wake.agent.instance"))
+	}
+	for _, c := range []struct {
+		kind, call string
+		start      []byte
+	}{
+		{"shell", "tool_b2", cursorEvent("subagentStart", "conv-5b7e", "subagent_type", "shell", "tool_call_id", "tool_b2")},
+		{"generalPurpose", "tool_b3", cursorEvent("subagentStart", "conv-8f2a", "subagent_type", "generalPurpose", "tool_call_id", "tool_b3", "parent_agent_id", "conv-5b7e")},
+	} {
+		if out := string(Handle(host, c.start, o)); out != "{}" {
+			t.Fatalf("told the host %q starting a subagent no rule names", out)
+		}
+		paying := cursorEvent("preToolUse", "conv-"+c.call, "parent_tool_call_id", c.call, "tool_name", "MCP:pay", "tool_input", map[string]any{})
+		want := "Wake's flow policy (policy:no-pay-after-web) holds cursor/" + c.kind + " back after agent:cursor/explore, agent:cursor, tool:fetch_page, so this tool call wasn't run."
+		if got := cursorReason(t, string(Handle(host, paying, o))); got != want {
+			t.Errorf("told the %s subagent %q, want %q", c.kind, got, want)
+		}
+		spans := spooled(t, o)
+		lineage := []string{"cursor", "cursor#conv-8f2a", "cursor/explore#tool_a17"}
+		if s := spans[len(spans)-1]; s.get("wake.agent.instance") != "cursor/"+c.kind+"#"+c.call || !reflect.DeepEqual(s.list("wake.agent.lineage"), lineage) {
+			t.Errorf("recorded the %s subagent's refusal as %s under %v", c.kind, s.get("wake.agent.instance"), s.list("wake.agent.lineage"))
+		}
+	}
+}
+
+func TestACursorSubagentsAnswerBringsWhatEnteredIt(t *testing.T) {
+	for _, answer := range []string{"its Task call's result", "subagentStop"} {
+		t.Run(answer, func(t *testing.T) {
+			o := options(t)
+			o.Stop = true
+			serveFlow(t, o, "cursor", payPolicy("cursor"))
+			host := Hosts["cursor"]
+			handle(t, o, "cursor", "subagent_start")
+			Handle(host, exploreFetch, o)
+			if out := string(Handle(host, cursorPaying, o)); out != "{}" {
+				t.Fatalf("told the host %q: nothing the subagent found has reached the agent while it works", out)
+			}
+			in := exploreAnswers
+			if answer == "subagentStop" {
+				in = event(t, "cursor", "subagent_stop")
+			}
+			if out := Handle(host, in, o); len(out) != 0 {
+				t.Errorf("told the host %q when the subagent answered", out)
+			}
+			want := "Wake's flow policy (policy:no-pay-after-web) holds cursor back after agent:cursor/explore, tool:fetch_page, so this tool call wasn't run."
+			if got := cursorReason(t, string(Handle(host, cursorPaying, o))); got != want {
+				t.Errorf("told the agent %q, want %q: the answer brings the page the subagent fetched", got, want)
+			}
+			if names, _ := readNames(filepath.Join(o.Dir, unknownDir)); len(names) != 0 {
+				t.Errorf("counted %v as events it doesn't handle", names)
+			}
+		})
+	}
+}
+
+// Before Cursor 3.22, a subagent's hooks named nothing that ties them to the agent that
+// started it, and a subagent whose start wake-hook didn't see could be any. Wake can't
+// follow what either brings back, so the agent it answers has every origin from then.
+func TestACursorSubagentWakeCantFollowHoldsBackTheAgentItAnswers(t *testing.T) {
+	untied := cursorEvent("postToolUse", "conv-5b7e", "tool_name", "MCP:fetch_page", "tool_input", map[string]any{}, "tool_output", "{}")
+	for _, c := range []struct {
+		name    string
+		started bool
+		answer  []byte
+	}{
+		{"its Task call's result", true, exploreAnswers},
+		{"subagentStop naming no conversation", true, cursorEvent("subagentStop", "conv-8f2a", "subagent_type", "explore", "status", "completed")},
+		{"subagentStop naming one Wake didn't follow", true, cursorEvent("subagentStop", "conv-8f2a", "subagent_type", "explore", "status", "completed", "child_conversation_id", "conv-5b7e")},
+		{"a Task call whose start Wake didn't see", false, exploreAnswers},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o := options(t)
+			o.Stop = true
+			serveFlow(t, o, "cursor", payPolicy("cursor"))
+			host := Hosts["cursor"]
+			if c.started {
+				handle(t, o, "cursor", "subagent_start")
+			}
+			Handle(host, untied, o)
+			Handle(host, c.answer, o)
+			want := "Wake's flow policy (policy:no-pay-after-web) holds cursor back, because it started a subagent whose answer Wake can't follow, so this tool call wasn't run."
+			if got := cursorReason(t, string(Handle(host, cursorPaying, o))); got != want {
+				t.Errorf("told the agent %q, want %q", got, want)
+			}
+			if _, p := denied(t, o); !reflect.DeepEqual(p["origins"], []any{"*"}) || p["every_origin"] != unfollowed {
+				t.Errorf("refusal payload = %v", p)
+			}
+		})
+	}
+	// A Task call that failed, with no start seen, started no subagent: its start was refused.
+	o := options(t)
+	o.Stop = true
+	serveFlow(t, o, "cursor", payPolicy("cursor"))
+	failed := cursorEvent("postToolUseFailure", "conv-8f2a", "tool_name", "Task", "tool_input", map[string]any{}, "tool_use_id", "tool_a17", "failure_type", "permission_denied")
+	Handle(Hosts["cursor"], failed, o)
+	if out := string(Handle(Hosts["cursor"], cursorPaying, o)); out != "{}" {
+		t.Errorf("told the host %q after a Task call that started nothing", out)
+	}
+}
+
+// A Cursor subagent wake-hook placed is an instance started by the session that started it,
+// so a halt on that session, or on the subagent or its type, stops its calls.
+func TestAHaltCoversThePlacedCursorSubagent(t *testing.T) {
+	for _, agent := range []string{"cursor#conv-8f2a", "cursor/explore", "cursor/explore#tool_a17"} {
+		o := options(t)
+		o.Stop = true
+		writeRules(t, o, "cursor", 0, `{"halts":[]}`)
+		handle(t, o, "cursor", "subagent_start")
+		writeRules(t, o, "cursor", 0, fmt.Sprintf(`{"halts":[{"id":"h1","agents":[%q]}]}`, agent))
+		if out := handle(t, o, "cursor", "subagent_pre_tool"); !strings.Contains(out, `"permission":"deny"`) || !strings.Contains(out, refusal("h1")) {
+			t.Errorf("a halt on %s: told the subagent %q", agent, out)
+		}
+	}
+}
+
+// A subagent's call naming a Task call whose start wake-hook didn't see could come from a
+// subagent started with anything, so it has every origin.
+func TestACursorSubagentWhoseStartWakeDidntSeeHasEveryOrigin(t *testing.T) {
+	o := options(t)
+	o.Stop = true
+	serveFlow(t, o, "cursor", payPolicy("cursor"))
+	host := Hosts["cursor"]
+	want := "Wake's flow policy (policy:no-pay-after-web) holds cursor back, because it's a subagent whose start Wake didn't see, so this tool call wasn't run."
+	if got := cursorReason(t, string(Handle(host, explorePaying, o))); got != want {
+		t.Errorf("told the subagent %q, want %q", got, want)
+	}
+	if s, p := denied(t, o); s.get("wake.agent.instance") != "cursor#conv-5b7e" || p["every_origin"] != unseenStart {
+		t.Errorf("recorded the refusal as %s with %v", s.get("wake.agent.instance"), p)
+	}
+	if out := string(handle(t, o, "cursor", "subagent_pre_tool")); out != "{}" {
+		t.Errorf("told the host %q for a call no rule applies to", out)
 	}
 }
 
@@ -598,6 +793,45 @@ func TestAMessageFromAnAgentWithEveryOriginGivesEveryOriginForAsLong(t *testing.
 		if got := origins(t, s, agent, start+(defaultWindow+1)*sec); got.every != "" || len(got.origins) != 0 {
 			t.Errorf("%s: seen %v, not kept alive past research's window", agent, got)
 		}
+	}
+}
+
+func TestAMessageFromAnAgentWithEveryOriginCarriesWhatEnteredItSince(t *testing.T) {
+	s := store(t, defaultWindow)
+	start := 1_000_000 * sec
+	// Research has every origin, carried at start, then fetches the page at 300 and answers
+	// billing at 400.
+	s.saturate("research", start, carried)
+	s.note("research", "tool:fetch_page", start+300*sec, start+300*sec)
+	s.note("research", "agent:billing", start+300*sec, start+300*sec)
+	s.carry("research", "billing", start+400*sec)
+	if got := origins(t, s, "billing", start+defaultWindow*sec); got.every != carried {
+		t.Errorf("seen %v, want every origin, carried", got)
+	}
+	// Once research's every origin is past, the page counts for billing until its own window
+	// ends, and billing's own message doesn't come back to it.
+	for _, at := range []int64{defaultWindow + 1, 300 + defaultWindow} {
+		if got := origins(t, s, "billing", start+at*sec); got.every != "" || !reflect.DeepEqual(got.origins, []string{"tool:fetch_page"}) {
+			t.Errorf("at %d: seen %v, want the page", at, got)
+		}
+	}
+	if got := origins(t, s, "billing", start+(300+defaultWindow+1)*sec); got.every != "" || len(got.origins) != 0 {
+		t.Errorf("seen %v past the page's window", got)
+	}
+	// What's carried counts toward the receiver's bound, as any origin does: past it, the
+	// receiver has every origin from then.
+	later := start + 4000*sec
+	s.saturate("research", later, carried)
+	for i := range maxOrigins {
+		s.note("research", fmt.Sprintf("tool:r%d", i), later+sec, later+sec)
+	}
+	s.note("billing", "tool:search", later+sec, later+sec)
+	s.carry("research", "billing", later+sec)
+	if got := origins(t, s, "billing", later+(1+defaultWindow)*sec); got.every != saturated {
+		t.Errorf("seen %v, want every origin past the bound", got)
+	}
+	if got := origins(t, s, "billing", later+(2+defaultWindow)*sec); got.every != "" || len(got.origins) != 0 {
+		t.Errorf("seen %v once the window passed", got)
 	}
 }
 

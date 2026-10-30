@@ -272,6 +272,46 @@ def test_a_message_from_an_agent_with_every_origin_gives_every_origin_for_as_lon
         assert origins.seen(agent) == flow.Seen(), f"{agent}: not kept alive past research's window"
 
 
+def test_a_message_from_an_agent_with_every_origin_carries_what_entered_it_since():
+    clock = Clock()
+    origins = flow.Origins(clock)
+    start = clock.now
+    # Research has every origin, carried at start, then fetches the page at 300 and answers
+    # billing at 400.
+    for i in range(flow.MAX_ORIGINS + 1):
+        origins.note("web", f"tool:t{i}")
+    origins.carry("web", "research")
+    clock.now = start + 300
+    origins.note("research", "tool:fetch_page")
+    origins.note("research", "agent:billing")
+    clock.now = start + 400
+    origins.carry("research", "billing")
+    clock.now = start + flow.DEFAULT_WINDOW
+    assert origins.seen("billing") == flow.Seen((), flow.CARRIED)
+    # Once research's every origin is past, the page counts for billing until its own window
+    # ends, and billing's own message doesn't come back to it.
+    for at in (start + flow.DEFAULT_WINDOW + 1, start + 300 + flow.DEFAULT_WINDOW):
+        clock.now = at
+        assert origins.seen("billing") == flow.Seen(("tool:fetch_page",)), at - start
+    clock.now = start + 300 + flow.DEFAULT_WINDOW + 1
+    assert origins.seen("billing") == flow.Seen()
+    # What's carried counts toward the receiver's bound, as any origin does: past it, the
+    # receiver has every origin from then.
+    clock.now = start + 4_000
+    for i in range(flow.MAX_ORIGINS + 1):
+        origins.note("web", f"tool:u{i}")
+    origins.carry("web", "research")
+    clock.now = start + 4_001
+    for i in range(flow.MAX_ORIGINS):
+        origins.note("research", f"tool:r{i}")
+    origins.note("billing", "tool:search")
+    origins.carry("research", "billing")
+    clock.now = start + 4_001 + flow.DEFAULT_WINDOW
+    assert origins.seen("billing") == flow.Seen((), flow.SATURATED)
+    clock.now += 1
+    assert origins.seen("billing") == flow.Seen()
+
+
 def test_message_notes_the_sender_and_carries_what_entered_it(clock):
     flow.note("research", "tool:fetch_page")
     clock.now += 1

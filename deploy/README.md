@@ -101,4 +101,4 @@ spec:
       ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
 ```
 
-Add the identity provider's address. Route model calls through agentgateway too, as the reference fleet does with real models (the `openai` and `anthropic` routes in `examples/fleet/agentgateway.yaml`, with the keys in `models.yaml`): the gateway adds the provider's key, so no agent holds one, and the brake's deny covers the calls. Each other address you add is a way around the policy for whatever runs there.
+Add the identity provider's address. Route model calls through agentgateway too, as the reference fleet does with real models (the `openai` and `anthropic` routes in `examples/fleet/agentgateway.yaml`, with the keys in `models.yaml`): the gateway adds the provider's key, so no agent holds one, and the brake's deny covers the calls. Give those routes wake-proxy's `extProc` as the fleet's have it, and wake-proxy checks the tools each call lets the provider run (see "Model calls" in [docs/proxy.md](../docs/proxy.md)). Each other address you add is a way around the policy for whatever runs there.

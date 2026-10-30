@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [mcp_request, capture_hooks, canonical, a2a_exchange, authz_check, flow_policy, redact]
+        target: [mcp_request, capture_hooks, canonical, a2a_exchange, authz_check, flow_policy, redact, model_call]
     defaults:
       run:
         working-directory: proxy/fuzz

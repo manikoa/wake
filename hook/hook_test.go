@@ -160,6 +160,8 @@ func TestRecordsEachHostsActions(t *testing.T) {
 		{"cursor", "read_file", "tool_call", "read_file", "", "API_URL=https://api.example.com\n"},
 		{"cursor", "edit_file", "tool_call", "edit_file", "", nil},
 		{"cursor", "subagent_start", "", "", "", nil},
+		{"cursor", "subagent_post_tool", "tool_call", "Grep", "tool_c03", map[string]any{"matches": []any{"src/session.ts:12"}}},
+		{"cursor", "subagent_stop", "", "", "", nil},
 		{"grok", "prompt", "agent_message", "", "", nil},
 		{"grok", "pre_tool", "", "", "", nil},
 		{"grok", "post_tool", "tool_call", "Bash", "", nil},

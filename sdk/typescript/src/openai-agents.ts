@@ -41,7 +41,11 @@
  * as denied, and the run ends with AgentHalted. guard() has each hosted MCP tool ask before
  * every call, and answers itself, rejecting a call it holds back, unless the app answers its
  * calls through run interruptions: Wake can't answer for a person, so that tool is left as it
- * is.
+ * is. A hosted MCP call the app approves runs inside the model call whose input carries the
+ * approval, and the only hook the SDK has that can change that input is the run's
+ * callModelInputFilter. So the app gives the run checkApprovals() as that filter: it checks each
+ * call an input approves, through interruptions, for good with alwaysApprove, or for a server
+ * deferred tool search found, and turns down in the input the ones Wake holds back.
  *
  * At the same points, guard() applies the flow policy the rules carry (flow.ts), once no halt
  * covers the call: a tool call, or a handoff by the agent it reaches, is refused the same way,
@@ -58,7 +62,7 @@
  * Each hosted tool call a response reports enters its agent as tool:<the tool's name> when the
  * response's span ends, a hosted MCP call by the MCP tool's own name. Without sensitive data the
  * span leaves the response out, so every hosted tool but MCP that the call offered enters, and
- * a hosted MCP call enters when Wake approves it. The SDK hands spans to its trace processors
+ * a hosted MCP call enters when Wake lets it through. The SDK hands spans to its trace processors
  * one after another, so Wake can see a response's end after a tool from it has started: each
  * check Wake makes for an agent, guard()'s and the memory adapter's, first waits until Wake has
  * seen the end of each response of that agent's run whose start it saw, at most
@@ -76,9 +80,12 @@ import {
   Handoff,
   ToolGuardrailFunctionOutputFactory,
   type Agent,
+  type CallModelInputFilter,
+  type CallModelInputFilterArgs,
   type ComputerTool,
   type HandoffEnabledFunction,
   type HostedTool,
+  type ModelInputData,
   type RunContext,
   type RunToolApprovalItem,
   type Tool,
@@ -94,7 +101,7 @@ import { contextOf, EventGraph, failed, Recent, unique } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
 import type { Recorder } from "./recorder.ts";
-import { AgentHalted, flowRefusal, keptOf, refusal, stopsWith, unchecked, type Halts, type Refusal } from "./stop.ts";
+import { AgentHalted, flowRefusal, keptOf, refusal, stopsWith, UNCHECKED, unchecked, type Halts, type Refusal } from "./stop.ts";
 
 // The Agents SDK's tracing objects, as far as Wake reads them.
 interface SdkTrace {
@@ -196,6 +203,73 @@ function wouldAsk(setting: unknown, name: string): boolean {
   const names = never.tool_names ?? never.toolNames;
   const readOnly = never.read_only ?? never.readOnly;
   return !(Array.isArray(names) && names.includes(name) && readOnly === undefined);
+}
+
+/**
+ * Why an approval of a hosted MCP call is turned down when Wake can't find the request it
+ * answers, so it can't check the call.
+ */
+const UNFOUND = "Wake couldn't find the request this approves, so this tool call wasn't run.";
+
+/** The hosted MCP tools guard() has said it leaves to the app, each said once. */
+const leftToApp = new WeakSet<object>();
+
+/** A hosted MCP tool's request to call one of its server's tools: the MCP tool's own name, the arguments and the server. */
+interface McpRequest {
+  name: string;
+  arguments: unknown;
+  server: string | undefined;
+}
+
+/**
+ * What a model call's input item is, when it's a hosted MCP item the SDK keeps as a hosted tool
+ * call: mcp_approval_request, mcp_approval_response or mcp_call, by its name or its
+ * providerData's type, with its providerData.
+ */
+function mcpItem(item: unknown): { kind: string; data: Record<string, unknown> } | undefined {
+  if (field(item, "type") !== "hosted_tool_call") return undefined;
+  const data = field(item, "providerData");
+  if (data === null || typeof data !== "object") return undefined;
+  const kind = [field(data, "type"), field(item, "name")].find((k) => k === "mcp_approval_request" || k === "mcp_approval_response" || k === "mcp_call");
+  return kind === undefined ? undefined : { kind: kind as string, data: data as Record<string, unknown> };
+}
+
+/** The id of the request a hosted MCP item answers or ran for. */
+function approvalRequestId(data: Record<string, unknown>): unknown {
+  return field(data, "approval_request_id", "approvalRequestId");
+}
+
+/** The request an input item asks, when it's the hosted MCP request with this id. */
+function requestIn(item: unknown, id: string): McpRequest | undefined {
+  const asked = mcpItem(item);
+  if (asked?.kind !== "mcp_approval_request" || (field(asked.data, "id") ?? field(item, "id")) !== id) return undefined;
+  const name = field(asked.data, "name");
+  const server = field(asked.data, "server_label", "serverLabel");
+  return typeof name === "string" && name ? { name, arguments: field(asked.data, "arguments"), server: typeof server === "string" ? server : undefined } : undefined;
+}
+
+/**
+ * Turns the approval at input[index] into a rejection, with reason. It's changed in place, as the
+ * filter's own copy, or, when the filter was given the SDK's own items, replaced by a changed
+ * copy, since those mustn't change. Throws AgentHalted when neither can be done, rather than let
+ * the call run.
+ */
+function turnDown(input: unknown[], index: number, refused: Refusal, inPlace: boolean): void {
+  const item = input[index] as { providerData: Record<string, unknown> };
+  try {
+    if (inPlace) {
+      item.providerData.approve = false;
+      item.providerData.reason = refused[1];
+      if (item.providerData.approve === false && item.providerData.reason === refused[1]) return;
+    }
+  } catch {
+    // Replaced below.
+  }
+  try {
+    input[index] = { ...item, providerData: { ...item.providerData, approve: false, reason: refused[1] } };
+  } catch {
+    throw new AgentHalted(refused);
+  }
 }
 
 /**
@@ -330,6 +404,8 @@ export class WakeTracingProcessor extends EventGraph {
   readonly #open = new Recent<string, Open>(); // sdk span id of a response span Wake saw start and not end -> what checks wait on
   readonly #endedFirst = new Recent<string, true>(1024); // sdk span id of a response span whose end Wake saw before its start
   readonly #offeredFor = new Recent<string, Tool<any>[]>(); // sdk span id a model call is made under -> the tools ranInModelCall it offers
+  readonly #requests = new Recent<string, McpRequest>(); // hosted MCP request id -> the request, as a response the trace shows asked
+  readonly #decided = new Recent<string, Refusal | null>(); // hosted MCP request id -> the refusal its approval was turned down with, or null once let through
   #guardrail: ToolInputGuardrailDefinition | undefined; // the tool input guardrail guard() adds, made once
   /** How long a check waits for the responses its agent has open, at most (RESPONSE_WAIT_MILLIS). */
   _waitMillis = RESPONSE_WAIT_MILLIS;
@@ -359,7 +435,9 @@ export class WakeTracingProcessor extends EventGraph {
    * Hosted tools run at OpenAI. An agent that offers any but hosted MCP has its instructions
    * wrapped, to check each before every model call, which isn't made if one is held back. Each
    * hosted MCP tool asks before every call, and Wake answers, unless the app answers its calls
-   * through run interruptions, which leaves it as it is.
+   * through run interruptions, which leaves it as it is: guard() says so once for each such
+   * tool, and the calls the app approves are checked by checkApprovals(), the run's
+   * callModelInputFilter.
    */
   guard<A extends Agent<any, any>>(agent: A, ...others: Agent<any, any>[]): A {
     if (this.#quarantine === undefined) throw new Error("guard() needs the brake's rules: install(recorder, { quarantine })");
@@ -571,14 +649,24 @@ export class WakeTracingProcessor extends EventGraph {
    * Has a hosted MCP tool ask before every call, Wake answering each (#approveMcpCall), unless
    * the app answers its calls itself through run interruptions: its setting asks for some calls
    * and it has no callback. Wake can't answer for a person, and can't interrupt, so that tool
-   * is left as it is.
+   * is left as it is, and Wake says, once, that checkApprovals() checks the calls the app
+   * approves.
    */
   #guardHostedMcp(tool: HostedTool & { providerData: McpData }): void {
     const data = tool.providerData;
     const callback = data.on_approval;
     if (wrapped(callback)) return;
     const setting = data.require_approval ?? "never";
-    if (callback === undefined && setting !== "never") return;
+    if (callback === undefined && setting !== "never") {
+      if (!leftToApp.has(tool)) {
+        leftToApp.add(tool);
+        log.warn(
+          `guard() leaves hosted MCP server ${String(data.server_label ?? tool.name)} to the app, which approves its calls through run interruptions: ` +
+            "give the run checkApprovals() as its callModelInputFilter, or the calls the app approves run unchecked",
+        );
+      }
+      return;
+    }
     data.require_approval = "always";
     data.on_approval = Object.assign(async (context: RunContext<any>, item: RunToolApprovalItem) => this.#approveMcpCall(context, item, setting, callback), {
       [WAKE]: true as const,
@@ -591,7 +679,8 @@ export class WakeTracingProcessor extends EventGraph {
    * refusal as its reason, recorded as denied. Otherwise the tool's own callback answers, when
    * its own setting would have asked about the call, and Wake approves when it wouldn't. An
    * approved call's result comes back in the next response, which a trace without sensitive data
-   * leaves out, so it's noted entering the agent now.
+   * leaves out, so it's noted entering the agent now. The answer is decided here, so the input
+   * that carries it isn't checked again (checkApprovals).
    */
   async #approveMcpCall(context: RunContext<any>, item: RunToolApprovalItem, setting: unknown, callback: McpApproval | undefined): Promise<{ approve: boolean; reason?: string }> {
     const raw = item.rawItem as { name?: unknown; id?: unknown; providerData?: Record<string, unknown> };
@@ -603,10 +692,131 @@ export class WakeTracingProcessor extends EventGraph {
     const id = [request.id, raw.id].find((i): i is string => typeof i === "string" && i !== "");
     const server = typeof request.server_label === "string" ? request.server_label : undefined;
     const refused = this.#refuseCall(agent, name, request.arguments, id, { span, settled, server });
+    if (id !== undefined) this.#decided.set(id, refused ?? null);
     if (refused !== undefined) return { approve: false, reason: refused[1] };
     const answer = callback !== undefined && wouldAsk(setting, name) ? await callback(context, item) : { approve: true };
     if (answer.approve) entered.note(agent, `tool:${name}`);
     return answer;
+  }
+
+  /**
+   * A callModelInputFilter that checks each hosted MCP call a model call's input approves, which
+   * OpenAI runs inside that call. It's for the calls the app approves itself, which no callback
+   * of guard()'s answers: through run interruptions, for good with alwaysApprove, or for a server
+   * deferred tool search found, which guard() never sees. Give it to the run's options or the
+   * Runner's config:
+   *
+   *     const runner = new Runner({ callModelInputFilter: processor.checkApprovals() });
+   *
+   * Given the app's own filter, it checks the input that filter returns. Each call is checked as
+   * guard() answers a hosted MCP tool's request: the halts, then the flow policy, for a call by
+   * the agent to the MCP tool's own name. One held back has its approval turned into a rejection
+   * in the input, with the refusal as its reason, and is recorded as denied, with its server. One
+   * let through enters the agent now, as tool:<the MCP tool>.
+   *
+   * Wake matches an approval to the request it answers from the response that asked, which the
+   * trace shows with sensitive data, or else from the input, which holds it unless the
+   * conversation is kept at OpenAI (previousResponseId, conversationId). One it can't match it
+   * can't check, and turns down under halt-check-failed. Each approval is decided once: an input
+   * that carries it again, as a run's whole history does on each model call, gets the same
+   * answer, and one guard()'s callback answered, or whose call the input shows ran, is left as
+   * it is.
+   */
+  checkApprovals(own?: CallModelInputFilter<any>): CallModelInputFilter<any> {
+    if (this.#quarantine === undefined) throw new Error("checkApprovals() needs the brake's rules: install(recorder, { quarantine })");
+    // The filter is given its own copies of the input's items, unless the app's filter asks for
+    // the SDK's own, which mustn't change.
+    const identity = own?.preserveInputIdentity === true;
+    const filter = async (args: CallModelInputFilterArgs<any>): Promise<ModelInputData> => {
+      const data = own !== undefined ? await own(args) : args.modelData;
+      await this.#checkApprovals(args.agent?.name ?? this._recorder.agent, data, !identity);
+      return data;
+    };
+    return identity ? Object.assign(filter, { preserveInputIdentity: true }) : filter;
+  }
+
+  /**
+   * Checks each hosted MCP call the input approves, for checkApprovals(), turning down in place,
+   * or by a changed copy, the approval of each Wake holds back. It waits first, as every check
+   * does, to see the end of each response of the agent's run, which holds the requests.
+   */
+  async #checkApprovals(agent: string, data: ModelInputData, inPlace: boolean): Promise<void> {
+    if (this.#quarantine === undefined || !Array.isArray(data?.input)) return;
+    const input = data.input as unknown[];
+    const approved = input.flatMap((item, index) => {
+      const approval = mcpItem(item);
+      return approval?.kind === "mcp_approval_response" && approval.data.approve === true ? [{ index, id: approvalRequestId(approval.data) }] : [];
+    });
+    if (approved.length === 0) return;
+    const span = currentSpan();
+    let settled: boolean | undefined;
+    for (const { index, id } of approved) {
+      let refused: Refusal | undefined;
+      if (typeof id === "string" && this.#decided.has(id)) {
+        refused = this.#decided.get(id) ?? undefined;
+      } else {
+        try {
+          settled ??= await this.#settled(agent, span);
+          refused = this.#decideApproval(agent, id, input, span, settled);
+        } catch (error) {
+          log.warn("couldn't check a hosted MCP call the app approved; refusing it", error);
+          refused = unchecked();
+          if (typeof id === "string") this.#decided.set(id, refused);
+        }
+      }
+      if (refused !== undefined) turnDown(input, index, refused, inPlace);
+    }
+  }
+
+  /**
+   * The refusal of the hosted MCP call an approval of request id lets OpenAI run, in a model call
+   * of agent whose input is input, or undefined to let it run. The request is the one a response
+   * the trace showed asked, or else the one in the input. With neither, Wake can't check the
+   * call, and it's refused under halt-check-failed. A call the input shows ran already, in an
+   * earlier model call, is let be: nothing more runs. The refusal is recorded as denied, under
+   * the agent's run, the response that asked its parent.
+   */
+  #decideApproval(agent: string, id: unknown, input: unknown[], span: SdkSpan | undefined, settled: boolean): Refusal | undefined {
+    const key = typeof id === "string" ? id : undefined;
+    if (key !== undefined && input.some((item) => { const ran = mcpItem(item); return ran?.kind === "mcp_call" && approvalRequestId(ran.data) === key; })) {
+      this.#decided.set(key, null);
+      return undefined;
+    }
+    const request = key === undefined ? undefined : (this.#requests.get(key) ?? input.map((item) => requestIn(item, key)).find((r) => r !== undefined));
+    const askedBy = key === undefined ? undefined : this.#eventByItem.get(key);
+    let refused: Refusal | undefined;
+    if (request === undefined) {
+      const unfound: Refusal = [UNCHECKED, UNFOUND];
+      refused = unfound;
+      // Refused all the same if this fails; only its record may say less.
+      this.#safely("refused hosted MCP call", () => {
+        if (span !== undefined) this.#refusedAlone(span, agent, "mcp", null, key, unfound, undefined, askedBy);
+      });
+      log.warn(`refused a hosted MCP call of ${agent}: Wake couldn't find the request ${String(id)} it approves`);
+    } else {
+      refused = this.#refuseCall(agent, request.name, request.arguments, key, { span, settled, server: request.server, askedBy });
+      // Its result comes back in the response to the call it runs in.
+      if (refused === undefined) entered.note(agent, `tool:${request.name}`);
+    }
+    if (key !== undefined) this.#decided.set(key, refused ?? null);
+    return refused;
+  }
+
+  /**
+   * Keeps each hosted MCP tool's request to make a call that a response's span reports, by its
+   * id, for the input that approves it (checkApprovals). The span holds the response only with
+   * sensitive data.
+   */
+  #noteRequests(span: SdkSpan): void {
+    const output = field(span.spanData._response, "output");
+    if (!Array.isArray(output)) return;
+    for (const item of output) {
+      const id = field(item, "id");
+      const name = field(item, "name");
+      if (field(item, "type") !== "mcp_approval_request" || typeof id !== "string" || typeof name !== "string" || !name) continue;
+      const server = field(item, "server_label");
+      this.#requests.set(id, { name, arguments: field(item, "arguments"), server: typeof server === "string" ? server : undefined });
+    }
   }
 
   /** The guardrail: refuses a call a halt covers, telling the model why. */
@@ -625,16 +835,17 @@ export class WakeTracingProcessor extends EventGraph {
    * policy keeps it from what entered them: agent, as the SDK says, or else the agent whose run
    * the SDK's current span is in, or owner. It's noted on the call's span, to be recorded as
    * denied when that ends, or recorded as denied now if the SDK opened none for it, as for a
-   * guardrail run before the call's approval, or a hosted MCP call, whose server is named.
-   * Unsettled, Wake didn't see the end of a response the call may follow from, and it refuses,
-   * as a check that failed. Never throws: a check that fails refuses.
+   * guardrail run before the call's approval, or a hosted MCP call, whose server is named, and
+   * askedBy, the response that asked for it, is its parent when Wake knows it. Unsettled, Wake
+   * didn't see the end of a response the call may follow from, and it refuses, as a check that
+   * failed. Never throws: a check that fails refuses.
    */
   #refuseCall(
     agent: string | undefined,
     name: string,
     args: unknown,
     callId: string | undefined,
-    { owner, span = currentSpan(), settled = true, server }: { owner?: string; span?: SdkSpan; settled?: boolean; server?: string } = {},
+    { owner, span = currentSpan(), settled = true, server, askedBy }: { owner?: string; span?: SdkSpan; settled?: boolean; server?: string; askedBy?: string } = {},
   ): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
     let who = agent ?? owner ?? this._recorder.agent;
@@ -653,7 +864,7 @@ export class WakeTracingProcessor extends EventGraph {
       if (span === undefined) return;
       this.#refused.set(span.spanId, true);
       if (this.#pending.has(span.spanId)) this.#halted.set(span.spanId, { refusal: stopped, call: callId });
-      else this.#refusedAlone(span, who, name, args, callId, stopped, server);
+      else this.#refusedAlone(span, who, name, args, callId, stopped, server, askedBy);
     });
     log.warn(`refused a ${name} call of ${who}: ${refused[0]}`);
     return refused;
@@ -738,13 +949,13 @@ export class WakeTracingProcessor extends EventGraph {
   /**
    * Records a tool call refused where the SDK opened no span for it, as for a guardrail run
    * before the call's approval, a hosted MCP call, with its server, or a hosted tool a model call
-   * would have offered: denied, under its agent's run, the response that asked for it, or the
-   * agent's latest, its parent.
+   * would have offered: denied, under its agent's run, the response that asked for it, askedBy
+   * when given, or else the agent's latest, its parent.
    */
-  #refusedAlone(span: SdkSpan, agent: string, name: string, args: unknown, callId: string | undefined, refused: Refusal, server?: string): void {
+  #refusedAlone(span: SdkSpan, agent: string, name: string, args: unknown, callId: string | undefined, refused: Refusal, server?: string, askedBy?: string): void {
     const run = this.#runAt(span.spanId);
     const requested = typeof args === "string" ? this.#call.get(key(span.traceId, run ?? null, name, args)) : undefined;
-    const parent = requested?.[1] ?? this.#lastResponse.get(key(span.traceId, run ?? null, agent));
+    const parent = askedBy ?? requested?.[1] ?? this.#lastResponse.get(key(span.traceId, run ?? null, agent));
     const otel = this._recorder.tracer.startSpan(`execute_tool ${name}`, {}, this.#contextAt(span.spanId, span.traceId));
     const eventId = randomUUID();
     const at: SdkSpan = { traceId: span.traceId, spanId: "", parentId: span.spanId, spanData: { type: "function" }, error: null };
@@ -858,6 +1069,7 @@ export class WakeTracingProcessor extends EventGraph {
     }
     try {
       this.#safely("what entered", () => this.#entering(span, open));
+      if (span.spanData.type === "response") this.#safely("hosted MCP requests", () => this.#noteRequests(span));
       this.#safely("onSpanEnd", () => {
         const data = span.spanData;
         switch (data.type) {

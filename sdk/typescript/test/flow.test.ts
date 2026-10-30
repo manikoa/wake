@@ -286,8 +286,48 @@ test("content from an agent with every origin gives every origin, until that age
   time.seconds = 700;
   e.carry("c", "a");
   time.seconds = 900.001;
-  assert.deepEqual(e.seen("a"), [], "nor kept alive by passing it around");
   assert.deepEqual(e.seen("c"), ["agent:b"], "only what entered it since is known");
+  // c's message brought a agent:b, which entered c after c came to have every origin. a, at
+  // its bound, had no room for it, so it has every origin until agent:b's window ends.
+  assert.deepEqual(e.seen("a"), new Every(SATURATED));
+  time.seconds = 1_500.001;
+  assert.deepEqual(e.seen("a"), [], "nor kept alive by passing it around");
+});
+
+test("content from an agent with every origin carries what entered it since, for as long as each counts", () => {
+  const { time, e } = tracker();
+  // Research has every origin, carried at 0, then fetches the page at 300 and answers billing
+  // at 400.
+  for (let i = 0; i <= MAX_ORIGINS; i++) e.note("web", `tool:t${i}`);
+  e.carry("web", "research");
+  time.seconds = 300;
+  e.note("research", "tool:fetch_page");
+  e.note("research", "agent:billing");
+  time.seconds = 400;
+  e.carry("research", "billing");
+  time.seconds = 900;
+  assert.deepEqual(e.seen("billing"), new Every(CARRIED));
+  // Once research's every origin is past, the page counts for billing until its own window
+  // ends, and billing's own message doesn't come back to it.
+  for (const at of [900.001, 1_200]) {
+    time.seconds = at;
+    assert.deepEqual(e.seen("billing"), ["tool:fetch_page"], `at ${at}`);
+  }
+  time.seconds = 1_200.001;
+  assert.deepEqual(e.seen("billing"), []);
+  // What's carried counts toward the receiver's bound, as any origin does: past it, the
+  // receiver has every origin from then.
+  time.seconds = 4_000;
+  for (let i = 0; i <= MAX_ORIGINS; i++) e.note("web", `tool:u${i}`);
+  e.carry("web", "research");
+  time.seconds = 4_001;
+  for (let i = 0; i < MAX_ORIGINS; i++) e.note("research", `tool:r${i}`);
+  e.note("billing", "tool:search");
+  e.carry("research", "billing");
+  time.seconds = 4_901;
+  assert.deepEqual(e.seen("billing"), new Every(SATURATED));
+  time.seconds = 4_901.001;
+  assert.deepEqual(e.seen("billing"), []);
 });
 
 /** Rules that serve this policy, as a Quarantine does. */

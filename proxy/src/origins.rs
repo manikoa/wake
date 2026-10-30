@@ -129,6 +129,9 @@ pub const UNPLACED: &str = "the agents file doesn't list the caller, and its tok
 /// Why an agent counts as having every origin once a message or reply from one that does
 /// reached it.
 pub const CARRIED: &str = "a message or reply reached the agent from one with every origin";
+/// Why an agent counts as having every origin once a model's response that wake-proxy
+/// couldn't read reached it: it can't tell which tools the provider ran (models.rs).
+pub const UNREAD: &str = "a model's response reached the agent that wake-proxy couldn't read";
 /// Why an agent counts as having every origin past MAX_ORIGINS.
 const SATURATED: &str = "more origins entered the agent than wake-proxy keeps";
 
@@ -212,33 +215,47 @@ impl Inner {
         Some(self.agents.entry(key.to_string()).or_default())
     }
 
-    /// What entered any of whos since since, each origin with when it last entered any of
-    /// them. Err when that's every origin for any of them, with why and since when: at, now,
-    /// for a caller with no identity.
-    fn entered(&self, whos: &[Who<'_>], since: u64, at: u64) -> Result<HashMap<&str, u64>, (&'static str, u64)> {
-        if self.known_since > since {
-            return Err(("wake-proxy hasn't watched for a whole window yet", self.known_since));
-        }
-        let mut newest: HashMap<&str, u64> = HashMap::new();
-        for who in whos {
+    /// Why each of whos that has every origin since since has it, and since when: at, now,
+    /// for a caller with no identity. First, while wake-proxy hasn't watched for a whole
+    /// window, since it started.
+    fn every(&self, whos: &[Who<'_>], since: u64, at: u64) -> impl Iterator<Item = (&'static str, u64)> {
+        let started = (self.known_since > since)
+            .then_some(("wake-proxy hasn't watched for a whole window yet", self.known_since));
+        let each = whos.iter().filter_map(move |who| {
             let Some(key) = who.key() else {
-                return Err(("the caller has no identity", at));
+                return Some(("the caller has no identity", at));
             };
-            let Some(agent) = self.agents.get(key) else {
-                if let Some(overflowed) = self.overflowed_at.filter(|t| *t >= since) {
-                    return Err(("too many agents to remember this one", overflowed));
-                }
-                continue;
-            };
-            if let Some((saturated, why)) = agent.saturated.filter(|(t, _)| *t >= since) {
-                return Err((why, saturated));
+            match self.agents.get(key) {
+                Some(agent) => agent.saturated.filter(|(t, _)| *t >= since).map(|(t, why)| (why, t)),
+                None => self
+                    .overflowed_at
+                    .filter(|t| *t >= since)
+                    .map(|t| ("too many agents to remember this one", t)),
             }
+        });
+        started.into_iter().chain(each)
+    }
+
+    /// Each origin noted for any of whos since since, with when it last entered any of them,
+    /// whether or not any of them has every origin.
+    fn recorded(&self, whos: &[Who<'_>], since: u64) -> HashMap<&str, u64> {
+        let mut newest: HashMap<&str, u64> = HashMap::new();
+        for agent in whos.iter().filter_map(|who| self.agents.get(who.key()?)) {
             for (origin, seen) in agent.origins.iter().filter(|(_, seen)| **seen >= since) {
                 let at = newest.entry(origin).or_default();
                 *at = (*at).max(*seen);
             }
         }
-        Ok(newest)
+        newest
+    }
+
+    /// What entered any of whos since since, each origin with when it last entered any of
+    /// them. Err when that's every origin for any of them, with why and since when.
+    fn entered(&self, whos: &[Who<'_>], since: u64, at: u64) -> Result<HashMap<&str, u64>, (&'static str, u64)> {
+        match self.every(whos, since, at).next() {
+            Some(every) => Err(every),
+            None => Ok(self.recorded(whos, since)),
+        }
     }
 }
 
@@ -291,43 +308,44 @@ impl Observed {
     /// Notes that content from from, a message or a reply, reached each of to at: whatever
     /// had entered any of from within the window entered each of to too. Each origin keeps
     /// when it last entered them, so passing content on never makes it newer. When that's
-    /// every origin, each of to has every origin too, from when from did. What came from
-    /// one of to isn't carried back to them: an agent's own content, or its chain's, isn't
-    /// an origin of theirs.
+    /// every origin, each of to has every origin too, for as long as any of from does, and
+    /// what entered from after that time enters each of to as well, so it still counts once
+    /// every origin no longer does. What came from one of to isn't carried back to them: an
+    /// agent's own content, or its chain's, isn't an origin of theirs.
     pub fn carry(&self, from: &[Who<'_>], to: &[Who<'_>], at: u64) {
         let mut inner = self.lock();
         let since = at.saturating_sub(inner.window);
+        let every = inner.every(from, since, at).map(|(_, t)| t).max();
         let own: Vec<String> = to.iter().filter_map(Who::key).map(|k| format!("agent:{k}")).collect();
-        let carried = inner.entered(from, since, at).map(|entered| {
-            entered
-                .into_iter()
-                .filter(|(origin, _)| !own.iter().any(|o| o == origin))
-                .map(|(origin, seen)| (origin.to_string(), seen))
-                .collect::<Vec<_>>()
-        });
-        if carried.as_ref().is_ok_and(Vec::is_empty) {
+        // What entered by the time every origin did counts no longer than every origin does.
+        let carried: Vec<(String, u64)> = inner
+            .recorded(from, since)
+            .into_iter()
+            .filter(|(origin, seen)| every.is_none_or(|t| *seen > t) && !own.iter().any(|o| o == origin))
+            .map(|(origin, seen)| (origin.to_string(), seen))
+            .collect();
+        if every.is_none() && carried.is_empty() {
             return;
         }
         for who in to {
             let Some(agent) = inner.agent(*who, at) else { continue };
-            match &carried {
-                Ok(origins) => {
-                    for (origin, seen) in origins {
-                        agent.note(origin, *seen, since);
-                    }
-                }
-                Err((_, every_since)) => agent.saturate(*every_since, CARRIED),
+            if let Some(t) = every {
+                agent.saturate(t, CARRIED);
+            }
+            for (origin, seen) in &carried {
+                agent.note(origin, *seen, since);
             }
         }
     }
 
-    /// Notes that content nothing is known of reached each of to at, such as a message from
-    /// a caller nobody can name or place: each has every origin from then.
-    pub fn saturate(&self, to: &[Who<'_>], at: u64) {
+    /// Notes that content nothing is known of reached each of to at, for why, such as a
+    /// message from a caller nobody can name or place (CARRIED), or a model's response that
+    /// couldn't be read (UNREAD): each has every origin from then, for a window.
+    pub fn saturate(&self, to: &[Who<'_>], at: u64, why: &'static str) {
         let mut inner = self.lock();
         for who in to {
             if let Some(agent) = inner.agent(*who, at) {
-                agent.saturate(at, CARRIED);
+                agent.saturate(at, why);
             }
         }
     }
@@ -624,9 +642,62 @@ mod tests {
         o.carry(&[Who::Nobody], &[b], after_start(1_000));
         assert_eq!(o.seen(b, after_start(1_899), WINDOW), Seen::Every(CARRIED));
         assert_eq!(o.seen(b, after_start(1_901), WINDOW), Seen::These(vec![]));
-        o.saturate(&[c, Who::Nobody], after_start(2_000));
+        o.saturate(&[c, Who::Nobody], after_start(2_000), CARRIED);
         assert_eq!(o.seen(c, after_start(2_899), WINDOW), Seen::Every(CARRIED));
         assert_eq!(o.seen(c, after_start(2_901), WINDOW), Seen::These(vec![]));
+        // So is a model's response that couldn't be read, with its own reason.
+        o.saturate(&[a], after_start(3_000), UNREAD);
+        assert_eq!(o.seen(a, after_start(3_001), WINDOW), Seen::Every(UNREAD));
+        assert_eq!(o.seen(a, after_start(3_901), WINDOW), Seen::These(vec![]));
+    }
+
+    #[test]
+    fn content_from_an_agent_with_every_origin_carries_what_entered_it_since() {
+        let o = Observed::starting(START, WINDOW);
+        let (research, billing) = (Who::Agent("research"), Who::Agent("billing"));
+        // Research has every origin, carried at 0, then fetches the page at 300 and replies
+        // to billing at 400.
+        o.saturate(&[research], after_start(0), CARRIED);
+        o.note(research, "tool:fetch_page", after_start(300));
+        o.note(research, "agent:billing", after_start(300));
+        o.carry(&[research], &[billing], after_start(400));
+        assert_eq!(o.seen(billing, after_start(900), WINDOW), Seen::Every(CARRIED));
+        // Once research's every origin is past, the page counts for billing until its own
+        // window ends, and billing's own message doesn't come back to it.
+        for at in [901, 1_200] {
+            assert_eq!(
+                o.seen(billing, after_start(at), WINDOW),
+                Seen::These(vec!["tool:fetch_page".into()]),
+                "at {at}"
+            );
+        }
+        assert_eq!(o.seen(billing, after_start(1_201), WINDOW), Seen::These(vec![]));
+
+        // From several agents, it's every origin for as long as any of them has it.
+        let (child, support, notify) = (
+            Who::Unlisted("support/researcher#toolu_1"),
+            Who::Agent("support"),
+            Who::Agent("notify"),
+        );
+        o.saturate(&[child], after_start(2_000), CARRIED);
+        o.saturate(&[support], after_start(2_500), CARRIED);
+        o.carry(&[child, support], &[notify], after_start(2_600));
+        assert_eq!(o.seen(notify, after_start(3_400), WINDOW), Seen::Every(CARRIED));
+        assert_eq!(o.seen(notify, after_start(3_401), WINDOW), Seen::These(vec![]));
+
+        // What's carried counts toward the receiver's bound, as any origin does: past it, the
+        // receiver has every origin from then.
+        o.saturate(&[research], after_start(4_000), CARRIED);
+        for i in 0..MAX_ORIGINS {
+            o.note(research, &format!("tool:t{i}"), after_start(4_001));
+        }
+        o.note(billing, "tool:search", after_start(4_001));
+        o.carry(&[research], &[billing], after_start(4_001));
+        assert_eq!(
+            o.seen(billing, after_start(4_901), WINDOW),
+            Seen::Every("more origins entered the agent than wake-proxy keeps")
+        );
+        assert_eq!(o.seen(billing, after_start(4_902), WINDOW), Seen::These(vec![]));
     }
 
     #[test]

@@ -12,6 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 prost = "0.14.4"
+prost-types = "0.14.4"
 serde_json = "1"
 wake-proxy = { path = ".." }
 
@@ -66,3 +67,10 @@ name = "redact"
 path = "fuzz_targets/redact.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "model_call"
+path = "fuzz_targets/model_call.rs"
+test = false
+doc = false
+bench = false

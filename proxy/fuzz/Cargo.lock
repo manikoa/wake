@@ -3565,6 +3565,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "prost",
+ "prost-types",
  "serde_json",
  "wake-proxy",
 ]

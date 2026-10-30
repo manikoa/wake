@@ -30,6 +30,8 @@ pub struct Counters {
     pub mcp_calls: AtomicU64,
     /// A2A exchanges the processor saw.
     pub a2a_exchanges: AtomicU64,
+    /// Model calls the processor saw, on the gateway's model routes.
+    pub model_calls: AtomicU64,
     /// Hook calls dropped because the capture queue was full: calls seen and not recorded.
     pub hooks_dropped: AtomicU64,
     /// Events sent to the collector.
@@ -45,8 +47,8 @@ pub struct Counters {
     pub paired_in_order: AtomicU64,
     /// Calls the deny lever denied.
     pub denied: AtomicU64,
-    /// Calls under way when a halt landed, and cut: an A2A exchange, or an MCP result kept
-    /// from the caller.
+    /// Calls under way when a halt landed, and cut: an A2A exchange or a model call, or an
+    /// MCP result kept from the caller.
     pub cut: AtomicU64,
 }
 
