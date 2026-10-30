@@ -1,6 +1,6 @@
 # wake-proxy
 
-Records every MCP call and every A2A message between agents that goes through [agentgateway](https://agentgateway.dev) as a signed Wake event. That covers agents with no Wake SDK, and it gives an independent record of the calls agents with an SDK report themselves. The design is in [docs/proxy.md](../docs/proxy.md).
+Records the MCP calls and A2A messages between agents that go through [agentgateway](https://agentgateway.dev) as signed Wake events. That covers agents with no Wake SDK, and it gives an independent record of the calls agents with an SDK report themselves. The design is in [docs/proxy.md](../docs/proxy.md).
 
 agentgateway calls wake-proxy through its MCP guardrails hook (ExtMCP), before each `tools/call`, `resources/read` and `prompts/get` reaches its MCP server and again when the result comes back. wake-proxy:
 

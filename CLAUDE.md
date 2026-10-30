@@ -1,6 +1,6 @@
 # Wake
 
-Wake is an independent recorder and brake for multiagent AI systems. The source of truth for what to build is [docs/product-roadmap.md](docs/product-roadmap.md). When code and the roadmap disagree, the roadmap wins until someone changes it on purpose.
+Wake is security software for AI agents. The source of truth for what to build is [docs/product-roadmap.md](docs/product-roadmap.md). When code and the roadmap disagree, the roadmap wins until someone changes it on purpose.
 
 ## Current phase
 
@@ -19,7 +19,7 @@ Update these lines as each part of a gate is met and when the phase changes. The
 
 ## Repository
 
-This public repository holds only the open source recorder. The paid parts live in the private repository `manikoa/wake-platform`, checked out next to this one at `../wake-platform`. Folders and rules are in [docs/repo-layout.md](docs/repo-layout.md).
+This public repository holds only the open source core. The paid parts live in the private repository `usewake/wake-platform`, checked out next to this one at `../wake-platform`. Folders and rules are in [docs/repo-layout.md](docs/repo-layout.md).
 
 ## Skills
 

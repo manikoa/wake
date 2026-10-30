@@ -1,5 +1,5 @@
 /**
- * Wake recorder SDK. Records what every agent saw, said and did, and sends it to the Wake
+ * Wake SDK. Records what every agent saw, said and did, and sends it to the Wake
  * collector. Each framework's integration has its own entry point: wake-sdk/langchain,
  * wake-sdk/langgraph, wake-sdk/openai-agents and wake-sdk/claude-agent-sdk.
  */

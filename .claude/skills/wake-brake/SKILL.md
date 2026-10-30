@@ -7,7 +7,7 @@ description: Guide for building Wake's Brake phase exactly as the roadmap descri
 
 Read the `wake-architecture` skill first for the boundaries and principles, and confirm with the `wake-scope` skill that the project is in the Brake phase.
 
-The brake, its Temporal workers and the downstream view are paid parts, so they're built in the private repository (see `docs/repo-layout.md`). Only the proxy's deny support and the memory adapter's quarantine support go in this public repo, because they live in the open source recorder.
+The brake, its Temporal workers and the downstream view are paid parts, so they're built in the private repository (see `docs/repo-layout.md`). Only the proxy's deny support and the memory adapter's quarantine support go in this public repo, because they live in the open source core.
 
 ## What ships, and what counts as done
 

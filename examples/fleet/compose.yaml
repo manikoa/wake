@@ -1,4 +1,4 @@
-# The reference fleet on the staging recorder (deploy/compose.yaml): agents on three
+# The reference fleet on the staging stack (deploy/compose.yaml): agents on three
 # frameworks, in Python and TypeScript, and the tools they call, all through agentgateway,
 # all recorded by Wake, with stand-ins for the identity provider and E2B the brake pulls
 # levers on. run.sh brings it up and sends one request through it, then the same request
@@ -41,7 +41,7 @@ x-fleet: &fleet
     FLEET_OPENAI: ${OPENAI_API_KEY:+set}
     FLEET_ANTHROPIC: ${ANTHROPIC_API_KEY:+set}
   # Agents get the CA certificate to reach the collector over TLS, and nothing else from
-  # the recorder: no keys, no identity. Each also gets its own credentials from the
+  # the stack: no keys, no identity. Each also gets its own credentials from the
   # stand-ins, in a volume no other service but the stand-in issuing them mounts.
   volumes: [ca:/etc/wake/ca:ro]
   depends_on:

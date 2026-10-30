@@ -29,7 +29,7 @@ The goal is to catch drift from the roadmap while it's still cheap to fix: build
 - Features from a later phase. Name the phase and the gate.
 - Items the roadmap says to skip: Kafka, a graph database, your own identity provider or token service, a credential broker, your own policy language, self hosted ClickHouse or Temporal before a customer needs it.
 - A new language, database, queue or framework beyond the stack table.
-- Paid parts added to this public repo, or recorder code depending on them. The rules are in `docs/repo-layout.md`.
+- Paid parts added to this public repo, or open source code depending on them. The rules are in `docs/repo-layout.md`.
 - Code that settles an open roadmap question without a decision note.
 
 **Overengineering:**

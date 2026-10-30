@@ -1,4 +1,4 @@
-# The open source recorder, for a staging environment: the collector, which signs events
+# The open source core, for a staging environment: the collector, which signs events
 # and keeps the signed log; wake-proxy, which also enforces the brake's halts; and
 # agentgateway in front of your MCP servers and A2A agents (agentgateway.yaml), which
 # requires every agent to present its SVID. Keys, a development identity and the halts
@@ -6,13 +6,13 @@
 name: wake
 
 x-collector-image: &collector-image
-  image: ghcr.io/manikoa/wake-collector:${WAKE_VERSION:-dev}
+  image: ghcr.io/usewake/wake-collector:${WAKE_VERSION:-dev}
   build:
     context: ..
     dockerfile: collector/Dockerfile
 
 x-proxy-image: &proxy-image
-  image: ghcr.io/manikoa/wake-proxy:${WAKE_VERSION:-dev}
+  image: ghcr.io/usewake/wake-proxy:${WAKE_VERSION:-dev}
   build:
     context: ..
     dockerfile: proxy/Dockerfile

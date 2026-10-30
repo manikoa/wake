@@ -1,4 +1,4 @@
-# Merged over the staging recorder (deploy/compose.yaml) by compose.yaml's include, as
+# Merged over the staging stack (deploy/compose.yaml) by compose.yaml's include, as
 # networks.yaml is: the model providers' keys, for agentgateway's routes to them
 # (agentgateway.yaml). With FLEET_MODELS=real, research's and billing's model calls go
 # through the gateway, which adds the key, so no agent holds one and every agent's network

@@ -4,7 +4,7 @@ October 26, 2026 · Maniko · Updated October 28, 2026 (see [What changed on Oct
 
 ## In one page
 
-**What it is.** Wake is an independent recorder and brake for multiagent AI systems. It records what every agent saw, said and did in a log no agent can alter, traces what influenced each action across agents and memory, stops a whole fleet, or one sub-agent without stopping its run, and cuts off their credentials across clouds in one move, and proves all of it to auditors, insurers and customers.
+**What it is.** Wake is security software for AI agents. It records what every agent saw, said and did in a log no agent can alter, traces what influenced each action across agents and memory, stops a whole fleet, or one sub-agent without stopping its run, and cuts off their credentials across clouds in one move, and proves all of it to auditors, insurers and customers.
 
 **The problem.** Agents now act across tools, clouds and each other, but nobody can see what led to an action two agents upstream, stop every agent at once, or prove what happened. Each platform governs its own agents, and the brakes that exist either run inside the agent's own process or stop at one gateway. This month OpenAI disclosed that two of its internal agents switched off their own safety monitoring.
 
@@ -153,7 +153,7 @@ Three groups touch the product: the people who buy it, the people who use it eve
 ```text
 Month     0     6     12    18    24    30    36
 Validate  █◆                                     Release, interviews, Clavr game day
-Record     ██◆                                   Open source recorder, provenance view
+Record     ██◆                                   Open source core, provenance view
 Brake        ███◆                                Brake, downstream view, paid pilots
 Prove           ██████◆                          Evidence packs, Team plan, SOC 2
 Contain               ██████◆                    Flow policies, run charters, memory rollback
@@ -207,7 +207,7 @@ Price per protected agent and governed events, never per seat. Microsoft anchors
 
 | Package              | From phase | For                                           | Includes                                                                         | Starting hypothesis                                                               |
 |----------------------|------------|-----------------------------------------------|----------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
-| Open source recorder | Record     | Anyone                                        | SDKs, proxy, coding agent hooks, memory adapter, a self hosted signed log        | Free, always                                                                      |
+| Open source core     | Record     | Anyone                                        | SDKs, proxy, coding agent hooks, memory adapter, a self hosted signed log        | Free, always                                                                      |
 | Design partner pilot | Brake      | The first five customers                      | Hosted log, provenance view, brake, hands on setup                               | \$1,000 to \$3,000 a month                                                        |
 | Team                 | Prove      | AI native startups                            | All of the above plus evidence packs, a trust page and 10 or more levers         | About \$1,000 to \$5,000 a month: a platform fee plus protected agents and events |
 | Enterprise           | Contain    | Larger AI companies, fintechs and enterprises | The Contain module, private deployment, SIEM export, custom retention, SSO       | \$75K to \$250K a year                                                            |

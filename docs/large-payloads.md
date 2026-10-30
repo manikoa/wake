@@ -1,6 +1,6 @@
 # Payloads larger than a log entry
 
-Decided October 26, 2026: the recommendation below, built in manikoa/wake#13.
+Decided October 26, 2026: the recommendation below, built in usewake/wake#13.
 
 ## The problem
 
@@ -81,7 +81,7 @@ For each component:
 - **Collector:** sets the digest before signing SDK and memory adapter events. For events that arrive signed, a payload that doesn't match the signed digest makes the event invalid, the same as a bad signature.
 - **Proxy (not built):** signs the same shape. It sets the digest, leaves the payload out of what it signs, and still sends the payload on the span. How the bytes of a proxy payload that doesn't match its digest are linked from the entry is settled when the proxy is built; they're kept, under their own digest, either way.
 - **SDK:** no change. It still sends `wake.payload` and its own digest.
-- **Ingester (manikoa/wake-platform#2):** its signature check doesn't change, since it checks the entry's `event` bytes as they are. The payload now comes from the entry or the file instead of the event's attributes, and is checked against the signed digest before it reaches ClickHouse.
+- **Ingester (usewake/wake-platform#2):** its signature check doesn't change, since it checks the entry's `event` bytes as they are. The payload now comes from the entry or the file instead of the event's attributes, and is checked against the signed digest before it reaches ClickHouse.
 - **Existing logs:** only test logs exist, so nothing is migrated.
 
 ## Not covered
