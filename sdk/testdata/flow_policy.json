@@ -1,0 +1,84 @@
+{
+  "description": "Flow policy decisions every enforcer must make alike: wake-proxy (proxy/src/policy.rs) and both SDKs' checks in the agent's own process (docs/flow-everywhere.md). A case is a policy, a call and the origins that entered its caller within the window, newest first, or \"*\" for every origin. denied_by is the rule that must deny it, or null, and kept the origins behind the call that rule keeps from it. A call is a tool call (tool) or an agent being reached (receiver): a message, a handoff or a start. lineage is the agents the caller acts under, outermost first. invalid holds policies every enforcer must refuse, which then deny every call.",
+  "policies": {
+    "empty": {"window_seconds": 900, "rules": []},
+    "pay": {
+      "window_seconds": 600,
+      "rules": [
+        {"id": "no-pay-after-web", "callers": ["billing"], "tools": ["pay", "wire_*"], "forbid_origins": ["tool:fetch_page", "agent:*"]},
+        {"id": "billing-hears-support-only", "receivers": ["billing"], "allow_origins": ["agent:support", "tool:search"]}
+      ]
+    },
+    "quiet": {
+      "window_seconds": 900,
+      "rules": [
+        {"id": "research-quiet-after-web", "callers": ["research"], "forbid_origins": ["tool:fetch_page"]},
+        {"id": "a2a-routes", "path_prefixes": ["/agents/"], "forbid_origins": ["*"]}
+      ]
+    },
+    "order": {
+      "window_seconds": 900,
+      "rules": [
+        {"id": "no-refunds-after-mail", "tools": ["refund"], "forbid_origins": ["tool:read_email"]},
+        {"id": "nothing-after-mail", "callers": ["support"], "forbid_origins": ["tool:read_email"]},
+        {"id": "no-refunds-after-anything", "tools": ["refund"], "forbid_origins": ["*"]}
+      ]
+    },
+    "memory": {
+      "window_seconds": 900,
+      "rules": [
+        {"id": "no-pay-from-unlabeled-memory", "tools": ["pay"], "forbid_origins": ["memory:unlabeled"]},
+        {"id": "notify-from-our-own", "receivers": ["notify"], "allow_origins": ["agent:billing", "tool:lookup_order"]}
+      ]
+    }
+  },
+  "cases": [
+    {"name": "an empty policy denies nothing", "policy": "empty", "caller": "billing", "lineage": [], "tool": "pay", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "nothing untrusted entered billing, so it may pay", "policy": "pay", "caller": "billing", "lineage": [], "tool": "pay", "origins": ["tool:search"], "denied_by": null, "kept": []},
+    {"name": "a fetched page keeps billing from paying", "policy": "pay", "caller": "billing", "lineage": [], "tool": "pay", "origins": ["tool:fetch_page", "tool:search"], "denied_by": "policy:no-pay-after-web", "kept": ["tool:fetch_page"]},
+    {"name": "a prefix pattern covers wire_eur", "policy": "pay", "caller": "billing", "lineage": [], "tool": "wire_eur", "origins": ["tool:fetch_page"], "denied_by": "policy:no-pay-after-web", "kept": ["tool:fetch_page"]},
+    {"name": "a tool the rule doesn't name passes", "policy": "pay", "caller": "billing", "lineage": [], "tool": "lookup_order", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "agent:* keeps every message from another agent", "policy": "pay", "caller": "billing", "lineage": [], "tool": "pay", "origins": ["agent:research", "tool:search", "agent:support"], "denied_by": "policy:no-pay-after-web", "kept": ["agent:research", "agent:support"]},
+    {"name": "a rule for billing doesn't hold research", "policy": "pay", "caller": "research", "lineage": [], "tool": "pay", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "a sub-agent is held to the rules that name its chain", "policy": "pay", "caller": "billing/refunds", "lineage": ["billing"], "tool": "pay", "origins": ["tool:fetch_page"], "denied_by": "policy:no-pay-after-web", "kept": ["tool:fetch_page"]},
+    {"name": "the chain counts at any depth", "policy": "pay", "caller": "billing/refunds/ledger", "lineage": ["billing", "billing/refunds"], "tool": "wire_usd", "origins": ["agent:research"], "denied_by": "policy:no-pay-after-web", "kept": ["agent:research"]},
+    {"name": "every origin denies under the first rule that applies", "policy": "pay", "caller": "billing", "lineage": [], "tool": "pay", "origins": "*", "denied_by": "policy:no-pay-after-web", "kept": ["*"]},
+    {"name": "every origin passes a call no rule applies to", "policy": "pay", "caller": "billing", "lineage": [], "tool": "lookup_order", "origins": "*", "denied_by": null, "kept": []},
+    {"name": "an allowlist passes what it lists", "policy": "pay", "caller": "support", "lineage": [], "receiver": "billing", "origins": ["tool:search", "agent:support"], "denied_by": null, "kept": []},
+    {"name": "an allowlist keeps what it doesn't list", "policy": "pay", "caller": "research", "lineage": [], "receiver": "billing", "origins": ["tool:fetch_page", "tool:search", "agent:notify"], "denied_by": "policy:billing-hears-support-only", "kept": ["tool:fetch_page", "agent:notify"]},
+    {"name": "an allowlist passes a caller nothing entered", "policy": "pay", "caller": "research", "lineage": [], "receiver": "billing", "origins": [], "denied_by": null, "kept": []},
+    {"name": "every origin is kept even by an allowlist", "policy": "pay", "caller": "support", "lineage": [], "receiver": "billing", "origins": "*", "denied_by": "policy:billing-hears-support-only", "kept": ["*"]},
+    {"name": "a rule for a receiver doesn't apply to a tool call", "policy": "pay", "caller": "research", "lineage": [], "tool": "summarize", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "a rule for a receiver doesn't apply to reaching another agent", "policy": "pay", "caller": "research", "lineage": [], "receiver": "notify", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "a rule naming no tools or receivers holds every tool call", "policy": "quiet", "caller": "research", "lineage": [], "tool": "summarize", "origins": ["tool:fetch_page"], "denied_by": "policy:research-quiet-after-web", "kept": ["tool:fetch_page"]},
+    {"name": "and every agent the caller reaches", "policy": "quiet", "caller": "research", "lineage": [], "receiver": "notify", "origins": ["tool:fetch_page"], "denied_by": "policy:research-quiet-after-web", "kept": ["tool:fetch_page"]},
+    {"name": "a rule for request paths never meets a call made in the process", "policy": "quiet", "caller": "support", "lineage": [], "receiver": "billing", "origins": ["agent:research"], "denied_by": null, "kept": []},
+    {"name": "nor a tool call", "policy": "quiet", "caller": "support", "lineage": [], "tool": "lookup_order", "origins": "*", "denied_by": null, "kept": []},
+    {"name": "a tool call meets the rules naming no tools first, wherever they are in the file", "policy": "order", "caller": "support", "lineage": [], "tool": "refund", "origins": ["tool:read_email"], "denied_by": "policy:nothing-after-mail", "kept": ["tool:read_email"]},
+    {"name": "then the rules naming tools, in file order", "policy": "order", "caller": "billing", "lineage": [], "tool": "refund", "origins": ["tool:read_email", "tool:search"], "denied_by": "policy:no-refunds-after-mail", "kept": ["tool:read_email"]},
+    {"name": "a later rule denies what an earlier one keeps nothing from", "policy": "order", "caller": "billing", "lineage": [], "tool": "refund", "origins": ["tool:search"], "denied_by": "policy:no-refunds-after-anything", "kept": ["tool:search"]},
+    {"name": "unlabeled memory can be named", "policy": "memory", "caller": "billing", "lineage": [], "tool": "pay", "origins": ["memory:unlabeled", "tool:lookup_order"], "denied_by": "policy:no-pay-from-unlabeled-memory", "kept": ["memory:unlabeled"]},
+    {"name": "an allowlist keeps unlabeled memory without naming it", "policy": "memory", "caller": "support", "lineage": [], "receiver": "notify", "origins": ["tool:lookup_order", "memory:unlabeled"], "denied_by": "policy:notify-from-our-own", "kept": ["memory:unlabeled"]},
+    {"name": "and passes origins a label carried in from memory when it lists them", "policy": "memory", "caller": "support", "lineage": [], "receiver": "notify", "origins": ["agent:billing", "tool:lookup_order"], "denied_by": null, "kept": []}
+  ],
+  "invalid": [
+    {"name": "a rule that keeps nothing", "policy": {"rules": [{"id": "x", "tools": ["pay"]}]}},
+    {"name": "a field no enforcer knows", "policy": {"rules": [{"id": "x", "forbid_origins": ["*"], "stores": ["facts"]}]}},
+    {"name": "a top-level field no enforcer knows", "policy": {"rules": [], "mode": "audit"}},
+    {"name": "tools with receivers", "policy": {"rules": [{"id": "x", "tools": ["pay"], "receivers": ["billing"], "forbid_origins": ["*"]}]}},
+    {"name": "tools with path prefixes", "policy": {"rules": [{"id": "x", "tools": ["pay"], "path_prefixes": ["/a"], "forbid_origins": ["*"]}]}},
+    {"name": "an id with a space", "policy": {"rules": [{"id": "no pay", "forbid_origins": ["*"]}]}},
+    {"name": "an empty id", "policy": {"rules": [{"id": "", "forbid_origins": ["*"]}]}},
+    {"name": "an id over 64", "policy": {"rules": [{"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "forbid_origins": ["*"]}]}},
+    {"name": "two rules with one id", "policy": {"rules": [{"id": "x", "forbid_origins": ["*"]}, {"id": "x", "allow_origins": ["user"]}]}},
+    {"name": "a window of 0", "policy": {"window_seconds": 0, "rules": []}},
+    {"name": "a window over a day", "policy": {"window_seconds": 86401, "rules": []}},
+    {"name": "a wildcard among callers", "policy": {"rules": [{"id": "x", "callers": ["bill*"], "forbid_origins": ["*"]}]}},
+    {"name": "a wildcard not at the end", "policy": {"rules": [{"id": "x", "forbid_origins": ["tool:*_page"]}]}},
+    {"name": "an empty pattern", "policy": {"rules": [{"id": "x", "forbid_origins": [""]}]}},
+    {"name": "a rule that isn't an object", "policy": {"rules": ["x"]}},
+    {"name": "rules that aren't a list", "policy": {"rules": {"id": "x"}}},
+    {"name": "a list where a string goes", "policy": {"rules": [{"id": "x", "callers": "billing", "forbid_origins": ["*"]}]}},
+    {"name": "a window that isn't a whole number", "policy": {"window_seconds": 1.5, "rules": []}}
+  ]
+}

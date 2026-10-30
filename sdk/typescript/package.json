@@ -43,6 +43,10 @@
       "types": "./dist/quarantine.d.ts",
       "default": "./dist/quarantine.js"
     },
+    "./flow": {
+      "types": "./dist/flow.d.ts",
+      "default": "./dist/flow.js"
+    },
     "./aws": {
       "types": "./dist/aws.d.ts",
       "default": "./dist/aws.js"

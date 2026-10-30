@@ -34,6 +34,15 @@ a refused agent tool starts no run. A handoff is offered only while neither the 
 offering it nor the one it hands off to is halted, and one the model picked before a halt
 landed is refused as it starts. Hosted tools run at OpenAI, and can't be refused here. It's
 a cooperative stop: it holds only while the agent's code does.
+
+The same checks apply the flow policy wake-proxy serves with those rules (wake.flow), once
+no halt refuses the call: a tool call is refused when a rule holds its agent back for what
+entered it, a call to an agent used as a tool when one holds it back from reaching that
+agent, and a handoff likewise, which is then neither offered nor made. A tool's result
+enters the agent that called it as tool:<name>, an MCP server's tool by its MCP name. A
+handoff brings what had entered the agent handing off into the one it hands off to, as
+agent:<that agent> with the rest. So does a call to an agent used as a tool, or any run
+started inside a tool call, and what the run's agent said last brings what entered it back.
 """
 
 import dataclasses
@@ -48,7 +57,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
-from wake import events, links, stop
+from wake import events, flow, links, stop
 from wake._graph import EventGraph, _Recent, failed, never_raise
 from wake.recorder import Recorder
 
@@ -181,6 +190,8 @@ class WakeTracingProcessor(EventGraph):
         self._guardrail = None  # the tool input guardrail guard() adds, made once
         self._halted = _Recent()  # sdk span id of a tool call or handoff -> what refused it as it started
         self._instances = _Recent()  # instance -> its agent and lineage, for each Wake has seen start
+        self._agent_tools = _Recent()  # (agent, tool name) -> the agent a call to that agent tool runs
+        self._run_agent = _Recent()  # run -> the agent it has reached, which answers for it
         self._parent = _Recent()  # sdk span id -> its parent's sdk span id
         self._agent_span = _Recent()  # sdk span id of an agent span -> agent name
         # A run is told apart from other runs of its agent, and from other copies of it, by
@@ -243,6 +254,7 @@ class WakeTracingProcessor(EventGraph):
             return
         attributes = {}
         if kind == "agent":
+            caller = None
             with self._lock:
                 self._agent_span[span.span_id] = data.name
                 # The first agent span under a parent starts a run; the rest are its next
@@ -253,10 +265,16 @@ class WakeTracingProcessor(EventGraph):
                     tool = self._tool_above(span.parent_id)
                     if tool is not None:
                         self._runs_in[tool[0]] = [*(self._runs_in.get(tool[0]) or []), run]
+                        caller = self._tool_agents.get(tool[1])
                 self._runs[span.span_id] = run
+                self._run_agent[run] = data.name
                 instance, lineage = self._identity(span.span_id)
                 if instance:
                     self._instances[instance] = (data.name, lineage)
+            if caller:
+                # A run started inside a tool call, such as an agent used as a tool: what had
+                # entered the agent calling it enters it, with its input (wake.flow).
+                flow.message(caller, data.name)
             attributes = {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name,
                           events.AGENT_ID: data.name, **events.instance_attributes(instance, lineage)}
         otel = self._recorder.tracer.start_span(f"{kind} {getattr(data, 'name', '') or ''}".strip(), context=self._context(span), attributes=attributes)
@@ -318,7 +336,8 @@ class WakeTracingProcessor(EventGraph):
         it hands off to is halted, and if a halt lands after the model picked it, it raises
         AgentHalted as it starts. Bare agents in handoffs become the handoff the SDK would make
         of them. A tool the agent would run itself that Wake can't make refuse raises
-        TypeError, rather than run unstopped."""
+        TypeError, rather than run unstopped. The flow policy served with the halts refuses
+        the same calls and handoffs the same ways (wake.flow)."""
         from agents import Agent, FunctionTool, Handoff, handoff
         from agents.tool_guardrails import ToolInputGuardrail
 
@@ -341,6 +360,8 @@ class WakeTracingProcessor(EventGraph):
                         tool.tool_input_guardrails = [*(tool.tool_input_guardrails or []), self._guardrail]
                     if getattr(tool, "_is_agent_tool", False) and getattr(tool, "_agent_instance", None) is not None:
                         todo.append(tool._agent_instance)
+                        # A call to it starts that agent's run, which the flow policy checks too.
+                        self._agent_tools[(current.name, tool.name)] = tool._agent_instance.name
                 elif not _hosted(tool):
                     tool = self._guard_local(tool, current.name)
                 tools.append(tool)
@@ -441,7 +462,12 @@ class WakeTracingProcessor(EventGraph):
             except Exception:
                 arguments, call_id = None, None
             refused = self._refuse_call(None, name, arguments, call_id, owner=owner)
-            return run(*args, **kwargs) if refused is None else answer(refused)
+            if refused is not None:
+                return answer(refused)
+            # What it returns enters the agent calling it (wake.flow). The SDK opens no span for
+            # some of these, such as a local shell, so it's noted here.
+            flow.note(self._caller(None, owner), f"tool:{name}")
+            return run(*args, **kwargs)
 
         refusing._wake = True  # type: ignore[attr-defined]
         return refusing
@@ -488,16 +514,19 @@ class WakeTracingProcessor(EventGraph):
     def _refuse_call(self, agent: str | None, name: str, arguments: Any, call_id: str | None, *,
                      owner: str | None = None) -> "stop.Refusal | None":
         """The refusal of a tool call about to run, if a halt covers who's making it: agent, as
-        the SDK says, or else the agent whose run the SDK's current span is in, or owner. It's
-        noted on the call's span, to be recorded as denied when that ends, or recorded as
-        denied now if the SDK opened none for it, as for a local shell. Never raises: a check
-        that fails refuses."""
+        the SDK says, or else the agent whose run the SDK's current span is in, or owner. Or if
+        the flow policy holds them back from it, or, for an agent used as a tool, from
+        reaching that agent. It's noted on the call's span, to be recorded as denied when that
+        ends, or recorded as denied now if the SDK opened none for it, as for a local shell.
+        Never raises: a check that fails refuses."""
         if self._quarantine is None:
             return None
         span = _current_span()
         try:
             agent = agent or self._agent_at(getattr(span, "span_id", None)) or owner or self._recorder.agent
-            refused = self._refusal(agent, span)
+            with self._lock:
+                starts = self._agent_tools.get((agent, name))
+            refused = self._refusal(agent, span, tool=name, starts=starts)
         except Exception:
             log.warning("wake: couldn't check the halts for a tool call; refusing it", exc_info=True)
             agent, refused = agent or owner or self._recorder.agent, stop.unchecked()
@@ -537,13 +566,18 @@ class WakeTracingProcessor(EventGraph):
         log.warning("wake: refused a handoff of %s to %s: %s", source, target, refused.halt)
         raise stop.AgentHalted(refused)
 
-    def _refusal(self, agent: str, span: Any = None, *, target: str | None = None) -> "stop.Refusal | None":
+    def _refusal(self, agent: str, span: Any = None, *, tool: str | None = None, target: str | None = None,
+                 starts: str | None = None) -> "stop.Refusal | None":
         """The refusal of what a run of agent is about to do, if a halt covers it: by its name,
         the instance the run is and those that started it. With target, a handoff to target is
         refused too when a halt covers it, or the instance of it the handoff would start in
         the same run. The run is the one span is in, by default the SDK's current span, as for
         its events. While Wake can't place it, a halt on any run of the agent Wake has seen
-        refuses it. Never raises: a check that fails refuses."""
+        refuses it.
+
+        Then the flow policy (wake.flow), on what entered agent: a call to tool, and the run of
+        starts it begins, for an agent used as a tool; or a handoff to target. A rule for any
+        agent a halt here could name applies. Never raises: a check that fails refuses."""
         if self._quarantine is None:
             return None
         outcome = f"the handoff to {target} wasn't made" if target else "this tool call wasn't run"
@@ -573,6 +607,13 @@ class WakeTracingProcessor(EventGraph):
             if refused is None and target:
                 refused = stop.refusal(self._quarantine, f"{target}#{run}" if run else target, target_names,
                                        unplaced=target_unplaced, outcome=outcome)
+            if refused is None and target:
+                refused = flow.refusal(self._quarantine, who, agent, names | unplaced, receiver=target, outcome=outcome)
+            elif refused is None and tool:
+                refused = flow.refusal(self._quarantine, who, agent, names | unplaced, tool=tool, outcome=outcome)
+                if refused is None and starts:
+                    refused = flow.refusal(self._quarantine, who, agent, names | unplaced, receiver=starts,
+                                           outcome=outcome)
         except Exception:
             log.warning("wake: couldn't check the halts for %s; refusing", agent, exc_info=True)
             refused = stop.unchecked(outcome)
@@ -592,7 +633,7 @@ class WakeTracingProcessor(EventGraph):
         self._event(otel, types.SimpleNamespace(parent_id=sid, error=None), event_id, events.DENIED,
                     f"execute_tool {name}", agent, [parent] if parent else [], [],
                     {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name, "wake.brake.halt_id": refused.halt},
-                    {"input": _plain(arguments), "output": refused.reason})
+                    {"input": _plain(arguments), "output": refused.reason, **flow.payload(refused)})
         with self._lock:
             if call_id:
                 self._event_by_call[call_id] = event_id
@@ -712,7 +753,10 @@ class WakeTracingProcessor(EventGraph):
             pending = self._pending.pop(span.span_id, None) or {}
             # What the runs inside the tool call, such as an agent used as a tool, said last is
             # what the tool returns.
-            ran = [self._run_last[r] for r in self._runs_in.pop(span.span_id, None) or [] if r in self._run_last]
+            runs = self._runs_in.pop(span.span_id, None) or []
+            ran = [self._run_last[r] for r in runs if r in self._run_last]
+            answering = [self._run_agent[r] for r in runs if r in self._run_agent]
+            refused = span.span_id in self._halted
         returned = [*links._returned(pending.get("link")), *ran]
         links._exit(pending.get("link"))
         event_id = pending.get("event_id") or str(uuid.uuid4())
@@ -722,6 +766,13 @@ class WakeTracingProcessor(EventGraph):
             with self._lock:
                 self._returned_by_event[event_id] = returned
         agent = self._agent_for(span)
+        if not refused:
+            # What it returned enters the agent that called it (wake.flow), and what each run
+            # inside it said last brings what entered that run's agent. A hosted tool, such as
+            # web search, runs at OpenAI with no span of its own, so its result isn't noted.
+            flow.note(agent, f"tool:{data.name}")
+            for answered in answering:
+                flow.message(answered, agent)
         otel = self._take(span)
         if otel is None:
             return
@@ -759,16 +810,18 @@ class WakeTracingProcessor(EventGraph):
         if mcp and mcp.get("server"):
             attributes["wake.mcp.server"] = str(mcp["server"])
         kind, origins, output = events.TOOL_CALL, [f"tool:{data.name}"], _plain(data.output)
+        refusal: dict[str, Any] = {}
         if stopped:
-            # Refused in the agent's own process, under the halt: what the agent tried. The
-            # tool never ran, so nothing of it entered.
+            # Refused in the agent's own process, under the halt or the flow policy: what the
+            # agent tried. The tool never ran, so nothing of it entered.
             kind, origins, attributes["wake.brake.halt_id"] = events.DENIED, [], stopped.refusal.halt
             output = stopped.refusal.reason if output is None else output
+            refusal = flow.payload(stopped.refusal)
             with self._lock:
                 if stopped.call:
                     self._event_by_call[stopped.call] = event_id
         self._event(otel, span, event_id, kind, f"execute_tool {data.name}", agent, parents,
-                    origins, attributes, {"input": data.input, "output": output})
+                    origins, attributes, {"input": data.input, "output": output, **refusal})
         self._remember_output(within, event_id, output if isinstance(output, str) else _text(output))
         otel.end()
 
@@ -778,18 +831,21 @@ class WakeTracingProcessor(EventGraph):
             run = self._run_of(span)
             requested_by = self._last_response.get((span.trace_id, run, source))
             stopped = self._halted.pop(span.span_id, None)
+        if not stopped and data.from_agent and data.to_agent:
+            # What had entered the agent handing off enters the one it hands off to (wake.flow).
+            flow.message(data.from_agent, data.to_agent)
         otel = self._take(span)
         if otel is None:
             return
         event_id = str(uuid.uuid4())
         if stopped:
-            # Refused as it started, under the halt: the attempt to hand the target its task,
-            # in the name of the agent that tried. Nothing reached the target.
+            # Refused as it started, under the halt or the flow policy: the attempt to hand the
+            # target its task, in the name of the agent that tried. Nothing reached the target.
             target = stopped.receiver or data.to_agent or "unknown"
             self._event(otel, span, event_id, events.DENIED, f"agent_message {source} -> {target}", source,
                         [requested_by] if requested_by else [], [],
                         {"gen_ai.agent.name": target, "wake.brake.halt_id": stopped.refusal.halt, "wake.brake.receiver": target},
-                        {"from": source, "to": target, "output": stopped.refusal.reason})
+                        {"from": source, "to": target, "output": stopped.refusal.reason, **flow.payload(stopped.refusal)})
             otel.end()
             return
         target = data.to_agent or "unknown"
@@ -862,6 +918,14 @@ class WakeTracingProcessor(EventGraph):
         with self._lock:
             agent_sid = self._agent_above(sid)
             return self._agent_span.get(agent_sid) if agent_sid is not None else None
+
+    def _caller(self, agent: str | None, owner: str | None = None) -> str:
+        """Who is making a call: agent, as the SDK says, or else the agent whose run the SDK's
+        current span is in, or owner. Never raises."""
+        try:
+            return agent or self._agent_at(getattr(_current_span(), "span_id", None)) or owner or self._recorder.agent
+        except Exception:
+            return agent or owner or self._recorder.agent
 
     def _run(self, agent_sid) -> tuple[str | None, tuple[str, ...]]:
         """The run an agent span is a step of, by its first agent span, when it runs inside a

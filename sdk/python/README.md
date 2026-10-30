@@ -1,6 +1,6 @@
 # wake-sdk
 
-Records what every agent saw, said and did, and sends it to the Wake collector. It never signs anything, and recording never blocks or breaks the agent: if the collector is down, events are dropped and the agent keeps working. Given the brake's rules, a `Quarantine`, it does refuse on purpose: a tool call or run a halt covers, a memory write a quarantine locks, and every one of them while the rules are stale (see the stopping and Quarantine sections below).
+Records what every agent saw, said and did, and sends it to the Wake collector. It never signs anything, and recording never blocks or breaks the agent: if the collector is down, events are dropped and the agent keeps working. Given the brake's rules, a `Quarantine`, it does refuse on purpose: a tool call or run a halt covers or the flow policy holds back, a memory write a quarantine locks, and every one of them while the rules are stale (see the stopping, flow policy and Quarantine sections below).
 
 ## LangGraph
 
@@ -124,6 +124,23 @@ A halt covers a run by its name, the instance it is and the runs that started it
 - **It fails closed and trusts the agent's code,** as for Claude above: stale rules, and a check that fails, refuse every call and run.
 
 The recorder sends to `WAKE_ENDPOINT`, or `http://localhost:4318` by default. Over TLS with a private CA, set `WAKE_CA_FILE` to the CA's certificate. Wake reads only its own `WAKE_*` settings. The app's `OTEL_*` variables, such as its sampler, exporter headers or attribute limits, configure the app's telemetry and never Wake's. Its proxy settings, such as `HTTPS_PROXY`, and `REQUESTS_CA_BUNDLE` and `.netrc` apply to its own traffic, and Wake's goes straight to the collector. Wake records every event even under an unsampled parent. `flush()` waits at most its timeout, and returns False if events were dropped since the last flush. `health()` counts events sent and dropped, and `failed`, those the SDK couldn't record. Install with the `langchain` or `langgraph` extra.
+
+## Flow policies in the agent's process
+
+wake-proxy enforces a flow policy on the calls that pass it, and serves it with the brake's rules (see [docs/proxy.md](../../docs/proxy.md) and [docs/flow-everywhere.md](../../docs/flow-everywhere.md)). Each integration given those rules, a `Quarantine`, applies the same policy in the agent's own process, to the calls wake-proxy never sees: the agent's own tools, its handoffs and the runs it starts. Without a policy on wake-proxy, nothing more is checked.
+
+- **What's checked.** Where halts are checked, once no halt refuses: a tool call, before it runs; a handoff, a Claude Agent tool call, an OpenAI agent used as a tool and `handler.agent()`, as reaching the agent they'd start. Rules apply as in wake-proxy: a tool call meets the rules naming no tools, receivers or paths, then those whose `tools` match it; reaching an agent meets those naming no tools or paths whose `receivers` are empty or name it; `callers` cover the agent, its subagents and runs it started. The first rule that denies is named. `sdk/testdata/flow_policy.json` holds decisions wake-proxy and both SDKs make alike.
+- **What enters an agent,** and counts for the policy's window:
+  - a tool's result, as `tool:<name>`, an MCP tool by its MCP name: `mcp__crm__lookup_order` enters as `tool:lookup_order`;
+  - a message, handoff, subagent start or subagent answer from another agent, as `agent:<sender>`, with whatever had entered the sender, each as of when it entered the sender;
+  - a memory read, the origins its label carries when the label vouches for what was read, else `memory:unlabeled`.
+
+  The user's own prompt is never an origin.
+- **What a refusal says.** It looks like a halt's in each integration, and is recorded as a `denied` event under `policy:<id>`, with the origins behind it in its payload:
+  - `Wake's flow policy (policy:no-pay-after-web) holds billing back after tool:fetch_page, so this tool call wasn't run.`
+  - Past 256 origins within the window, or 10,000 agents, an agent counts as having every origin: `Wake's flow policy (policy:no-pay-after-web) holds billing back, because more origins entered it than Wake keeps, so this tool call wasn't run.`, with `every_origin` in the payload.
+  - A policy wake-proxy can't use, or that isn't valid, refuses everything under `policy:unreadable-policy`: `Wake's flow policy can't be read, so this tool call wasn't run.` Stale rules refuse everything already, under `stale-rules`.
+- **The proxy and the network stay the backstop.** This runs in the agent's process, so it stops a well-behaved agent fooled by what it read, and a compromised one can leave it out. wake-proxy goes on enforcing the policy on every call through it, and the network should leave agents no way out but wake-proxy. Hosted tools, such as OpenAI's web search, run at the provider and aren't checked here, and messages to agents in other processes are wake-proxy's to check.
 
 ## Memory
 

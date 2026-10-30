@@ -21,6 +21,10 @@ parent is the write. An entry with no label, such as one planted or written outs
 or one changed since it was written, gets no parent, so the completeness metric flags it
 rather than trusting it.
 
+For the flow policy (wake.flow), a read brings the origins its label carries, but the
+user's, into the agent reading it, as of the read, when the label vouches for what was read.
+What no label vouches for enters as memory:unlabeled, which a rule can name.
+
 Wrappers: WakeStore in wake.langgraph wraps LangGraph's BaseStore (and so langmem), and
 Memory.write_file / read_file handle memory files. Both keep the versions an entry held in
 its label's history, and roll back to one (WakeStore.rollback, Memory.rollback_file).
@@ -53,7 +57,7 @@ from typing import Any
 
 from opentelemetry import trace
 
-from wake import events, links
+from wake import events, flow, links
 from wake._graph import failed
 from wake.quarantine import MemoryLocked, MemoryQuarantined, Quarantine
 
@@ -368,11 +372,30 @@ class Memory:
             write = _event_id(label.get("event")) if isinstance(label, Mapping) else None
             self._refused("read", store, entry, hidden, parents=[write] if write else [])
             return hidden
+        self._entered(text, label)
         try:
             self._read(store, entry, text, label, content)
         except Exception:
             self._failed("a memory read")
         return None
+
+    def _entered(self, text: str, label: Mapping[str, Any] | None) -> None:
+        """Notes what a read brings into the agent reading it, for the flow policy: the origins
+        its label carries, when the label vouches for what was read, but the user's, which
+        isn't an origin. memory:unlabeled when no label vouches for it. Past MAX_ORIGINS of
+        them the agent has every origin anyway, so no more are noted. Never raises."""
+        try:
+            agent = self._handler._current_agent()
+            vouched = isinstance(label, Mapping) and label.get("sha256") == digest(text)
+            origins = label.get("origins") if vouched else None
+            if not isinstance(origins, list):
+                flow.note(agent, flow.UNLABELED)
+                return
+            brought = dict.fromkeys(o for o in origins if isinstance(o, str) and o != events.ORIGIN_USER)
+            for origin in list(brought)[: flow.MAX_ORIGINS + 1]:
+                flow.note(agent, origin)
+        except Exception:
+            log.warning("wake: failed to note what a memory read brought in", exc_info=True)
 
     def write_file(self, path: str | Path, text: str) -> None:
         """Writes a memory file and its label, next to it as <file>.wake.json. The label

@@ -9,19 +9,39 @@
  * stale (Quarantine); and while an integration can't yet tell which instance is acting, any
  * call a halt on one it could be would cover. A check that fails refuses too: the brake fails
  * closed.
+ *
+ * At the same points, once no halt covers a call, each integration asks flowRefusal whether
+ * the flow policy served with the halts keeps it from what entered its caller (flow.ts), and
+ * refuses what the policy keeps the same way.
  */
 
+import { entered, UNREADABLE, type Denial, type FlowCall, type FlowPolicy } from "./flow.ts";
 import { log } from "./log.ts";
 
 /** The id a call is refused under when its halts couldn't be checked. */
 export const UNCHECKED = "halt-check-failed";
 
-/** A call a halt stops: the halt, as the denied event names it, and what the agent is told. */
-export type Refusal = readonly [halt: string, reason: string];
+/**
+ * What a refusal under the flow policy adds to the denied event's payload, as wake-proxy's
+ * does: the origins its rule kept from the call, or * for every origin, and then why the caller
+ * counted as having every origin.
+ */
+export interface Kept {
+  readonly origins: readonly string[];
+  readonly every_origin?: string;
+}
+
+/**
+ * A call a halt or the flow policy stops: the halt, as the denied event names it, what the
+ * agent is told, and, under the flow policy, what's behind it.
+ */
+export type Refusal = readonly [halt: string, reason: string, kept?: Kept];
 
 /** What says whether a halt covers some names: the brake's rules, a Quarantine. */
 export interface Halts {
   halted(names: Iterable<string>): string | null;
+  /** The flow policy served with the halts (flow.ts), or undefined when there's none. Rules that can't say, such as a test's, have none. */
+  flow?(): FlowPolicy | undefined;
   /** Called by an integration that refuses halted instances' calls with these rules (stopsWith). */
   _stopsInstances?(): void;
 }
@@ -71,6 +91,47 @@ export function refusal(
 /** The refusal when Wake couldn't work out whether a halt covers a call. */
 export function unchecked(outcome = "this tool call wasn't run"): Refusal {
   return [UNCHECKED, `Wake couldn't check its halts, so ${outcome}.`];
+}
+
+/**
+ * The refusal of a call the flow policy served with the halts keeps from what entered its
+ * caller in this process, by the caller's name; who is the caller as the agent is told, as for
+ * a halt, such as the instance it is. call names the agents the caller acts under too, as for
+ * the halts: an instance, <agent>#<id>, counts as its agent as well, so a rule naming an agent
+ * holds the sub-agents its runs start. Undefined without a policy, as when wake-proxy serves
+ * none. Never throws: a check that fails refuses, as a policy that can't be read does.
+ */
+export function flowRefusal(halts: Halts | undefined, who: string, call: FlowCall, outcome = "this tool call wasn't run"): Refusal | undefined {
+  if (halts?.flow === undefined) return undefined;
+  let denial: Denial | undefined;
+  try {
+    const policy = halts.flow();
+    if (policy === undefined) return undefined;
+    const lineage = [...(call.lineage ?? [])];
+    if (policy.unreadable === null) entered.setWindow(policy.windowSeconds);
+    denial = policy.deciding({ ...call, lineage: [...lineage, ...lineage.map(agentOf)] }, policy.unreadable === null ? entered.seen(call.caller) : []);
+  } catch (error) {
+    log.warn(`couldn't check the flow policy for ${who}; refusing`, error);
+    denial = { halt: UNREADABLE, origins: [], unreadable: true };
+  }
+  if (denial === undefined) return undefined;
+  if (denial.unreadable) return [denial.halt, `Wake's flow policy can't be read, so ${outcome}.`, { origins: [] }];
+  if (denial.every !== undefined) {
+    const why = denial.every;
+    return [denial.halt, `Wake's flow policy (${denial.halt}) holds ${who} back, because ${why}, so ${outcome}.`, { origins: denial.origins, every_origin: why }];
+  }
+  return [denial.halt, `Wake's flow policy (${denial.halt}) holds ${who} back after ${denial.origins.join(", ")}, so ${outcome}.`, { origins: denial.origins }];
+}
+
+/** The agent an instance, <agent>#<id>, is a run of; any other name is its own. */
+function agentOf(name: string): string {
+  const at = name.lastIndexOf("#");
+  return at > 0 ? name.slice(0, at) : name;
+}
+
+/** What a denied event's payload adds for a refusal: under the flow policy, what's behind it. */
+export function keptOf(refused: Refusal | undefined): Kept | Record<string, never> {
+  return refused?.[2] ?? {};
 }
 
 /**

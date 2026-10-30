@@ -40,6 +40,10 @@
  * rejects with MemoryLocked: it's kept, as evidence. Each refusal is recorded as a denied event. If
  * checking the quarantine fails, the write or delete is refused and the entry isn't served.
  * In a process that names its agents' runs, each run's writes are locked by its own name.
+ *
+ * What a read serves enters the agent reading it, for the flow policy (flow.ts): the origins
+ * its label carries, but the user's, when the label vouches for it, and memory:unlabeled when
+ * none does, as for an entry planted or changed since it was written.
  */
 
 import { randomBytes, randomUUID } from "node:crypto";
@@ -49,6 +53,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { Context, Span } from "@opentelemetry/api";
 
 import * as events from "./events.ts";
+import { entered, MAX_ORIGINS, UNLABELED } from "./flow.ts";
 import { failed, traceIdOf, unique, type Recording } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
@@ -384,7 +389,8 @@ export class Memory {
 
   /**
    * Records a read of an entry, with the label it was stored with, if any. Returns the id of
-   * the quarantine that stops the entry being served, or null to serve it.
+   * the quarantine that stops the entry being served, or null to serve it. What's served enters
+   * the agent reading it.
    */
   read(store: string, entry: string, content: unknown, label: Label | null | undefined): string | null {
     const text = contentOf(content);
@@ -394,12 +400,30 @@ export class Memory {
       this.#refused("read", store, entry, hidden, write ? [write] : []);
       return hidden;
     }
+    this.#entering(text, isLabel(label) ? label : null);
     try {
       this.#read(store, entry, text, isLabel(label) ? label : null, content);
     } catch (error) {
       this._failed("a memory read", error);
     }
     return null;
+  }
+
+  /**
+   * Notes what content read from memory brings into the agent reading it, now: the origins its
+   * label carries, but the user's, which isn't an origin, when the label vouches for the content
+   * by its digest, and memory:unlabeled when no label does. Past MAX_ORIGINS of them the agent
+   * has every origin anyway, so no more are noted.
+   */
+  #entering(text: string, label: Label | null): void {
+    try {
+      const agent = this.#handler._currentAgent();
+      const vouched = label !== null && label.sha256 === digest(text) && Array.isArray(label.origins);
+      const origins = vouched ? unique(strings(label.origins).filter((o) => o !== events.ORIGIN_USER)).slice(0, MAX_ORIGINS + 1) : [UNLABELED];
+      for (const origin of origins) entered.note(agent, origin);
+    } catch (error) {
+      log.warn("couldn't note what a memory read brought in", error);
+    }
   }
 
   /**

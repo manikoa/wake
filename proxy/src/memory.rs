@@ -3,12 +3,16 @@
 //! can reach it without reaching the control API.
 //!
 //! ```text
-//! GET /v1/memory?agent=<id>&process=<id>&ttl=<seconds>&stops=1   {"version", "locked_by", "hidden_by", "quarantines": [...], "halts": [...]}
+//! GET /v1/memory?agent=<id>&process=<id>&ttl=<seconds>&stops=1   {"version", "locked_by", "hidden_by", "quarantines": [...], "halts": [...], "flow"}
 //! ```
 //!
 //! The halts let an SDK stop its agent, or one instance of it such as an in-process
 //! sub-agent, in its own process: the calls that never reach the proxy, and the sub-agents
 //! the proxy can't tell from their parent because they share its credentials.
+//!
+//! `flow` is the flow policy in force (policy.rs), so the SDK applies it to the same calls,
+//! with the origins it saw enter the agent: see docs/flow-everywhere.md. It's absent when no
+//! policy is enforced, and `{"unreadable": true}` when the file can't be used.
 //!
 //! Each fetch is noted, under the agent and the process the SDK names, and the brake reads
 //! the notes from the control API to confirm an agent's SDK has a quarantine or halt: in
@@ -26,13 +30,31 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use crate::halts::{Fetcher, Halts, MemoryRules};
 use crate::listen::{self, Limits};
+use crate::policy::{Policy, Served};
 
-async fn rules(State(halts): State<Arc<Halts>>, Query(query): Query<HashMap<String, String>>) -> Json<MemoryRules> {
+/// Where the rules served come from.
+#[derive(Clone)]
+struct Sources {
+    halts: Arc<Halts>,
+    policy: Arc<Policy>,
+}
+
+/// What an SDK is served: its memory rules and halts, then the flow policy in force.
+#[derive(Serialize)]
+struct Rules {
+    #[serde(flatten)]
+    memory: MemoryRules,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flow: Option<Served>,
+}
+
+async fn rules(State(sources): State<Sources>, Query(query): Query<HashMap<String, String>>) -> Json<Rules> {
     let agent = query.get("agent").map(String::as_str).unwrap_or("");
     // An agent name is short; a longer one isn't noted.
     let agent = if agent.len() <= 256 { agent } else { "" };
@@ -44,26 +66,37 @@ async fn rules(State(halts): State<Arc<Halts>>, Query(query): Query<HashMap<Stri
         query.get("ttl").map(String::as_str),
         query.get("stops").is_some_and(|s| s == "1"),
     );
-    Json(halts.memory_rules_for(agent, process, fetcher))
+    Json(Rules {
+        memory: sources.halts.memory_rules_for(agent, process, fetcher),
+        flow: sources.policy.served(),
+    })
 }
 
-pub fn router(halts: Arc<Halts>) -> Router {
-    Router::new().route("/v1/memory", get(rules)).with_state(halts)
+pub fn router(halts: Arc<Halts>, policy: Arc<Policy>) -> Router {
+    Router::new()
+        .route("/v1/memory", get(rules))
+        .with_state(Sources { halts, policy })
 }
 
 /// Serves the memory rules on listener until shutdown resolves.
-pub async fn serve(listener: TcpListener, halts: Arc<Halts>, shutdown: impl std::future::Future<Output = ()> + Send) {
-    serve_with(listener, halts, listen::MEMORY, shutdown).await
+pub async fn serve(
+    listener: TcpListener,
+    halts: Arc<Halts>,
+    policy: Arc<Policy>,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) {
+    serve_with(listener, halts, policy, listen::MEMORY, shutdown).await
 }
 
 /// Serves the memory rules with these limits.
 pub async fn serve_with(
     listener: TcpListener,
     halts: Arc<Halts>,
+    policy: Arc<Policy>,
     limits: Limits,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) {
-    let app = router(halts);
+    let app = router(halts, policy);
     let open = Arc::new(Semaphore::new(limits.connections));
     tokio::pin!(shutdown);
     loop {

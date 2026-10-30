@@ -35,6 +35,18 @@
  * and one the model picked before a halt landed is refused as it starts. Hosted tools run at
  * OpenAI, and can't be refused here. It's a cooperative stop: it holds only while the agent's
  * code does.
+ *
+ * At the same points, guard() applies the flow policy the rules carry (flow.ts), once no halt
+ * covers the call: a tool call, or a handoff by the agent it reaches, is refused the same way,
+ * and a handoff isn't offered, while the policy keeps it from what entered the agent making
+ * it. What entered each agent is noted as its spans end, by its name: a tool's result as
+ * tool:<name>, an MCP server's tool by the name the SDK gives it, which is its MCP name unless
+ * the agent's mcpConfig includes server names in tool names; a handoff in its target as
+ * agent:<source>, with what had entered the source; and a run inside a tool call, such as an
+ * agent used as a tool, starts with what had entered the agent calling it, and gives back what
+ * entered it with its answer. So they're noted only while the SDK traces, as Wake records.
+ * The SDK doesn't say which agent an agent tool runs, so a rule for that agent as a receiver
+ * isn't checked when it starts, only its own calls are; hosted tools' results aren't noted.
  */
 
 import { randomUUID } from "node:crypto";
@@ -58,11 +70,12 @@ import {
 import { ROOT_CONTEXT, SpanStatusCode, trace, type Context, type Span as OtelSpan } from "@opentelemetry/api";
 
 import * as events from "./events.ts";
+import { entered } from "./flow.ts";
 import { contextOf, EventGraph, failed, Recent, unique } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
 import type { Recorder } from "./recorder.ts";
-import { AgentHalted, refusal, stopsWith, unchecked, type Halts, type Refusal } from "./stop.ts";
+import { AgentHalted, flowRefusal, keptOf, refusal, stopsWith, unchecked, type Halts, type Refusal } from "./stop.ts";
 
 // The Agents SDK's tracing objects, as far as Wake reads them.
 interface SdkTrace {
@@ -214,6 +227,7 @@ export class WakeTracingProcessor extends EventGraph {
   readonly #toolsSince = new Recent<Key, string[]>(); // (trace, run, agent) -> tool calls since its last response, when inputs are hidden
   readonly #quarantine: Halts | undefined;
   readonly #halted = new Recent<string, Stopped>(); // sdk span id of a tool call or handoff -> what refused it as it started
+  readonly #refused = new Recent<string, true>(); // sdk span id of a tool call or handoff refused, which nothing of entered
   readonly #instances = new Recent<string, [string, string[]]>(); // instance -> its agent and lineage, for each Wake has seen start
   #guardrail: ToolInputGuardrailDefinition | undefined; // the tool input guardrail guard() adds, made once
 
@@ -236,7 +250,8 @@ export class WakeTracingProcessor extends EventGraph {
    * throws AgentHalted as it starts. Bare agents in handoffs become the handoff the SDK would
    * make of them. The SDK doesn't say which agent an agent tool runs, so pass the agents used
    * as tools too. A tool the agent would run itself that Wake can't make refuse throws a
-   * TypeError, rather than run unstopped.
+   * TypeError, rather than run unstopped. Each refuses what the flow policy the rules carry
+   * keeps too, and a handoff it would refuse isn't offered.
    */
   guard<A extends Agent<any, any>>(agent: A, ...others: Agent<any, any>[]): A {
     if (this.#quarantine === undefined) throw new Error("guard() needs the brake's rules: install(recorder, { quarantine })");
@@ -361,7 +376,8 @@ export class WakeTracingProcessor extends EventGraph {
 
   /**
    * The handoff, offered only while neither the agent offering it nor the one it hands off to is
-   * halted, and refused as it starts, throwing AgentHalted, if a halt has landed since.
+   * halted, nor the flow policy keeps it, and refused as it starts, throwing AgentHalted, if that
+   * has changed since.
    */
   #guardHandoff(item: Handoff<any, any>, owner: string): Handoff<any, any> {
     const enabled = item.isEnabled as HandoffEnabledFunction<any> & { wake?: true };
@@ -394,11 +410,11 @@ export class WakeTracingProcessor extends EventGraph {
   }
 
   /**
-   * The refusal of a tool call about to run, if a halt covers who's making it: agent, as the SDK
-   * says, or else the agent whose run the SDK's current span is in, or owner. It's noted on the
-   * call's span, to be recorded as denied when that ends, or recorded as denied now if the SDK
-   * opened none for it, as for a guardrail run before the call's approval. Never throws: a check
-   * that fails refuses.
+   * The refusal of a tool call about to run, if a halt covers who's making it, or the flow
+   * policy keeps it from what entered them: agent, as the SDK says, or else the agent whose run
+   * the SDK's current span is in, or owner. It's noted on the call's span, to be recorded as
+   * denied when that ends, or recorded as denied now if the SDK opened none for it, as for a
+   * guardrail run before the call's approval. Never throws: a check that fails refuses.
    */
   #refuseCall(agent: string | undefined, name: string, args: unknown, callId: string | undefined, owner?: string): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
@@ -407,7 +423,7 @@ export class WakeTracingProcessor extends EventGraph {
     let refused: Refusal | undefined;
     try {
       who = agent ?? this.#agentAt(span?.spanId) ?? who;
-      refused = this._refusal(who, { span });
+      refused = this._refusal(who, { span, tool: name });
     } catch (error) {
       log.warn("couldn't check the halts for a tool call; refusing it", error);
       refused = unchecked();
@@ -417,6 +433,7 @@ export class WakeTracingProcessor extends EventGraph {
     // Refused all the same if this fails; only its record may say less.
     this.#safely("refused tool call", () => {
       if (span === undefined) return;
+      this.#refused.set(span.spanId, true);
       if (this.#pending.has(span.spanId)) this.#halted.set(span.spanId, { refusal: stopped, call: callId });
       else this.#refusedAlone(span, who, name, args, callId, stopped);
     });
@@ -426,7 +443,8 @@ export class WakeTracingProcessor extends EventGraph {
 
   /**
    * Throws AgentHalted, noting the refusal on the handoff's span to be recorded as denied, if a
-   * halt covers the agent handing off or the one it would hand off to.
+   * halt covers the agent handing off or the one it would hand off to, or the flow policy keeps
+   * the handoff from what entered the agent handing off.
    */
   #refuseHandoff(target: string, owner: string): void {
     const span = currentSpan();
@@ -435,6 +453,7 @@ export class WakeTracingProcessor extends EventGraph {
     const refused = this._refusal(source, { span, target });
     if (refused === undefined) return;
     this.#safely("refused handoff", () => {
+      if (handing !== undefined) this.#refused.set(handing.spanId, true);
       if (handing !== undefined && this.#spans.has(handing.spanId)) this.#halted.set(handing.spanId, { refusal: refused, receiver: target });
     });
     log.warn(`refused a handoff of ${source} to ${target}: ${refused[0]}`);
@@ -446,10 +465,12 @@ export class WakeTracingProcessor extends EventGraph {
    * instance the run is and those that started it. With target, a handoff to target is refused
    * too when a halt covers it, or the instance of it the handoff would start in the same run.
    * The run is the one span is in, by default the SDK's current span, as for its events. While
-   * Wake can't place it, a halt on any run of the agent Wake has seen refuses it. Never throws:
-   * a check that fails refuses.
+   * Wake can't place it, a halt on any run of the agent Wake has seen refuses it. Then the flow
+   * policy, on what entered agent: a call to tool, or a handoff to target, it keeps is refused
+   * too, its rules for callers holding the run's lineage as the halts do. Never throws: a check
+   * that fails refuses.
    */
-  _refusal(agent: string, { span = currentSpan(), target }: { span?: SdkSpan; target?: string } = {}): Refusal | undefined {
+  _refusal(agent: string, { span = currentSpan(), target, tool }: { span?: SdkSpan; target?: string; tool?: string } = {}): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
     const outcome = target !== undefined ? `the handoff to ${target} wasn't made` : "this tool call wasn't run";
     try {
@@ -480,6 +501,10 @@ export class WakeTracingProcessor extends EventGraph {
         const instance = run !== undefined ? `${target}#${run}` : undefined;
         refused = refusal(this.#quarantine, instance ?? target, instance !== undefined ? [target, instance] : [target], { unplaced: targetUnplaced, outcome });
       }
+      if (refused === undefined && (target !== undefined || tool !== undefined)) {
+        const call = target !== undefined ? { receiver: target } : { tool };
+        refused = flowRefusal(this.#quarantine, who, { caller: agent, lineage: [...names, ...unplaced], ...call }, outcome);
+      }
       return refused;
     } catch (error) {
       log.warn(`couldn't check the halts for ${agent}; refusing`, error);
@@ -503,7 +528,7 @@ export class WakeTracingProcessor extends EventGraph {
       "gen_ai.operation.name": "execute_tool",
       "gen_ai.tool.name": name,
       "wake.brake.halt_id": refused[0],
-    }, { input: args ?? null, output: refused[1] });
+    }, { input: args ?? null, output: refused[1], ...keptOf(refused) });
     if (callId) this.#eventByCall.set(callId, eventId);
     this.#remember(otel.spanContext().traceId, run, eventId, refused[1]);
     otel.end();
@@ -547,7 +572,12 @@ export class WakeTracingProcessor extends EventGraph {
           run = span.spanId;
           this.#firsts.set(key(span.traceId, span.parentId), run);
           const tool = this.#toolAbove(span.parentId);
-          if (tool !== undefined) this.#runsIn.set(tool[0], [...(this.#runsIn.get(tool[0]) ?? []), run]);
+          if (tool !== undefined) {
+            this.#runsIn.set(tool[0], [...(this.#runsIn.get(tool[0]) ?? []), run]);
+            // A run inside a tool call, such as an agent used as a tool, starts with what had
+            // entered the agent calling it.
+            entered.message(this.#agentAt(tool[0]) ?? this._recorder.agent, String(data.name));
+          }
         }
         this.#runs.set(span.spanId, run);
         const [instance, lineage] = this.#identity(span.spanId);
@@ -592,6 +622,7 @@ export class WakeTracingProcessor extends EventGraph {
   }
 
   async onSpanEnd(span: SdkSpan): Promise<void> {
+    this.#safely("what entered", () => this.#entering(span));
     this.#safely("onSpanEnd", () => {
       const data = span.spanData;
       switch (data.type) {
@@ -607,6 +638,25 @@ export class WakeTracingProcessor extends EventGraph {
           return this.#handoffEnded(span);
       }
     });
+  }
+
+  /**
+   * Notes what a span that ended brought into an agent (flow.ts): a tool's result enters the
+   * agent that called it, unless Wake refused the call; a handoff that was made enters its
+   * target from its source; and the answer of a run inside a tool call goes back to the agent
+   * that called the tool, with what had entered the run.
+   */
+  #entering(span: SdkSpan): void {
+    const data = span.spanData;
+    if (data.type === "function") {
+      if (!this.#refused.has(span.spanId)) entered.note(this.#agentFor(span), `tool:${String(data.name ?? "")}`);
+    } else if (data.type === "handoff") {
+      // The SDK names the target once the handoff is made, and never for one refused.
+      if (typeof data.to_agent === "string" && data.to_agent && !this.#refused.has(span.spanId)) entered.message(String(data.from_agent ?? "unknown"), data.to_agent);
+    } else if (data.type === "agent") {
+      const tool = this.#toolAbove(span.parentId);
+      if (tool !== undefined) entered.message(String(data.name), this.#agentAt(tool[0]) ?? this._recorder.agent);
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -773,8 +823,8 @@ export class WakeTracingProcessor extends EventGraph {
     let origins = [`tool:${name}`];
     let output = data.output ?? null;
     if (stopped !== undefined) {
-      // Refused in the agent's own process, under the halt: what the agent tried. The tool
-      // never ran, so nothing of it entered.
+      // Refused in the agent's own process, under the halt or the flow policy: what the agent
+      // tried, and what the policy kept from it. The tool never ran, so nothing of it entered.
       kind = events.DENIED;
       origins = [];
       attributes["wake.brake.halt_id"] = stopped.refusal[0];
@@ -784,6 +834,7 @@ export class WakeTracingProcessor extends EventGraph {
     this.#event(otel, span, eventId, kind, `execute_tool ${name}`, agent, parents, origins, attributes, {
       input: input ?? null,
       output,
+      ...keptOf(stopped?.refusal),
     });
     // A refused call's output, as the model reads it, is the refusal.
     this.#remember(traceId, run, eventId, stopped !== undefined ? stopped.refusal[1] : text(output));
@@ -800,14 +851,14 @@ export class WakeTracingProcessor extends EventGraph {
     if (otel === undefined) return;
     const eventId = randomUUID();
     if (stopped !== undefined) {
-      // Refused as it started, under the halt: the attempt to hand the target its task, in the
-      // name of the agent that tried. Nothing reached the target.
+      // Refused as it started, under the halt or the flow policy: the attempt to hand the target
+      // its task, in the name of the agent that tried. Nothing reached the target.
       const target = stopped.receiver ?? String(data.to_agent ?? "unknown");
       this.#event(otel, span, eventId, events.DENIED, `agent_message ${source} -> ${target}`, source, requestedBy ? [requestedBy] : [], [], {
         "gen_ai.agent.name": target,
         "wake.brake.halt_id": stopped.refusal[0],
         "wake.brake.receiver": target,
-      }, { from: source, to: target, output: stopped.refusal[1] });
+      }, { from: source, to: target, output: stopped.refusal[1], ...keptOf(stopped.refusal) });
       otel.end();
       return;
     }

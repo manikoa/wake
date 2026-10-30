@@ -13,6 +13,7 @@ use wake_proxy::budget::{Budget, Events};
 use wake_proxy::control;
 use wake_proxy::export::Counters;
 use wake_proxy::halts::Halts;
+use wake_proxy::policy::{FlowPolicy, Policy};
 use wake_proxy::signer::dev_identity_with_tls;
 
 const BRAKE: &str = "spiffe://wake.local/brake";
@@ -441,6 +442,7 @@ async fn a_quarantine_reaches_the_memory_adapters() {
     tokio::spawn(wake_proxy::memory::serve(
         listener,
         c.halts.clone(),
+        Arc::new(Policy::fixed(FlowPolicy::empty())),
         std::future::pending(),
     ));
     // Its SDK says how long it acts on the rules, and that it stops halted instances.
@@ -454,6 +456,8 @@ async fn a_quarantine_reaches_the_memory_adapters() {
     .unwrap();
     assert_eq!(rules["locked_by"], "q1");
     assert_eq!(rules["quarantines"][0]["selection"]["origins"][0], "tool:fetch_page");
+    // No flow policy is enforced, so none is served, and the SDK checks nothing.
+    assert!(rules.get("flow").is_none(), "{rules}");
 
     // The brake sees that billing's adapter has it, and that billing's one process stops
     // halted instances.
@@ -647,4 +651,39 @@ async fn a_rotated_svid_and_bundle_serve_the_next_connection() {
     // brake's old SVID isn't under the new bundle.
     assert!(brake(&first).get(&url).send().await.is_err());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn the_flow_policy_reaches_the_sdks_with_their_rules() {
+    let c = control().await;
+    let policy = Arc::new(Policy::fixed(
+        FlowPolicy::parse(
+            br#"{"window_seconds": 600, "rules": [{"id": "no-pay-after-web", "callers": ["billing"], "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}]}"#,
+        )
+        .unwrap(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let memory = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(wake_proxy::memory::serve(
+        listener,
+        c.halts.clone(),
+        policy,
+        std::future::pending(),
+    ));
+    let rules: serde_json::Value = reqwest::get(format!(
+        "{memory}/v1/memory?agent=billing&process=7.a1b2c3&ttl=30&stops=1"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    // The SDK gets the policy the proxy enforces, to apply to the calls the proxy never sees.
+    assert_eq!(rules["flow"]["window_seconds"], 600);
+    assert_eq!(rules["flow"]["rules"][0]["id"], "no-pay-after-web");
+    assert_eq!(rules["flow"]["rules"][0]["tools"][0], "pay");
+    assert_eq!(rules["flow"]["version"].as_str().unwrap().len(), 64);
+    // Its memory rules and halts come with it, as before.
+    assert!(rules["halts"].is_array(), "{rules}");
+    assert!(rules["quarantines"].is_array(), "{rules}");
 }

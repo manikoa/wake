@@ -3,7 +3,9 @@
 # compose.yaml), which agentgateway joins, and the collector too for the agents, which
 # send it their events. wake-proxy stays on compose's default network with agentgateway,
 # the collector and the brake, and no agent joins it. The stand-ins and memory-rules join
-# the agents' networks they serve in compose.yaml. See "Network" in README.md.
+# the agents' networks they serve in compose.yaml. Those networks are internal: nothing on
+# them reaches the internet, so an agent's only way out is agentgateway. real.yaml opens the
+# two whose agents call a model provider in FLEET_MODELS=real. See "Network" in README.md.
 services:
   agentgateway:
     networks: [default, support, research, billing, notify, tools]
@@ -18,7 +20,12 @@ services:
 
 networks:
   support:
+    internal: true
   research:
+    internal: true
   billing:
+    internal: true
   notify:
+    internal: true
   tools:
+    internal: true

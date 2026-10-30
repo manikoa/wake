@@ -70,5 +70,33 @@ These are for staging:
 - Signing keys are files in a volume, and the collector and the ingester can read each other's.
 - The identity is a development CA, and every agent's development SVID is in the `identity` volume.
 - The log is on local disk.
+- Nothing stops an agent from reaching the network around agentgateway. This compose file runs no agents, so it can't close their networks.
 
 Production keeps the collector's key in KMS, gets SVIDs from SPIRE for wake-proxy, agentgateway (its gateway `tls.spiffe`) and every agent, and writes the log to the customer's bucket with object lock.
+
+It also leaves each agent no way out but agentgateway. A flow policy decides only on what passes wake-proxy, and the SDKs' check in the agent's own process ([flow-everywhere.md](../docs/flow-everywhere.md)) is one a compromised agent can switch off. So the network has to stop an agent from calling an MCP server or an API around the gateway. Allow each agent's egress only to agentgateway, the collector and the identity provider, plus wake-proxy's memory port (9003) for an agent whose memory adapter fetches its rules. The reference fleet does this with internal Docker networks (`examples/fleet/networks.yaml`). On Kubernetes, a NetworkPolicy like this one, with the namespaces and labels changed to yours:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agents-out-through-wake
+  namespace: agents
+spec:
+  podSelector: {}            # every agent in the namespace
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: wake}}
+          podSelector: {matchExpressions: [{key: app, operator: In, values: [agentgateway, collector]}]}
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: wake}}
+          podSelector: {matchLabels: {app: wake-proxy}}
+      ports: [{port: 9003, protocol: TCP}]
+    - to:                    # the cluster's DNS, so the agents can find those
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+```
+
+Add the identity provider's address, and a model provider's while an agent's model calls don't go through agentgateway. Each address you add is a way around the policy for whatever runs there.

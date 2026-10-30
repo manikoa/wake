@@ -38,6 +38,13 @@
  * an error message, as it does any error by default; with handleToolErrors off it throws,
  * ending the graph's run. Each refusal is recorded as denied, once. It's a cooperative stop: it
  * holds only while the agent's code does.
+ *
+ * The same checks apply the flow policy the rules carry (flow.ts), once no halt covers the
+ * call: a tool call, or a run agent() would start, by the agent it reaches, is refused the same
+ * way when the policy keeps it from what entered the agent making it, the named run's, or the
+ * recorder's outside any. A tool's result enters that agent once the tool has run, by the
+ * tool's name. A run started inside another starts with what had entered that one, entering
+ * as agent:<that run's agent>, and its reply, and what it returns, bring back what entered it.
  */
 
 import { randomUUID } from "node:crypto";
@@ -51,12 +58,13 @@ import { AsyncLocalStorageProviderSingleton } from "@langchain/core/singletons";
 import { ROOT_CONTEXT, SpanStatusCode, trace, type Context, type Span, type SpanContext } from "@opentelemetry/api";
 
 import * as events from "./events.ts";
+import { entered } from "./flow.ts";
 import { failed, Graph, MIN_MATCH, Recent, contextOf, traceIdOf, unique } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
 import type { Recorder } from "./recorder.ts";
 import { registerToolCall, unregisterToolCall } from "./registry.ts";
-import { AgentHalted, refusal, stopsWith, unchecked, type Halts, type Refusal } from "./stop.ts";
+import { AgentHalted, flowRefusal, keptOf, refusal, stopsWith, unchecked, type Halts, type Refusal } from "./stop.ts";
 
 export { AgentHalted } from "./stop.ts";
 
@@ -119,9 +127,10 @@ export class AgentRun {
     }
   }
 
-  /** Records this agent's answer going back to the agent that handed off to it. */
+  /** Records this agent's answer going back to the agent that handed off to it. It brings that agent what had entered this run. */
   reply(content: unknown): void {
     if (this._parent === undefined) return;
+    entered.message(this.agent, this._parent.agent);
     try {
       this._handler._recordMessage(this, this._parent, content);
     } catch (error) {
@@ -195,11 +204,12 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
   readonly #underTool = new Recent<string, true>(); // tool call run id whose nested run's first event is recorded
   readonly #quarantine: Halts | undefined;
   readonly #callContext = new Recent<string, SpanContext>(); // tool call id -> the model call that requested it
+  readonly #entering = new Recent<string, [agent: string, tool: string]>(); // tool call run id -> the agent its result enters, and the tool
   #installed: Installed | undefined;
 
   /**
    * With quarantine, the brake's rules for the agent (Quarantine), agent(), WakeToolNode and
-   * every tool call stop what a halt covers.
+   * every tool call stop what a halt covers, and what the flow policy they carry keeps.
    */
   constructor(recorder: Recorder, { quarantine }: { quarantine?: Halts } = {}) {
     // Callbacks are awaited, in order, so a tool call finds the model call that requested
@@ -241,7 +251,11 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
    * input came from, such as "user". Call reply() on the run to record the answer going back.
    *
    * With the brake's rules, a run a halt covers, by its name or what starts it, isn't started:
-   * this throws AgentHalted, and the attempt is recorded as denied.
+   * this throws AgentHalted, and the attempt is recorded as denied. Nor is one the flow policy
+   * keeps from what entered the run starting it, or the recorder's agent at the top.
+   *
+   * Started inside another run, it starts with what had entered that run, and what it returns,
+   * or throws, brings that run what entered it.
    */
   agent<T>(name: string, fn: (run: AgentRun) => T): T;
   agent<T>(name: string, options: AgentOptions, fn: (run: AgentRun) => T): T;
@@ -249,26 +263,35 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
     const [options, fn] = typeof optionsOrFn === "function" ? [{}, optionsOrFn] : [optionsOrFn, maybeFn!];
     this.#refuseStart(name, options.input);
     const run = this.#startRun(name, options.input, options.origin);
+    const starter = run._parent?.agent;
+    if (starter !== undefined) entered.message(starter, name);
+    const answered = () => {
+      if (starter !== undefined) entered.message(name, starter);
+    };
     let result: T;
     try {
       result = currentRun.run(run, () => fn(run));
     } catch (error) {
       this.#endSpan(run._span, error);
+      answered();
       throw error;
     }
     if (result instanceof Promise) {
       return result.then(
         (value) => {
           this.#endSpan(run._span);
+          answered();
           return value;
         },
         (error) => {
           this.#endSpan(run._span, error);
+          answered();
           throw error;
         },
       ) as T;
     }
     this.#endSpan(run._span);
+    answered();
     return result;
   }
 
@@ -406,6 +429,8 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
     // run is opened, it never runs, and nothing but the refusal is recorded.
     const refused = this.#refuseTool({ name, id: toolCallId, args: parsed(input) });
     if (refused !== undefined) throw new AgentHalted(refused);
+    // Its result enters the agent making it once it has run, whether or not it's recorded.
+    this.#safely("tool call entering", () => this.#entering.set(runId, [currentRun.getStore()?.agent ?? this._recorder.agent, name]));
     this.#safely("handleToolStart", () => {
       parentRuns.set(runId, parentRunId);
       const requestedBy = toolCallId ? this.#eventByToolCall.get(toolCallId) : undefined;
@@ -428,6 +453,7 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
   }
 
   override handleToolEnd(output: unknown, runId: string): void {
+    this.#entered(runId);
     this.#safely("handleToolEnd", () => {
       this.#rememberToolResult(runId, output);
       this.#endEvent(runId, toolOutput(output), undefined, text(output));
@@ -435,10 +461,18 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
   }
 
   override handleToolError(error: unknown, runId: string): void {
+    // What a tool that failed says enters the agent too: its error can carry what it read.
+    this.#entered(runId);
     this.#safely("handleToolError", () => {
       this.#rememberToolResult(runId, undefined);
       this.#endEvent(runId, null, error);
     });
+  }
+
+  /** Notes that the result of the tool call runId names entered the agent that made it, as tool:<the tool's name>. */
+  #entered(runId: string): void {
+    const call = this.#entering.pop(runId);
+    if (call !== undefined) entered.note(call[0], `tool:${call[1]}`);
   }
 
   // Cooperative stops.
@@ -455,12 +489,13 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
 
   /**
    * The refusal of a tool call about to run, if a halt covers the agent making it, the run it's
-   * in or what started that run, recorded as denied; undefined for a call to run. Never throws:
-   * a check that fails refuses.
+   * in or what started that run, or the flow policy keeps it from what entered that agent,
+   * recorded as denied; undefined for a call to run. Never throws: a check that fails refuses.
    */
   #refuseTool(call: { name?: string; args?: unknown; id?: string }): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
     const run = currentRun.getStore();
+    const name = call.name || "tool";
     let who = this._recorder.agent;
     let refused: Refusal | undefined;
     try {
@@ -471,19 +506,22 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
         who = run.instance ?? run.agent;
       }
       refused = refusal(this.#quarantine, who, names);
+      if (refused === undefined) refused = flowRefusal(this.#quarantine, who, { caller: run?.agent ?? this._recorder.agent, lineage: names, tool: name });
     } catch (error) {
       log.warn("couldn't check the halts for a tool call; refusing it", error);
       refused = unchecked();
     }
     if (refused === undefined) return undefined;
-    const name = call.name || "tool";
-    const [halt, reason] = refused;
-    this.#safely("refused tool call", () => this.#refusedCall(run, name, call, halt, reason));
-    log.warn(`refused a ${name} call of ${who}: ${halt}`);
+    const stopped = refused;
+    this.#safely("refused tool call", () => this.#refusedCall(run, name, call, stopped));
+    log.warn(`refused a ${name} call of ${who}: ${refused[0]}`);
     return refused;
   }
 
-  /** Throws AgentHalted, recording the attempt, if a halt covers the run of name about to start here. */
+  /**
+   * Throws AgentHalted, recording the attempt, if a halt covers the run of name about to start
+   * here, or the flow policy keeps it from what entered the run starting it.
+   */
   #refuseStart(name: string, input: unknown): void {
     if (this.#quarantine === undefined) return;
     const enclosing = currentRun.getStore();
@@ -492,23 +530,30 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
     try {
       const lineage = enclosing !== undefined ? [...enclosing.lineage, enclosing.instance ?? enclosing.agent] : [];
       refused = refusal(this.#quarantine, name, [this._recorder.agent, name, ...lineage], { outcome });
+      if (refused === undefined) {
+        // It's reached from the run starting it, or from the recorder's agent at the top.
+        const caller = enclosing?.agent ?? this._recorder.agent;
+        const who = enclosing !== undefined ? (enclosing.instance ?? enclosing.agent) : caller;
+        refused = flowRefusal(this.#quarantine, who, { caller, lineage: [this._recorder.agent, ...lineage], receiver: name }, outcome);
+      }
     } catch (error) {
       log.warn(`couldn't check the halts for a run of ${name}; refusing it`, error);
       refused = unchecked(outcome);
     }
     if (refused === undefined) return;
-    const [halt] = refused;
-    this.#safely("refused run", () => this.#refusedStart(enclosing, name, input, halt));
-    log.warn(`refused to start a run of ${name}: ${halt}`);
+    const stopped = refused;
+    this.#safely("refused run", () => this.#refusedStart(enclosing, name, input, stopped));
+    log.warn(`refused to start a run of ${name}: ${refused[0]}`);
     throw new AgentHalted(refused);
   }
 
   /**
-   * Records a tool call a halt refused before it ran: what the agent tried, under the model
-   * call that asked for it. The tool never ran, so it has no origins. The model's next call
-   * reads the refusal.
+   * Records a tool call a halt or the flow policy refused before it ran: what the agent tried,
+   * under the model call that asked for it, and what the policy kept from it. The tool never
+   * ran, so it has no origins. The model's next call reads the refusal.
    */
-  #refusedCall(run: AgentRun | undefined, name: string, call: { args?: unknown; id?: string }, halt: string, reason: string): void {
+  #refusedCall(run: AgentRun | undefined, name: string, call: { args?: unknown; id?: string }, refused: Refusal): void {
+    const [halt, reason] = refused;
     const requestedBy = call.id ? this.#eventByToolCall.get(call.id) : undefined;
     const requester = call.id ? this.#callContext.get(call.id) : undefined;
     const context =
@@ -519,16 +564,17 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
           : this._eventContext();
     const attributes: Record<string, string> = { "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name, "wake.brake.halt_id": halt };
     if (call.id) attributes["gen_ai.tool.call.id"] = call.id;
-    const eventId = this.#denied(`execute_tool ${name}`, run, requestedBy !== undefined ? [requestedBy] : [], [], attributes, { input: call.args ?? null, output: reason }, context);
+    const payload = { input: call.args ?? null, output: reason, ...keptOf(refused) };
+    const eventId = this.#denied(`execute_tool ${name}`, run, requestedBy !== undefined ? [requestedBy] : [], [], attributes, payload, context);
     if (call.id) this.#resultByToolCall.set(call.id, eventId);
   }
 
   /**
-   * Records a run a halt refused to start: the attempt to hand it its task, in the name of what
-   * tried, descending from what tried's latest event. Nothing entered the run, so it has no
-   * origins.
+   * Records a run a halt or the flow policy refused to start: the attempt to hand it its task,
+   * in the name of what tried, descending from what tried's latest event, and what the policy
+   * kept from it. Nothing entered the run, so it has no origins.
    */
-  #refusedStart(sender: AgentRun | undefined, name: string, content: unknown, halt: string): void {
+  #refusedStart(sender: AgentRun | undefined, name: string, content: unknown, refused: Refusal): void {
     const context = sender?._span !== undefined ? trace.setSpan(ROOT_CONTEXT, sender._span) : this._eventContext();
     const traceId = traceIdOf(context);
     const parents = [...this.#latestOf(sender), ...(traceId && content !== undefined && content !== null ? this._matchingOutputs(traceId, text(content)) : [])];
@@ -538,8 +584,8 @@ export class WakeCallbackHandler extends Graph(BaseCallbackHandler) {
       sender,
       parents,
       [],
-      { "gen_ai.agent.name": name, "wake.brake.halt_id": halt, "wake.brake.receiver": name },
-      { from: agent, to: name, content: content ?? null },
+      { "gen_ai.agent.name": name, "wake.brake.halt_id": refused[0], "wake.brake.receiver": name },
+      { from: agent, to: name, content: content ?? null, ...keptOf(refused) },
       context,
     );
   }

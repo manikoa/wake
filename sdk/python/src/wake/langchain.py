@@ -37,6 +37,14 @@ raise_error has LangChain pass that on, so the tool never runs. A ToolNode then 
 ending the graph's run, unless its handle_tool_errors catches every error, when the model
 gets it as an error message. Each refusal is recorded as denied, once. It's a cooperative
 stop: it holds only while the agent's code does.
+
+The same checks apply the flow policy wake-proxy serves with those rules (wake.flow), once
+no halt refuses the call: a tool call is refused when a rule holds the agent making it back
+for what entered it, and agent() refuses a run when one holds back the run starting it, or
+the recorder's agent at the top, from reaching it. A tool's result enters the agent that
+called it as tool:<name>. A run started inside another starts with what had entered that
+one, as agent:<that agent> with the rest, and its answer, by reply() or when it ends, brings
+what entered it back.
 """
 
 import asyncio
@@ -57,7 +65,7 @@ from langchain_core.tracers.context import register_configure_hook
 from opentelemetry import trace
 from opentelemetry.trace import Span, Status, StatusCode
 
-from wake import events, links, stop
+from wake import events, flow, links, stop
 from wake._graph import _MIN_MATCH, EventGraph, _Recent, failed, never_raise
 from wake.recorder import Recorder
 from wake.stop import AgentHalted
@@ -109,6 +117,8 @@ class AgentRun:
         """Record this agent's answer going back to the agent that handed off to it."""
         if self._parent is None:
             return
+        # It brings what entered this run into that one (wake.flow).
+        flow.message(self.agent, self._parent.agent)
         try:
             self._handler._record_message(sender=self, receiver=self._parent, content=content)
         except Exception:
@@ -134,7 +144,8 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
 
     def __init__(self, recorder: Recorder, quarantine: "Quarantine | None" = None) -> None:
         """With quarantine, the brake's rules for the agent (wake.quarantine), agent(), the
-        ToolNode wrappers and every tool call stop what a halt covers."""
+        ToolNode wrappers and every tool call stop what a halt covers, and what the flow policy
+        served with them holds back (wake.flow)."""
         EventGraph.__init__(self, recorder)
         self._quarantine = quarantine
         stop.stops_with(quarantine)
@@ -149,6 +160,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         self._seen_user_messages = _Recent()  # message id, or (trace id, digest) for one with no id
         self._linked = _Recent()  # top level run id -> the link it started under, for its first event
         self._under_tool = _Recent()  # tool call run id whose nested run's first event is recorded
+        self._running = _Recent()  # tool call run id -> the agent calling it and the tool, whose result enters it
         self._installed: _Installed | None = None
 
     def install(self) -> "WakeCallbackHandler":
@@ -174,9 +186,15 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         Call reply() on the run to record the answer going back.
 
         With the brake's rules, a run a halt covers, by its name or what starts it, isn't
-        started: this raises AgentHalted, and the attempt is recorded as denied.
+        started: this raises AgentHalted, and the attempt is recorded as denied. So is a run
+        the flow policy holds back the run starting it from reaching.
         """
         self._refuse_start(name, input)
+        enclosing = _current_run.get()
+        if enclosing is not None:
+            # Started inside another agent's run: what had entered that run enters this one,
+            # with its message (wake.flow).
+            flow.message(enclosing.agent, name)
         run = self._start_run(name, input, origin)
         token = _current_run.set(run)
         error: BaseException | None = None
@@ -193,6 +211,10 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                 # finished by a different task. That context never saw the run.
                 pass
             self._end_span(run._span, error)
+            if enclosing is not None:
+                # What it found goes back to the run that started it, as its answer does,
+                # whether or not it replied.
+                flow.message(name, enclosing.agent)
 
     # Structure: one invoke_agent span per top level run groups its events into a trace.
 
@@ -340,7 +362,10 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         refused = self._refuse_tool({"name": name, "id": tool_call_id, "args": inputs if inputs is not None else input_str})
         if refused is not None:
             raise AgentHalted(refused)
+        run = _current_run.get()
         with self._lock:
+            # Its result enters the agent calling it, once it comes back (wake.flow).
+            self._running[run_id] = (run.agent if run else self._recorder.agent, name)
             self._parent_run[run_id] = parent_run_id
             requested_by = self._event_by_tool_call.get(tool_call_id) if tool_call_id else None
         attributes = {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name}
@@ -387,25 +412,38 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
 
     @never_raise
     def _cancelled(self, run_id: UUID) -> None:
+        with self._lock:
+            self._running.pop(run_id, None)  # cancelled: nothing came back
         self._end_event(run_id, None, asyncio.CancelledError())
 
     @never_raise
     def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs) -> None:
+        self._tool_returned(run_id)
         self._remember_tool_result(run_id, output)
         self._end_event(run_id, _tool_output(output), text=_text(output))
 
     @never_raise
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs) -> None:
+        # An error can carry what the tool read, so it enters as a result does.
+        self._tool_returned(run_id)
         self._remember_tool_result(run_id, None)
         self._end_event(run_id, None, error)
+
+    def _tool_returned(self, run_id: UUID) -> None:
+        """Notes the tool's result entering the agent that called it, as tool:<name>."""
+        with self._lock:
+            calling = self._running.pop(run_id, None)
+        if calling is not None:
+            agent, name = calling
+            flow.note(agent, f"tool:{name}")
 
     # Cooperative stops.
 
     def wrap_tool_call(self, request, execute):
         """For a LangGraph ToolNode (ToolNode(tools, wrap_tool_call=handler.wrap_tool_call,
         awrap_tool_call=handler.awrap_tool_call)), or a create_agent middleware's hook of the
-        same name: refuses a tool call a halt covers before it runs, answering the model with
-        why, and records it as denied. Any other call runs."""
+        same name: refuses a tool call a halt covers, or the flow policy holds back, before it
+        runs, answering the model with why, and records it as denied. Any other call runs."""
         refused = self._tool_refusal(request)
         return execute(request) if refused is None else refused
 
@@ -415,7 +453,8 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         return await execute(request) if refused is None else refused
 
     def _tool_refusal(self, request) -> ToolMessage | None:
-        """The answer to a tool call a halt covers, recorded as denied; None for a call to run."""
+        """The answer to a tool call a halt covers or the flow policy holds back, recorded as
+        denied; None for a call to run."""
         call = getattr(request, "tool_call", None)
         call = call if isinstance(call, dict) else {}
         refused = self._refuse_tool(call)
@@ -426,8 +465,8 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
 
     def _refuse_tool(self, call: dict) -> "stop.Refusal | None":
         """The refusal of a tool call about to run, if a halt covers the agent making it, the
-        run it's in or what started that run, recorded as denied; None for a call to run. Never
-        raises: a check that fails refuses."""
+        run it's in or what started that run, or the flow policy holds that agent back from it,
+        recorded as denied; None for a call to run. Never raises: a check that fails refuses."""
         if self._quarantine is None:
             return None
         run, who = _current_run.get(), self._recorder.agent
@@ -439,6 +478,11 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
                     names.add(run.instance)
                 who = run.instance or run.agent
             refused = stop.refusal(self._quarantine, who, names)
+            if refused is None:
+                # Then the flow policy, on what entered the agent. A rule for the recorder's
+                # agent, or for a run that started this one, covers it too.
+                refused = flow.refusal(self._quarantine, who, run.agent if run is not None else self._recorder.agent,
+                                       names, tool=call.get("name") or "tool")
         except Exception:
             log.warning("wake: couldn't check the halts for a tool call; refusing it", exc_info=True)
             refused = stop.unchecked()
@@ -451,7 +495,8 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
 
     def _refuse_start(self, name: str, input: Any) -> None:
         """Raises AgentHalted, recording the attempt, if a halt covers the run of name about
-        to start here: by its name, or what starts it."""
+        to start here: by its name, or what starts it. Or if the flow policy holds back what
+        starts it, the run it's started in or else the recorder's agent, from reaching it."""
         if self._quarantine is None:
             return
         enclosing = _current_run.get()
@@ -459,6 +504,11 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
             lineage = (*enclosing.lineage, enclosing.instance or enclosing.agent) if enclosing is not None else ()
             refused = stop.refusal(self._quarantine, name, {self._recorder.agent, name, *lineage},
                                    outcome=f"this run of {name} wasn't started")
+            if refused is None:
+                caller = enclosing.agent if enclosing is not None else self._recorder.agent
+                who = (enclosing.instance or enclosing.agent) if enclosing is not None else caller
+                refused = flow.refusal(self._quarantine, who, caller, {self._recorder.agent, *lineage}, receiver=name,
+                                       outcome=f"this run of {name} wasn't started")
         except Exception:
             log.warning("wake: couldn't check the halts for a run of %s; refusing it", name, exc_info=True)
             refused = stop.unchecked(f"this run of {name} wasn't started")
@@ -470,9 +520,9 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
 
     @never_raise
     def _refused_call(self, run: AgentRun | None, name: str, call: dict, refused: stop.Refusal) -> None:
-        """Records a tool call a halt refused before it ran: what the agent tried, under the
-        model call that asked for it. The tool never ran, so it has no origins. The model's
-        next call reads the refusal."""
+        """Records a tool call a halt or the flow policy refused before it ran: what the agent
+        tried, under the model call that asked for it. The tool never ran, so it has no
+        origins. The model's next call reads the refusal."""
         call_id = call.get("id")
         with self._lock:
             requested_by = self._event_by_tool_call.get(call_id) if call_id else None
@@ -487,16 +537,17 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         if call_id:
             attributes["gen_ai.tool.call.id"] = call_id
         event_id = self._denied(f"execute_tool {name}", run, [requested_by] if requested_by else [], [],
-                                attributes, {"input": call.get("args"), "output": refused.reason}, context)
+                                attributes, {"input": call.get("args"), "output": refused.reason, **flow.payload(refused)},
+                                context)
         if call_id:
             with self._lock:
                 self._result_by_tool_call[call_id] = event_id
 
     @never_raise
     def _refused_start(self, sender: AgentRun | None, name: str, content: Any, refused: stop.Refusal) -> None:
-        """Records a run a halt refused to start: the attempt to hand it its task, in the name
-        of what tried, descending from what tried's latest event. Nothing entered the run, so
-        it has no origins."""
+        """Records a run a halt or the flow policy refused to start: the attempt to hand it its
+        task, in the name of what tried, descending from what tried's latest event. Nothing
+        entered the run, so it has no origins."""
         if sender is not None and sender._span is not None:
             context = trace.set_span_in_context(sender._span)
         else:
@@ -507,7 +558,7 @@ class WakeCallbackHandler(EventGraph, BaseCallbackHandler):
         agent = sender.agent if sender is not None else self._recorder.agent
         self._denied(f"agent_message {agent} -> {name}", sender, parents, [],
                      {"gen_ai.agent.name": name, "wake.brake.halt_id": refused.halt, "wake.brake.receiver": name},
-                     {"from": agent, "to": name, "content": content}, context)
+                     {"from": agent, "to": name, "content": content, **flow.payload(refused)}, context)
 
     def _denied(self, span_name: str, run: AgentRun | None, parents: list[str], origins: list[str],
                 attributes: dict[str, Any], payload: Any, context) -> str:

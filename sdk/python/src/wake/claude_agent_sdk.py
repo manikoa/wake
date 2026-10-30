@@ -36,6 +36,14 @@ subagent of a type a halt covers. That reaches what the proxy deny can't, such a
 and subagents that call with their parent's credentials, which the proxy can't tell from
 their parent. It's a cooperative stop: it holds only while the agent's code does, and a
 compromised agent can leave it out.
+
+The same hooks apply the flow policy wake-proxy serves with those rules (wake.flow), once
+no halt refuses the call: a tool call, and an Agent tool call as the start of the subagent
+it would start, are refused when a rule holds the agent back for what entered it. A tool's
+result enters the agent that called it as tool:<name>, an MCP tool by its own name, as the
+hook after it says. A subagent starts with what had entered the agent starting it, and its
+answer brings what entered it back, as agent:<subagent> with the rest: from the Agent
+tool's result, or, for a subagent in the background, when it stops.
 """
 
 import dataclasses
@@ -62,7 +70,7 @@ from claude_agent_sdk import (
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
-from wake import events, links, stop
+from wake import events, flow, links, stop
 from wake._graph import EventGraph, _Recent, failed, never_raise
 from wake.recorder import Recorder
 
@@ -181,6 +189,7 @@ class _Tool:
         self.ended_at: int | None = None
         self.frame = None  # the in-process tool's link frame, once it runs
         self.halted: str | None = None  # the halt its call was refused under
+        self.refusal: stop.Refusal | None = None  # and the refusal itself, for its denied event
 
 
 class _Run:
@@ -212,7 +221,8 @@ class WakeClaudeAgent(EventGraph):
         self._agent_ids = _Recent()  # tool use id -> the agent_id its hook named, for a subagent's
         self._subagents = _Recent()  # a hook's agent_id -> the names of the instance it is: itself, then its lineage
         self._spawned = _Recent()  # Agent tool use id -> its session, and the agent, instance and lineage it started
-        self._halted = _Recent()  # tool use id -> the halt a hook refused it under
+        self._halted = _Recent()  # tool use id -> the refusal a hook refused it with
+        self._background = _Recent()  # agent_id of a subagent in the background -> it, and the agent it answers
         self._ambiguous = _Recent()  # tool call event id -> True: an in-process call Wake can't tell from another
         self._sessions = _Recent(limit=1024)  # session id -> its run now
         self._last_calls = _Recent(limit=1024)  # session id -> its last model call, for the next turn
@@ -221,7 +231,8 @@ class WakeClaudeAgent(EventGraph):
     # Setup.
 
     def options(self, options=None):
-        """These options, with hooks that open each tool call before it runs."""
+        """These options, with hooks that open each tool call before it runs, and note what
+        its result and a subagent's answer bring into the agent (wake.flow)."""
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 
         options = options if options is not None else ClaudeAgentOptions()
@@ -230,6 +241,7 @@ class WakeClaudeAgent(EventGraph):
             ("PreToolUse", self._pre_tool_use),
             ("PostToolUse", self._post_tool_use),
             ("PostToolUseFailure", self._post_tool_use),
+            ("SubagentStop", self._subagent_stop),
         ):
             hooks.setdefault(event, []).append(HookMatcher(hooks=[callback]))
         return dataclasses.replace(options, hooks=hooks)
@@ -255,12 +267,18 @@ class WakeClaudeAgent(EventGraph):
         self._hook_opened(hook_input, tool_use_id)
         refused = self._halting(hook_input, tool_use_id)
         if refused is None:
+            self._starting(hook_input)
             return {}
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                        "permissionDecisionReason": refused.reason}}
 
     async def _post_tool_use(self, hook_input, tool_use_id, context) -> dict:
         self._hook_closed(hook_input, tool_use_id)
+        self._hook_entered(hook_input)
+        return {}
+
+    async def _subagent_stop(self, hook_input, tool_use_id, context) -> dict:
+        self._stopped(hook_input)
         return {}
 
     @never_raise
@@ -299,11 +317,17 @@ class WakeClaudeAgent(EventGraph):
         could be any the session started, or one started by any of them that the stream hasn't
         shown yet, since hooks can run ahead of the code reading it. So the call is refused if a
         halt covers any of them. An Agent tool call is refused too when a halt covers the
-        subagent type it would start. A check that fails refuses the call too."""
+        subagent type it would start. A check that fails refuses the call too.
+
+        Then the flow policy (wake.flow), on what entered the agent: the tool call, by its
+        tool's own name, and an Agent tool call as reaching the subagent it would start. A rule
+        for the agent covers its subagents, and while Wake can't tell which instance is
+        calling, a rule for any it could be, or any that started one, applies."""
         if self._quarantine is None:
             return None
         who = self._recorder.agent
         try:
+            name = hook_input.get("tool_name") or ""
             agent_id = hook_input.get("agent_id")
             agent_type = hook_input.get("agent_type") if agent_id else None
             agent = f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
@@ -316,10 +340,15 @@ class WakeClaudeAgent(EventGraph):
                 who = known[0]
             unplaced = self._instances(hook_input.get("session_id")) if agent_id and not known else ()
             refused = stop.refusal(self._quarantine, who, names, unplaced=unplaced)
-            if refused is None and hook_input.get("tool_name") in SUBAGENT_TOOLS:
+            target = _subagent(self._recorder.agent, hook_input.get("tool_input")) if name in SUBAGENT_TOOLS else None
+            if refused is None and target:
                 # What it would start: a new instance of that type, which no halt can name yet.
-                target = _subagent(self._recorder.agent, hook_input.get("tool_input"))
                 refused = stop.refusal(self._quarantine, target, {target})
+            if refused is None:
+                lineage = names | set(unplaced)
+                refused = flow.refusal(self._quarantine, who, agent, lineage, tool=_short_name(name))
+                if refused is None and target:
+                    refused = flow.refusal(self._quarantine, who, agent, lineage, receiver=target)
         except Exception:
             log.warning("wake: couldn't check the halts for a tool call; refusing it", exc_info=True)
             refused = stop.unchecked()
@@ -328,10 +357,10 @@ class WakeClaudeAgent(EventGraph):
         try:
             with self._lock:
                 if tool_use_id:
-                    self._halted[tool_use_id] = refused.halt
+                    self._halted[tool_use_id] = refused
                 tool = self._tools.get(tool_use_id) if tool_use_id else None
             if tool is not None:
-                tool.halted = refused.halt
+                tool.halted, tool.refusal = refused.halt, refused
         except Exception:
             # Refused all the same; only its record may say less.
             failed(self._recorder, "_halting")
@@ -352,6 +381,52 @@ class WakeClaudeAgent(EventGraph):
             tool.ended_at = time.time_ns()
             if hook_input.get("hook_event_name") == "PostToolUseFailure":
                 tool.error = str(hook_input.get("error") or "error")
+
+    # What enters each agent, for the flow policy (wake.flow). The hooks say it before Claude
+    # Code goes on, so it's noted before any later call is checked; the stream says it too.
+
+    def _hook_agent(self, hook_input) -> str:
+        """The agent a hook's call is made by: the agent, or <agent>/<subagent type>."""
+        agent_type = hook_input.get("agent_type") if hook_input.get("agent_id") else None
+        return f"{self._recorder.agent}/{agent_type}" if agent_type else self._recorder.agent
+
+    @never_raise
+    def _starting(self, hook_input) -> None:
+        """An Agent tool call let through starts its subagent: what had entered the agent
+        starting it enters it, with the task it's handed."""
+        if hook_input.get("tool_name") in SUBAGENT_TOOLS:
+            flow.message(self._hook_agent(hook_input), _subagent(self._recorder.agent, hook_input.get("tool_input")))
+
+    @never_raise
+    def _hook_entered(self, hook_input) -> None:
+        """What a tool's result brings into the agent that called it, once it has run:
+        tool:<name>, an MCP tool by its own name, as wake-proxy names it. An Agent tool's
+        result is the subagent's answer, which brings what entered the subagent. One left
+        running in the background answers when it stops."""
+        name = hook_input.get("tool_name") or ""
+        agent = self._hook_agent(hook_input)
+        if name not in SUBAGENT_TOOLS:
+            flow.note(agent, f"tool:{_short_name(name)}")
+            return
+        target = _subagent(self._recorder.agent, hook_input.get("tool_input"))
+        response = hook_input.get("tool_response")
+        response = response if isinstance(response, dict) else {}
+        if response.get("status") in LAUNCHED:
+            agent_id = response.get("agentId")
+            if isinstance(agent_id, str) and agent_id:
+                with self._lock:
+                    self._background[agent_id] = (target, agent)
+            return
+        flow.message(target, agent)
+
+    @never_raise
+    def _stopped(self, hook_input) -> None:
+        """A subagent in the background has stopped: its answer reaches the agent that started
+        it, before Claude Code gives that agent the answer."""
+        with self._lock:
+            answered = self._background.pop(hook_input.get("agent_id"), None)
+        if answered is not None:
+            flow.message(*answered)
 
     # In-process tools.
 
@@ -613,7 +688,10 @@ class WakeClaudeAgent(EventGraph):
         tool = _Tool(event_id, span, name, arguments, agent, run)
         self._remember_lineage(event_id, [], [f"tool:{name}"])
         with self._lock:
-            tool.halted = self._halted.get(tool_use_id)  # its hook refused it before the stream got here
+            refused = self._halted.get(tool_use_id)
+            if refused is not None:
+                # Its hook refused it before the stream got here.
+                tool.halted, tool.refusal = refused.halt, refused
             self._tools[tool_use_id] = tool
             self._tool_agents[event_id] = agent
             if not server:
@@ -640,9 +718,15 @@ class WakeClaudeAgent(EventGraph):
             payload["error"] = tool.error or _text(output) or error
         kind, origins = events.TOOL_CALL, [f"tool:{tool.name}"]
         if tool.halted:
-            # Refused in the agent's own process, under the halt: what the agent tried. The
-            # tool never ran, so nothing of it entered.
+            # Refused in the agent's own process, under the halt or the flow policy: what the
+            # agent tried. The tool never ran, so nothing of it entered.
             kind, origins, attributes["wake.brake.halt_id"] = events.DENIED, [], tool.halted
+            payload.update(flow.payload(tool.refusal))
+        elif tool.name not in SUBAGENT_TOOLS and not error:
+            # Its result entered the agent, as its hook said if it had one: a server tool's, run
+            # at Anthropic, is known only from the stream. One that ran and failed was noted by
+            # its hook, and one Claude Code refused never ran. An Agent tool's comes as an answer.
+            flow.note(tool.agent, f"tool:{_short_name(tool.name)}")
         self._emit(tool.span, tool.event_id, kind, f"execute_tool {tool.name}", tool.agent,
                    tool.parents, origins, attributes, payload, error=error, who=tool)
         self._remember_output(tool.span.get_span_context().trace_id, tool.event_id, _text(output))
@@ -736,6 +820,9 @@ class WakeClaudeAgent(EventGraph):
 
     def _returned(self, run: _Run, thread: _Thread, tool_use_id: str, content: Any) -> None:
         sub = run.threads.pop(tool_use_id)
+        # The answer brings what entered the subagent into the agent it answers, as its hooks
+        # said if they ran.
+        flow.message(sub.agent, thread.agent)
         self._end_call(sub)
         sub.span.end()
         source = sub.last_call or run.handoffs.get(tool_use_id)
