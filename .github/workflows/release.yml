@@ -1,4 +1,4 @@
-# Releases the open source recorder when a vX.Y.Z tag is pushed: the collector and
+# Releases the open source core when a vX.Y.Z tag is pushed: the collector and
 # wake-proxy images on GHCR, wake-log and wake-keygen for checking a log without Wake,
 # the Python SDK on PyPI and the TypeScript SDK on npm. Every artifact is signed with
 # Sigstore, keyless, by this workflow's own identity, and gets SLSA build provenance and

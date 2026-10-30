@@ -66,7 +66,7 @@ Build the 95% metric early as a query: the share of action events with an unbrok
 - The collector's Go processor checks signatures before events reach the log, and records events that fail the check instead of silently dropping them.
 - The provenance graph is built from the log, never fed straight from the collector. An ingester in `wake-platform` reads the log into Postgres and ClickHouse, checks each signature again with public keys only, and can replay the log from the start. The design is in `wake-platform/docs/provenance-storage.md`.
 - Signing happens at the first hop outside the agent's process: the collector signs SDK and memory adapter events, and the proxy signs its own (`docs/signing.md`). The SDK never holds a key. The signed bytes are defined in `docs/events.md`.
-- The open source package includes a self hosted signed log, so a team can run the recorder with no Wake account.
+- The open source package includes a self hosted signed log, so a team can run the core with no Wake account.
 
 ## Recording never blocks
 
@@ -86,7 +86,7 @@ The view is a paid part, so it's built in the private repository, not this one (
 
 ## Releases
 
-The recorder is open source and free forever. From the first public release, sign releases with Sigstore and publish SLSA provenance and an SBOM. Security teams need to read exactly what runs in their stack, and Wake will be a target.
+The open source core is free forever. From the first public release, sign releases with Sigstore and publish SLSA provenance and an SBOM. Security teams need to read exactly what runs in their stack, and Wake will be a target.
 
 ## Not in Record
 
@@ -98,4 +98,4 @@ The brake and the deny lever, the downstream view, detection rules and risk scor
 - [ ] Traces stitched across at least one agent to agent hop for each partner
 - [ ] Over 95% of actions with complete provenance, measured by the query above
 - [ ] One real issue caught and written up with the provenance view
-- [ ] Signed releases, SLSA provenance and SBOMs published for the open source recorder
+- [ ] Signed releases, SLSA provenance and SBOMs published for the open source core

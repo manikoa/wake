@@ -1,12 +1,12 @@
 {
   "name": "wake-sdk",
   "version": "0.1.0",
-  "description": "Wake recorder SDK: records what every agent saw, said and did.",
+  "description": "Wake SDK: records what an agent does, and holds halts and flow policies over its local tools and handoffs.",
   "license": "Apache-2.0",
   "author": "Anthony Maniko <117973652+manikoa@users.noreply.github.com>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/manikoa/wake.git",
+    "url": "git+https://github.com/usewake/wake.git",
     "directory": "sdk/typescript"
   },
   "type": "module",

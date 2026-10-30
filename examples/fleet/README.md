@@ -1,6 +1,6 @@
 # Reference fleet
 
-Four agents on three frameworks, in Python and TypeScript, talking over A2A and MCP through agentgateway, recorded by Wake's SDKs in both languages. It's the recorder's end to end test, run in CI, and the target for game days. It doesn't depend on any design partner's product.
+Four agents on three frameworks, in Python and TypeScript, talking over A2A and MCP through agentgateway, recorded by Wake's SDKs in both languages. It's the open source core's end to end test, run in CI, and the target for game days. It doesn't depend on any design partner's product.
 
 | Agent | Framework | Does | Talks to |
 |---|---|---|---|
@@ -17,7 +17,7 @@ Notify is the TypeScript agent (`notify/`, a pnpm project with an image of its o
 ./run.sh
 ```
 
-It starts the staging recorder (`deploy/compose.yaml`) with this directory's `agentgateway.yaml`, plus the stand-ins, the tools and the agents. Then it sends one request through support, checks that nothing of the fleet's can be reached around the gateway (see [Network](#network)), and sends the same request again with `policy.json` in force (see [Flow policy](#flow-policy)). It checks the signed log with `wake-log`, and checks each request with `check.py`:
+It starts the staging stack (`deploy/compose.yaml`) with this directory's `agentgateway.yaml`, plus the stand-ins, the tools and the agents. Then it sends one request through support, checks that nothing of the fleet's can be reached around the gateway (see [Network](#network)), and sends the same request again with `policy.json` in force (see [Flow policy](#flow-policy)). It checks the signed log with `wake-log`, and checks each request with `check.py`:
 
 - Every agent and every hop is recorded: by the SDKs, the memory adapter, and the proxy for A2A and MCP.
 - Each request is in one trace, and every parent is in the log.
@@ -59,7 +59,7 @@ The identity provider is as strict as Okta's documentation allows: a client sees
 
 ## Identity
 
-agentgateway names each caller from its SPIFFE ID or JWT, as in production: for a delegated token, the agent it names as acting (`act.sub`), else its subject. Failing those, it uses the `x-fleet-agent` header the agents send. That header is a stand-in so the example needs no identity provider, and any caller can set it, so don't trust it outside the example; `deploy/agentgateway.yaml` requires each agent's SVID instead. `agents.json` lists the names wake-proxy accepts, so a call naming anyone else, or no one, is denied while any agent is halted. The agents get the CA certificate for the collector's TLS, and nothing else from the recorder: no keys and no identity.
+agentgateway names each caller from its SPIFFE ID or JWT, as in production: for a delegated token, the agent it names as acting (`act.sub`), else its subject. Failing those, it uses the `x-fleet-agent` header the agents send. That header is a stand-in so the example needs no identity provider, and any caller can set it, so don't trust it outside the example; `deploy/agentgateway.yaml` requires each agent's SVID instead. `agents.json` lists the names wake-proxy accepts, so a call naming anyone else, or no one, is denied while any agent is halted. The agents get the CA certificate for the collector's TLS, and nothing else from the stack: no keys and no identity.
 
 ## Network
 
@@ -70,11 +70,11 @@ A compromised agent can reach the rest of the fleet only through agentgateway, w
 | `support`, `research`, `notify` | that agent, agentgateway, the collector, the identity provider |
 | `billing` | billing, agentgateway, the collector, the identity provider, E2B, `memory-rules` |
 | `tools` | the tools server, agentgateway, the identity provider |
-| `default` | agentgateway, wake-proxy, the collector, the stand-ins, `memory-rules`, and the brake and Temporal when they run next to the recorder |
+| `default` | agentgateway, wake-proxy, the collector, the stand-ins, `memory-rules`, and the brake and Temporal when they run next to the staging stack |
 
 The agents' and the tools server's networks are internal: Docker routes nothing from them to anywhere outside the fleet, the internet included. So an agent can't call an MCP server or an API around agentgateway, where a flow policy would never see the call. That holds with `FLEET_MODELS=real` too: research's and billing's model calls go through agentgateway's model routes, which alone reach the providers.
 
-No agent is on `default`, so none can reach wake-proxy's hooks or its control API (9002), or the brake and Temporal, any of which could undo a halt, as long as none of them publishes a port (below). The collector and the stand-ins join each network they serve rather than one network all the agents share, since on a shared network every agent could reach every other one. None of them forwards anything: each listens on its own port. The stand-ins are on `default` for the brake, which pulls its levers there. The tools server records nothing, so it has no way to the collector. `networks.yaml` attaches the recorder's services from `deploy/compose.yaml`, which is unchanged for staging.
+No agent is on `default`, so none can reach wake-proxy's hooks or its control API (9002), or the brake and Temporal, any of which could undo a halt, as long as none of them publishes a port (below). The collector and the stand-ins join each network they serve rather than one network all the agents share, since on a shared network every agent could reach every other one. None of them forwards anything: each listens on its own port. The stand-ins are on `default` for the brake, which pulls its levers there. The tools server records nothing, so it has no way to the collector. `networks.yaml` attaches the stack's services from `deploy/compose.yaml`, which is unchanged for staging.
 
 wake-proxy needs a network namespace of its own, not agentgateway's: in the gateway's, its control API would be at the gateway's address on every agent's network. And nothing an agent mustn't reach may publish a port, even on `127.0.0.1`: Docker takes a published port at the container's own address from every network. The fleet publishes only agentgateway's, and `networks.yaml` drops the collector's.
 

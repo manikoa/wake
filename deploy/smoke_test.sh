@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts the recorder from compose.yaml, sends events from the Python SDK over TLS, and
+# Starts the stack from compose.yaml, sends events from the Python SDK over TLS, and
 # checks they're signed into the log. Then it checks the deny lever: a halted agent's own
 # MCP call through agentgateway is denied, a streamed A2A reply under way is cut when a halt
 # lands, and both are signed into the log and counted in wake-proxy's metrics. CI runs it;

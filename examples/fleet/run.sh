@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the reference fleet end to end: brings it up on the staging recorder, sends one
+# Runs the reference fleet end to end: brings it up on the staging stack, sends one
 # customer request through the support agent, checks that each agent and the tools server
 # can reach the rest of the fleet, the model providers and the internet only through
 # agentgateway (reach.py), sends the same request again under a flow policy (policy.json),

@@ -1,6 +1,6 @@
-# Running the recorder
+# Running the open source core
 
-`compose.yaml` runs the open source recorder in one place, such as a staging environment:
+`compose.yaml` runs the open source core's services in one place, such as a staging environment:
 
 - **collector:** receives events over OTLP/HTTP with TLS on port 4318, signs the SDK's events, checks the proxy's, and keeps the signed log in the `data` volume. Only `spiffe://wake.local/proxy` may sign proxy events (`WAKE_PROXY_ID` changes it). Its health check is on port 13133 and its own metrics, for Prometheus, on port 8888 at `/metrics`, both published on this host's loopback. Alert on `wake_log_dropped_events`.
 - **wake-proxy:** records MCP calls and A2A messages for agentgateway, which reaches its hooks on a Unix socket in the `proxy-socket` volume. No other service mounts it, since anything that can call the hooks can get events signed. Its metrics, for Prometheus, are on port 9464 at `/metrics`, published on this host's loopback. Alert on `wake_proxy_hooks_dropped_total` and `wake_proxy_events_dropped_total`, calls it saw and didn't record, and on `wake_proxy_state_ok` going to 0.
@@ -64,7 +64,7 @@ docker compose run --rm --no-deps --entrypoint /wake-log collector verify -log /
   -signer proxy=spiffe://wake.local/proxy
 ```
 
-The provenance view and its ingester run on top of this in `manikoa/wake-platform`.
+The provenance view and its ingester run on top of this in `usewake/wake-platform`.
 
 ## Before production
 
