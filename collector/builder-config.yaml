@@ -10,12 +10,12 @@ receivers:
   - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.164.0
 
 processors:
-  - gomod: github.com/manikoa/wake/collector v0.0.0
-    import: github.com/manikoa/wake/collector/processor/wakesignprocessor
+  - gomod: github.com/usewake/wake/collector v0.0.0
+    import: github.com/usewake/wake/collector/processor/wakesignprocessor
 
 exporters:
-  - gomod: github.com/manikoa/wake/collector v0.0.0
-    import: github.com/manikoa/wake/collector/exporter/wakelogexporter
+  - gomod: github.com/usewake/wake/collector v0.0.0
+    import: github.com/usewake/wake/collector/exporter/wakelogexporter
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.164.0
 
 extensions:
@@ -27,5 +27,5 @@ providers:
   - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.70.0
 
 replaces:
-  - github.com/manikoa/wake/collector => ../
-  - github.com/manikoa/wake/log => ../../log
+  - github.com/usewake/wake/collector => ../
+  - github.com/usewake/wake/log => ../../log

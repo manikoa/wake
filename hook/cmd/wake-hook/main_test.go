@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manikoa/wake/hook"
+	"github.com/usewake/wake/hook"
 )
 
 // Exit code 2 is how the hosts hear a refusal they can't be told in their own words: an

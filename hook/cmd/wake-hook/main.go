@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/manikoa/wake/hook"
+	"github.com/usewake/wake/hook"
 )
 
 // version is set when a release is built.

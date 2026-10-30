@@ -2,7 +2,7 @@
 // the checkpoint's signature, that every entry is in the signed tree, and each event's
 // signature and payload. With -entries it also prints every entry as a JSON line.
 //
-//	go run github.com/manikoa/wake/log/cmd/wake-log verify -log ./log -log-key keys/log.pub \
+//	go run github.com/usewake/wake/log/cmd/wake-log verify -log ./log -log-key keys/log.pub \
 //	    -key keys/collector.pub -bundle identity/bundle.pem -signer proxy=spiffe://wake.local/proxy
 //
 // -log is the log's directory, or an http(s) URL it's served from. -key is a note format
@@ -40,8 +40,8 @@ import (
 	"strings"
 	"time"
 
-	wakelog "github.com/manikoa/wake/log"
 	"github.com/transparency-dev/tessera/client"
+	wakelog "github.com/usewake/wake/log"
 	"golang.org/x/mod/sumdb/note"
 )
 

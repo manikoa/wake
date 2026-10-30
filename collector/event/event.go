@@ -15,7 +15,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
 
-	wakelog "github.com/manikoa/wake/log"
+	wakelog "github.com/usewake/wake/log"
 )
 
 // Attribute names used here. See docs/events.md for the full list.

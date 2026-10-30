@@ -1,7 +1,7 @@
 // Command wake-keygen writes a note format key pair: <out>.key (private) and <out>.pub.
 // Use one pair for the log's checkpoints and another for the collector's event signatures.
 //
-//	go run github.com/manikoa/wake/log/cmd/wake-keygen -name spiffe://example.org/wake/collector -out keys/collector
+//	go run github.com/usewake/wake/log/cmd/wake-keygen -name spiffe://example.org/wake/collector -out keys/collector
 //
 // The private key is written whole or not at all, and never over an existing one. The
 // public key is derived from it, so a crash between the two files leaves a pair that
@@ -19,7 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	wakelog "github.com/manikoa/wake/log"
+	wakelog "github.com/usewake/wake/log"
 	"golang.org/x/mod/sumdb/note"
 )
 
