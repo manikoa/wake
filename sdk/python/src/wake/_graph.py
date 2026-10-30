@@ -117,6 +117,19 @@ class EventGraph:
         several that can run at once (docs/events.md). None for an agent that runs as one."""
         return None, ()
 
+    def _acting(self) -> "tuple[str, str, frozenset[str]] | None":
+        """Who is acting now, for the flow policy's check of a memory change it makes
+        (wake.flow), named as this integration's own checks name it: the agent, whose origins
+        count; who it is as told, its instance when it has one; and the names a rule's callers
+        may match, the agent, its instance and what started it, and the recorder's agent. None
+        when the integration can't tell which agent is acting."""
+        agent = self._current_agent()
+        instance, lineage = self._current_instance()
+        names = {self._recorder.agent, agent, *lineage}
+        if instance:
+            names.add(instance)
+        return agent, instance or agent, frozenset(names)
+
     def _remember_output(self, trace_id: Hashable, event_id: str, text: str) -> None:
         text = text.strip()
         if len(text) < _MIN_MATCH:

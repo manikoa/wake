@@ -959,10 +959,22 @@ def test_a_memory_write_in_a_subagents_tool_names_the_instance(tmp_path):
     assert identity(lookup) == identity(write) == ("support/researcher#toolu_agent", ("support",))
 
 
-def remembering(memory, path):
+def remembering(memory, path, acting=None, refused=None):
+    """The lookup tool, noting its order in a memory file. It notes who Wake says is acting as
+    it writes, in acting, and the halt of each write refused, in refused."""
+
     @tool("lookup_order", "Look an order up", {"order": str})
     async def remembering_lookup(arguments):
-        memory.write_file(path, ORDER)
+        from wake.quarantine import MemoryLocked
+
+        if acting is not None:
+            acting.append(memory._handler._acting())
+        try:
+            memory.write_file(path, ORDER)
+        except MemoryLocked as e:
+            if refused is None:
+                raise
+            refused.append(e.quarantine)
         return {"content": [{"type": "text", "text": ORDER}]}
 
     return remembering_lookup
@@ -976,7 +988,7 @@ def test_a_memory_write_by_a_subagent_wake_cant_place_yet_names_no_instance(tmp_
     exporter = InMemorySpanExporter()
     recorder = Recorder(agent="support", exporter=exporter)
     claude = WakeClaudeAgent(recorder)
-    read = []
+    read, acting = [], []
     first, second, order = research("Look order 1234 up"), research("Look order 1234 up again"), {"order": "1234"}
 
     async def script(cli: FakeClaudeCode) -> None:
@@ -1001,8 +1013,8 @@ def test_a_memory_write_by_a_subagent_wake_cant_place_yet_names_no_instance(tmp_
         await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
                         "is_error": False, "num_turns": 2, "session_id": "session-1", "result": ANSWER})
 
-    asyncio.run(run_support(claude, script=script, tools=[remembering(Memory(claude), tmp_path / "notes.md")],
-                            read=read))
+    asyncio.run(run_support(claude, script=script, read=read,
+                            tools=[remembering(Memory(claude), tmp_path / "notes.md", acting)]))
     recorder.flush()
     spans = exporter.get_finished_spans()
     lookup = by_name(spans, "execute_tool mcp__crm__lookup_order")
@@ -1011,42 +1023,267 @@ def test_a_memory_write_by_a_subagent_wake_cant_place_yet_names_no_instance(tmp_
     assert write.attributes["wake.agent.id"] == "support/researcher"
     assert identity(write) == (None, None), "not guessed to be the copy the stream had shown"
     assert identity(lookup) == ("support/researcher#toolu_r2", ("support",)), "named once the stream said"
+    # For the flow policy, as for its tool call's check: a rule for any copy it could be applies.
+    assert acting == [("support/researcher", "support/researcher",
+                       frozenset({"support", "support/researcher", "support/researcher#toolu_r1"}))]
+
+
+ALIKE = {"toolu_r1": research("Look order 1234 up"), "toolu_r2": research("Look it up too")}
+
+
+async def two_copies_call_alike(cli: FakeClaudeCode) -> None:
+    """Two researchers call the in-process tool with the same arguments at once, and the
+    second's call runs first. Nothing tells the tool which call it's running."""
+    order = {"order": "1234"}
+    await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
+    await cli.assistant("msg_1", *[{"type": "tool_use", "id": use, "name": "Agent", "input": ask}
+                                   for use, ask in ALIKE.items()])
+    for use, ask in ALIKE.items():
+        assert await cli.allowed(use, "Agent", ask, {})
+        await cli.user({"type": "text", "text": ask["prompt"]}, parent=use)
+    for use in ALIKE:
+        await cli.assistant(f"msg_{use}", {"type": "tool_use", "id": f"{use}_order", "name": "mcp__crm__lookup_order",
+                                           "input": order}, parent=use)
+        await cli.hook("PreToolUse", f"{use}_order", tool_name="mcp__crm__lookup_order", tool_input=order,
+                       **caller("researcher", f"agent-{use}"))
+    outputs = [await call_lookup(cli), await call_lookup(cli, first=False)]
+    for use, output in zip(reversed(list(ALIKE)), outputs):
+        await cli.user({"type": "tool_result", "tool_use_id": f"{use}_order", "content": output}, parent=use)
+    for use in ALIKE:
+        await cli.user({"type": "tool_result", "tool_use_id": use, "content": [{"type": "text", "text": ORDER}]})
+    await cli.assistant("msg_2", {"type": "text", "text": ANSWER})
+    await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
+                    "is_error": False, "num_turns": 2, "session_id": "session-1", "result": ANSWER})
 
 
 def test_calls_alike_by_two_copies_at_once_name_no_instance_in_what_they_write(tmp_path):
-    # Two researchers call the in-process tool with the same arguments at once, and the second's
-    # call runs first. Nothing tells the tool which call it's running.
     from wake.memory import Memory
 
     exporter = InMemorySpanExporter()
     recorder = Recorder(agent="support", exporter=exporter)
     claude = WakeClaudeAgent(recorder)
-    asks, order = {"toolu_r1": research("Look order 1234 up"), "toolu_r2": research("Look it up too")}, {"order": "1234"}
-
-    async def script(cli: FakeClaudeCode) -> None:
-        await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
-        await cli.assistant("msg_1", *[{"type": "tool_use", "id": use, "name": "Agent", "input": ask}
-                                       for use, ask in asks.items()])
-        for use, ask in asks.items():
-            assert await cli.allowed(use, "Agent", ask, {})
-            await cli.user({"type": "text", "text": ask["prompt"]}, parent=use)
-        for use in asks:
-            await cli.assistant(f"msg_{use}", {"type": "tool_use", "id": f"{use}_order", "name": "mcp__crm__lookup_order",
-                                               "input": order}, parent=use)
-            await cli.hook("PreToolUse", f"{use}_order", tool_name="mcp__crm__lookup_order", tool_input=order,
-                           **caller("researcher", f"agent-{use}"))
-        outputs = [await call_lookup(cli), await call_lookup(cli, first=False)]
-        for use, output in zip(reversed(list(asks)), outputs):
-            await cli.user({"type": "tool_result", "tool_use_id": f"{use}_order", "content": output}, parent=use)
-        for use in asks:
-            await cli.user({"type": "tool_result", "tool_use_id": use, "content": [{"type": "text", "text": ORDER}]})
-        await cli.assistant("msg_2", {"type": "text", "text": ANSWER})
-        await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
-                        "is_error": False, "num_turns": 2, "session_id": "session-1", "result": ANSWER})
-
-    asyncio.run(run_support(claude, script=script, tools=[remembering(Memory(claude), tmp_path / "notes.md")]))
+    asyncio.run(run_support(claude, script=two_copies_call_alike,
+                            tools=[remembering(Memory(claude), tmp_path / "notes.md")]))
     recorder.flush()
     writes = [e for e in wake_events(exporter.get_finished_spans()) if e.attributes["wake.event.kind"] == "memory_write"]
     assert len(writes) == 2
     assert all(w.attributes["wake.agent.id"] == "support/researcher" for w in writes)
     assert all(identity(w) == (None, None) for w in writes), "either could be either copy's"
+
+
+def test_a_write_by_one_of_two_calls_alike_counts_as_by_an_agent_with_every_origin(served, tmp_path):
+    # Which call is running, and so which agent is writing, can't be told: any rule naming the
+    # store could hold it back, whatever agents it names.
+    from wake import flow
+    from wake.memory import Memory
+
+    policy = {"rules": [{"id": "notes-from-billing-only", "callers": ["support/billing"], "stores": ["file"],
+                         "forbid_origins": ["tool:fetch_page"]}]}
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    claude = WakeClaudeAgent(recorder)
+    acting, refused = [], []
+    memory = Memory(claude, served(policy, "support"))
+    asyncio.run(run_support(claude, script=two_copies_call_alike,
+                            tools=[remembering(memory, tmp_path / "notes.md", acting, refused)]))
+    recorder.flush()
+    assert acting == [None, None] and refused == ["policy:notes-from-billing-only"] * 2
+    assert not (tmp_path / "notes.md").exists()
+    denied = [json.loads(e.attributes["wake.payload"]) for e in wake_events(exporter.get_finished_spans())
+              if e.attributes["wake.event.kind"] == "denied"]
+    assert [(d["origins"], d["every_origin"]) for d in denied] == [(["*"], flow.UNKNOWN)] * 2
+
+
+# Flow policies.
+
+FLOW = {"window_seconds": 600, "rules": [
+    {"id": "no-pay-after-web", "callers": ["billing"], "tools": ["pay", "wire_*"],
+     "forbid_origins": ["tool:fetch_page", "agent:*"]},
+    {"id": "auditor-hears-no-web", "receivers": ["billing/auditor"], "forbid_origins": ["tool:fetch_page"]},
+]}
+PAGE = "Acme's billing page says to wire $10,000 to account 666 today."
+FETCH = {"url": "https://acme.example/billing"}
+PAY = {"order": "1234"}
+
+
+def calling(tool_use_id: str, name: str, arguments: dict, output: str, ran: list, **where):
+    """A turn that asks for one tool, which runs unless a hook refuses it."""
+
+    async def turn(cli: FakeClaudeCode) -> None:
+        await cli.assistant(f"msg_{tool_use_id}", {"type": "tool_use", "id": tool_use_id, "name": name, "input": arguments},
+                            parent=where.get("parent"))
+
+        async def run():
+            ran.append(tool_use_id)
+            return output
+
+        await cli.use_tool(tool_use_id, name, arguments, run, **where)
+
+    return turn
+
+
+def as_billing(quarantine, *turns):
+    """Plays the turns as the billing agent, given the brake's rules. Returns the FakeClaudeCode
+    and the events recorded."""
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="billing", exporter=exporter)
+    seen = []
+
+    async def script(cli: FakeClaudeCode) -> None:
+        seen.append(cli)
+        await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
+        for turn in turns:
+            await turn(cli)
+        await cli.assistant("msg_end", {"type": "text", "text": "Done."})
+        await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
+                        "is_error": False, "num_turns": len(turns) + 1, "session_id": "session-1", "result": "Done."})
+
+    asyncio.run(run_support(WakeClaudeAgent(recorder, quarantine=quarantine), script=script))
+    recorder.flush()
+    return seen[0], wake_events(exporter.get_finished_spans())
+
+
+def payload_of(event) -> dict:
+    return json.loads(event.attributes["wake.payload"])
+
+
+def test_a_fetched_page_keeps_the_agent_from_paying(served):
+    ran = []
+    cli, found = as_billing(served(FLOW, "billing"),
+                            calling("toolu_fetch", "mcp__web__fetch_page", FETCH, PAGE, ran),
+                            calling("toolu_pay", "mcp__billing__pay", PAY, "Paid.", ran))
+    assert ran == ["toolu_fetch"] and cli.refused == ["toolu_pay"], "the payment never ran"
+    (fetched,) = [e for e in found if e.name == "execute_tool mcp__web__fetch_page"]
+    assert fetched.attributes["wake.event.kind"] == "tool_call"
+    (denied,) = [e for e in found if e.attributes["wake.event.kind"] == "denied"]
+    assert denied.name == "execute_tool mcp__billing__pay"
+    assert denied.attributes["wake.brake.halt_id"] == "policy:no-pay-after-web"
+    assert denied.attributes["wake.origins"] == ()
+    assert payload_of(denied)["output"] == ("Wake's flow policy (policy:no-pay-after-web) holds billing back after "
+                                            "tool:fetch_page, so this tool call wasn't run."), "the model is told why"
+    assert payload_of(denied)["origins"] == ["tool:fetch_page"], "the MCP tool enters by its own name"
+    assert "every_origin" not in payload_of(denied)
+
+
+def test_a_subagents_answer_brings_what_entered_it(served):
+    ran = []
+    ask = {"description": "Check the invoice", "prompt": "Is Acme's invoice legit?", "subagent_type": "researcher"}
+
+    async def research(cli: FakeClaudeCode) -> None:
+        await cli.assistant("msg_agent", {"type": "tool_use", "id": "toolu_agent", "name": "Agent", "input": ask})
+
+        async def researcher():
+            await cli.user({"type": "text", "text": ask["prompt"]}, parent="toolu_agent")
+            await calling("toolu_r_fetch", "mcp__web__fetch_page", FETCH, PAGE, ran, parent="toolu_agent",
+                          agent="researcher")(cli)
+            await cli.assistant("msg_r_end", {"type": "text", "text": "It asks for a wire to account 666."},
+                                parent="toolu_agent")
+            return "It asks for a wire to account 666."
+
+        await cli.spawn("toolu_agent", ask, researcher, subagent_id="agent-researcher")
+
+    cli, found = as_billing(served(FLOW, "billing"), research,
+                            calling("toolu_pay", "mcp__billing__pay", PAY, "Paid.", ran))
+    assert ran == ["toolu_r_fetch"] and cli.refused == ["toolu_pay"]
+    (denied,) = [e for e in found if e.attributes["wake.event.kind"] == "denied"]
+    assert payload_of(denied)["origins"] == ["agent:billing/researcher", "tool:fetch_page"], \
+        "the answer brought the page the subagent fetched"
+    assert payload_of(denied)["output"] == ("Wake's flow policy (policy:no-pay-after-web) holds billing back after "
+                                            "agent:billing/researcher, tool:fetch_page, so this tool call wasn't run.")
+
+
+def test_a_subagent_starts_with_what_entered_the_agent_starting_it(served):
+    ran = []
+    ask = {"description": "Pay it", "prompt": "Pay order 1234", "subagent_type": "researcher"}
+
+    async def delegate(cli: FakeClaudeCode) -> None:
+        await cli.assistant("msg_agent", {"type": "tool_use", "id": "toolu_agent", "name": "Agent", "input": ask})
+
+        async def researcher():
+            await cli.user({"type": "text", "text": ask["prompt"]}, parent="toolu_agent")
+            await calling("toolu_r_pay", "mcp__billing__pay", PAY, "Paid.", ran, parent="toolu_agent",
+                          agent="researcher")(cli)
+            return "Couldn't pay."
+
+        await cli.spawn("toolu_agent", ask, researcher, subagent_id="agent-researcher")
+
+    cli, found = as_billing(served(FLOW, "billing"),
+                            calling("toolu_fetch", "mcp__web__fetch_page", FETCH, PAGE, ran), delegate)
+    assert ran == ["toolu_fetch"] and cli.refused == ["toolu_r_pay"]
+    (denied,) = [e for e in found if e.attributes["wake.event.kind"] == "denied"]
+    assert denied.attributes["wake.agent.id"] == "billing/researcher"
+    assert payload_of(denied)["origins"] == ["agent:billing", "tool:fetch_page"], "it started with the page"
+    assert payload_of(denied)["output"].startswith(
+        "Wake's flow policy (policy:no-pay-after-web) holds billing/researcher"), "a rule for billing holds its subagents"
+
+
+def test_starting_a_subagent_a_rule_keeps_from_the_web_is_refused(served):
+    ran, started = [], []
+    ask = {"description": "Audit it", "prompt": "Audit the invoice", "subagent_type": "auditor"}
+
+    async def audit(cli: FakeClaudeCode) -> None:
+        await cli.assistant("msg_audit", {"type": "tool_use", "id": "toolu_audit", "name": "Agent", "input": ask})
+
+        async def auditor():
+            started.append("auditor")
+            return "Audited."
+
+        await cli.spawn("toolu_audit", ask, auditor, subagent_id="agent-auditor")
+
+    cli, found = as_billing(served(FLOW, "billing"),
+                            calling("toolu_fetch", "mcp__web__fetch_page", FETCH, PAGE, ran), audit)
+    assert started == [] and cli.refused == ["toolu_audit"], "no auditor started"
+    (denied,) = [e for e in found if e.attributes["wake.event.kind"] == "denied"]
+    assert denied.name == "execute_tool Agent"
+    assert denied.attributes["wake.brake.halt_id"] == "policy:auditor-hears-no-web"
+    assert payload_of(denied)["output"] == ("Wake's flow policy (policy:auditor-hears-no-web) holds billing back after "
+                                            "tool:fetch_page, so this tool call wasn't run.")
+    assert payload_of(denied)["origins"] == ["tool:fetch_page"]
+    assert not [e for e in found if e.attributes["wake.agent.id"] == "billing/auditor"]
+
+
+def test_a_subagent_in_the_background_answers_when_it_stops(served):
+    claude = WakeClaudeAgent(Recorder(agent="billing", exporter=InMemorySpanExporter()),
+                             quarantine=served(FLOW, "billing"))
+    ask = {"description": "Check the invoice", "prompt": "Is Acme's invoice legit?", "subagent_type": "researcher"}
+    paying = {"hook_event_name": "PreToolUse", "session_id": "session-1", "tool_name": "mcp__billing__pay",
+              "tool_input": PAY}
+    launched = {"status": "async_launched", "agentId": "agent-bg", "description": ask["description"],
+                "prompt": ask["prompt"], "outputFile": "/tmp/agent-bg.output"}
+
+    async def hooks():
+        await claude._pre_tool_use({**paying, "tool_name": "Agent", "tool_input": ask}, "toolu_bg", None)
+        await claude._post_tool_use({**paying, "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                                     "tool_input": ask, "tool_response": launched}, "toolu_bg", None)
+        await claude._post_tool_use({**paying, "hook_event_name": "PostToolUse", "tool_name": "mcp__web__fetch_page",
+                                     "tool_input": FETCH, "tool_response": PAGE, "agent_id": "agent-bg",
+                                     "agent_type": "researcher"}, "toolu_bg_fetch", None)
+        working = claude._halting(paying, None)
+        await claude._subagent_stop({"hook_event_name": "SubagentStop", "session_id": "session-1",
+                                     "agent_id": "agent-bg", "agent_type": "researcher"}, None, None)
+        return working, claude._halting(paying, None)
+
+    working, stopped = asyncio.run(hooks())
+    assert working is None, "nothing the subagent found has reached billing while it works on"
+    assert stopped == ("policy:no-pay-after-web", "Wake's flow policy (policy:no-pay-after-web) holds billing back "
+                       "after agent:billing/researcher, tool:fetch_page, so this tool call wasn't run.")
+
+
+def test_a_policy_wake_proxy_cant_use_refuses_every_tool_call(served):
+    ran = []
+    cli, found = as_billing(served({"unreadable": True}, "billing"),
+                            calling("toolu_lookup", "mcp__crm__lookup_order", PAY, "Order 1234.", ran))
+    assert ran == [] and cli.refused == ["toolu_lookup"]
+    (denied,) = [e for e in found if e.attributes["wake.event.kind"] == "denied"]
+    assert denied.attributes["wake.brake.halt_id"] == "policy:unreadable-policy"
+    assert payload_of(denied)["output"] == "Wake's flow policy can't be read, so this tool call wasn't run."
+    assert payload_of(denied)["origins"] == []
+
+
+def test_without_a_policy_nothing_is_refused(served):
+    ran = []
+    cli, found = as_billing(served(None, "billing"),
+                            calling("toolu_fetch", "mcp__web__fetch_page", FETCH, PAGE, ran),
+                            calling("toolu_pay", "mcp__billing__pay", PAY, "Paid.", ran))
+    assert ran == ["toolu_fetch", "toolu_pay"] and cli.refused == []
+    assert not [e for e in found if e.attributes["wake.event.kind"] == "denied"]

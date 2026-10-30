@@ -36,6 +36,8 @@ curl --cacert wake-ca.pem --cert research.pem --key research.key https://localho
 
 **Identity is required.** agentgateway refuses a caller without an SVID from the trust bundle at the TLS handshake, so the brake always knows which agent a call is from. `agents.json` maps each agent's name to the identities it authenticates with; the brake halts agents by those names, and the proxy records them by those names. Add each of your agents there, or a halt on any agent denies its calls too, as a caller nobody can name. `WAKE_AGENTS` swaps in another file.
 
+**Flow policy.** wake-proxy enforces the flow policy in `policy.json` and serves it to the SDKs (see "Flow policies" in [docs/proxy.md](../docs/proxy.md)). It has no rules, so it denies nothing. `WAKE_POLICY` swaps in another file, which wake-proxy reads again within two seconds of a change. For one window after wake-proxy starts, every agent counts as having every origin, since what entered before isn't known, so any rule that applies denies.
+
 To authenticate agents with JWTs from your identity provider instead of SVIDs, replace the gateway's `tls.root` with a `jwtAuth` on the gateway, not on a route, since the gateway's deny runs before any route's policies:
 
 ```yaml
@@ -70,5 +72,33 @@ These are for staging:
 - Signing keys are files in a volume, and the collector and the ingester can read each other's.
 - The identity is a development CA, and every agent's development SVID is in the `identity` volume.
 - The log is on local disk.
+- Nothing stops an agent from reaching the network around agentgateway. This compose file runs no agents, so it can't close their networks.
 
 Production keeps the collector's key in KMS, gets SVIDs from SPIRE for wake-proxy, agentgateway (its gateway `tls.spiffe`) and every agent, and writes the log to the customer's bucket with object lock.
+
+It also leaves each agent no way out but agentgateway. A flow policy decides only on what passes wake-proxy, and the SDKs' check in the agent's own process ([flow-everywhere.md](../docs/flow-everywhere.md)) is one a compromised agent can switch off. So the network has to stop an agent from calling an MCP server or an API around the gateway. Allow each agent's egress only to agentgateway, the collector and the identity provider, plus wake-proxy's memory port (9003) for an agent whose memory adapter fetches its rules. The reference fleet does this with internal Docker networks (`examples/fleet/networks.yaml`). On Kubernetes, a NetworkPolicy like this one, with the namespaces and labels changed to yours:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agents-out-through-wake
+  namespace: agents
+spec:
+  podSelector: {}            # every agent in the namespace
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: wake}}
+          podSelector: {matchExpressions: [{key: app, operator: In, values: [agentgateway, collector]}]}
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: wake}}
+          podSelector: {matchLabels: {app: wake-proxy}}
+      ports: [{port: 9003, protocol: TCP}]
+    - to:                    # the cluster's DNS, so the agents can find those
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+```
+
+Add the identity provider's address. Route model calls through agentgateway too, as the reference fleet does with real models (the `openai` and `anthropic` routes in `examples/fleet/agentgateway.yaml`, with the keys in `models.yaml`): the gateway adds the provider's key, so no agent holds one, and the brake's deny covers the calls. Each other address you add is a way around the policy for whatever runs there.

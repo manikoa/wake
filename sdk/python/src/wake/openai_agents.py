@@ -32,8 +32,32 @@ by a tool input guardrail. One to a tool the agent runs itself, a shell, an edit
 computer or a custom tool, is refused as it starts. Either way it's recorded as denied, and
 a refused agent tool starts no run. A handoff is offered only while neither the agent
 offering it nor the one it hands off to is halted, and one the model picked before a halt
-landed is refused as it starts. Hosted tools run at OpenAI, and can't be refused here. It's
-a cooperative stop: it holds only while the agent's code does.
+landed is refused as it starts. It's a cooperative stop: it holds only while the agent's
+code does.
+
+Hosted tools run at OpenAI, inside the model call, so they're checked around it. Before each
+model call of an agent that offers hosted tools other than hosted MCP (web search, file
+search, code interpreter, image generation, tool search, programmatic tool calling, a shell in
+a hosted container), each is checked as a call by the agent to a tool of its name: if any is
+held back, the model call isn't made, each held back is recorded as denied, and the run ends
+with AgentHalted. A hosted MCP tool is made to ask before every call, and Wake answers each:
+a call held back is rejected with why, and recorded as denied. One allowed gets the answer of
+the tool's own approval callback when its own setting would have asked, and is approved
+otherwise. A hosted MCP tool whose calls the app approves itself, through run interruptions,
+is left as it is: Wake can't answer for a person.
+
+The same checks apply the flow policy wake-proxy serves with those rules (wake.flow), once
+no halt refuses the call: a tool call is refused when a rule holds its agent back for what
+entered it, a call to an agent used as a tool when one holds it back from reaching that
+agent, and a handoff likewise, which is then neither offered nor made. A tool's result
+enters the agent that called it as tool:<name>, an MCP server's tool by its MCP name. A
+hosted tool's call enters as tool:<name> as the response holding it comes in, before
+anything that follows from that response is checked, a hosted MCP call by its MCP tool's own
+name. Without sensitive data the trace doesn't say which hosted tools ran, so every hosted
+tool the agent offered that call enters, but hosted MCP, which enters as each call Wake
+answers for is approved. A handoff brings what had entered the agent handing off into the one it hands off to,
+as agent:<that agent> with the rest. So does a call to an agent used as a tool, or any run
+started inside a tool call, and what the run's agent said last brings what entered it back.
 """
 
 import dataclasses
@@ -43,12 +67,13 @@ import inspect
 import logging
 import types
 import uuid
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
-from wake import events, links, stop
+from wake import events, flow, links, stop
 from wake._graph import EventGraph, _Recent, failed, never_raise
 from wake.recorder import Recorder
 
@@ -57,10 +82,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("wake")
 
-# Tools that run at OpenAI, where nothing in the agent's process can refuse them. A shell
-# runs there too when its environment isn't local.
+# Tools that run at OpenAI, inside the model call, where nothing in the agent's process can
+# refuse one call at a time. A shell runs there too when its environment isn't local.
 _HOSTED = ("FileSearchTool", "WebSearchTool", "HostedMCPTool", "ImageGenerationTool", "CodeInterpreterTool",
            "ToolSearchTool", "ProgrammaticToolCallingTool")
+# A hosted tool's call in a response, and the name of the tool that made it, as agents offer
+# it. A hosted MCP call is by its MCP tool's own name, and a hosted shell's by its tool's.
+_HOSTED_CALLS = {"web_search_call": "web_search", "file_search_call": "file_search",
+                 "code_interpreter_call": "code_interpreter", "image_generation_call": "image_generation",
+                 "tool_search_call": "tool_search", "program": "programmatic_tool_calling"}
 
 # What the SDK asks of a computer while it carries out a computer call.
 _COMPUTER_ACTIONS = ("click", "double_click", "drag", "keypress", "move", "screenshot", "scroll", "type", "wait")
@@ -143,6 +173,23 @@ def _hosted(tool: Any) -> bool:
     return _kind(tool, "ShellTool") and isinstance(environment, dict) and environment.get("type", "local") != "local"
 
 
+def _asks(setting: Any, name: str) -> bool:
+    """Whether a hosted MCP tool's own require_approval would ask before a call to the MCP
+    tool name, as OpenAI applies it: always unless it's "never", and under a filter unless the
+    filter's never names the tool. Left out, OpenAI asks. A filter on tools' read-only hints
+    can't be applied here, so a call it would cover counts as asking."""
+    if setting == "never":
+        return False
+    if not isinstance(setting, Mapping):
+        return True
+    always, never = setting.get("always"), setting.get("never")
+    if isinstance(always, Mapping) and name in (always.get("tool_names") or ()):
+        return True
+    if not isinstance(never, Mapping) or never.get("read_only") is not None:
+        return True
+    return name not in (never.get("tool_names") or ())
+
+
 class _Stopped(NamedTuple):
     """A tool call or handoff refused as it started: the refusal, the call's id when the SDK
     gives it, and the agent a handoff would have started."""
@@ -181,6 +228,8 @@ class WakeTracingProcessor(EventGraph):
         self._guardrail = None  # the tool input guardrail guard() adds, made once
         self._halted = _Recent()  # sdk span id of a tool call or handoff -> what refused it as it started
         self._instances = _Recent()  # instance -> its agent and lineage, for each Wake has seen start
+        self._agent_tools = _Recent()  # (agent, tool name) -> the agent a call to that agent tool runs
+        self._run_agent = _Recent()  # run -> the agent it has reached, which answers for it
         self._parent = _Recent()  # sdk span id -> its parent's sdk span id
         self._agent_span = _Recent()  # sdk span id of an agent span -> agent name
         # A run is told apart from other runs of its agent, and from other copies of it, by
@@ -207,6 +256,9 @@ class WakeTracingProcessor(EventGraph):
         self._tool_instances = _Recent()  # tool call event id -> the instance making it, and its lineage
         self._tool_runs = _Recent()  # tool call event id -> the run making it
         self._tools_since = _Recent()  # (trace, run, agent) -> tool calls since its last response, when inputs are hidden
+        self._agent_data = _Recent()  # sdk span id of an agent span -> its data, which names the tools offered each call
+        self._hosted_names = _Recent()  # agent guard() covers -> its hosted tools but hosted MCP, by name
+        self._shells = _Recent()  # agent guard() covers -> its shell tool's name, and whether it runs at OpenAI
 
     # TracingProcessor.
 
@@ -243,8 +295,10 @@ class WakeTracingProcessor(EventGraph):
             return
         attributes = {}
         if kind == "agent":
+            caller = None
             with self._lock:
                 self._agent_span[span.span_id] = data.name
+                self._agent_data[span.span_id] = data
                 # The first agent span under a parent starts a run; the rest are its next
                 # agents, after a handoff.
                 run = self._firsts.get((span.trace_id, span.parent_id))
@@ -253,10 +307,16 @@ class WakeTracingProcessor(EventGraph):
                     tool = self._tool_above(span.parent_id)
                     if tool is not None:
                         self._runs_in[tool[0]] = [*(self._runs_in.get(tool[0]) or []), run]
+                        caller = self._tool_agents.get(tool[1])
                 self._runs[span.span_id] = run
+                self._run_agent[run] = data.name
                 instance, lineage = self._identity(span.span_id)
                 if instance:
                     self._instances[instance] = (data.name, lineage)
+            if caller:
+                # A run started inside a tool call, such as an agent used as a tool: what had
+                # entered the agent calling it enters it, with its input (wake.flow).
+                flow.message(caller, data.name)
             attributes = {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": data.name,
                           events.AGENT_ID: data.name, **events.instance_attributes(instance, lineage)}
         otel = self._recorder.tracer.start_span(f"{kind} {getattr(data, 'name', '') or ''}".strip(), context=self._context(span), attributes=attributes)
@@ -318,7 +378,15 @@ class WakeTracingProcessor(EventGraph):
         it hands off to is halted, and if a halt lands after the model picked it, it raises
         AgentHalted as it starts. Bare agents in handoffs become the handoff the SDK would make
         of them. A tool the agent would run itself that Wake can't make refuse raises
-        TypeError, rather than run unstopped."""
+        TypeError, rather than run unstopped. The flow policy served with the halts refuses
+        the same calls and handoffs the same ways (wake.flow).
+
+        Hosted tools run at OpenAI, inside the model call. Each model call of an agent that
+        offers hosted tools other than hosted MCP is checked first, by the agent's hooks
+        (on_llm_start, the agent's own still called): when a halt or the flow policy holds back
+        any of them, the call isn't made, and AgentHalted ends the run. Each hosted MCP tool is
+        made to ask before every call, and Wake answers: see _answer_mcp. One whose calls the
+        app approves itself, through run interruptions, is left as it is."""
         from agents import Agent, FunctionTool, Handoff, handoff
         from agents.tool_guardrails import ToolInputGuardrail
 
@@ -334,17 +402,33 @@ class WakeTracingProcessor(EventGraph):
             if id(current) in seen:
                 continue
             seen.add(id(current))
-            tools = []
+            tools, hosted = [], []
             for tool in current.tools:
                 if isinstance(tool, FunctionTool):
                     if self._guardrail not in (tool.tool_input_guardrails or []):
                         tool.tool_input_guardrails = [*(tool.tool_input_guardrails or []), self._guardrail]
                     if getattr(tool, "_is_agent_tool", False) and getattr(tool, "_agent_instance", None) is not None:
                         todo.append(tool._agent_instance)
-                elif not _hosted(tool):
+                        # A call to it starts that agent's run, which the flow policy checks too.
+                        self._agent_tools[(current.name, tool.name)] = tool._agent_instance.name
+                elif _kind(tool, "HostedMCPTool"):
+                    self._guard_hosted_mcp(tool, current.name)
+                elif _hosted(tool):
+                    hosted.append(tool)
+                else:
                     tool = self._guard_local(tool, current.name)
                 tools.append(tool)
             current.tools = tools
+            shell = next((t for t in tools if _kind(t, "ShellTool")), None)
+            with self._lock:
+                # What a model call of it may run at OpenAI, for when the trace doesn't say, by
+                # any agent of its name.
+                self._hosted_names[current.name] = self._hosted_names.get(current.name, frozenset()) | {
+                    t.name for t in hosted}
+                if shell is not None:
+                    self._shells[current.name] = (shell.name, _hosted(shell))
+            if hosted:
+                self._guard_model_calls(current)
             for server in getattr(current, "mcp_servers", None) or []:
                 if hasattr(server, "tool_input_guardrails") and self._guardrail not in (server.tool_input_guardrails or []):
                     server.tool_input_guardrails = [*(server.tool_input_guardrails or []), self._guardrail]
@@ -441,7 +525,12 @@ class WakeTracingProcessor(EventGraph):
             except Exception:
                 arguments, call_id = None, None
             refused = self._refuse_call(None, name, arguments, call_id, owner=owner)
-            return run(*args, **kwargs) if refused is None else answer(refused)
+            if refused is not None:
+                return answer(refused)
+            # What it returns enters the agent calling it (wake.flow). The SDK opens no span for
+            # some of these, such as a local shell, so it's noted here.
+            flow.note(self._caller(None, owner), f"tool:{name}")
+            return run(*args, **kwargs)
 
         refusing._wake = True  # type: ignore[attr-defined]
         return refusing
@@ -473,6 +562,110 @@ class WakeTracingProcessor(EventGraph):
             item.on_invoke_handoff = on_invoke_handoff
         return item
 
+    def _guard_model_calls(self, agent) -> None:
+        """Has each model call of agent check first the hosted tools it offers, other than
+        hosted MCP, through the agent's hooks: on_llm_start raises AgentHalted, before the
+        call is made, when any is held back (_check_model_call), then calls the agent's own
+        on_llm_start. Hooks that can't be given that raise TypeError, rather than leave the
+        model calls unchecked."""
+        from agents import AgentHooks
+
+        hooks = agent.hooks if agent.hooks is not None else AgentHooks()
+        start = getattr(hooks, "on_llm_start", None)
+        if getattr(start, "_wake", False):
+            agent.hooks = hooks
+            return
+        owner = agent.name
+
+        async def on_llm_start(context, agent, system_prompt, input_items):
+            self._check_model_call(agent, owner)
+            if callable(start):
+                started = start(context, agent, system_prompt, input_items)
+                if inspect.isawaitable(started):
+                    await started
+
+        on_llm_start._wake = True  # type: ignore[attr-defined]
+        try:
+            hooks.on_llm_start = on_llm_start
+        except (AttributeError, TypeError) as e:
+            raise TypeError(f"guard() can't check the model calls of {owner}, whose hosted tools run at OpenAI: "
+                            f"its hooks, {type(hooks).__name__}, can't be wrapped ({e})") from e
+        agent.hooks = hooks
+
+    def _check_model_call(self, agent, owner: str) -> None:
+        """Before a model call of agent: checks each hosted tool it offers, other than hosted
+        MCP, as a call by the agent to a tool of its name, halts first, then the flow policy.
+        They run inside the call, with no check of their own, so if any is held back, this
+        raises AgentHalted and the call isn't made. Each held back is recorded as denied, under
+        the agent's run. A check that fails refuses."""
+        name = getattr(agent, "name", None) or owner
+        span = _current_span()
+        held = None
+        for tool in list(getattr(agent, "tools", None) or []):
+            if not _hosted(tool) or _kind(tool, "HostedMCPTool"):
+                continue
+            tool_name = getattr(tool, "name", None) or type(tool).__name__
+            refused = self._refusal(name, span, tool=tool_name,
+                                    outcome=f"its model call, which could run {tool_name} at OpenAI, wasn't made")
+            if refused is None:
+                continue
+            try:
+                if getattr(span, "span_id", None) is not None:
+                    self._refused_alone(span, name, tool_name, None, None, refused)
+            except Exception:
+                # Refused all the same; only its record may say less.
+                log.warning("wake: failed to record a refused model call", exc_info=True)
+                failed(self._recorder, "a refused model call")
+            log.warning("wake: refused a model call of %s, which could run %s at OpenAI: %s", name, tool_name,
+                        refused.halt)
+            held = held or refused
+        if held is not None:
+            raise stop.AgentHalted(held)
+
+    def _guard_hosted_mcp(self, tool, owner: str) -> None:
+        """A hosted MCP tool, made to ask before every call so that Wake answers each
+        (_answer_mcp). owner is the agent guard() found it on, which a call is checked as when
+        no span says who's calling. A tool whose own setting asks before some calls and that
+        has no callback is approved by the app, through run interruptions: Wake can't answer
+        for a person, or interrupt, so it's left as it is."""
+        callback = tool.on_approval_request
+        if getattr(callback, "_wake", False):
+            return
+        config = tool.tool_config if isinstance(tool.tool_config, Mapping) else {}
+        setting = config.get("require_approval")
+        if callback is None and setting != "never":
+            return
+
+        async def on_approval_request(request):
+            return await self._answer_mcp(request, owner, setting, callback)
+
+        on_approval_request._wake = True  # type: ignore[attr-defined]
+        tool.tool_config = {**config, "require_approval": "always"}
+        tool.on_approval_request = on_approval_request
+
+    async def _answer_mcp(self, request, owner: str, setting: Any, callback) -> dict[str, Any]:
+        """The answer to a hosted MCP tool's request to make a call: rejected, with why, when a
+        halt covers the agent making it or the flow policy holds the agent back from the MCP
+        tool, by its own name, and recorded as denied. Otherwise the tool's own callback's
+        answer, when its own setting would have asked before this call, or else approved. Once
+        approved, tool:<MCP tool> enters the agent: the call's result comes back in the next
+        response, and noting it now doesn't depend on the trace."""
+        data = getattr(request, "data", None)
+        name = _field(data, "name") or "mcp"
+        agent = self._caller(None, owner)
+        refused = self._refuse_call(agent, name, _field(data, "arguments"), _field(data, "id"))
+        if refused is not None:
+            return {"approve": False, "reason": refused.reason}
+        if callback is not None and _asks(setting, name):
+            answer = callback(request)
+            if inspect.isawaitable(answer):
+                answer = await answer
+        else:
+            answer = {"approve": True}
+        if _field(answer, "approve"):
+            flow.note(agent, f"tool:{name}")
+        return answer
+
     def _check_tool_call(self, data):
         """The guardrail: refuses a call a halt covers, telling the model why."""
         from agents.tool_guardrails import ToolGuardrailFunctionOutput
@@ -488,16 +681,19 @@ class WakeTracingProcessor(EventGraph):
     def _refuse_call(self, agent: str | None, name: str, arguments: Any, call_id: str | None, *,
                      owner: str | None = None) -> "stop.Refusal | None":
         """The refusal of a tool call about to run, if a halt covers who's making it: agent, as
-        the SDK says, or else the agent whose run the SDK's current span is in, or owner. It's
-        noted on the call's span, to be recorded as denied when that ends, or recorded as
-        denied now if the SDK opened none for it, as for a local shell. Never raises: a check
-        that fails refuses."""
+        the SDK says, or else the agent whose run the SDK's current span is in, or owner. Or if
+        the flow policy holds them back from it, or, for an agent used as a tool, from
+        reaching that agent. It's noted on the call's span, to be recorded as denied when that
+        ends, or recorded as denied now if the SDK opened none for it, as for a local shell.
+        Never raises: a check that fails refuses."""
         if self._quarantine is None:
             return None
         span = _current_span()
         try:
             agent = agent or self._agent_at(getattr(span, "span_id", None)) or owner or self._recorder.agent
-            refused = self._refusal(agent, span)
+            with self._lock:
+                starts = self._agent_tools.get((agent, name))
+            refused = self._refusal(agent, span, tool=name, starts=starts)
         except Exception:
             log.warning("wake: couldn't check the halts for a tool call; refusing it", exc_info=True)
             agent, refused = agent or owner or self._recorder.agent, stop.unchecked()
@@ -537,16 +733,22 @@ class WakeTracingProcessor(EventGraph):
         log.warning("wake: refused a handoff of %s to %s: %s", source, target, refused.halt)
         raise stop.AgentHalted(refused)
 
-    def _refusal(self, agent: str, span: Any = None, *, target: str | None = None) -> "stop.Refusal | None":
+    def _refusal(self, agent: str, span: Any = None, *, tool: str | None = None, target: str | None = None,
+                 starts: str | None = None, outcome: str | None = None) -> "stop.Refusal | None":
         """The refusal of what a run of agent is about to do, if a halt covers it: by its name,
         the instance the run is and those that started it. With target, a handoff to target is
         refused too when a halt covers it, or the instance of it the handoff would start in
         the same run. The run is the one span is in, by default the SDK's current span, as for
         its events. While Wake can't place it, a halt on any run of the agent Wake has seen
-        refuses it. Never raises: a check that fails refuses."""
+        refuses it.
+
+        Then the flow policy (wake.flow), on what entered agent: a call to tool, and the run of
+        starts it begins, for an agent used as a tool; or a handoff to target. A rule for any
+        agent a halt here could name applies. outcome is what the refusal says didn't happen,
+        by default the tool call or the handoff. Never raises: a check that fails refuses."""
         if self._quarantine is None:
             return None
-        outcome = f"the handoff to {target} wasn't made" if target else "this tool call wasn't run"
+        outcome = outcome or (f"the handoff to {target} wasn't made" if target else "this tool call wasn't run")
         try:
             span = span if span is not None else _current_span()
             sid = getattr(span, "span_id", None)
@@ -573,6 +775,13 @@ class WakeTracingProcessor(EventGraph):
             if refused is None and target:
                 refused = stop.refusal(self._quarantine, f"{target}#{run}" if run else target, target_names,
                                        unplaced=target_unplaced, outcome=outcome)
+            if refused is None and target:
+                refused = flow.refusal(self._quarantine, who, agent, names | unplaced, receiver=target, outcome=outcome)
+            elif refused is None and tool:
+                refused = flow.refusal(self._quarantine, who, agent, names | unplaced, tool=tool, outcome=outcome)
+                if refused is None and starts:
+                    refused = flow.refusal(self._quarantine, who, agent, names | unplaced, receiver=starts,
+                                           outcome=outcome)
         except Exception:
             log.warning("wake: couldn't check the halts for %s; refusing", agent, exc_info=True)
             refused = stop.unchecked(outcome)
@@ -592,7 +801,7 @@ class WakeTracingProcessor(EventGraph):
         self._event(otel, types.SimpleNamespace(parent_id=sid, error=None), event_id, events.DENIED,
                     f"execute_tool {name}", agent, [parent] if parent else [], [],
                     {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name, "wake.brake.halt_id": refused.halt},
-                    {"input": _plain(arguments), "output": refused.reason})
+                    {"input": _plain(arguments), "output": refused.reason, **flow.payload(refused)})
         with self._lock:
             if call_id:
                 self._event_by_call[call_id] = event_id
@@ -608,6 +817,9 @@ class WakeTracingProcessor(EventGraph):
             otel.end()
 
     def _response_ended(self, span, data) -> None:
+        # The SDK ends the response span before any tool from that response runs, so what its
+        # hosted tools brought in is noted before anything that follows from it is checked.
+        self._note_hosted(span, data)
         response = data.response
         output = list(getattr(response, "output", None) or [])
         self._model_call(
@@ -617,6 +829,64 @@ class WakeTracingProcessor(EventGraph):
             output_items=output,
             response_id=getattr(response, "id", None),
         )
+
+    def _note_hosted(self, span, data) -> None:
+        """Notes that each hosted tool call in a response brought its result into the agent
+        whose response it is, as tool:<name>, now (wake.flow): a hosted MCP call by its MCP
+        tool's own name. Without sensitive data the response isn't on the span, so every hosted
+        tool the agent offered that call, but hosted MCP, is noted instead. Never raises: when
+        the response can't be read, that's what's noted too."""
+        agent = self._agent_for(span)
+        try:
+            response = getattr(data, "response", None)
+            names = self._offered_hosted(span, agent) if response is None else self._hosted_calls(
+                agent, list(getattr(response, "output", None) or []))
+        except Exception:
+            log.warning("wake: couldn't read which hosted tools a response ran; noting every one offered",
+                        exc_info=True)
+            try:
+                names = self._offered_hosted(span, agent)
+            except Exception:
+                failed(self._recorder, "hosted tool results")
+                return
+        for name in dict.fromkeys(names):
+            flow.note(agent, f"tool:{name}")
+
+    def _hosted_calls(self, agent: str, output: list) -> list[str]:
+        """The hosted tools a response's output items say ran, by name. A shell call ran at
+        OpenAI when the agent's shell is hosted, as guard() found it, or, for an agent it
+        didn't, when the call names a hosted environment or the response holds its output."""
+        with self._lock:
+            shell = self._shells.get(agent)
+        ran_there = {_field(i, "call_id") for i in output if _field(i, "type") == "shell_call_output"}
+        names = []
+        for item in output:
+            kind = _field(item, "type")
+            if kind in _HOSTED_CALLS:
+                names.append(_HOSTED_CALLS[kind])
+            elif kind == "mcp_call" and _field(item, "name"):
+                names.append(_field(item, "name"))
+            elif kind == "shell_call":
+                environment = _field(_field(item, "environment"), "type")
+                hosted = shell[1] if shell is not None else (
+                    environment not in (None, "local") or _field(item, "call_id") in ran_there)
+                if hosted:
+                    names.append(shell[0] if shell is not None else "shell")
+        return names
+
+    def _offered_hosted(self, span, agent: str) -> list[str]:
+        """The hosted tools, but hosted MCP, the agent offered the model call span is, by name:
+        those guard() found on it, or for an agent it didn't, those of the SDK's own hosted
+        tools' names the agent's span says it offered."""
+        with self._lock:
+            agent_sid = self._agent_above(span.parent_id)
+            data = self._agent_data.get(agent_sid) if agent_sid is not None else None
+            known = self._hosted_names.get(agent)
+        offered = getattr(data, "tools", None)
+        offered = set(offered) if isinstance(offered, list) else None
+        if known is not None:
+            return sorted(n for n in known if offered is None or n in offered)
+        return [n for n in _HOSTED_CALLS.values() if offered is not None and n in offered]
 
     def _generation_ended(self, span, data) -> None:
         # Chat Completions models report generations rather than responses.
@@ -712,7 +982,10 @@ class WakeTracingProcessor(EventGraph):
             pending = self._pending.pop(span.span_id, None) or {}
             # What the runs inside the tool call, such as an agent used as a tool, said last is
             # what the tool returns.
-            ran = [self._run_last[r] for r in self._runs_in.pop(span.span_id, None) or [] if r in self._run_last]
+            runs = self._runs_in.pop(span.span_id, None) or []
+            ran = [self._run_last[r] for r in runs if r in self._run_last]
+            answering = [self._run_agent[r] for r in runs if r in self._run_agent]
+            refused = span.span_id in self._halted
         returned = [*links._returned(pending.get("link")), *ran]
         links._exit(pending.get("link"))
         event_id = pending.get("event_id") or str(uuid.uuid4())
@@ -722,6 +995,14 @@ class WakeTracingProcessor(EventGraph):
             with self._lock:
                 self._returned_by_event[event_id] = returned
         agent = self._agent_for(span)
+        if not refused:
+            # What it returned enters the agent that called it (wake.flow), and what each run
+            # inside it said last brings what entered that run's agent. A hosted tool, such as
+            # web search, runs at OpenAI with no span of its own: its result is noted as the
+            # response holding it comes in (_note_hosted).
+            flow.note(agent, f"tool:{data.name}")
+            for answered in answering:
+                flow.message(answered, agent)
         otel = self._take(span)
         if otel is None:
             return
@@ -759,16 +1040,18 @@ class WakeTracingProcessor(EventGraph):
         if mcp and mcp.get("server"):
             attributes["wake.mcp.server"] = str(mcp["server"])
         kind, origins, output = events.TOOL_CALL, [f"tool:{data.name}"], _plain(data.output)
+        refusal: dict[str, Any] = {}
         if stopped:
-            # Refused in the agent's own process, under the halt: what the agent tried. The
-            # tool never ran, so nothing of it entered.
+            # Refused in the agent's own process, under the halt or the flow policy: what the
+            # agent tried. The tool never ran, so nothing of it entered.
             kind, origins, attributes["wake.brake.halt_id"] = events.DENIED, [], stopped.refusal.halt
             output = stopped.refusal.reason if output is None else output
+            refusal = flow.payload(stopped.refusal)
             with self._lock:
                 if stopped.call:
                     self._event_by_call[stopped.call] = event_id
         self._event(otel, span, event_id, kind, f"execute_tool {data.name}", agent, parents,
-                    origins, attributes, {"input": data.input, "output": output})
+                    origins, attributes, {"input": data.input, "output": output, **refusal})
         self._remember_output(within, event_id, output if isinstance(output, str) else _text(output))
         otel.end()
 
@@ -778,18 +1061,21 @@ class WakeTracingProcessor(EventGraph):
             run = self._run_of(span)
             requested_by = self._last_response.get((span.trace_id, run, source))
             stopped = self._halted.pop(span.span_id, None)
+        if not stopped and data.from_agent and data.to_agent:
+            # What had entered the agent handing off enters the one it hands off to (wake.flow).
+            flow.message(data.from_agent, data.to_agent)
         otel = self._take(span)
         if otel is None:
             return
         event_id = str(uuid.uuid4())
         if stopped:
-            # Refused as it started, under the halt: the attempt to hand the target its task,
-            # in the name of the agent that tried. Nothing reached the target.
+            # Refused as it started, under the halt or the flow policy: the attempt to hand the
+            # target its task, in the name of the agent that tried. Nothing reached the target.
             target = stopped.receiver or data.to_agent or "unknown"
             self._event(otel, span, event_id, events.DENIED, f"agent_message {source} -> {target}", source,
                         [requested_by] if requested_by else [], [],
                         {"gen_ai.agent.name": target, "wake.brake.halt_id": stopped.refusal.halt, "wake.brake.receiver": target},
-                        {"from": source, "to": target, "output": stopped.refusal.reason})
+                        {"from": source, "to": target, "output": stopped.refusal.reason, **flow.payload(stopped.refusal)})
             otel.end()
             return
         target = data.to_agent or "unknown"
@@ -862,6 +1148,14 @@ class WakeTracingProcessor(EventGraph):
         with self._lock:
             agent_sid = self._agent_above(sid)
             return self._agent_span.get(agent_sid) if agent_sid is not None else None
+
+    def _caller(self, agent: str | None, owner: str | None = None) -> str:
+        """Who is making a call: agent, as the SDK says, or else the agent whose run the SDK's
+        current span is in, or owner. Never raises."""
+        try:
+            return agent or self._agent_at(getattr(_current_span(), "span_id", None)) or owner or self._recorder.agent
+        except Exception:
+            return agent or owner or self._recorder.agent
 
     def _run(self, agent_sid) -> tuple[str | None, tuple[str, ...]]:
         """The run an agent span is a step of, by its first agent span, when it runs inside a

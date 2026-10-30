@@ -5,18 +5,24 @@
 //! A rule decides on what entered the caller through the proxy within the policy's window
 //! (origins.rs), never on anything the caller sends: an agent can't leave a header out, or
 //! send one, to get past a rule. Rules that name MCP tools are checked by the MCP hook,
-//! which sees the tool; the rest by ext_authz, on every request.
+//! which sees the tool; rules that name memory stores hold writes through the SDKs' memory
+//! adapters, which never pass the proxy, so it checks none of its calls against them; the
+//! rest are checked by ext_authz, on every request.
 //!
 //! Like `Halts`, a policy fails closed: a `--policy-file` that can't be read, or isn't a
 //! valid policy, denies every call under `policy:unreadable-policy` until it's fixed. The
 //! file is read again when it changes.
+//!
+//! The policy in force is also served to the SDKs with their memory rules (memory.rs), so
+//! they apply it in the agent's own process to the calls that never reach the proxy: see
+//! docs/flow-everywhere.md. sdk/testdata/flow_policy.json pins the decisions all three make.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agents::Agents;
 use crate::halts::{Halt, Scope};
@@ -31,31 +37,52 @@ pub const DEFAULT_WINDOW_SECS: u64 = 900;
 pub const RELOAD_EVERY: Duration = Duration::from_secs(2);
 
 /// One rule: the calls it targets, and the origins it keeps from them.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlowRule {
     pub id: String,
     /// The calling agents it applies to, by name or identity. Empty means every caller.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub callers: Vec<String>,
     /// The agents an A2A route reaches that it applies to. Empty means every receiver.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receivers: Vec<String>,
     /// The request paths it applies to, by prefix. Empty means every path.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
     /// The MCP tools, resources and prompts it applies to, as the proxy records them: a
     /// tool's or prompt's name, a resource's URI. Exact, or a prefix ending in `*`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// The memory stores it applies to: a write, a delete or a rollback through an SDK's
+    /// memory adapter, by the store's name. Exact, or a prefix ending in `*`. Those never
+    /// pass the proxy, so it serves these rules to the SDKs and holds none of its own calls
+    /// to them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stores: Vec<String>,
     /// Origins that may not be behind a call it targets: denied when any origin that
     /// entered the caller matches one. Exact, or a prefix ending in `*`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbid_origins: Vec<String>,
     /// The only origins that may be behind a call it targets: denied when an origin that
     /// entered the caller matches none. A caller nothing entered passes.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_origins: Vec<String>,
+}
+
+/// The policy as the SDKs are served it, with their memory rules (memory.rs).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Served {
+    /// The rules in force and their window, with a SHA-256 of both, so an SDK can tell a
+    /// new policy from the one it has.
+    Rules {
+        version: String,
+        window_seconds: u64,
+        rules: Vec<FlowRule>,
+    },
+    /// A file that can't be used: the SDKs deny every call, as ext_authz does.
+    Unreadable { unreadable: bool },
 }
 
 #[derive(Deserialize)]
@@ -198,9 +225,10 @@ impl FlowPolicy {
             Who::Nobody => None,
         };
         for rule in &self.rules {
-            // The MCP hook checks the rules that name tools, and ext_authz the rest.
+            // The MCP hook checks the rules that name tools, and ext_authz the rest, but for
+            // the rules that name memory stores, which hold only the SDKs' memory writes.
             let names_tools = !rule.tools.is_empty();
-            if (at == At::Mcp) != names_tools || !rule.targets(target, agents) {
+            if !rule.stores.is_empty() || (at == At::Mcp) != names_tools || !rule.targets(target, agents) {
                 continue;
             }
             let (origins, every) = match seen {
@@ -264,11 +292,19 @@ impl FlowRule {
                 "rule {id} names tools with receivers or path_prefixes: the MCP hook, which sees the tool, sees neither"
             ));
         }
+        if !self.stores.is_empty()
+            && (!self.tools.is_empty() || !self.receivers.is_empty() || !self.path_prefixes.is_empty())
+        {
+            return Err(format!(
+                "rule {id} names stores with tools, receivers or path_prefixes: a memory write has none of them"
+            ));
+        }
         let lists = [
             ("callers", &self.callers, false),
             ("receivers", &self.receivers, false),
             ("path_prefixes", &self.path_prefixes, false),
             ("tools", &self.tools, true),
+            ("stores", &self.stores, true),
             ("forbid_origins", &self.forbid_origins, true),
             ("allow_origins", &self.allow_origins, true),
         ];
@@ -368,6 +404,25 @@ impl Policy {
         self.current.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The policy to serve the SDKs, or None when no policy is enforced, so an SDK checks
+    /// nothing.
+    pub fn served(&self) -> Option<Served> {
+        if !self.enforcing() {
+            return None;
+        }
+        let current = self.current();
+        if current.unreadable.is_some() {
+            return Some(Served::Unreadable { unreadable: true });
+        }
+        use sha2::{Digest, Sha256};
+        let canonical = serde_json::to_vec(&(current.window_seconds, &current.rules)).unwrap_or_default();
+        Some(Served::Rules {
+            version: hex::encode(Sha256::digest(&canonical)),
+            window_seconds: current.window_seconds,
+            rules: current.rules.clone(),
+        })
+    }
+
     /// Reads the file again if it changed since it was last read, and returns whether it
     /// did. The window observed takes the new one first, so no check sees a longer window
     /// than what was kept.
@@ -422,6 +477,178 @@ mod tests {
 
     fn policy(json: &str) -> FlowPolicy {
         FlowPolicy::parse(json.as_bytes()).unwrap()
+    }
+
+    /// The decisions sdk/testdata/flow_policy.json pins, which both SDKs make too in the
+    /// agent's own process: a tool call meets ext_authz's rules, then the MCP hook's; an agent
+    /// reached meets ext_authz's, with that receiver. Neither has a request path there.
+    #[test]
+    fn decides_as_the_shared_vectors_say() {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/testdata/flow_policy.json");
+        let vectors: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let strings = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap().to_string())
+                .collect()
+        };
+        let none = Agents::none();
+        let cases = vectors["cases"].as_array().unwrap();
+        assert!(cases.len() >= 20);
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let named = case["policy"].as_str().unwrap();
+            let p = policy(&vectors["policies"][named].to_string());
+            let caller = case["caller"].as_str().unwrap();
+            // The caller acts under its lineage, as a sub-agent acts under the agents in its
+            // token's chain.
+            let lineage = strings(&case["lineage"]);
+            let token = lineage.first().map(|outermost| Token {
+                subject: outermost.clone(),
+                actors: std::iter::once(caller.to_string())
+                    .chain(lineage.iter().rev().cloned())
+                    .collect(),
+                id: None,
+                expires: None,
+                bound: false,
+                cut: false,
+            });
+            let seen = match &case["origins"] {
+                serde_json::Value::String(every) if every == "*" => Seen::Every("every origin"),
+                origins => Seen::These(strings(origins)),
+            };
+            let call = Target {
+                caller: Who::Agent(caller),
+                token: token.as_ref(),
+                receiver: None,
+                path: None,
+                tool: None,
+            };
+            if case["store"].is_string() {
+                // A memory write never passes the proxy: the SDKs' memory adapters decide these
+                // cases. Here no rule naming stores may hold a call the proxy sees instead.
+                let tool = Target {
+                    tool: Some("write_memory"),
+                    ..call
+                };
+                for (at, target) in [(At::Authz, &call), (At::Mcp, &tool)] {
+                    let denial = p.deciding(at, target, &seen, &none);
+                    assert!(
+                        denial.is_none_or(|d| !p
+                            .rules
+                            .iter()
+                            .any(|r| !r.stores.is_empty() && d.halt.id == format!("policy:{}", r.id))),
+                        "{name}"
+                    );
+                }
+                continue;
+            }
+            let denial = match (case["tool"].as_str(), case["receiver"].as_str()) {
+                (Some(tool), None) => p.deciding(At::Authz, &call, &seen, &none).or_else(|| {
+                    p.deciding(
+                        At::Mcp,
+                        &Target {
+                            tool: Some(tool),
+                            ..call
+                        },
+                        &seen,
+                        &none,
+                    )
+                }),
+                (None, Some(receiver)) => p.deciding(
+                    At::Authz,
+                    &Target {
+                        receiver: Some(receiver),
+                        ..call
+                    },
+                    &seen,
+                    &none,
+                ),
+                _ => panic!("{name}: a case is a tool call or reaches an agent"),
+            };
+            assert_eq!(
+                denial.as_ref().map(|d| d.halt.id.as_str()),
+                case["denied_by"].as_str(),
+                "{name}"
+            );
+            assert_eq!(
+                denial.map(|d| d.origins).unwrap_or_default(),
+                strings(&case["kept"]),
+                "{name}"
+            );
+        }
+        for case in vectors["invalid"].as_array().unwrap() {
+            assert!(
+                FlowPolicy::parse(case["policy"].to_string().as_bytes()).is_err(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn rules_for_memory_stores_never_hold_a_call_through_the_proxy() {
+        let p = policy(r#"{"rules": [{"id": "no-web-into-facts", "stores": ["facts"], "forbid_origins": ["*"]}]}"#);
+        let call = Target {
+            caller: Who::Agent("research"),
+            token: None,
+            receiver: Some("support"),
+            path: Some("/agents/support"),
+            tool: None,
+        };
+        let none = Agents::none();
+        for seen in [Seen::Every("every origin"), Seen::These(vec!["tool:fetch_page".into()])] {
+            assert_eq!(p.deciding(At::Authz, &call, &seen, &none), None);
+            let tool = Target {
+                tool: Some("facts"),
+                ..call
+            };
+            assert_eq!(p.deciding(At::Mcp, &tool, &seen, &none), None);
+        }
+        // They're served, so the SDKs hold the writes the proxy never sees.
+        let served = serde_json::to_value(Policy::fixed(p).served().unwrap()).unwrap();
+        assert_eq!(served["rules"][0]["stores"], serde_json::json!(["facts"]));
+    }
+
+    #[test]
+    fn serves_the_sdks_the_rules_in_force_or_that_none_can_be_used() {
+        // No policy file and no rules: nothing is served, so an SDK checks nothing.
+        assert_eq!(Policy::fixed(FlowPolicy::empty()).served(), None);
+        let p = Policy::fixed(policy(
+            r#"{"window_seconds": 600, "rules": [{"id": "no-pay-after-web", "callers": ["billing"], "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}]}"#,
+        ));
+        let served = serde_json::to_value(p.served().unwrap()).unwrap();
+        assert_eq!(served["window_seconds"], 600);
+        // Empty lists are left out, as a policy file may leave them out.
+        assert_eq!(
+            served["rules"],
+            serde_json::json!([{"id": "no-pay-after-web", "callers": ["billing"], "tools": ["pay"], "forbid_origins": ["tool:fetch_page"]}])
+        );
+        let version = served["version"].as_str().unwrap().to_string();
+        assert_eq!(version.len(), 64);
+        // What's served, but for its version, reads back as the same policy, and the version
+        // follows its content.
+        let mut back = served.clone();
+        back.as_object_mut().unwrap().remove("version");
+        assert_eq!(policy(&back.to_string()), *p.current());
+        let longer = Policy::fixed(FlowPolicy {
+            window_seconds: 900,
+            ..(*p.current()).clone()
+        });
+        assert_ne!(
+            serde_json::to_value(longer.served().unwrap()).unwrap()["version"],
+            version.as_str()
+        );
+        // A file that can't be used is served as such, and the SDKs deny every call.
+        let dir = std::env::temp_dir().join(format!("wake-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(
+            serde_json::to_value(Policy::from_file(&path).served().unwrap()).unwrap(),
+            serde_json::json!({"unreadable": true})
+        );
     }
 
     fn mcp(caller: &str, tool: &str) -> Target<'static> {
