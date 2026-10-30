@@ -428,24 +428,26 @@ class Origins:
         within the window enters receiver too. Each origin keeps when it entered, so passing
         content on never makes it newer, and agents talking back and forth don't keep it alive.
         receiver's own messages, agent:<receiver>, don't come back to it. When sender has every
-        origin, so does receiver, for as long as sender does."""
+        origin, so does receiver, for as long as sender does, and what entered sender after
+        that time enters receiver as well, so it still counts once every origin no longer
+        does."""
         at = self._clock()
         with self._lock:
             since = at - self._window
-            found = self._entered(sender, since)
-            if isinstance(found, _Every):
-                kept = self._agent(receiver, at)
-                if kept is not None:
-                    kept.saturate(found.since, CARRIED)
-                return
+            every = self._every(sender, since)
             own = f"agent:{receiver}"
-            carried = [(o, t) for o, t in found.items() if o != own]
-            if not carried:
+            # What entered by the time every origin did counts no longer than every origin does.
+            carried = [(o, t) for o, t in self._recorded(sender, since).items()
+                       if o != own and (every is None or t > every.since)]
+            if every is None and not carried:
                 return  # nothing to carry keeps no agent
             kept = self._agent(receiver, at)
-            if kept is not None:
-                for origin, seen in carried:
-                    kept.note(origin, seen, since)
+            if kept is None:
+                return
+            if every is not None:
+                kept.saturate(every.since, CARRIED)
+            for origin, seen in carried:
+                kept.note(origin, seen, since)
 
     def seen(self, agent: str) -> Seen:
         """What entered agent within the window: each origin once, newest first, ties by name."""
@@ -472,18 +474,30 @@ class Origins:
         kept = self._agents[name] = _Agent()
         return kept
 
-    def _entered(self, name: str, since: float) -> "dict[str, float] | _Every":
-        """What entered an agent since since, each origin with when it last entered, or every
-        origin, since when and why. An agent not kept could be one that couldn't be, while that
-        has happened within the window. Call with the lock held."""
+    def _every(self, name: str, since: float) -> _Every | None:
+        """Since when, and why, an agent has had every origin, if it has since since. An agent
+        not kept could be one that couldn't be, while that has happened within the window. Call
+        with the lock held."""
         kept = self._agents.get(name)
         if kept is None:
             if self._overflowed is not None and self._overflowed >= since:
                 return _Every(self._overflowed, OVERFLOWED)
-            return {}
+            return None
         if kept.every is not None and kept.every.since >= since:
             return kept.every
-        return {o: t for o, t in kept.origins.items() if t >= since}
+        return None
+
+    def _recorded(self, name: str, since: float) -> dict[str, float]:
+        """Each origin noted for an agent since since, with when it last entered, whether or
+        not the agent has every origin. Call with the lock held."""
+        kept = self._agents.get(name)
+        return {} if kept is None else {o: t for o, t in kept.origins.items() if t >= since}
+
+    def _entered(self, name: str, since: float) -> "dict[str, float] | _Every":
+        """What entered an agent since since, each origin with when it last entered, or every
+        origin, since when and why. Call with the lock held."""
+        every = self._every(name, since)
+        return every if every is not None else self._recorded(name, since)
 
 
 _entered = Origins()

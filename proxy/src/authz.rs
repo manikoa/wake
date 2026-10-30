@@ -66,7 +66,7 @@ pub const HEADER_HALTS: &str = "wake-halts";
 const PERMISSION_DENIED: i32 = 7;
 
 /// What a check is about.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Call {
     pub caller: Option<String>,
     pub receiver: Option<String>,
@@ -273,11 +273,28 @@ pub fn check_policy(
     target: &Target<'_>,
     now: u64,
 ) -> Option<Denial> {
-    let seen = match origins::behind(agents, target.caller, target.token) {
+    policy.deciding(at_hook, target, &seen(policy, observed, agents, target, now), agents)
+}
+
+/// What a policy decides on a call from target's caller that could reach any tool at all:
+/// the first rule naming tools that applies to the caller and keeps an origin that entered
+/// it. A model call that lets its provider call an MCP server's tools without listing them
+/// is one (models.rs).
+pub fn check_policy_any_tool(
+    policy: &FlowPolicy,
+    observed: &Observed,
+    agents: &Agents,
+    target: &Target<'_>,
+    now: u64,
+) -> Option<Denial> {
+    policy.deciding_any_tool(target, &seen(policy, observed, agents, target, now), agents)
+}
+
+fn seen(policy: &FlowPolicy, observed: &Observed, agents: &Agents, target: &Target<'_>, now: u64) -> Seen {
+    match origins::behind(agents, target.caller, target.token) {
         Ok(whos) => observed.seen_by(&whos, now, policy.window_seconds),
         Err(why) => Seen::Every(why),
-    };
-    policy.deciding(at_hook, target, &seen, agents)
+    }
 }
 
 fn ids() -> ([u8; 16], [u8; 8]) {

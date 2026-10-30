@@ -26,7 +26,8 @@ type Action struct {
 	// nothing the host said is lost.
 	Rest map[string]any
 
-	flow flowAct // what it means for the flow policy, beyond the tool it calls (flow.go)
+	flow    flowAct  // what it means for the flow policy, beyond the tool it calls (flow.go)
+	lineage []string // what started the subagent, outermost first, when wake-hook placed it
 }
 
 // flowAct is what an action means for the flow policy, beyond the tool it calls: a
@@ -38,6 +39,15 @@ type flowAct struct {
 	background bool   // the subagent runs on in the background, and answers when it stops
 	agentID    string // the id the background subagent's hooks name it by
 	stopped    bool   // a subagent stopped: if it ran in the background, its answer arrives
+
+	// Cursor runs each subagent in a conversation of its own, which the Task call that
+	// started it ties to the agent that did (place, in flow.go).
+	call       string // the Task call starting the subagent, as subagentStart names it
+	answers    bool   // its result is the answer of the subagent its Task call started
+	parentCall string // the Task call that started the subagent making the call
+	child      string // the conversation of the subagent that stopped
+	spawner    string // the conversation of the agent that started the subagent
+	unplaced   bool   // a subagent makes the call, but wake-hook didn't see it start
 }
 
 // A Host reads one product's hook events and answers them its way.
@@ -52,11 +62,15 @@ type Host struct {
 	// ownName is a tool's own name, given the host's name for it, for the flow policy: an
 	// MCP tool's, as wake-proxy names it. The host's name for it when nil.
 	ownName func(tool string) string
-	// subagents says the host names the subagent making each call, and starts one with a
-	// tool whose input and result Wake reads, as Claude Code does. The flow policy then
-	// holds each type of subagent as an agent of its own. Elsewhere, a session is one
-	// agent to the flow policy, its subagents included.
+	// subagents says the host names the subagent making each call, as Claude Code does, or
+	// lets wake-hook place it, as Cursor does (conversations), and says when one starts and
+	// when it answers. The flow policy then holds each type of subagent as an agent of its
+	// own. Elsewhere, a session is one agent to the flow policy, its subagents included.
 	subagents bool
+	// conversations says the host runs each subagent in a conversation of its own, and
+	// names the call that started it on the subagent's own tool hooks, as Cursor does. Its
+	// events are placed in the session of the agent that started it (place, in flow.go).
+	conversations bool
 }
 
 // toolName is a tool's name as a flow rule names it, and as its result enters an agent.
@@ -72,7 +86,7 @@ var Hosts = map[string]*Host{
 	"claude-code": {Name: "claude-code", parse: parseClaude, refuse: refuseClaude, ownName: mcpToolName, subagents: true},
 	// Codex took Claude Code's hooks: the same events, fields and answers, but for its subagents.
 	"codex":       {Name: "codex", parse: parseCodex, refuse: refuseClaude, ownName: mcpToolName},
-	"cursor":      {Name: "cursor", parse: parseCursor, refuse: refuseCursor, allow: allowCursor, ownName: cursorToolName},
+	"cursor":      {Name: "cursor", parse: parseCursor, refuse: refuseCursor, allow: allowCursor, ownName: cursorToolName, subagents: true, conversations: true},
 	"grok":        {Name: "grok", parse: parseGrok, refuse: refuseDecision},
 	"gemini":      {Name: "gemini", parse: parseGemini, refuse: refuseDecision},
 	"antigravity": {Name: "antigravity", parse: parseAntigravity, refuse: refuseDecision, allow: allowAntigravity},
@@ -216,8 +230,12 @@ func refuseClaude(a Action, reason string) []byte {
 	}})
 }
 
+// Cursor's hooks. Each subagent runs in a conversation of its own, whose tool hooks name
+// the Task call that started it, from Cursor 3.22: that ties the subagent to the agent that
+// started it (place, in flow.go). The fields that do so stay in the payload's hook too.
 func parseCursor(f fields, _ string) (Action, bool) {
 	a := Action{Event: f.str("hook_event_name"), Session: f.str("conversation_id")}
+	a.flow.parentCall, _ = f["parent_tool_call_id"].(string)
 	switch a.Event {
 	case "preToolUse":
 		a.Gate = true
@@ -227,10 +245,12 @@ func parseCursor(f fields, _ string) (Action, bool) {
 		a.toolCall(f)
 		a.Output = decoded(f.take("tool_output"))
 		a.Duration = f.millis("duration")
+		a.flow.answers = a.Tool == cursorSubagentTool
 	case "postToolUseFailure":
 		// Its docs give no fields for the failure, so they stay in the payload's hook.
 		a.Kind = "tool_call"
 		a.toolCall(f)
+		a.flow.answers = a.Tool == cursorSubagentTool
 	case "beforeShellExecution":
 		a.Gate, a.Tool = true, "Shell"
 		a.Input = map[string]any{"command": f.take("command")}
@@ -259,18 +279,31 @@ func parseCursor(f fields, _ string) (Action, bool) {
 		a.Kind, a.Gate, a.Prompt = "agent_message", true, true
 		a.Input = f.take("prompt")
 	case "subagentStart":
-		// The subagent's own events name a conversation of their own, which nothing ties to
-		// this one, so only its start is checked against what entered the agent starting it.
+		// Checked as reaching the subagent. Its own hooks name the Task call starting it, by
+		// which they're placed once it's let through.
 		a.Gate, a.Tool = true, "subagent"
 		subagent := f.take("subagent_type")
 		a.Input = map[string]any{"subagent_type": subagent, "task": f.take("task")}
 		a.flow.starts, a.flow.onlyStarts = true, true
 		a.flow.subagent, _ = subagent.(string)
+		if a.flow.call, _ = f["tool_call_id"].(string); a.flow.call == "" {
+			a.flow.call, _ = f["subagent_id"].(string)
+		}
+		a.flow.spawner, _ = f["parent_agent_id"].(string)
+	case "subagentStop":
+		// Nothing new to record, but the subagent's answer reaches the agent that started it.
+		a.flow.stopped = true
+		a.flow.child, _ = f["child_conversation_id"].(string)
+		a.flow.spawner, _ = f["parent_agent_id"].(string)
 	default:
 		return a, false
 	}
 	return a, true
 }
+
+// cursorSubagentTool is the tool a Cursor agent starts a subagent with. Its result is the
+// subagent's answer.
+const cursorSubagentTool = "Task"
 
 func refuseCursor(a Action, reason string) []byte {
 	if a.Prompt {

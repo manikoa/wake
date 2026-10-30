@@ -47,6 +47,12 @@ pub fn render(counters: &Counters, halts: &Halts) -> String {
         counter(&c.a2a_exchanges),
     );
     metric(
+        "wake_proxy_model_calls_total",
+        "counter",
+        "Model calls the processor saw, on the gateway's model routes.",
+        counter(&c.model_calls),
+    );
+    metric(
         "wake_proxy_hooks_dropped_total",
         "counter",
         "MCP calls seen and not recorded, because the capture queue was full.",
@@ -91,7 +97,7 @@ pub fn render(counters: &Counters, halts: &Halts) -> String {
     metric(
         "wake_proxy_cut_total",
         "counter",
-        "Calls under way when a halt landed, and cut: A2A exchanges, and MCP results kept from the caller.",
+        "Calls under way when a halt landed, and cut: A2A exchanges and model calls, and MCP results kept from the caller.",
         counter(&c.cut),
     );
     let state = halts.state();
@@ -204,6 +210,7 @@ mod tests {
             "wake_proxy_halts_version 1",
             "wake_proxy_state_ok 1",
             "# TYPE wake_proxy_mcp_calls_total counter",
+            "wake_proxy_model_calls_total 0",
             "# TYPE wake_proxy_state_ok gauge",
         ] {
             assert!(text.lines().any(|l| l == line), "{line} in:\n{text}");

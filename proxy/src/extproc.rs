@@ -27,6 +27,10 @@
 //! entered the agent it comes from. Each is noted before its headers are answered, and
 //! again before each part of its body is, so content that entered the agent it comes from
 //! while a reply streams goes with it.
+//!
+//! The gateway's model routes call the same service, naming the provider in a `model`
+//! attribute. Such an exchange is a model call, which models.rs checks and notes; a halt
+//! that covers its caller cuts it as it cuts an A2A exchange.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,6 +51,7 @@ use crate::canonical::{Event, Value};
 use crate::export::Counters;
 use crate::halts::{Halt, Halts};
 use crate::mcp::{self, TraceParent};
+use crate::models::{self, ModelCall};
 use crate::origins::{self, Observed, Who};
 use crate::policy::{FlowPolicy, Policy};
 use crate::token::Token;
@@ -89,6 +94,8 @@ pub const ATTR_SENDER: &str = "sender";
 pub const ATTR_RECEIVER: &str = "receiver";
 /// What the gateway says about the token the sender presented, if a JWT (token.rs).
 pub const ATTR_SENDER_TOKEN: &str = "sender_token";
+/// The provider a model route reaches, which makes the exchange a model call (models.rs).
+pub const ATTR_MODEL: &str = "model";
 
 /// How much of each body is kept for the event's payload.
 pub use crate::budget::MAX_CAPTURE;
@@ -137,6 +144,9 @@ pub struct Exchange {
     // Where the message and the reply are noted as origins entering the agent that gets
     // each, for flow policies.
     observed: Option<Arc<Observed>>,
+    // What model calls share, and this exchange's, when it's one.
+    models: Option<models::Shared>,
+    model: Option<Box<ModelCall>>,
 }
 
 impl Exchange {
@@ -170,6 +180,17 @@ impl Exchange {
         self
     }
 
+    /// Handles an exchange whose attributes name a model provider as a model call (models.rs).
+    pub fn with_models(mut self, shared: models::Shared) -> Self {
+        self.models = Some(shared);
+        self
+    }
+
+    /// Whether the exchange is a model call: known from its first message.
+    pub fn is_model(&self) -> bool {
+        self.model.is_some()
+    }
+
     fn note_delivery(&self, to_receiver: bool, now: SystemTime) {
         let Some(observed) = &self.observed else { return };
         let at = nanos(now);
@@ -195,7 +216,7 @@ impl Exchange {
             }
             match origins::behind(agents, sender, token) {
                 Ok(from) => observed.carry(&from, &[receiver], at),
-                Err(_) => observed.saturate(&[receiver], at),
+                Err(_) => observed.saturate(&[receiver], at, origins::CARRIED),
             }
         } else {
             // The reply reaches the agents the sender acts under too, and carries whatever
@@ -264,6 +285,18 @@ impl Exchange {
                 .get(ATTRIBUTES)
                 .and_then(|s| s.fields.get(ATTR_SENDER_TOKEN))
                 .and_then(Token::from_value);
+            if let (Some(provider), Some(shared)) = (raw(ATTR_MODEL), &self.models) {
+                self.model = Some(Box::new(ModelCall::new(
+                    models::Provider::named(&provider),
+                    shared.clone(),
+                    self.agents.clone(),
+                    self.request_mode,
+                    self.response_mode,
+                )));
+            }
+        }
+        if self.model.is_some() {
+            return self.handle_model(request, now);
         }
         let mut events = Vec::new();
         let answer = match request.request {
@@ -342,6 +375,38 @@ impl Exchange {
         )
     }
 
+    /// A message of a model call: models.rs answers it, and the exchange keeps the request
+    /// line and whether the call is under way, for halts that land during it.
+    fn handle_model(&mut self, request: ProcessingRequest, now: SystemTime) -> (ProcessingResponse, Vec<Event>) {
+        match &request.request {
+            Some(Phase::RequestHeaders(h)) => self.read_request_line(&header_map(h)),
+            Some(Phase::ResponseHeaders(h)) => self.ended |= h.end_of_stream,
+            Some(Phase::ResponseBody(b)) => self.ended |= b.end_of_stream,
+            Some(Phase::ResponseTrailers(_)) => self.ended = true,
+            _ => {}
+        }
+        let Some(model) = self.model.as_mut() else {
+            return (ProcessingResponse::default(), vec![]);
+        };
+        let (answer, events) = model.handle(request, &self.call, now);
+        // Refused: the call won't be made.
+        if matches!(answer.response, Some(Answer::ImmediateResponse(_))) {
+            self.ended = true;
+        }
+        (answer, events)
+    }
+
+    /// The request line and link headers, for checking halts and recording denials.
+    fn read_request_line(&mut self, headers: &HashMap<String, String>) {
+        self.call.method = headers.get(":method").cloned().unwrap_or_default();
+        self.call.host = headers.get(":authority").cloned().unwrap_or_default();
+        self.call.path = headers.get(":path").cloned().unwrap_or_default();
+        self.call.headers = [mcp::HEADER_TRACEPARENT, mcp::HEADER_PARENTS]
+            .into_iter()
+            .filter_map(|k| headers.get(k).map(|v| (k.to_string(), v.clone())))
+            .collect();
+    }
+
     /// Records whatever the exchange still owes: the gateway closed the stream, or the
     /// response never finished.
     pub fn finish(&mut self, now: SystemTime) -> Vec<Event> {
@@ -376,13 +441,7 @@ impl Exchange {
 
     fn request_headers(&mut self, h: &HttpHeaders, now: SystemTime) -> HeadersResponse {
         let headers = header_map(h);
-        self.call.method = headers.get(":method").cloned().unwrap_or_default();
-        self.call.host = headers.get(":authority").cloned().unwrap_or_default();
-        self.call.path = headers.get(":path").cloned().unwrap_or_default();
-        self.call.headers = [mcp::HEADER_TRACEPARENT, mcp::HEADER_PARENTS]
-            .into_iter()
-            .filter_map(|k| headers.get(k).map(|v| (k.to_string(), v.clone())))
-            .collect();
+        self.read_request_line(&headers);
         self.started_at = nanos(now);
         if headers.get(":method").map(String::as_str) != Some("POST") {
             // Agent cards and other reads aren't messages.
@@ -633,7 +692,7 @@ fn link_mutation(trace_id: [u8; 16], span: [u8; 8], event_id: &str) -> HeaderMut
     }
 }
 
-fn body_answer(full_duplex: bool, body: Vec<u8>, end_of_stream: bool) -> BodyResponse {
+pub(crate) fn body_answer(full_duplex: bool, body: Vec<u8>, end_of_stream: bool) -> BodyResponse {
     if !full_duplex {
         // Buffered: no mutation means the gateway forwards the body as it was.
         return BodyResponse::default();
@@ -671,7 +730,7 @@ fn payload(from: &str, to: &str, body: &[u8], streamed: bool, truncated: bool) -
     out
 }
 
-fn header_map(h: &HttpHeaders) -> HashMap<String, String> {
+pub(crate) fn header_map(h: &HttpHeaders) -> HashMap<String, String> {
     h.headers
         .as_ref()
         .map(|m| {
@@ -706,7 +765,7 @@ fn attributes(request: &ProcessingRequest) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn nanos(t: SystemTime) -> u64 {
+pub(crate) fn nanos(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
@@ -725,14 +784,16 @@ pub struct Processor {
     counters: Arc<Counters>,
     policy: Arc<Policy>,
     observed: Arc<Observed>,
+    approvals: Arc<models::Approvals>,
 }
 
 /// How many tasks the processor remembers the starting message of.
 pub const TASKS_REMEMBERED: usize = 10_000;
 
 impl Processor {
-    /// bodies bounds what every exchange's captured bodies hold together. An exchange a halt
-    /// covers is cut, and senders and receivers are named through the halts' identity map.
+    /// bodies bounds what every exchange's captured bodies, and every model call's held
+    /// events, hold together. An exchange a halt covers is cut, and senders and receivers are
+    /// named through the halts' identity map.
     pub fn new(events: Events, halts: Arc<Halts>, bodies: Arc<Budget>, counters: Arc<Counters>) -> Self {
         Processor {
             events,
@@ -742,6 +803,7 @@ impl Processor {
             counters,
             policy: Arc::new(Policy::fixed(FlowPolicy::empty())),
             observed: Arc::new(Observed::starting(0, crate::policy::DEFAULT_WINDOW_SECS)),
+            approvals: Arc::new(models::Approvals::new(models::APPROVALS_REMEMBERED)),
         }
     }
 
@@ -774,14 +836,22 @@ impl ExternalProcessor for Processor {
         let bodies = self.bodies.clone();
         let counters = self.counters.clone();
         let observed = self.policy.enforcing().then(|| self.observed.clone());
-        counters.a2a_exchanges.fetch_add(1, Ordering::Relaxed);
+        let models = models::Shared {
+            policy: self.policy.clone(),
+            observed: self.observed.clone(),
+            approvals: self.approvals.clone(),
+            counters: counters.clone(),
+            held: bodies.clone(),
+        };
         tokio::spawn(async move {
             let mut exchange = Exchange::with_tasks(tasks)
                 .with_agents(halts.agents().clone())
                 .with_budget(bodies)
-                .with_observed(observed);
+                .with_observed(observed)
+                .with_models(models);
             let mut changes = halts.changes();
             let mut watching = true;
+            let mut counted = false;
             let emit = |list: Vec<Event>| {
                 for e in list {
                     events.send(e);
@@ -800,6 +870,10 @@ impl ExternalProcessor for Processor {
                     message = incoming.next() => {
                         let Some(Ok(message)) = message else { break };
                         let (answer, done) = exchange.handle(message, SystemTime::now());
+                        if !std::mem::replace(&mut counted, true) {
+                            let seen = if exchange.is_model() { &counters.model_calls } else { &counters.a2a_exchanges };
+                            seen.fetch_add(1, Ordering::Relaxed);
+                        }
                         // A halt can land between ext_authz letting the call in and this.
                         let covering = exchange.halted_by(&halts);
                         if !covering.is_empty() {

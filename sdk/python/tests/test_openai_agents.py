@@ -1329,6 +1329,7 @@ def test_a_hosted_mcp_call_held_back_is_rejected_and_recorded(served):
     assert tool.tool_config["require_approval"] == "always", "every call asks first"
     denied, payload = denied_in(events_)
     assert attrs(denied)["gen_ai.tool.name"] == "lookup_order"
+    assert attrs(denied)["wake.mcp.server"] == "crm"
     assert attrs(denied)["wake.brake.halt_id"] == "policy:no-crm-after-web"
     assert payload["origins"] == ["tool:fetch_page"] and payload["input"] == '{"order": "1234"}'
     assert payload["output"] == reason
@@ -1400,8 +1401,10 @@ def test_a_hosted_mcp_tool_the_app_approves_through_interruptions_is_left_as_it_
         tool = crm(setting)
         config = dict(tool.tool_config)
         processor = WakeTracingProcessor(Recorder(agent="support", exporter=InMemorySpanExporter()), quarantine=Halts())
-        processor.guard(Agent(name="billing", tools=[tool]))
+        billing = processor.guard(Agent(name="billing", tools=[tool]))
         assert tool.tool_config == config and tool.on_approval_request is None, setting
+        assert getattr(billing.hooks.on_llm_start, "_wake", False) and getattr(billing.hooks.on_llm_end, "_wake", False), \
+            "each call the app approves is checked before the model call that runs it"
 
 
 def test_a_halt_rejects_every_hosted_mcp_call():
@@ -1412,3 +1415,202 @@ def test_a_halt_rejects_every_hosted_mcp_call():
                                  "reason": "Wake halted billing (halt-billing), so this tool call wasn't run."}]
     denied, _ = denied_in(events_)
     assert (attrs(denied)["gen_ai.tool.name"], attrs(denied)["wake.brake.halt_id"]) == ("lookup_order", "halt-billing")
+
+
+# Hosted MCP calls the app approves itself: OpenAI runs each inside the model call whose input
+# carries the approval, which Wake checks first.
+
+CRM_REFUSED = ("Wake's flow policy (policy:no-crm-after-web) holds billing back after tool:fetch_page, so this tool "
+               "call wasn't run.")
+UNFOUND = "Wake couldn't find the request this approves, so this tool call wasn't run."
+ONE_LOOKUP = {"rules": [{"id": "one-lookup", "callers": ["billing"], "tools": ["lookup_order"],
+                         "forbid_origins": ["tool:lookup_order"]}]}
+FETCH_TERMS = call("fetch_page", json.dumps({"url": "https://acme.example/terms"}), "call_fetch_terms")
+
+
+def answers(model: Asked) -> list[list[dict]]:
+    """The answers to hosted MCP tools' requests in the input of each model call, as sent."""
+    return [[{k: item[k] for k in ("approval_request_id", "approve", "reason") if k in item}
+             for item in turn if isinstance(item, dict) and item.get("type") == "mcp_approval_response"]
+            for turn in model.inputs if isinstance(turn, list)]
+
+
+def approved_by_the_app(agent, quarantine, *, always=False, halt=None, **run):
+    """Runs the guarded agent until a hosted MCP call waits on the app, approves it as the app
+    would, through the run's interruptions, and runs on: the result, the events and the
+    processor. A halt given lands while the app decides. run holds Runner.run's own arguments,
+    such as previous_response_id, and the run config's."""
+    from agents import RunConfig
+
+    own = {k: run.pop(k) for k in ("previous_response_id", "conversation_id") if k in run}
+    exporter = InMemorySpanExporter()
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter), quarantine=quarantine)
+    set_trace_processors([processor])
+
+    async def asked_and_approved():
+        result = await Runner.run(processor.guard(agent), "Check order 1234.", run_config=RunConfig(**run), **own)
+        assert len(result.interruptions) == 1, "the app is asked"
+        if halt is not None:
+            quarantine.halts.append(halt)
+        state = result.to_state()
+        state.approve(result.interruptions[0], always_approve=always)
+        return await Runner.run(agent, state, run_config=RunConfig(**run), **own)
+
+    try:
+        result = asyncio.run(asked_and_approved())
+    finally:
+        set_trace_processors([])
+    processor._recorder.flush()
+    return result, wake_events(exporter.get_finished_spans()), processor
+
+
+def test_a_call_the_app_approves_that_the_policy_holds_back_is_turned_down_before_it_runs(served):
+    from wake import flow
+
+    request = asking()
+    model = Asked([[FETCH], [request], [FETCH_TERMS], [say("Couldn't look it up.")]])
+    billing = Agent(name="billing", tools=[fetching(), crm("always")], model=model)
+    result, events_, _ = approved_by_the_app(billing, served(NO_CRM_AFTER_WEB, "billing"))
+    assert result.final_output == "Couldn't look it up."
+    rejected = {"approval_request_id": request.id, "approve": False, "reason": CRM_REFUSED}
+    assert answers(model) == [[], [], [rejected], [rejected]], \
+        "turned down in the input sent, and again in each that carries it after"
+    denied, payload = denied_in(events_)  # once
+    assert denied.name == "execute_tool lookup_order"
+    assert attrs(denied)["gen_ai.tool.name"] == "lookup_order"
+    assert attrs(denied)["wake.mcp.server"] == "crm"
+    assert attrs(denied)["wake.brake.halt_id"] == "policy:no-crm-after-web"
+    assert attrs(denied)["wake.agent.id"] == "billing" and attrs(denied)["wake.origins"] == ()
+    assert payload["origins"] == ["tool:fetch_page"] and payload["input"] == '{"order": "1234"}'
+    assert payload["output"] == CRM_REFUSED
+    asked = [e for e in events_ if attrs(e)["wake.event.kind"] == "model_call"][1]
+    assert attrs(denied)["wake.parents"] == (attrs(asked)["wake.event.id"],), "the response that asked, before the run resumed"
+    assert "tool:lookup_order" not in flow.entered().seen("billing").origins, "it never ran"
+
+
+def test_a_call_the_app_approves_that_a_halt_covers_is_turned_down():
+    model = Asked([[asking()], [say("Couldn't look it up.")]])
+    billing = Agent(name="billing", tools=[crm("always")], model=model)
+    _, events_, _ = approved_by_the_app(billing, Halts(), halt={"id": "halt-billing", "agents": ["billing"]})
+    assert [a.get("reason") for a in answers(model)[-1]] == [
+        "Wake halted billing (halt-billing), so this tool call wasn't run."]
+    denied, _ = denied_in(events_)
+    assert (attrs(denied)["gen_ai.tool.name"], attrs(denied)["wake.brake.halt_id"]) == ("lookup_order", "halt-billing")
+
+
+def test_a_call_the_app_approves_that_wake_lets_through_enters_the_agent_before_it_runs(served):
+    from wake import flow
+
+    entered = []
+
+    class Answering(Asked):
+        async def get_response(self, *args, **kwargs):
+            entered.append(flow.entered().seen("billing").origins)
+            return await super().get_response(*args, **kwargs)
+
+    request = asking()
+    model = Answering([[request], [mcp_called(), say("Paid in full.")]])
+    billing = Agent(name="billing", tools=[crm("always")], model=model)
+    result, events_, _ = approved_by_the_app(billing, served(NO_CRM_AFTER_WEB, "billing"),
+                                             trace_include_sensitive_data=False)
+    assert result.final_output == "Paid in full."
+    assert answers(model) == [[], [{"approval_request_id": request.id, "approve": True}]], "approved, as the app said"
+    assert entered == [(), ("tool:lookup_order",)], "noted before the model call that runs it, the trace or not"
+    assert "denied" not in kinds_of(events_)
+
+
+def test_each_call_the_app_approves_for_good_is_checked_before_it_runs(served):
+    first, second = asking(), asking(arguments='{"order": "5678"}')
+    model = Asked([[first], [mcp_called(), second], [say("Looked one up.")]])
+    billing = Agent(name="billing", tools=[crm("always")], model=model)
+    result, events_, _ = approved_by_the_app(billing, served(ONE_LOOKUP, "billing"), always=True)
+    assert result.interruptions == [], "the second wasn't asked about: the app approved its tool for good"
+    reason = ("Wake's flow policy (policy:one-lookup) holds billing back after tool:lookup_order, so this tool call "
+              "wasn't run.")
+    assert answers(model)[-1] == [{"approval_request_id": first.id, "approve": True},
+                                  {"approval_request_id": second.id, "approve": False, "reason": reason}], \
+        "the first ran, and what it brought back holds the second back"
+    _, payload = denied_in(events_)
+    assert payload["input"] == '{"order": "5678"}' and payload["origins"] == ["tool:lookup_order"]
+
+
+def test_with_the_conversation_at_openai_the_request_is_the_one_the_response_asked(served):
+    request = asking()
+    model = Asked([[FETCH], [request], [say("Couldn't look it up.")]])
+    billing = Agent(name="billing", tools=[fetching(), crm("always")], model=model)
+    _, events_, _ = approved_by_the_app(billing, served(NO_CRM_AFTER_WEB, "billing"), previous_response_id="resp_0",
+                                        trace_include_sensitive_data=False)
+    assert [i["type"] for i in model.inputs[-1]] == ["mcp_approval_response"], "the input holds the approval alone"
+    assert answers(model)[-1] == [{"approval_request_id": request.id, "approve": False, "reason": CRM_REFUSED}]
+    assert attrs(denied_in(events_)[0])["gen_ai.tool.name"] == "lookup_order"
+
+
+def test_an_approval_wake_cant_match_to_its_request_is_turned_down(served):
+    from agents import RunState
+
+    # Resumed in another process, with the conversation kept at OpenAI: no response this
+    # process saw asked, and the input holds the approval alone.
+    request = asking()
+    billing = Agent(name="billing", tools=[crm("always")], model=Asked([[request]]))
+    first = WakeTracingProcessor(Recorder(agent="support", exporter=InMemorySpanExporter()), quarantine=Halts())
+    set_trace_processors([first])
+    try:
+        asked = asyncio.run(Runner.run(first.guard(billing), "Check order 1234.", previous_response_id="resp_0"))
+    finally:
+        set_trace_processors([])
+    saved = asked.to_state().to_string()
+
+    model = Asked([[say("Couldn't look it up.")]])
+    elsewhere = Agent(name="billing", tools=[crm("always")], model=model)
+    exporter = InMemorySpanExporter()
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter), quarantine=served(None, "billing"))
+    set_trace_processors([processor])
+
+    async def resumed():
+        state = await RunState.from_string(processor.guard(elsewhere), saved)
+        state.approve(state.get_interruptions()[0])
+        return await Runner.run(elsewhere, state, previous_response_id="resp_0")
+
+    try:
+        asyncio.run(resumed())
+    finally:
+        set_trace_processors([])
+    processor._recorder.flush()
+    assert answers(model) == [[{"approval_request_id": request.id, "approve": False, "reason": UNFOUND}]], \
+        "with no policy and no halt, still turned down: Wake can't check it"
+    denied, payload = denied_in(wake_events(exporter.get_finished_spans()))
+    assert (attrs(denied)["gen_ai.tool.name"], attrs(denied)["wake.brake.halt_id"]) == ("mcp", "halt-check-failed")
+    assert payload["output"] == UNFOUND
+
+
+def test_an_approval_the_input_shows_ran_or_wake_answered_itself_is_left_as_it_is(served):
+    from openai.types.responses.response_output_item import McpCall
+
+    # Its call ran in an earlier model call, whose response the input holds: nothing more runs.
+    request = asking()
+    ran = McpCall(type="mcp_call", id="mcp_1", approval_request_id=request.id, arguments='{"order": "1234"}',
+                  name="lookup_order", server_label="crm", output="Order 1234: paid in full.", status="completed")
+    history = [{"role": "user", "content": "Check order 1234."}, request.model_dump(exclude_none=True),
+               {"type": "mcp_approval_response", "approval_request_id": request.id, "approve": True},
+               ran.model_dump(exclude_none=True)]
+    model = Asked([[say("Paid in full.")]])
+    billing = Agent(name="billing", tools=[crm("always")], model=model)
+    exporter = InMemorySpanExporter()
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter),
+                                     quarantine=Halts({"id": "halt-billing", "agents": ["billing"]}))
+    set_trace_processors([processor])
+    try:
+        asyncio.run(Runner.run(processor.guard(billing), history))
+    finally:
+        set_trace_processors([])
+    processor._recorder.flush()
+    assert answers(model) == [[{"approval_request_id": request.id, "approve": True}]]
+    assert "denied" not in kinds_of(wake_events(exporter.get_finished_spans()))
+
+    # Wake's own answer to a tool that asks it is decided once: what the call it let through
+    # brought back doesn't hold it back after.
+    model = Asked([[asking()], [mcp_called(), say("Paid in full.")]])
+    billing = Agent(name="billing", tools=[crm("never")], model=model)
+    _, events_, _ = guarded_run(billing, served(ONE_LOOKUP, "billing"))
+    assert approvals(model) == [{"approve": True}]
+    assert "denied" not in kinds_of(events_)

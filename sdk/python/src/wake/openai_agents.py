@@ -44,7 +44,11 @@ with AgentHalted. A hosted MCP tool is made to ask before every call, and Wake a
 a call held back is rejected with why, and recorded as denied. One allowed gets the answer of
 the tool's own approval callback when its own setting would have asked, and is approved
 otherwise. A hosted MCP tool whose calls the app approves itself, through run interruptions,
-is left as it is: Wake can't answer for a person.
+is left as it is: Wake can't answer for a person. Each call the app approves is checked
+instead before the model call that runs it, whose input carries the approval: one held back
+has its approval turned into a rejection, with why, in that input, and is recorded as denied.
+Wake matches an approval to the request it answers, from the response that asked or from the
+input, and turns down one it can't match, since it can't check it.
 
 The same checks apply the flow policy wake-proxy serves with those rules (wake.flow), once
 no halt refuses the call: a tool call is refused when a rule holds its agent back for what
@@ -54,8 +58,8 @@ enters the agent that called it as tool:<name>, an MCP server's tool by its MCP 
 hosted tool's call enters as tool:<name> as the response holding it comes in, before
 anything that follows from that response is checked, a hosted MCP call by its MCP tool's own
 name. Without sensitive data the trace doesn't say which hosted tools ran, so every hosted
-tool the agent offered that call enters, but hosted MCP, which enters as each call Wake
-answers for is approved. A handoff brings what had entered the agent handing off into the one it hands off to,
+tool the agent offered that call enters, but hosted MCP, which enters as each call Wake checks
+is let through. A handoff brings what had entered the agent handing off into the one it hands off to,
 as agent:<that agent> with the rest. So does a call to an agent used as a tool, or any run
 started inside a tool call, and what the run's agent said last brings what entered it back.
 """
@@ -94,6 +98,10 @@ _HOSTED_CALLS = {"web_search_call": "web_search", "file_search_call": "file_sear
 
 # What the SDK asks of a computer while it carries out a computer call.
 _COMPUTER_ACTIONS = ("click", "double_click", "drag", "keypress", "move", "screenshot", "scroll", "type", "wait")
+
+# Why an approval of a hosted MCP call is turned down when Wake can't find the request it
+# answers, so it can't check the call.
+_UNFOUND = "Wake couldn't find the request this approves, so this tool call wasn't run."
 
 
 def install(recorder: Recorder, quarantine: "Quarantine | None" = None) -> "WakeTracingProcessor":
@@ -259,6 +267,8 @@ class WakeTracingProcessor(EventGraph):
         self._agent_data = _Recent()  # sdk span id of an agent span -> its data, which names the tools offered each call
         self._hosted_names = _Recent()  # agent guard() covers -> its hosted tools but hosted MCP, by name
         self._shells = _Recent()  # agent guard() covers -> its shell tool's name, and whether it runs at OpenAI
+        self._requests = _Recent()  # hosted MCP request id -> (MCP tool name, arguments, server label), as a response asked
+        self._decided = _Recent()  # hosted MCP request id -> the refusal its approval was turned down with, or None once let through
 
     # TracingProcessor.
 
@@ -382,11 +392,13 @@ class WakeTracingProcessor(EventGraph):
         the same calls and handoffs the same ways (wake.flow).
 
         Hosted tools run at OpenAI, inside the model call. Each model call of an agent that
-        offers hosted tools other than hosted MCP is checked first, by the agent's hooks
-        (on_llm_start, the agent's own still called): when a halt or the flow policy holds back
-        any of them, the call isn't made, and AgentHalted ends the run. Each hosted MCP tool is
-        made to ask before every call, and Wake answers: see _answer_mcp. One whose calls the
-        app approves itself, through run interruptions, is left as it is."""
+        offers hosted tools is checked first, by the agent's hooks (on_llm_start and
+        on_llm_end, the agent's own still called): when a halt or the flow policy holds back any
+        of them but hosted MCP, the call isn't made, and AgentHalted ends the run. Each hosted
+        MCP tool is made to ask before every call, and Wake answers: see _answer_mcp. One whose
+        calls the app approves itself, through run interruptions, is left as it is, and each
+        call the app approves is checked before the model call that runs it: see
+        _check_approvals."""
         from agents import Agent, FunctionTool, Handoff, handoff
         from agents.tool_guardrails import ToolInputGuardrail
 
@@ -402,7 +414,7 @@ class WakeTracingProcessor(EventGraph):
             if id(current) in seen:
                 continue
             seen.add(id(current))
-            tools, hosted = [], []
+            tools, hosted, mcp = [], [], False
             for tool in current.tools:
                 if isinstance(tool, FunctionTool):
                     if self._guardrail not in (tool.tool_input_guardrails or []):
@@ -413,6 +425,7 @@ class WakeTracingProcessor(EventGraph):
                         self._agent_tools[(current.name, tool.name)] = tool._agent_instance.name
                 elif _kind(tool, "HostedMCPTool"):
                     self._guard_hosted_mcp(tool, current.name)
+                    mcp = True
                 elif _hosted(tool):
                     hosted.append(tool)
                 else:
@@ -427,7 +440,7 @@ class WakeTracingProcessor(EventGraph):
                     t.name for t in hosted}
                 if shell is not None:
                     self._shells[current.name] = (shell.name, _hosted(shell))
-            if hosted:
+            if hosted or mcp:
                 self._guard_model_calls(current)
             for server in getattr(current, "mcp_servers", None) or []:
                 if hasattr(server, "tool_input_guardrails") and self._guardrail not in (server.tool_input_guardrails or []):
@@ -563,30 +576,40 @@ class WakeTracingProcessor(EventGraph):
         return item
 
     def _guard_model_calls(self, agent) -> None:
-        """Has each model call of agent check first the hosted tools it offers, other than
-        hosted MCP, through the agent's hooks: on_llm_start raises AgentHalted, before the
-        call is made, when any is held back (_check_model_call), then calls the agent's own
-        on_llm_start. Hooks that can't be given that raise TypeError, rather than leave the
-        model calls unchecked."""
+        """Has each model call of agent go past Wake first, through the agent's hooks. Its
+        on_llm_start raises AgentHalted, before the call is made, when any hosted tool it offers
+        but hosted MCP is held back (_check_model_call), then turns down each hosted MCP call
+        the call's input approves that Wake holds back (_check_approvals), then calls the
+        agent's own on_llm_start. Its on_llm_end keeps each hosted MCP tool's request in the
+        response (_note_requests), then calls the agent's own on_llm_end. Hooks that can't be
+        given that raise TypeError, rather than leave the model calls unchecked."""
         from agents import AgentHooks
 
         hooks = agent.hooks if agent.hooks is not None else AgentHooks()
         start = getattr(hooks, "on_llm_start", None)
-        if getattr(start, "_wake", False):
-            agent.hooks = hooks
-            return
+        end = getattr(hooks, "on_llm_end", None)
         owner = agent.name
 
         async def on_llm_start(context, agent, system_prompt, input_items):
             self._check_model_call(agent, owner)
+            self._check_approvals(agent, owner, input_items)
             if callable(start):
                 started = start(context, agent, system_prompt, input_items)
                 if inspect.isawaitable(started):
                     await started
 
-        on_llm_start._wake = True  # type: ignore[attr-defined]
+        async def on_llm_end(context, agent, response):
+            self._note_requests(response)
+            if callable(end):
+                ended = end(context, agent, response)
+                if inspect.isawaitable(ended):
+                    await ended
+
         try:
-            hooks.on_llm_start = on_llm_start
+            for name, wrapped, own in (("on_llm_start", on_llm_start, start), ("on_llm_end", on_llm_end, end)):
+                if not getattr(own, "_wake", False):
+                    wrapped._wake = True  # type: ignore[attr-defined]
+                    setattr(hooks, name, wrapped)
         except (AttributeError, TypeError) as e:
             raise TypeError(f"guard() can't check the model calls of {owner}, whose hosted tools run at OpenAI: "
                             f"its hooks, {type(hooks).__name__}, can't be wrapped ({e})") from e
@@ -622,12 +645,109 @@ class WakeTracingProcessor(EventGraph):
         if held is not None:
             raise stop.AgentHalted(held)
 
+    def _check_approvals(self, agent, owner: str, items) -> None:
+        """Before a model call of agent: checks each hosted MCP call its input approves, which
+        OpenAI runs inside the call, as _answer_mcp checks a request: the halts, then the flow
+        policy, for a call by the agent to the MCP tool's own name. That covers the calls the app
+        approves itself, through run interruptions or for good, which no callback of Wake's
+        answers. A call held back has its approval turned into a rejection in the input, which
+        is the very list the SDK sends, with the refusal as its reason, and is recorded as
+        denied. One let through enters the agent now, as tool:<the MCP tool>. An approval Wake
+        can't match to the request it answers (_decide_approval) is turned down as well.
+
+        Each approval is decided once: an input that carries it again, as a run's whole history
+        does on each model call, gets the same answer, and one Wake's own callback answered is
+        left as it is. Never raises but AgentHalted, when an approval it turns down can't be
+        changed."""
+        if self._quarantine is None or not isinstance(items, list):
+            return
+        name = getattr(agent, "name", None) or owner
+        for index, item in enumerate(items):
+            if _field(item, "type") != "mcp_approval_response" or not _field(item, "approve"):
+                continue
+            request_id = _field(item, "approval_request_id")
+            try:
+                with self._lock:
+                    decided, refused = request_id in self._decided, self._decided.get(request_id)
+                if not decided:
+                    refused = self._decide_approval(name, request_id, items)
+            except Exception:
+                log.warning("wake: couldn't check a hosted MCP call the app approved; refusing it", exc_info=True)
+                refused = stop.unchecked()
+                try:
+                    with self._lock:
+                        self._decided[request_id] = refused
+                except Exception:
+                    pass
+            if refused is not None:
+                _turn_down(items, index, refused)
+
+    def _decide_approval(self, agent: str, request_id: Any, items: list) -> "stop.Refusal | None":
+        """The refusal of the hosted MCP call an approval of request_id lets OpenAI run, in a
+        model call of agent whose input is items, or None to let it run. The request is the one
+        a response of this process asked (_note_requests), or else the one in the input, as a
+        run's whole history holds it. When neither has it, as when a run resumes in another
+        process with its conversation kept at OpenAI (previous_response_id, conversation_id),
+        Wake can't check the call, and it's refused under halt-check-failed. A call the input
+        shows ran already, in an earlier model call, is let be: nothing more runs. The refusal
+        is recorded as denied, under the agent's run, the response that asked its parent."""
+        if any(_field(i, "type") == "mcp_call" and _field(i, "approval_request_id") == request_id for i in items):
+            with self._lock:
+                self._decided[request_id] = None
+            return None
+        with self._lock:
+            request = self._requests.get(request_id)
+            asked_by = self._event_by_item.get(request_id)
+        if request is None:
+            found = next((i for i in items if _field(i, "type") == "mcp_approval_request"
+                          and _field(i, "id") == request_id), None)
+            if found is not None:
+                request = (_field(found, "name"), _field(found, "arguments"), _field(found, "server_label"))
+        if request is None or not isinstance(request[0], str) or not request[0]:
+            refused = stop.Refusal(stop.UNCHECKED, _UNFOUND)
+            try:
+                span = _current_span()
+                if getattr(span, "span_id", None) is not None:
+                    self._refused_alone(span, agent, "mcp", None, request_id, refused, asked_by=asked_by)
+            except Exception:
+                # Refused all the same; only its record may say less.
+                log.warning("wake: failed to record a refused hosted MCP call", exc_info=True)
+                failed(self._recorder, "a refused hosted MCP call")
+            log.warning("wake: refused a hosted MCP call of %s: Wake couldn't find the request %s it approves", agent,
+                        request_id)
+        else:
+            tool, arguments, server = request
+            refused = self._refuse_call(agent, tool, arguments, request_id, server=server, asked_by=asked_by)
+            if refused is None:
+                # Its result comes back in the response to the call it runs in.
+                flow.note(agent, f"tool:{tool}")
+        with self._lock:
+            self._decided[request_id] = refused
+        return refused
+
+    def _note_requests(self, response) -> None:
+        """Keeps each hosted MCP tool's request to make a call that a model's response holds, by
+        its id, for the input that approves it (_check_approvals): the MCP tool's own name, the
+        arguments and the server. The SDK hands each response to the agent's hooks before it
+        asks the app, or a callback, about any request in it. Never raises: a request not kept
+        is one Wake can't check, and refuses."""
+        try:
+            for item in list(getattr(response, "output", None) or []):
+                request_id = _field(item, "id")
+                if _field(item, "type") == "mcp_approval_request" and request_id:
+                    with self._lock:
+                        self._requests[request_id] = (_field(item, "name"), _field(item, "arguments"),
+                                                      _field(item, "server_label"))
+        except Exception:
+            log.warning("wake: couldn't keep the hosted MCP requests in a response", exc_info=True)
+
     def _guard_hosted_mcp(self, tool, owner: str) -> None:
         """A hosted MCP tool, made to ask before every call so that Wake answers each
         (_answer_mcp). owner is the agent guard() found it on, which a call is checked as when
         no span says who's calling. A tool whose own setting asks before some calls and that
         has no callback is approved by the app, through run interruptions: Wake can't answer
-        for a person, or interrupt, so it's left as it is."""
+        for a person, or interrupt, so it's left as it is, and each call the app approves is
+        checked before the model call that runs it (_check_approvals)."""
         callback = tool.on_approval_request
         if getattr(callback, "_wake", False):
             return
@@ -646,14 +766,20 @@ class WakeTracingProcessor(EventGraph):
     async def _answer_mcp(self, request, owner: str, setting: Any, callback) -> dict[str, Any]:
         """The answer to a hosted MCP tool's request to make a call: rejected, with why, when a
         halt covers the agent making it or the flow policy holds the agent back from the MCP
-        tool, by its own name, and recorded as denied. Otherwise the tool's own callback's
-        answer, when its own setting would have asked before this call, or else approved. Once
-        approved, tool:<MCP tool> enters the agent: the call's result comes back in the next
-        response, and noting it now doesn't depend on the trace."""
+        tool, by its own name, and recorded as denied, with its server. Otherwise the tool's own
+        callback's answer, when its own setting would have asked before this call, or else
+        approved. Once approved, tool:<MCP tool> enters the agent: the call's result comes back
+        in the next response, and noting it now doesn't depend on the trace. The answer is
+        decided here, so the input that carries it isn't checked again (_check_approvals)."""
         data = getattr(request, "data", None)
         name = _field(data, "name") or "mcp"
         agent = self._caller(None, owner)
-        refused = self._refuse_call(agent, name, _field(data, "arguments"), _field(data, "id"))
+        request_id = _field(data, "id")
+        refused = self._refuse_call(agent, name, _field(data, "arguments"), request_id,
+                                    server=_field(data, "server_label"))
+        if request_id:
+            with self._lock:
+                self._decided[request_id] = refused
         if refused is not None:
             return {"approve": False, "reason": refused.reason}
         if callback is not None and _asks(setting, name):
@@ -679,13 +805,15 @@ class WakeTracingProcessor(EventGraph):
         return ToolGuardrailFunctionOutput.reject_content(refused.reason, output_info={"halt": refused.halt})
 
     def _refuse_call(self, agent: str | None, name: str, arguments: Any, call_id: str | None, *,
-                     owner: str | None = None) -> "stop.Refusal | None":
+                     owner: str | None = None, server: str | None = None,
+                     asked_by: str | None = None) -> "stop.Refusal | None":
         """The refusal of a tool call about to run, if a halt covers who's making it: agent, as
         the SDK says, or else the agent whose run the SDK's current span is in, or owner. Or if
         the flow policy holds them back from it, or, for an agent used as a tool, from
         reaching that agent. It's noted on the call's span, to be recorded as denied when that
-        ends, or recorded as denied now if the SDK opened none for it, as for a local shell.
-        Never raises: a check that fails refuses."""
+        ends, or recorded as denied now if the SDK opened none for it, as for a local shell or a
+        hosted MCP call, whose server is named, and asked_by, the response that asked for it,
+        is its parent when Wake knows it. Never raises: a check that fails refuses."""
         if self._quarantine is None:
             return None
         span = _current_span()
@@ -706,7 +834,7 @@ class WakeTracingProcessor(EventGraph):
                 if noted:
                     self._halted[sid] = _Stopped(refused, call_id)
             if not noted and sid is not None:
-                self._refused_alone(span, agent, name, arguments, call_id, refused)
+                self._refused_alone(span, agent, name, arguments, call_id, refused, server=server, asked_by=asked_by)
         except Exception:
             # Refused all the same; only its record may say less.
             log.warning("wake: failed to record a refused tool call", exc_info=True)
@@ -787,20 +915,24 @@ class WakeTracingProcessor(EventGraph):
             refused = stop.unchecked(outcome)
         return refused
 
-    def _refused_alone(self, span, agent: str, name: str, arguments: Any, call_id: str | None, refused) -> None:
+    def _refused_alone(self, span, agent: str, name: str, arguments: Any, call_id: str | None, refused, *,
+                       server: str | None = None, asked_by: str | None = None) -> None:
         """Records a tool call refused where the SDK opened no span for it, such as a local
-        shell's: denied, under its agent's run, the response that asked for it its parent."""
+        shell's or a hosted MCP call's, with its server: denied, under its agent's run, the
+        response that asked for it its parent, asked_by when given, or else the agent's latest."""
         sid = span.span_id
         with self._lock:
             run = self._run_at(sid)
             requested = self._call.get((span.trace_id, run, name, arguments)) if isinstance(arguments, str) else None
-            parent = requested[1] if requested else self._last_response.get((span.trace_id, run, agent))
+            parent = asked_by or (requested[1] if requested else self._last_response.get((span.trace_id, run, agent)))
             context = self._context_at(sid, span.trace_id)
         otel = self._recorder.tracer.start_span(f"execute_tool {name}", context=context)
         event_id = str(uuid.uuid4())
+        attributes = {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name, "wake.brake.halt_id": refused.halt}
+        if server:
+            attributes["wake.mcp.server"] = str(server)
         self._event(otel, types.SimpleNamespace(parent_id=sid, error=None), event_id, events.DENIED,
-                    f"execute_tool {name}", agent, [parent] if parent else [], [],
-                    {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name, "wake.brake.halt_id": refused.halt},
+                    f"execute_tool {name}", agent, [parent] if parent else [], [], attributes,
                     {"input": _plain(arguments), "output": refused.reason, **flow.payload(refused)})
         with self._lock:
             if call_id:
@@ -1269,3 +1401,28 @@ def _refused_shell(refused: stop.Refusal):
 
 def _raise(refused: stop.Refusal):
     raise stop.AgentHalted(refused)
+
+
+def _turn_down(items: list, index: int, refused: stop.Refusal) -> None:
+    """Turns the approval at items[index] of a model call's input into a rejection, with the
+    refusal as its reason. It's changed where it is, which keeps the item the SDK tracks as
+    sent, or, when it can't be, replaced by a rejection of its own. Raises AgentHalted when
+    neither can be done, rather than let the call run."""
+    item = items[index]
+    try:
+        if isinstance(item, dict):
+            item["approve"], item["reason"] = False, refused.reason
+        else:
+            item.approve, item.reason = False, refused.reason
+        if _field(item, "approve") is False and _field(item, "reason") == refused.reason:
+            return
+    except Exception:
+        pass
+    try:
+        plain = _plain(item)
+        rejected = dict(plain) if isinstance(plain, Mapping) else {
+            "type": "mcp_approval_response", "approval_request_id": _field(item, "approval_request_id")}
+        rejected.update(approve=False, reason=refused.reason)
+        items[index] = rejected
+    except Exception as e:
+        raise stop.AgentHalted(refused) from e

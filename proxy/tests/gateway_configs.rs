@@ -1,7 +1,9 @@
 //! The agentgateway configs that ship with Wake keep the deny lever whole: every call is
 //! checked at the gateway, before routing, and fails closed; every A2A route also names the
 //! agent it reaches; and callers authenticate, so the deny knows which agent is calling.
-//! A route added without these would let a halted agent's calls through.
+//! A route added without these would let a halted agent's calls through. Every route to a
+//! model provider has wake-proxy read its calls, failing closed, so the tools a provider runs
+//! inside a call are held to the flow policy.
 
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -114,6 +116,94 @@ fn every_a2a_route_denies_calls_to_a_halted_agent() {
     }
 }
 
+/// The provider a model route's `ai` backend reaches, as wake-proxy names it.
+fn provider(route: &Yaml) -> Option<&'static str> {
+    let backends = route["backends"].as_vec()?;
+    let providers: Vec<&Yaml> = backends.iter().map(|b| &b["ai"]["provider"]).collect();
+    let named = |key: &str| providers.iter().any(|p| !p[key].is_badvalue());
+    match (named("openAI"), named("anthropic")) {
+        (true, false) => Some("openai"),
+        (false, true) => Some("anthropic"),
+        _ => None,
+    }
+}
+
+/// A tool the provider runs inside a model call, such as web search, is seen only by the
+/// ext_proc hook on the model route: each route to a model provider must have wake-proxy read
+/// its calls whole, name the provider, and fail closed, or such a tool would run unchecked.
+#[test]
+fn every_model_route_has_wake_proxy_read_its_calls_and_fails_closed() {
+    let mut model_routes = 0;
+    for (path, _) in CONFIGS {
+        let config = load(path);
+        for (i, route) in config["routes"].as_vec().unwrap().iter().enumerate() {
+            let policies = &route["policies"];
+            let name = route["name"].as_str().map(String::from).unwrap_or(format!("#{i}"));
+            let proc = &policies["extProc"];
+            let model = proc["requestAttributes"]["model"].as_str();
+            if policies["ai"].is_badvalue() {
+                // An A2A exchange named as a model call would go unrecorded.
+                assert!(
+                    model.is_none(),
+                    "{path}: route {name} names a model without an ai policy"
+                );
+                continue;
+            }
+            model_routes += 1;
+            assert!(
+                policies["a2a"].is_badvalue(),
+                "{path}: route {name} is a model route and A2A"
+            );
+            assert!(!proc.is_badvalue(), "{path}: model route {name} has no extProc");
+            assert_eq!(
+                proc["failureMode"].as_str(),
+                Some("failClosed"),
+                "{path}: route {name}: a model call wake-proxy can't check must fail"
+            );
+            assert_eq!(
+                proc["host"].as_str(),
+                Some("unix:/run/wake/proxy.sock"),
+                "{path}: route {name}"
+            );
+            let options = &proc["processingOptions"];
+            for (option, want) in [
+                ("requestHeaderMode", "send"),
+                ("requestBodyMode", "buffered"),
+                ("responseHeaderMode", "send"),
+                ("responseBodyMode", "bufferedPartial"),
+            ] {
+                assert_eq!(options[option].as_str(), Some(want), "{path}: route {name}: {option}");
+            }
+            assert_eq!(
+                options["allowModeOverride"].as_bool(),
+                Some(true),
+                "{path}: route {name}: a streamed response must be passed on as it comes"
+            );
+            assert_eq!(
+                model.map(|m| m.trim_matches('"')),
+                provider(route),
+                "{path}: route {name}: extProc's model must name the provider its backend reaches"
+            );
+            for key in ["sender", "sender_token"] {
+                assert!(
+                    proc["requestAttributes"][key].as_str().is_some(),
+                    "{path}: route {name}: extProc must send {key}"
+                );
+            }
+            // agentgateway buffers 2 MiB of a request for ext_proc unless the route's buffer
+            // policy says more, and fails a larger one. The gRPC message carrying the body to
+            // wake-proxy must fit what it takes, headers and all.
+            let buffered = policies["buffer"]["request"]["maxBytes"].as_i64().unwrap_or(0);
+            let most = wake_proxy::extmcp::MAX_MESSAGE as i64 - (1 << 20);
+            assert!(
+                (2 << 20) < buffered && buffered <= most,
+                "{path}: route {name}: buffer.request.maxBytes must be over 2 MiB, and at most {most}, not {buffered}"
+            );
+        }
+    }
+    assert!(model_routes >= 2, "the reference fleet routes to OpenAI and Anthropic");
+}
+
 #[test]
 fn mcp_capture_can_pair_each_response_with_its_request() {
     for (path, _) in CONFIGS {
@@ -192,8 +282,9 @@ fn hooks(path: &str, config: &Yaml) -> Vec<Hook> {
 }
 
 /// A halt that lands during a call is enforced by the capture hooks: ext_proc cuts an A2A
-/// exchange, and ExtMCP keeps a result from its caller. So they must see the caller as the
-/// deny lever does, or a halt would cut other agents' calls, or miss the halted one's.
+/// exchange or a model call, and ExtMCP keeps a result from its caller. So they must see the
+/// caller as the deny lever does, or a halt would cut other agents' calls, or miss the halted
+/// one's. On a model route, ext_proc also checks the caller against the flow policy.
 #[test]
 fn the_capture_hooks_see_the_caller_the_deny_lever_does() {
     for (path, _) in CONFIGS {

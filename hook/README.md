@@ -73,12 +73,13 @@ Add `"allowManagedHooksOnly": true` to stop other hooks running. `SubagentStop` 
     "postToolUse": [{"command": "wake-hook cursor"}],
     "postToolUseFailure": [{"command": "wake-hook cursor"}],
     "subagentStart": [{"command": "wake-hook cursor --stop", "failClosed": true}],
+    "subagentStop": [{"command": "wake-hook cursor"}],
     "beforeSubmitPrompt": [{"command": "wake-hook cursor --stop", "failClosed": true}]
   }
 }
 ```
 
-Cursor's shell, MCP and file hooks are read too. They can describe the same calls as `preToolUse` and `postToolUse`, though, so wire one set.
+`subagentStop` records nothing, but says when a subagent has answered, for the flow policy. From Cursor 3.22, a subagent's tool hooks name the `Task` call that started it, which ties its calls to the agent that started it (see [docs/hooks.md](../docs/hooks.md)). Cursor's shell, MCP and file hooks are read too. They can describe the same calls as `preToolUse` and `postToolUse`, though, so wire one set.
 
 **Grok Build**, in its organization's hooks or `~/.grok/hooks/wake.json`:
 

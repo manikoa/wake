@@ -5,9 +5,10 @@
 //! A rule decides on what entered the caller through the proxy within the policy's window
 //! (origins.rs), never on anything the caller sends: an agent can't leave a header out, or
 //! send one, to get past a rule. Rules that name MCP tools are checked by the MCP hook,
-//! which sees the tool; rules that name memory stores hold writes through the SDKs' memory
-//! adapters, which never pass the proxy, so it checks none of its calls against them; the
-//! rest are checked by ext_authz, on every request.
+//! which sees the tool, and against the tools a provider would run inside a model call, on
+//! the gateway's model routes (models.rs); rules that name memory stores hold writes through
+//! the SDKs' memory adapters, which never pass the proxy, so it checks none of its calls
+//! against them; the rest are checked by ext_authz, on every request.
 //!
 //! Like `Halts`, a policy fails closed: a `--policy-file` that can't be read, or isn't a
 //! valid policy, denies every call under `policy:unreadable-policy` until it's fixed. The
@@ -133,7 +134,7 @@ pub struct Target<'a> {
 }
 
 /// Where a call is checked: ext_authz checks the rules that name no tools, and the MCP
-/// hook those that do.
+/// hook those that do, as does a model route for the tools a provider would run (models.rs).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum At {
     Authz,
@@ -213,6 +214,24 @@ impl FlowPolicy {
 
     /// The first rule checked at at that denies the call, given what entered its caller.
     pub fn deciding(&self, at: At, target: &Target<'_>, seen: &Seen, agents: &Agents) -> Option<Denial> {
+        self.first_denying(at, target, seen, agents, false)
+    }
+
+    /// The first rule naming tools that denies a call from target's caller to any tool at all,
+    /// given what entered the caller: a call whose tool isn't known, such as one a model call
+    /// lets the provider make to an MCP server whose tools it doesn't list (models.rs).
+    pub fn deciding_any_tool(&self, target: &Target<'_>, seen: &Seen, agents: &Agents) -> Option<Denial> {
+        self.first_denying(At::Mcp, target, seen, agents, true)
+    }
+
+    fn first_denying(
+        &self,
+        at: At,
+        target: &Target<'_>,
+        seen: &Seen,
+        agents: &Agents,
+        any_tool: bool,
+    ) -> Option<Denial> {
         if self.unreadable.is_some() {
             return (at == At::Authz).then(|| Denial {
                 halt: halt(UNREADABLE.into(), true, None),
@@ -228,7 +247,7 @@ impl FlowPolicy {
             // The MCP hook checks the rules that name tools, and ext_authz the rest, but for
             // the rules that name memory stores, which hold only the SDKs' memory writes.
             let names_tools = !rule.tools.is_empty();
-            if !rule.stores.is_empty() || (at == At::Mcp) != names_tools || !rule.targets(target, agents) {
+            if !rule.stores.is_empty() || (at == At::Mcp) != names_tools || !rule.targets(target, agents, any_tool) {
                 continue;
             }
             let (origins, every) = match seen {
@@ -323,7 +342,9 @@ impl FlowRule {
         Ok(())
     }
 
-    fn targets(&self, target: &Target<'_>, agents: &Agents) -> bool {
+    /// Whether the rule applies to the call. With any_tool, the call could reach any tool, so a
+    /// rule naming tools applies whichever it names.
+    fn targets(&self, target: &Target<'_>, agents: &Agents, any_tool: bool) -> bool {
         let names = |who: &Who<'_>| {
             who.key()
                 .is_some_and(|k| self.callers.iter().any(|c| agents.named(c) == k))
@@ -351,7 +372,8 @@ impl FlowRule {
             || target
                 .path
                 .is_some_and(|p| self.path_prefixes.iter().any(|x| p.starts_with(x.as_str())));
-        let tools = self.tools.is_empty() || target.tool.is_some_and(|t| self.tools.iter().any(|x| matches(x, t)));
+        let tools =
+            self.tools.is_empty() || any_tool || target.tool.is_some_and(|t| self.tools.iter().any(|x| matches(x, t)));
         callers && receivers && paths && tools
     }
 }
@@ -724,6 +746,44 @@ mod tests {
             p.deciding(At::Authz, &mcp("billing", "pay"), &seen(&["tool:fetch_page"]), &none),
             None
         );
+    }
+
+    #[test]
+    fn a_call_to_any_tool_meets_every_rule_naming_tools_for_its_caller() {
+        let p = policy(
+            r#"{"rules": [
+                {"id": "no-pay-for-support", "callers": ["support"], "tools": ["pay"], "forbid_origins": ["tool:*"]},
+                {"id": "billing-hears-no-pages", "receivers": ["billing"], "forbid_origins": ["tool:fetch_page"]},
+                {"id": "facts", "stores": ["facts"], "forbid_origins": ["tool:fetch_page"]},
+                {"id": "no-pay-after-web", "callers": ["billing"], "tools": ["pay", "wire_*"], "forbid_origins": ["tool:fetch_page"]}
+            ]}"#,
+        );
+        let none = Agents::none();
+        let any = |caller: &str| Target {
+            tool: None,
+            ..mcp(caller, "x")
+        };
+        // Whichever tool it reaches, a rule naming tools that applies to billing holds it back.
+        let d = p
+            .deciding_any_tool(&any("billing"), &seen(&["tool:fetch_page"]), &none)
+            .unwrap();
+        assert_eq!(
+            (d.halt.id.as_str(), d.origins),
+            ("policy:no-pay-after-web", vec!["tool:fetch_page".into()])
+        );
+        // Only one that keeps an origin that entered, and only one for the caller.
+        assert_eq!(
+            p.deciding_any_tool(&any("billing"), &seen(&["agent:support"]), &none),
+            None
+        );
+        assert_eq!(
+            p.deciding_any_tool(&any("research"), &seen(&["tool:fetch_page"]), &none),
+            None
+        );
+        // Every origin is kept by any rule that applies.
+        let every = Seen::Every("wake-proxy hasn't watched for a whole window yet");
+        assert!(p.deciding_any_tool(&any("billing"), &every, &none).is_some());
+        assert!(p.deciding_any_tool(&any("research"), &every, &none).is_none());
     }
 
     #[test]

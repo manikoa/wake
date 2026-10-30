@@ -10,7 +10,8 @@ package hook
 //   - a tool's result enters the agent that called it as tool:<name>, by the tool's own
 //     name: an MCP tool's, as wake-proxy names it;
 //   - a subagent starts with what had entered the agent starting it, and its answer brings
-//     back what entered it, each as agent:<sender> with whatever had entered the sender;
+//     back what entered it, each as agent:<sender> with whatever had entered the sender. A
+//     Cursor subagent's events are placed in the session that started it (place);
 //   - the user's prompt isn't an origin, and isn't checked.
 //
 // Each hook is a process of its own, so what entered each agent is kept as files, one per
@@ -45,9 +46,11 @@ const (
 	maxOrigins = 256
 
 	// Why an agent counts as having every origin.
-	saturated = "more origins entered it than Wake keeps"
-	carried   = "a message or reply reached it from one with every origin"
-	noSession = "the hook event names no session"
+	saturated   = "more origins entered it than Wake keeps"
+	carried     = "a message or reply reached it from one with every origin"
+	noSession   = "the hook event names no session"
+	unseenStart = "it's a subagent whose start Wake didn't see"
+	unfollowed  = "it started a subagent whose answer Wake can't follow"
 )
 
 // A flowRule is one rule: the calls it applies to, and the origins it keeps from them. An
@@ -451,7 +454,8 @@ func flowReason(d *denial, who, outcome string) string {
 }
 
 // flowAgent is the agent an action is made by, as the flow policy names it: the agent,
-// or <agent>/<agent type> for a subagent Claude Code names, as the SDKs name it.
+// or <agent>/<agent type> for a subagent Claude Code names, or a Cursor subagent placed
+// (place), as the SDKs name it.
 func flowAgent(host *Host, agent string, a Action) string {
 	if host.subagents && a.Subagent != "" && a.SubagentType != "" {
 		return agent + "/" + a.SubagentType
@@ -483,7 +487,11 @@ func (o Options) flowRefusal(host *Host, a Action, w who, by string, rules *brak
 		return unreadable
 	}
 	s := seen{every: noSession}
-	if a.Session != "" {
+	switch {
+	case a.flow.unplaced:
+		// What it started with isn't known.
+		s = seen{every: unseenStart}
+	case a.Session != "":
 		var err error
 		if s, err = o.flowStore(host.Name, a.Session, p.window).seen(by, o.Now().UnixNano()); err != nil {
 			return unreadable
@@ -507,22 +515,32 @@ func (o Options) flowRefusal(host *Host, a Action, w who, by string, rules *brak
 // a tool's result enters the agent that called it, as tool:<name>; a subagent starts with
 // what had entered the agent starting it, and its answer brings back what entered it.
 // It's noted whether or not anything is checked, since a gate that checks reads what the
-// hooks that don't noted. Noting never fails the hook.
-func (o Options) entered(host *Host, a Action, by string) {
+// hooks that don't noted. w is who acts, and by the agent it is to the flow policy.
+// Noting never fails the hook.
+func (o Options) entered(host *Host, a Action, w who, by string) {
 	defer func() { recover() }()
 	f := a.flow
 	switch {
 	case a.Session == "":
 		return // nothing to keep it by
-	case f.onlyStarts:
-		return // Cursor's subagent: nothing ties its conversation to this one
 	case !f.stopped && !f.starts && a.Kind != "tool_call":
 		return // a prompt, or a call yet to run
 	}
-	s := o.flowStore(host.Name, a.Session, o.flowWindow(o.Agent))
+	window := o.flowWindow(o.Agent)
+	s := o.flowStore(host.Name, a.Session, window)
 	now := o.Now().UnixNano()
 	target := o.Agent + "/" + f.subagent
+	known := o.subagents(host.Name)
 	switch {
+	case f.stopped && host.conversations:
+		// A Cursor subagent stopped: subagentStop names its conversation, which its first
+		// event placed. When none was, Wake followed nothing the subagent did, as before
+		// Cursor named the Task call on its hooks, so it can't tell what the answer brings.
+		if p, ok := known.get(byConversation, f.child); ok {
+			o.flowStore(host.Name, p.Session, window).message(p.From, p.To, now)
+		} else {
+			s.saturate(by, now, unfollowed)
+		}
 	case f.stopped:
 		// A subagent left running in the background has stopped: its answer reaches the
 		// agent that started it.
@@ -531,6 +549,13 @@ func (o Options) entered(host *Host, a Action, by string) {
 		}
 	case f.starts && a.Gate:
 		s.message(by, target, now)
+		if f.call != "" {
+			// Cursor's subagent: its own hooks will name the call starting it.
+			known.keep(byTaskCall, f.call, subagentFile{
+				Call: f.call, Session: a.Session, Type: f.subagent, From: target, To: by,
+				Lineage: append(append([]string{}, w.lineage...), w.instance),
+			})
+		}
 	case f.starts && f.background:
 		// It answers when it stops.
 		if f.agentID != "" {
@@ -538,9 +563,74 @@ func (o Options) entered(host *Host, a Action, by string) {
 		}
 	case f.starts:
 		s.message(target, by, now)
+	case f.answers:
+		// A Cursor Task call came back with its subagent's answer.
+		p, ok := known.get(byTaskCall, a.CallID)
+		switch {
+		case ok:
+			session := o.flowStore(host.Name, p.Session, window)
+			session.message(p.From, p.To, now)
+			if p.Conversation == "" {
+				// None of the subagent's own events named the call, so Wake followed none.
+				session.saturate(p.To, now, unfollowed)
+			}
+		case a.Event == "postToolUse":
+			// A subagent ran whose start wake-hook didn't see.
+			s.saturate(by, now, unfollowed)
+		default:
+			// It failed, starting none, as when its start was refused.
+			s.note(by, "tool:"+host.toolName(a.Tool), now, now)
+		}
 	default:
 		s.note(by, "tool:"+host.toolName(a.Tool), now, now)
 	}
+}
+
+// place puts an event of a Cursor subagent in the session of the agent that started it,
+// as that subagent: <agent>/<subagent type>, an instance of its own by the Task call that
+// started it. Cursor runs each subagent in a conversation of its own, but from 3.22 the
+// subagent's tool hooks name the Task call that started it (parent_tool_call_id), which
+// subagentStart named too, and wake-hook kept when it let that start through. Once one of
+// its events is placed, so is every event in its conversation: the shell, MCP and file
+// hooks, which name no call, and the start of a subagent of its own. subagentStart and
+// subagentStop belong to the agent starting the subagent, whose conversation they name
+// from 3.27 (parent_agent_id). An event naming a call whose start wake-hook didn't let
+// through stays in its own conversation, and its subagent counts as having every origin,
+// since what it started with isn't known. Placing never fails the hook: an event it can't
+// place stays where it is.
+func (o Options) place(host *Host, a *Action) {
+	defer func() { recover() }()
+	f := &a.flow
+	known := o.subagents(host.Name)
+	var p subagentFile
+	var ok bool
+	switch {
+	case f.parentCall != "":
+		if p, ok = known.get(byTaskCall, f.parentCall); !ok {
+			f.unplaced = true
+			return
+		}
+		if a.Session != "" && p.Conversation != a.Session {
+			// Its first event: what it does from now is followed, and its answer with it.
+			p.Conversation = a.Session
+			known.keep(byTaskCall, p.Call, p)
+			known.keep(byConversation, a.Session, p)
+		}
+	case f.spawner != "" && f.spawner != a.Session:
+		if p, ok = known.get(byConversation, f.spawner); !ok {
+			p, ok = subagentFile{Session: f.spawner}, true // the agent's own conversation
+		}
+	default:
+		p, ok = known.get(byConversation, a.Session)
+	}
+	if !ok {
+		return
+	}
+	if a.Rest == nil {
+		a.Rest = map[string]any{}
+	}
+	a.Rest["conversation_id"] = a.Session // its own, kept in the payload
+	a.Session, a.Subagent, a.SubagentType, a.lineage = p.Session, p.Call, p.Type, p.Lineage
 }
 
 // flowWindow is the window of the flow policy in the rules serve last left for agent, or
@@ -692,22 +782,27 @@ func (s flowStore) saturate(agent string, since int64, why string) {
 	s.put(path, everyFile{Since: since, Why: why})
 }
 
-// what is what entered agent since since: each origin with when it last entered, or, when
-// every is set, every origin, since when and why.
-func (s flowStore) what(agent string, since int64) (origins map[string]int64, every *everyFile, err error) {
-	dir := s.agentDir(agent)
+// every is since when, and why, agent has had every origin, if it has since since.
+func (s flowStore) every(agent string, since int64) (*everyFile, error) {
 	var e everyFile
-	switch err := readJSON(filepath.Join(dir, everyName), &e); {
+	switch err := readJSON(filepath.Join(s.agentDir(agent), everyName), &e); {
 	case err == nil && e.Since >= since:
-		return nil, &e, nil
+		return &e, nil
 	case err != nil && !errors.Is(err, os.ErrNotExist):
-		return nil, nil, err
+		return nil, err
 	}
+	return nil, nil
+}
+
+// recorded is each origin noted for agent since since, with when it last entered, whether
+// or not it has every origin.
+func (s flowStore) recorded(agent string, since int64) (map[string]int64, error) {
+	dir := s.agentDir(agent)
 	names, err := readNames(dir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, nil, err
+		return nil, err
 	}
-	origins = map[string]int64{}
+	origins := map[string]int64{}
 	for _, n := range names {
 		if strings.HasPrefix(n, ".") || n == everyName {
 			continue
@@ -717,12 +812,22 @@ func (s flowStore) what(agent string, since int64) (origins map[string]int64, ev
 		case errors.Is(err, os.ErrNotExist):
 			// Forgotten by a hook making room since the directory was read.
 		case err != nil:
-			return nil, nil, err
+			return nil, err
 		case o.At >= since && o.At > origins[o.Origin]:
 			origins[o.Origin] = o.At
 		}
 	}
-	return origins, nil, nil
+	return origins, nil
+}
+
+// what is what entered agent since since: each origin with when it last entered, or, when
+// every is set, every origin, since when and why.
+func (s flowStore) what(agent string, since int64) (origins map[string]int64, every *everyFile, err error) {
+	if every, err = s.every(agent, since); every != nil || err != nil {
+		return nil, every, err
+	}
+	origins, err = s.recorded(agent, since)
+	return origins, nil, err
 }
 
 // seen is what entered agent within the window, now being now: each origin once, newest
@@ -761,18 +866,24 @@ func sortedOrigins(origins map[string]int64) []string {
 // within the window enters receiver too. Each origin keeps when it entered, so passing
 // content on never makes it newer, and agents talking back and forth don't keep it alive.
 // receiver's own messages, agent:<receiver>, don't come back to it. When sender has every
-// origin, so does receiver, for as long as sender does.
+// origin, so does receiver, for as long as sender does, and what entered sender after that
+// time enters receiver as well, so it still counts once every origin no longer does.
 func (s flowStore) carry(sender, receiver string, now int64) {
-	origins, every, err := s.what(sender, now-s.window)
+	since := now - s.window
+	every, err := s.every(sender, since)
 	if err != nil {
 		return
 	}
 	if every != nil {
 		s.saturate(receiver, every.Since, carried)
+	}
+	origins, err := s.recorded(sender, since)
+	if err != nil {
 		return
 	}
 	for _, o := range sortedOrigins(origins) {
-		if o != "agent:"+receiver {
+		// What entered by the time every origin did counts no longer than every origin does.
+		if o != "agent:"+receiver && (every == nil || origins[o] > every.Since) {
 			s.note(receiver, o, origins[o], now)
 		}
 	}
@@ -810,4 +921,51 @@ func (s flowStore) answered(agentID string) (from, to string, ok bool) {
 		return "", "", false
 	}
 	return b.From, b.To, true
+}
+
+// Cursor's subagents are kept by the Task call that started each, and, once one of its own
+// events named that call, by the conversation it runs in (place). Each is kept in a
+// directory of its own under flow/, which serve forgets once it's been left a day, as it
+// forgets a session's.
+const (
+	byTaskCall     = "task call"
+	byConversation = "conversation"
+)
+
+// A subagentFile is a subagent Cursor started with a Task call: the call, the session of
+// the agent that started it, its type, the agent it is and the agent it answers, as the
+// flow policy names them, what started it, outermost first, and, once one of its events
+// named the call, its conversation.
+type subagentFile struct {
+	Call         string   `json:"call"`
+	Session      string   `json:"session"`
+	Type         string   `json:"type"`
+	From         string   `json:"from"`
+	To           string   `json:"to"`
+	Lineage      []string `json:"lineage"`
+	Conversation string   `json:"conversation,omitempty"`
+}
+
+// subagents is where one host's subagents are kept, in the flow directory.
+type subagents struct {
+	root flowStore
+	host string
+}
+
+func (o Options) subagents(host string) subagents {
+	return subagents{root: flowStore{dir: filepath.Join(o.Dir, flowDir)}, host: host}
+}
+
+func (k subagents) path(by, id string) string {
+	return filepath.Join(k.root.dir, name(k.host, by, id), "subagent")
+}
+
+// get is the subagent kept by id, a Task call's or a conversation's.
+func (k subagents) get(by, id string) (p subagentFile, ok bool) {
+	ok = id != "" && readJSON(k.path(by, id), &p) == nil
+	return p, ok
+}
+
+func (k subagents) keep(by, id string, p subagentFile) {
+	k.root.put(k.path(by, id), p)
 }
