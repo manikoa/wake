@@ -3,8 +3,10 @@ calls it never sees, with the origins Wake saw enter each agent. See docs/flow-e
 
 wake-proxy serves the policy it enforces with the brake's rules (wake.quarantine), and each
 integration checks it where it checks halts (wake.stop), once they let the call through:
-before a tool call, a handoff, and the start of an agent's run. A rule decides on what
-entered the calling agent within the policy's window, as wake-proxy's rules do:
+before a tool call, a handoff, and the start of an agent's run. The memory adapter
+(wake.memory) checks the rules that name stores before each write, delete and rollback,
+which never pass wake-proxy. A rule decides on what entered the calling agent within the
+policy's window, as wake-proxy's rules do:
 
 - a tool's result enters the agent that called it as tool:<name>, an MCP tool by its MCP
   name, as wake-proxy records it;
@@ -58,22 +60,26 @@ UNLABELED = "memory:unlabeled"
 SATURATED = "more origins entered it than Wake keeps"
 OVERFLOWED = "too many agents to remember this one"
 CARRIED = "a message or reply reached it from one with every origin"
+UNKNOWN = "Wake can't tell which agent is acting"
 
-_LISTS = ("callers", "receivers", "path_prefixes", "tools", "forbid_origins", "allow_origins")
+_LISTS = ("callers", "receivers", "path_prefixes", "tools", "stores", "forbid_origins", "allow_origins")
 # The lists whose entries may be a prefix ending in *; the rest are exact.
-_PATTERNS = frozenset({"tools", "forbid_origins", "allow_origins"})
+_PATTERNS = frozenset({"tools", "stores", "forbid_origins", "allow_origins"})
 _ID = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 
 
 class Rule(NamedTuple):
     """One rule: the calls it applies to, and the origins it keeps from them. An empty list
-    leaves that out, so a rule naming no callers applies to every caller."""
+    leaves that out, so a rule naming no callers applies to every caller. A rule naming
+    stores applies only to changes to those memory stores, and a rule naming none never
+    does."""
 
     id: str
     callers: tuple[str, ...] = ()
     receivers: tuple[str, ...] = ()
     path_prefixes: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
+    stores: tuple[str, ...] = ()
     forbid_origins: tuple[str, ...] = ()
     allow_origins: tuple[str, ...] = ()
 
@@ -116,32 +122,37 @@ class Policy:
         self.version = version
         self.unreadable = unreadable
 
-    def deciding(self, caller: str, lineage: Iterable[str], seen: Seen, *, tool: str | None = None,
-                 receiver: str | None = None) -> Denial | None:
+    def deciding(self, caller: str | None, lineage: Iterable[str], seen: Seen, *, tool: str | None = None,
+                 receiver: str | None = None, store: str | None = None) -> Denial | None:
         """The first rule that refuses a call by caller, given what entered it, or None to let
         it through. lineage names the agents caller acts under, such as those that started it.
-        The call is a tool call (tool), or reaches another agent (receiver), as a message, a
-        handoff or the start of its run does.
+        A caller of None is one Wake can't name, which any rule's callers could be, as for
+        wake-proxy. The call is a tool call (tool), reaches another agent (receiver), as a
+        message, a handoff or the start of its run does, or changes a memory store (store): a
+        write, a delete or a rollback.
 
         A tool call meets the rules wake-proxy applies to an MCP call: first those naming no
-        tools that name no receivers or path_prefixes, which its ext_authz applies to every
-        call, then those whose tools match the tool. Reaching an agent meets those naming no
-        tools or path_prefixes whose receivers are empty or name it. A rule for paths only
-        ever meets HTTP requests at wake-proxy. Each is in file order."""
+        tools that name no receivers, path_prefixes or stores, which its ext_authz applies to
+        every call, then those whose tools match the tool. Reaching an agent meets those
+        naming no tools, path_prefixes or stores whose receivers are empty or name it. A
+        change to a store meets only those whose stores match it. A rule for paths only ever
+        meets HTTP requests at wake-proxy. Each is in file order."""
         if self.unreadable is not None:
             return Denial(UNREADABLE, ())
-        if (tool is None) == (receiver is None):
-            raise ValueError("a call is a tool call or reaches an agent")
+        if sum(call is not None for call in (tool, receiver, store)) != 1:
+            raise ValueError("a call is a tool call, reaches an agent or changes a store")
         if tool is not None:
-            rules = [r for r in self.rules if not (r.tools or r.receivers or r.path_prefixes)]
+            rules = [r for r in self.rules if not (r.tools or r.receivers or r.path_prefixes or r.stores)]
             rules += [r for r in self.rules if any(_matches(p, tool) for p in r.tools)]
+        elif receiver is not None:
+            rules = [r for r in self.rules if not (r.tools or r.path_prefixes or r.stores)
+                     and (not r.receivers or receiver in r.receivers)]
         else:
-            rules = [r for r in self.rules
-                     if not (r.tools or r.path_prefixes) and (not r.receivers or receiver in r.receivers)]
+            rules = [r for r in self.rules if any(_matches(p, store) for p in r.stores)]
         names = {caller, *lineage}
         for rule in rules:
             # A rule for an agent covers the calls made under it, a subagent's included.
-            if rule.callers and names.isdisjoint(rule.callers):
+            if rule.callers and caller is not None and names.isdisjoint(rule.callers):
                 continue
             if seen.every is not None:
                 return Denial(f"policy:{rule.id}", ("*",), seen.every)
@@ -160,9 +171,10 @@ def parse(value: Any) -> Policy:
     """A policy, as wake-proxy serves it, checked as wake-proxy checks its file
     (proxy/src/policy.rs). Raises ValueError, saying why, for one wake-proxy wouldn't take: a
     field it doesn't know, a value of the wrong type, a rule that keeps nothing, names tools
-    with receivers or path_prefixes, or has an id that isn't 1 to 64 of A-Z a-z 0-9 . _ : - or
-    that another rule has, an entry that's empty or has a * anywhere a pattern can't, or a
-    window outside 1 to 86,400 seconds."""
+    with receivers or path_prefixes, names stores with tools, receivers or path_prefixes, or
+    has an id that isn't 1 to 64 of A-Z a-z 0-9 . _ : - or that another rule has, an entry
+    that's empty or has a * anywhere a pattern can't, or a window outside 1 to 86,400
+    seconds."""
     if not isinstance(value, Mapping):
         raise ValueError("a policy must be a JSON object")
     unknown = sorted(set(value) - {"version", "window_seconds", "rules"})
@@ -211,6 +223,8 @@ def _rule(value: Any) -> Rule:
         raise ValueError(f"rule {rule_id} keeps nothing: give it forbid_origins or allow_origins")
     if lists["tools"] and (lists["receivers"] or lists["path_prefixes"]):
         raise ValueError(f"rule {rule_id} names tools with receivers or path_prefixes")
+    if lists["stores"] and (lists["tools"] or lists["receivers"] or lists["path_prefixes"]):
+        raise ValueError(f"rule {rule_id} names stores with tools, receivers or path_prefixes: a memory write has none")
     return Rule(rule_id, **lists)
 
 
@@ -250,9 +264,20 @@ def _policy(quarantine: Any) -> Policy | None:
         _last = (value, policy)
         why = policy.unreadable if policy is not None else None
         if why is not None and why != _warned:
-            log.warning("wake: %s; refusing every tool call, handoff and run start until it can be used", why)
+            log.warning("wake: %s; refusing every tool call, handoff, run start and memory write until it can be "
+                        "used", why)
         _warned = why
     return policy
+
+
+def enforcing(quarantine: Any) -> bool:
+    """Whether the brake's rules carry a flow policy, one that can be used or not. Never
+    raises: rules that can't say whether they do are taken to, so the check that follows
+    fails closed."""
+    try:
+        return quarantine is not None and _policy(quarantine) is not None
+    except Exception:
+        return True
 
 
 class HeldBack(Refusal):
@@ -268,14 +293,17 @@ class HeldBack(Refusal):
         return held
 
 
-def refusal(quarantine: Any, who: str, caller: str, lineage: Iterable[str] = (), *, tool: str | None = None,
-            receiver: str | None = None, outcome: str = "this tool call wasn't run") -> HeldBack | None:
+def refusal(quarantine: Any, who: str, caller: str | None, lineage: Iterable[str] = (), *, tool: str | None = None,
+            receiver: str | None = None, store: str | None = None,
+            outcome: str = "this tool call wasn't run") -> HeldBack | None:
     """The refusal of a call caller is about to make, if the flow policy in the brake's rules
-    holds it back: a tool call (tool), or reaching another agent (receiver). who is caller as
-    the agent is told, such as the instance it is. lineage names the agents caller acts under:
-    the agent and instances that started it, each instance <agent>#<id> acting as its agent
-    too. None without rules, or when they carry no policy. Never raises: when the check itself
-    fails, it refuses, as a policy that can't be read does."""
+    holds it back: a tool call (tool), reaching another agent (receiver), or a change to a
+    memory store (store). who is caller as the agent is told, such as the instance it is.
+    lineage names the agents caller acts under: the agent and instances that started it, each
+    instance <agent>#<id> acting as its agent too. A caller of None is one Wake can't tell: it
+    counts as having every origin, and any rule's callers could be it. None without rules, or
+    when they carry no policy. Never raises: when the check itself fails, it refuses, as a
+    policy that can't be read does."""
     if quarantine is None:
         return None
     try:
@@ -287,7 +315,8 @@ def refusal(quarantine: Any, who: str, caller: str, lineage: Iterable[str] = (),
         origins = entered()
         origins.set_window(policy.window_seconds)
         acting = {name for n in lineage for name in (n, _agent_of(n))}
-        denial = policy.deciding(caller, acting, origins.seen(caller), tool=tool, receiver=receiver)
+        seen = Seen((), UNKNOWN) if caller is None else origins.seen(caller)
+        denial = policy.deciding(caller, acting, seen, tool=tool, receiver=receiver, store=store)
     except Exception:
         log.warning("wake: couldn't check the flow policy for %s; refusing", who, exc_info=True)
         return HeldBack(UNREADABLE, f"Wake's flow policy can't be read, so {outcome}.")

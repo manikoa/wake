@@ -1,5 +1,5 @@
 {
-  "description": "Flow policy decisions every enforcer must make alike: wake-proxy (proxy/src/policy.rs) and both SDKs' checks in the agent's own process (docs/flow-everywhere.md). A case is a policy, a call and the origins that entered its caller within the window, newest first, or \"*\" for every origin. denied_by is the rule that must deny it, or null, and kept the origins behind the call that rule keeps from it. A call is a tool call (tool) or an agent being reached (receiver): a message, a handoff or a start. lineage is the agents the caller acts under, outermost first. invalid holds policies every enforcer must refuse, which then deny every call.",
+  "description": "Flow policy decisions every enforcer must make alike: wake-proxy (proxy/src/policy.rs) and both SDKs' checks in the agent's own process (docs/flow-everywhere.md). A case is a policy, a call and the origins that entered its caller within the window, newest first, or \"*\" for every origin. denied_by is the rule that must deny it, or null, and kept the origins behind the call that rule keeps from it. A call is a tool call (tool), an agent being reached (receiver): a message, a handoff or a start, or a change to a memory store (store): a write, a delete or a rollback, which only the SDKs' memory adapters see, so wake-proxy only checks that no rule naming stores holds its own calls. lineage is the agents the caller acts under, outermost first. invalid holds policies every enforcer must refuse, which then deny every call.",
   "policies": {
     "empty": {"window_seconds": 900, "rules": []},
     "pay": {
@@ -28,7 +28,9 @@
       "window_seconds": 900,
       "rules": [
         {"id": "no-pay-from-unlabeled-memory", "tools": ["pay"], "forbid_origins": ["memory:unlabeled"]},
-        {"id": "notify-from-our-own", "receivers": ["notify"], "allow_origins": ["agent:billing", "tool:lookup_order"]}
+        {"id": "notify-from-our-own", "receivers": ["notify"], "allow_origins": ["agent:billing", "tool:lookup_order"]},
+        {"id": "no-web-into-facts", "stores": ["facts", "customers/*"], "forbid_origins": ["tool:fetch_page", "memory:unlabeled"]},
+        {"id": "ledger-from-orders-only", "callers": ["billing"], "stores": ["ledger"], "allow_origins": ["tool:lookup_order", "agent:support"]}
       ]
     }
   },
@@ -59,14 +61,30 @@
     {"name": "a later rule denies what an earlier one keeps nothing from", "policy": "order", "caller": "billing", "lineage": [], "tool": "refund", "origins": ["tool:search"], "denied_by": "policy:no-refunds-after-anything", "kept": ["tool:search"]},
     {"name": "unlabeled memory can be named", "policy": "memory", "caller": "billing", "lineage": [], "tool": "pay", "origins": ["memory:unlabeled", "tool:lookup_order"], "denied_by": "policy:no-pay-from-unlabeled-memory", "kept": ["memory:unlabeled"]},
     {"name": "an allowlist keeps unlabeled memory without naming it", "policy": "memory", "caller": "support", "lineage": [], "receiver": "notify", "origins": ["tool:lookup_order", "memory:unlabeled"], "denied_by": "policy:notify-from-our-own", "kept": ["memory:unlabeled"]},
-    {"name": "and passes origins a label carried in from memory when it lists them", "policy": "memory", "caller": "support", "lineage": [], "receiver": "notify", "origins": ["agent:billing", "tool:lookup_order"], "denied_by": null, "kept": []}
+    {"name": "and passes origins a label carried in from memory when it lists them", "policy": "memory", "caller": "support", "lineage": [], "receiver": "notify", "origins": ["agent:billing", "tool:lookup_order"], "denied_by": null, "kept": []},
+    {"name": "a fetched page keeps an agent from writing to a store a rule names", "policy": "memory", "caller": "research", "lineage": [], "store": "facts", "origins": ["tool:fetch_page", "tool:search"], "denied_by": "policy:no-web-into-facts", "kept": ["tool:fetch_page"]},
+    {"name": "a prefix pattern covers a store's namespaces", "policy": "memory", "caller": "support", "lineage": [], "store": "customers/42", "origins": ["memory:unlabeled"], "denied_by": "policy:no-web-into-facts", "kept": ["memory:unlabeled"]},
+    {"name": "a store no rule names takes the write", "policy": "memory", "caller": "research", "lineage": [], "store": "scratch", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "an allowlist for a store passes what it lists", "policy": "memory", "caller": "billing", "lineage": [], "store": "ledger", "origins": ["tool:lookup_order", "agent:support"], "denied_by": null, "kept": []},
+    {"name": "and keeps what it doesn't from the agents it names, their sub-agents included", "policy": "memory", "caller": "billing/refunds", "lineage": ["billing"], "store": "ledger", "origins": ["agent:research", "tool:lookup_order"], "denied_by": "policy:ledger-from-orders-only", "kept": ["agent:research"]},
+    {"name": "a rule for a store's writers doesn't hold another agent", "policy": "memory", "caller": "support", "lineage": [], "store": "ledger", "origins": ["agent:research"], "denied_by": null, "kept": []},
+    {"name": "every origin is kept from a store a rule names", "policy": "memory", "caller": "notify", "lineage": [], "store": "facts", "origins": "*", "denied_by": "policy:no-web-into-facts", "kept": ["*"]},
+    {"name": "a rule for stores doesn't hold a tool call", "policy": "memory", "caller": "research", "lineage": [], "tool": "summarize", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "nor reaching another agent", "policy": "memory", "caller": "research", "lineage": [], "receiver": "support", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "a rule naming no stores doesn't hold a memory write", "policy": "quiet", "caller": "research", "lineage": [], "store": "facts", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []},
+    {"name": "nor does a rule for tools", "policy": "pay", "caller": "billing", "lineage": [], "store": "ledger", "origins": ["tool:fetch_page"], "denied_by": null, "kept": []}
   ],
   "invalid": [
     {"name": "a rule that keeps nothing", "policy": {"rules": [{"id": "x", "tools": ["pay"]}]}},
-    {"name": "a field no enforcer knows", "policy": {"rules": [{"id": "x", "forbid_origins": ["*"], "stores": ["facts"]}]}},
+    {"name": "a field no enforcer knows", "policy": {"rules": [{"id": "x", "forbid_origins": ["*"], "actions": ["write"]}]}},
     {"name": "a top-level field no enforcer knows", "policy": {"rules": [], "mode": "audit"}},
     {"name": "tools with receivers", "policy": {"rules": [{"id": "x", "tools": ["pay"], "receivers": ["billing"], "forbid_origins": ["*"]}]}},
     {"name": "tools with path prefixes", "policy": {"rules": [{"id": "x", "tools": ["pay"], "path_prefixes": ["/a"], "forbid_origins": ["*"]}]}},
+    {"name": "stores with tools", "policy": {"rules": [{"id": "x", "stores": ["facts"], "tools": ["pay"], "forbid_origins": ["*"]}]}},
+    {"name": "stores with receivers", "policy": {"rules": [{"id": "x", "stores": ["facts"], "receivers": ["billing"], "forbid_origins": ["*"]}]}},
+    {"name": "stores with path prefixes", "policy": {"rules": [{"id": "x", "stores": ["facts"], "path_prefixes": ["/a"], "forbid_origins": ["*"]}]}},
+    {"name": "a wildcard not at the end of a store", "policy": {"rules": [{"id": "x", "stores": ["cust*s"], "forbid_origins": ["*"]}]}},
+    {"name": "an empty store", "policy": {"rules": [{"id": "x", "stores": [""], "forbid_origins": ["*"]}]}},
     {"name": "an id with a space", "policy": {"rules": [{"id": "no pay", "forbid_origins": ["*"]}]}},
     {"name": "an empty id", "policy": {"rules": [{"id": "", "forbid_origins": ["*"]}]}},
     {"name": "an id over 64", "policy": {"rules": [{"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "forbid_origins": ["*"]}]}},

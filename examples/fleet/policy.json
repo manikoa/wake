@@ -1,0 +1,6 @@
+{
+  "window_seconds": 120,
+  "rules": [
+    {"id": "no-payments-from-the-web", "callers": ["billing"], "tools": ["refund"], "forbid_origins": ["tool:fetch_page"]}
+  ]
+}

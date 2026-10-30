@@ -1,6 +1,6 @@
 # Flow policies everywhere an agent acts
 
-Decided October 30, 2026, by the founder, building ahead into Contain.
+Decided October 30, 2026, by the founder, building ahead into Contain. What that first left out was added the same day, by the same decision ([below](#what-it-left-out-added-the-same-day)).
 
 ## The question
 
@@ -29,7 +29,7 @@ A flow policy keeps content from an untrusted origin, such as a page a tool fetc
 
 3. **It fails closed where the proxy does.** Rules gone stale already refuse every call (`stale-rules`), and the flow policy comes with them. An unreadable policy refuses every call as `policy:unreadable-policy`. Past 256 origins within the window, an agent counts as having every origin, and any rule that applies denies.
 
-4. **One set of test vectors decides the same calls everywhere.** `sdk/testdata/flow_policy.json` holds policies and calls (caller, lineage, tool or receiver, origins) with the decision each must get. wake-proxy's tests, the Python SDK's and the TypeScript SDK's all read it, so the three can't drift apart.
+4. **One set of test vectors decides the same calls everywhere.** `sdk/testdata/flow_policy.json` holds policies and calls (caller, lineage, tool, receiver or store, origins) with the decision each must get. wake-proxy's tests, the Python SDK's, the TypeScript SDK's and `wake-hook`'s all read it, so they can't drift apart.
 
 5. **The proxy becomes the only way out of the reference fleet.** The agents' networks are `internal`, so the only places an agent reaches are agentgateway, the collector, the identity provider and the fleet's own stand-ins. The end-to-end test checks that no agent reaches the internet, the Docker host, or a port it shouldn't. `deploy/README.md` gains a "Before production" item for the same egress rule, with an example Kubernetes NetworkPolicy.
 
@@ -37,9 +37,25 @@ A flow policy keeps content from an untrusted origin, such as a page a tool fetc
 
 The architecture's rule is that anything an agent can switch off may only capture. That still holds for every decision here: the policy is set and served out of band, and wake-proxy goes on enforcing it where an agent can't reach. The SDK's check is a second layer for the calls wake-proxy never sees, as the SDKs' halts already are. A compromised agent can switch it off, which is why the proxy and the network stay the backstop: a refusal in the process stops a well-behaved agent fooled by what it read, and the egress rule stops a compromised one from going around the proxy.
 
-## Not in this change
+## What it left out, added the same day
 
-- **Coding agents' hooks.** `wake-hook` can refuse a tool call, so it can apply the same policy once [#74](https://github.com/usewake/wake/pull/74) merges.
-- **Rules for memory writes.** Refusing untrusted content into trusted memory stays the write gate's job, in code, until declarative rules for stores are designed.
-- **Hosted tools**, such as the OpenAI Agents SDK's web search, run at the provider, out of the process's reach.
-- **Model calls in the fleet's `real` mode.** They need a route through agentgateway to a model provider before the agents' networks can close in that mode too.
+6. **Rules for memory writes.** A rule may name `stores`, each exact or a prefix ending in `*`: a store as the memory adapter names it, such as a LangGraph namespace joined with `/`, or `file` for memory files. Such a rule holds every write, delete and rollback in a matching store, by a matching caller, and decides on what had entered the caller, as for a tool call. The memory adapter checks it after the brake's quarantines and before the app's write gate, and a refusal is the adapter's own (`MemoryLocked`), recorded as a `denied` event under `policy:<id>` with the origins behind it. A rule naming stores can't name tools, receivers or paths, and a rule naming no stores never holds a memory change, so a policy written before stores keeps its meaning. A policy that can't be used refuses every memory change too. wake-proxy never sees these changes: it reads and serves the rules, and holds none of its own calls to them.
+
+7. **Hosted tools.** A tool the provider runs inside the model call, such as the OpenAI Agents SDK's web search, can't be refused one call at a time in the agent's process. So, in the OpenAI Agents SDK integrations:
+   - What one brings in enters the agent as `tool:<name>`, by the hosted tool's name (`tool:web_search`), once the response is in and before anything that follows from it. When the trace leaves the response out, Wake can't see which ran, so it notes every hosted tool the agent offered that call. The TypeScript SDK hands Wake a response's end a moment after the run goes on, so there each check first waits, up to 5 seconds, for the end of every response of the agent's run, and refuses past that.
+   - Before each model call, `guard()` checks each hosted tool the agent offers, as a tool call by that agent: the halts, then the flow policy. If any is held back, the model call isn't made, and the run stops with the refusal, since the provider would run the tool unchecked. Each is recorded as a `denied` event.
+   - A hosted MCP tool is checked per call: `guard()` makes it ask before every call, and answers from the halts and the flow policy, then from the tool's own approval callback if it has one. A call it lets through enters the agent as the MCP tool's own name. One whose calls the app approves through the run's interruptions is left as it is: Wake can't answer for a person.
+
+8. **Coding agents.** `wake-hook` applies the policy to the calls its host makes, after the halts, on #74's branch (`docs/hooks.md`, "The flow policy"). Each hook is a process of its own, so what entered each agent of a session is kept in files, one per origin. MCP tools go by their own names, as wake-proxy names them. A Claude Code subagent starts with what had entered the agent starting it, and its answer brings back what entered it, as in the Claude Agent SDK integration. A Codex session and its subagents count as one agent, since its hooks don't say when a subagent starts or answers, and a Cursor subagent's start is checked, though nothing ties its own events to the agent that started it. The same change fixes `wake-hook serve` fetching the rules from wake-proxy's address rather than `/v1/memory`, and a restart leaving hooks on stale rules for good.
+
+9. **Model calls through agentgateway.** The reference fleet's `real` mode sends research's and billing's model calls to agentgateway's `openai` and `anthropic` routes, which add the provider's key (`examples/fleet/models.yaml`), so no agent holds one, and every agent's network stays internal in that mode too. The gateway's deny lever covers those calls: a halted agent's model calls are denied. `deploy/README.md` says to route model calls the same way.
+
+10. **A flow policy in the reference fleet's scenario.** The staging recorder now runs wake-proxy with `--policy-file`, a policy with no rules unless `WAKE_POLICY` names another. `run.sh` sends the customer's request as before, then the same request with `examples/fleet/policy.json` in force, once wake-proxy has watched for a whole window. Its rule keeps content from `fetch_page` from triggering billing's `refund` calls, and `check.py` checks that wake-proxy refused both, the $500 the page asked for and the $80 the customer did, which came in the same message, and traces the refused payment back to the page.
+
+## Not covered yet
+
+- **Claude's server tools**, which Anthropic runs inside the model call. Claude Code has no hook before a model call, so they can't be checked in the agent's process, and what they bring in is noted as the stream shows it, which can be after the agent's next call.
+- **What a model call asks for.** wake-proxy decides on who makes a model call through the gateway, not on what it asks the model, such as the hosted tools it offers.
+- **A hosted MCP tool approved through interruptions**, as above, and in the TypeScript SDK one the app approved for good, or one found through deferred tool search.
+- **Cursor's subagents:** what enters one isn't carried back to the agent that started it.
+- **Carrying every origin.** When a message comes from an agent with every origin, an origin that entered the sender later isn't carried with it: wake-proxy, the SDKs and `wake-hook` alike.

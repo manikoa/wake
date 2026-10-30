@@ -17,7 +17,7 @@ import { tool } from "@langchain/core/tools";
 import { InMemoryStore } from "@langchain/langgraph";
 import { z } from "zod";
 
-import { entered, parsePolicy, UNLABELED } from "../src/flow.ts";
+import { entered, MAX_ORIGINS, parsePolicy, SATURATED, UNKNOWN, UNLABELED, UNREADABLE } from "../src/flow.ts";
 import { AgentHalted, WakeCallbackHandler, WakeStore } from "../src/langgraph.ts";
 import { contentOf, digest, GATE_DENIED, LABEL_KEY, LABEL_SUFFIX, MAX_HISTORY, Memory, MemoryLocked } from "../src/memory.ts";
 import type { Quarantine } from "../src/quarantine.ts";
@@ -757,4 +757,215 @@ test("an entry the quarantine doesn't serve brings nothing in", async () => {
   const session = new Session("mem-hidden-reader");
   assert.equal(await new WakeStore(inner, new Memory(session.handler, { quarantine })).get(["facts"], "planted"), null);
   assert.deepEqual(entered.seen("mem-hidden-reader"), []);
+});
+
+// Flow rules for memory stores: what entered the agent making a change holds it.
+
+const WEB_INTO_FACTS = {
+  window_seconds: 900,
+  rules: [{ id: "no-web-into-facts", stores: ["facts", "customers/*", "file"], forbid_origins: ["tool:fetch_page", "memory:unlabeled"] }],
+};
+
+/** The brake's rules, as a Quarantine holds them: locking what lockedBy says, hiding nothing, and serving this flow policy, if any. */
+function flowing(policy: unknown, { lockedBy = null, flow }: { lockedBy?: string | null; flow?: () => unknown } = {}): Quarantine {
+  const parsed = policy === undefined ? undefined : parsePolicy(policy);
+  return { lockedBy: () => lockedBy, hiding: () => null, track: async () => true, halted: () => null, flow: flow ?? (() => parsed) } as unknown as Quarantine;
+}
+
+const fetchPage = tool(async () => PAGE, { name: "fetch_page", description: "Fetch a web page.", schema: z.object({ url: z.string() }) });
+
+/** Runs fn in a named run of agent, after its tool fetched a page, so tool:fetch_page entered it. */
+async function afterThePage<T>(session: Session, agent: string, fn: () => Promise<T>): Promise<T> {
+  return session.handler.agent(agent, { input: "Read Acme's billing page", origin: "user" }, async () => {
+    await fetchPage.invoke({ url: "https://acme.example/billing" }, { callbacks: [session.handler] });
+    return fn();
+  });
+}
+
+/** Checks a refusal under the flow policy is recorded as write-gate refusals are, with what its rule kept. */
+function refusedUnder(denied: Parameters<typeof payload>[0], [store, entry, action, halt]: [string, string, string, string], kept: string[]): void {
+  assert.equal(attr(denied, "wake.event.kind"), "denied");
+  assert.equal(attr(denied, "wake.capture"), "memory_adapter");
+  assert.deepEqual([attr(denied, "wake.memory.store"), attr(denied, "wake.memory.entry"), attr(denied, "wake.memory.refused")], [store, entry, action]);
+  assert.equal(attr(denied, "wake.brake.halt_id"), halt);
+  assert.deepEqual(payload(denied).origins, kept);
+  assert.ok(!("every_origin" in payload(denied)), "only when every origin");
+}
+
+const lockedBy = (halt: string) => (e: unknown) => e instanceof MemoryLocked && e.quarantine === halt;
+
+test("a flow rule keeps what entered an agent out of the stores it names, and records each refusal", async () => {
+  const session = new Session("mem-flow-app");
+  const memory = new Memory(session.handler, { quarantine: flowing(WEB_INTO_FACTS) });
+  const inner = new InMemoryStore();
+  const store = new WakeStore(inner, memory);
+  const dir = await temporary();
+  const notes = join(dir, "notes.md");
+  // Written before any page entered the clerk: nothing entered it, so the rule keeps nothing.
+  await session.handler.agent("mem-flow-clerk", async () => {
+    await store.put(["facts"], "acme", { text: "Acme's account is 123." });
+    await store.put(["facts"], "acme", { text: "Acme's account is 124." });
+    await memory.writeFile(notes, "v1: pay Acme's account 123");
+    await memory.writeFile(notes, "v2: pay Acme's account 124");
+  });
+  const before = (await session.events("memory_write")).length;
+  assert.equal(before, 4);
+
+  const refusedBy = lockedBy("policy:no-web-into-facts");
+  await afterThePage(session, "mem-flow-research", async () => {
+    assert.deepEqual(entered.seen("mem-flow-research"), ["tool:fetch_page"]);
+    await assert.rejects(memory.write("facts", "acme-bank", PAGE), refusedBy, "a generic write");
+    await assert.rejects(memory.delete("customers/42", "acme"), refusedBy, "a delete, by a prefix pattern");
+    await assert.rejects(store.rollback(["facts"], "acme"), refusedBy, "a rollback");
+    await assert.rejects(memory.writeFile(notes, PAGE), refusedBy, "a memory file");
+    await assert.rejects(memory.rollbackFile(notes), refusedBy, "a memory file's rollback");
+    await assert.rejects(
+      store.batch([
+        { namespace: ["scratch"], key: "a", value: { text: "fine on its own" } },
+        { namespace: ["customers", "42"], key: "b", value: { text: PAGE } },
+      ]),
+      refusedBy,
+      "a batch with one change the rule holds",
+    );
+    // A store no rule names takes the write, and reads aren't changes.
+    await memory.write("scratch", "page", PAGE);
+    assert.deepEqual((await store.get(["facts"], "acme"))!.value, { text: "Acme's account is 124." });
+  });
+
+  // Nothing refused was written, nor does the log say it was.
+  assert.equal((await inner.get(["facts"], "acme"))!.value.text, "Acme's account is 124.", "not rolled back");
+  assert.equal(await inner.get(["scratch"], "a"), null, "the batch ran none of it");
+  assert.equal(await readFile(notes, "utf8"), "v2: pay Acme's account 124");
+  const writes = await session.events("memory_write");
+  assert.deepEqual(writes.slice(before).map((w) => attr(w, "wake.memory.store")), ["scratch"]);
+
+  const denied = await session.events("denied");
+  const file = await realpath(notes);
+  const expected: [string, string, string, string][] = [
+    ["facts", "acme-bank", "write", "policy:no-web-into-facts"],
+    ["customers/42", "acme", "delete", "policy:no-web-into-facts"],
+    ["facts", "acme", "write", "policy:no-web-into-facts"],
+    ["file", file, "write", "policy:no-web-into-facts"],
+    ["file", file, "write", "policy:no-web-into-facts"],
+    ["customers/42", "b", "write", "policy:no-web-into-facts"],
+  ];
+  assert.equal(denied.length, expected.length);
+  for (const [n, refusal] of expected.entries()) refusedUnder(denied[n], refusal, ["tool:fetch_page"]);
+  assert.ok(denied.every((d) => attr(d, "wake.agent.id") === "mem-flow-research"), "in the name of the agent making the change");
+});
+
+test("a change refused in a tool call descends from it", async () => {
+  const session = new Session("mem-flow-tool-app");
+  const memory = new Memory(session.handler, { quarantine: flowing(WEB_INTO_FACTS) });
+  const remember = tool(async ({ note }) => (await memory.write("facts", "acme", note), "Noted."), {
+    name: "remember",
+    description: "Note something down.",
+    schema: z.object({ note: z.string() }),
+  });
+  await afterThePage(session, "mem-flow-noter", () =>
+    assert.rejects(remember.invoke({ note: PAGE }, { callbacks: [session.handler] }), lockedBy("policy:no-web-into-facts")),
+  );
+  const [denied] = await session.events("denied");
+  const toolCall = (await session.events("tool_call")).find((e) => attr(e, "gen_ai.tool.name") === "remember")!;
+  refusedUnder(denied, ["facts", "acme", "write", "policy:no-web-into-facts"], ["tool:fetch_page"]);
+  assert.deepEqual(parents(denied), [id(toolCall)]);
+  assert.equal(denied.spanContext().traceId, toolCall.spanContext().traceId);
+});
+
+test("a flow rule for a store's writers holds the runs they start, and every origin is kept", async () => {
+  const policy = { rules: [{ id: "ledger-from-orders-only", callers: ["mem-flow-lead"], stores: ["ledger"], allow_origins: ["tool:lookup_order"] }] };
+  const session = new Session("mem-flow-lead-app");
+  const memory = new Memory(session.handler, { quarantine: flowing(policy) });
+  // The lead read a page, and started a run of the clerk, which starts with what entered the lead.
+  await afterThePage(session, "mem-flow-lead", () =>
+    session.handler.agent("mem-flow-ledger-clerk", { input: "Book the payment." }, async () => {
+      await assert.rejects(memory.write("ledger", "acme", "paid 10,000"), lockedBy("policy:ledger-from-orders-only"));
+    }),
+  );
+  // On its own, the clerk isn't the lead: the rule doesn't hold it.
+  entered.note("mem-flow-ledger-clerk", "tool:fetch_page");
+  await session.handler.agent("mem-flow-ledger-clerk", () => memory.write("ledger", "acme", "paid 10,000"));
+  const [denied] = await session.events("denied");
+  refusedUnder(denied, ["ledger", "acme", "write", "policy:ledger-from-orders-only"], ["agent:mem-flow-lead", "tool:fetch_page"]);
+  assert.match(attr(denied, "wake.agent.instance") as string, /^mem-flow-ledger-clerk#/);
+
+  // Past its bound of origins, an agent has every origin, and the rule keeps them all.
+  for (let i = 0; i <= MAX_ORIGINS; i++) entered.note("mem-flow-busy", `tool:t${i}`);
+  const busy = new Memory(session.handler, { quarantine: flowing(WEB_INTO_FACTS) });
+  await session.handler.agent("mem-flow-busy", () => assert.rejects(busy.write("facts", "acme", "x"), lockedBy("policy:no-web-into-facts")));
+  const every = (await session.events("denied")).at(-1)!;
+  assert.deepEqual(payload(every).origins, ["*"]);
+  assert.equal(payload(every).every_origin, SATURATED);
+});
+
+test("the quarantine is checked before the flow policy, and the flow policy before the gate", async () => {
+  const session = new Session("mem-flow-order-app");
+  const asked: string[] = [];
+  const gate = (store: string, entry: string) => (asked.push(`${store}/${entry}`), !entry.startsWith("refused"));
+  const locked = new Memory(session.handler, { quarantine: flowing(WEB_INTO_FACTS, { lockedBy: "q1" }), gate });
+  const memory = new Memory(session.handler, { quarantine: flowing(WEB_INTO_FACTS), gate });
+  await afterThePage(session, "mem-flow-order", async () => {
+    await assert.rejects(locked.write("facts", "acme", PAGE), lockedBy("q1"), "a locked agent is refused by its lock");
+    await assert.rejects(memory.write("facts", "acme", PAGE), lockedBy("policy:no-web-into-facts"));
+    assert.deepEqual(asked, [], "the gate isn't asked about what the quarantine or the flow policy refuses");
+    await memory.write("scratch", "acme", PAGE);
+    await assert.rejects(memory.write("scratch", "refused", PAGE), lockedBy(GATE_DENIED), "what the flow policy passes, the gate still judges");
+    assert.deepEqual(asked, ["scratch/acme", "scratch/refused"]);
+  });
+  const denied = await session.events("denied");
+  assert.deepEqual(denied.map((d) => attr(d, "wake.brake.halt_id")), ["q1", "policy:no-web-into-facts", GATE_DENIED], "one record for each, by what refused it");
+  assert.ok(!("origins" in payload(denied[0])) && !("origins" in payload(denied[2])), "origins are the flow policy's to say");
+});
+
+test("a flow policy that can't be used, or a check that fails, refuses every change; none served changes nothing", async () => {
+  const session = new Session("mem-flow-broken-app");
+  const inner = new InMemoryStore();
+  const unreadable = new WakeStore(inner, new Memory(session.handler, { quarantine: flowing({ unreadable: true }) }));
+  const invalid = new Memory(session.handler, { quarantine: flowing({ rules: [{ id: "x", stores: ["facts"], tools: ["pay"], forbid_origins: ["*"] }] }) });
+  const throwing = new Memory(session.handler, {
+    quarantine: flowing(undefined, {
+      flow: () => {
+        throw new Error("the rules can't be read");
+      },
+    }),
+  });
+  await session.handler.agent("mem-flow-clean", async () => {
+    // Nothing entered this agent, and the store is one no rule could name: refused all the same.
+    await assert.rejects(unreadable.put(["scratch"], "a", { text: "x" }), lockedBy(UNREADABLE));
+    await assert.rejects(unreadable.delete(["scratch"], "a"), lockedBy(UNREADABLE));
+    await assert.rejects(invalid.write("scratch", "a", "x"), lockedBy(UNREADABLE));
+    await assert.rejects(throwing.write("scratch", "a", "x"), lockedBy(UNREADABLE));
+  });
+  assert.equal(await inner.get(["scratch"], "a"), null);
+  for (const denied of await session.events("denied")) {
+    assert.equal(attr(denied, "wake.brake.halt_id"), UNREADABLE);
+    assert.deepEqual(payload(denied).origins, []);
+  }
+  assert.equal((await session.events("denied")).length, 4);
+
+  // No policy served, or no quarantine given: the page is no reason to refuse.
+  const free = new Memory(session.handler, { quarantine: flowing(undefined) });
+  await afterThePage(session, "mem-flow-free", async () => {
+    await free.write("facts", "acme", PAGE);
+    await new Memory(session.handler).write("facts", "acme", PAGE);
+  });
+  assert.equal((await session.events("denied")).length, 4);
+});
+
+test("a change by an agent the integration can't tell counts as every origin, under any rule naming its store", async () => {
+  const policy = { rules: [{ id: "ledger-from-billing", callers: ["billing"], stores: ["ledger"], allow_origins: ["tool:lookup_order"] }] };
+  for (const why of ["can't tell", "fails to tell"]) {
+    const session = new Session(`mem-flow-unknown-app-${why}`);
+    session.handler._acting = () => {
+      if (why === "fails to tell") throw new Error("identity bug");
+      return undefined;
+    };
+    const memory = new Memory(session.handler, { quarantine: flowing(policy) });
+    await assert.rejects(memory.write("ledger", "acme", "paid"), lockedBy("policy:ledger-from-billing"), "whatever agents the rule names");
+    await memory.write("scratch", "acme", "paid");
+    const [denied, ...rest] = await session.events("denied");
+    assert.equal(rest.length, 0, "a store no rule names takes the change");
+    assert.deepEqual(payload(denied).origins, ["*"]);
+    assert.equal(payload(denied).every_origin, UNKNOWN);
+  }
 });

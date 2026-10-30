@@ -36,6 +36,8 @@ curl --cacert wake-ca.pem --cert research.pem --key research.key https://localho
 
 **Identity is required.** agentgateway refuses a caller without an SVID from the trust bundle at the TLS handshake, so the brake always knows which agent a call is from. `agents.json` maps each agent's name to the identities it authenticates with; the brake halts agents by those names, and the proxy records them by those names. Add each of your agents there, or a halt on any agent denies its calls too, as a caller nobody can name. `WAKE_AGENTS` swaps in another file.
 
+**Flow policy.** wake-proxy enforces the flow policy in `policy.json` and serves it to the SDKs (see "Flow policies" in [docs/proxy.md](../docs/proxy.md)). It has no rules, so it denies nothing. `WAKE_POLICY` swaps in another file, which wake-proxy reads again within two seconds of a change. For one window after wake-proxy starts, every agent counts as having every origin, since what entered before isn't known, so any rule that applies denies.
+
 To authenticate agents with JWTs from your identity provider instead of SVIDs, replace the gateway's `tls.root` with a `jwtAuth` on the gateway, not on a route, since the gateway's deny runs before any route's policies:
 
 ```yaml
@@ -99,4 +101,4 @@ spec:
       ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
 ```
 
-Add the identity provider's address, and a model provider's while an agent's model calls don't go through agentgateway. Each address you add is a way around the policy for whatever runs there.
+Add the identity provider's address. Route model calls through agentgateway too, as the reference fleet does with real models (the `openai` and `anthropic` routes in `examples/fleet/agentgateway.yaml`, with the keys in `models.yaml`): the gateway adds the provider's key, so no agent holds one, and the brake's deny covers the calls. Each other address you add is a way around the policy for whatever runs there.

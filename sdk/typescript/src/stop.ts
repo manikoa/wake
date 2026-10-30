@@ -15,7 +15,7 @@
  * refuses what the policy keeps the same way.
  */
 
-import { entered, UNREADABLE, type Denial, type FlowCall, type FlowPolicy } from "./flow.ts";
+import { entered, Every, UNKNOWN, UNREADABLE, type Denial, type FlowCall, type FlowPolicy } from "./flow.ts";
 import { log } from "./log.ts";
 
 /** The id a call is refused under when its halts couldn't be checked. */
@@ -98,8 +98,10 @@ export function unchecked(outcome = "this tool call wasn't run"): Refusal {
  * caller in this process, by the caller's name; who is the caller as the agent is told, as for
  * a halt, such as the instance it is. call names the agents the caller acts under too, as for
  * the halts: an instance, <agent>#<id>, counts as its agent as well, so a rule naming an agent
- * holds the sub-agents its runs start. Undefined without a policy, as when wake-proxy serves
- * none. Never throws: a check that fails refuses, as a policy that can't be read does.
+ * holds the sub-agents its runs start. A caller Wake can't tell, undefined, counts as having
+ * every origin, and any rule's callers could be it. Undefined without a policy, as when
+ * wake-proxy serves none. Never throws: a check that fails refuses, as a policy that can't be
+ * read does.
  */
 export function flowRefusal(halts: Halts | undefined, who: string, call: FlowCall, outcome = "this tool call wasn't run"): Refusal | undefined {
   if (halts?.flow === undefined) return undefined;
@@ -109,7 +111,8 @@ export function flowRefusal(halts: Halts | undefined, who: string, call: FlowCal
     if (policy === undefined) return undefined;
     const lineage = [...(call.lineage ?? [])];
     if (policy.unreadable === null) entered.setWindow(policy.windowSeconds);
-    denial = policy.deciding({ ...call, lineage: [...lineage, ...lineage.map(agentOf)] }, policy.unreadable === null ? entered.seen(call.caller) : []);
+    const seen = policy.unreadable !== null ? [] : call.caller === undefined ? new Every(UNKNOWN) : entered.seen(call.caller);
+    denial = policy.deciding({ ...call, lineage: [...lineage, ...lineage.map(agentOf)] }, seen);
   } catch (error) {
     log.warn(`couldn't check the flow policy for ${who}; refusing`, error);
     denial = { halt: UNREADABLE, origins: [], unreadable: true };

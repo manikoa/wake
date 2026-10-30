@@ -43,6 +43,15 @@ the entry, read_file raises MemoryQuarantined), and overwriting or deleting one 
 MemoryLocked: it's kept, as evidence. Each refusal is recorded as a `denied` event. If
 checking the quarantine fails, the write or delete is refused and the entry isn't served.
 In a process that names its agents' runs, each run's writes are locked by its own name.
+
+The quarantine's rules carry the flow policy wake-proxy serves, when it enforces one, and
+its rules that name stores hold the changes to them: once the quarantine lets a write,
+delete or rollback through, and before the gate is asked, it raises MemoryLocked under
+policy:<id> when a rule naming the store holds back the agent making it, for what entered
+that agent, as the integrations name it. A policy that can't be used, or a check that
+fails, refuses every change under policy:unreadable-policy. When the integration can't tell
+which agent is acting, it counts as one with every origin, so any rule naming the store
+refuses the change.
 """
 
 import hashlib
@@ -215,7 +224,8 @@ class Memory:
     gate, if given, is called as gate(store, entry, content, origins) before each write, with
     the content's text and the origins upstream of it; before each delete, with content None;
     and before each rollback, with the content and origins of the version it restores. A
-    falsy answer refuses it, and so does a gate that raises."""
+    falsy answer refuses it, and so does a gate that raises. It's asked last: after the
+    quarantine, and the flow policy served with its rules, let the change through."""
 
     def __init__(
         self,
@@ -239,7 +249,8 @@ class Memory:
         recording failed. current and label are what the entry holds now (None if nothing)
         and the label stored with it. Raises MemoryLocked, before anything is written, when
         the brake's quarantine locks this agent's writes, or hides the entry: a quarantined
-        entry is kept, as evidence, not overwritten. And when the gate refuses it."""
+        entry is kept, as evidence, not overwritten. And when the flow policy served with the
+        quarantine's rules holds this agent back from the store, or the gate refuses it."""
         return self._admit_write(store, entry, content, current, label)()
 
     def _admit_write(
@@ -249,6 +260,7 @@ class Memory:
         checked whole before any of it is recorded. With history, the label it records keeps
         the version the write replaces."""
         self._check("write", store, entry, current, label)
+        self._held_back("write", store, entry, self._linked())
         text = content_of(content)
         lineage = self._gated("write", store, entry, text, lambda: self._parents_and_origins(text))
         previous = _history(label, current) if history else []
@@ -267,7 +279,8 @@ class Memory:
         """Records the delete of an entry, given what it holds now (None if nothing) and the
         label stored with it. Raises MemoryLocked, before anything is deleted, when the
         brake's quarantine locks this agent's writes, or hides the entry: a quarantined
-        entry is kept, as evidence. And when the gate refuses it."""
+        entry is kept, as evidence. And when the flow policy holds this agent back from the
+        store, or the gate refuses it."""
         self._admit_delete(store, entry, current, label)()
 
     def _admit_delete(
@@ -275,6 +288,7 @@ class Memory:
     ) -> Callable[[], None]:
         """Checks a delete as delete() does, and returns what records it."""
         self._check("delete", store, entry, current, label)
+        self._held_back("delete", store, entry, self._linked())
         lineage = self._gated("delete", store, entry, None, self._delete_lineage)
 
         def record() -> None:
@@ -309,6 +323,7 @@ class Memory:
         if hidden:
             self._refused("write", store, entry, hidden, parents=self._linked() + [event])
             raise MemoryLocked(hidden, store, entry)
+        self._held_back("write", store, entry, self._linked() + [event])
         self._gated("write", store, entry, text, lambda: ([event], origins))
         # The version it replaces is kept too, so a rollback can be rolled back.
         previous = _history(label, current)
@@ -333,6 +348,33 @@ class Memory:
             write = _event_id(label.get("event")) if isinstance(label, Mapping) else None
             self._refused(action, store, entry, refused, parents=self._linked() + ([write] if write else []))
             raise MemoryLocked(refused, store, entry)
+
+    def _held_back(self, action: str, store: str, entry: str, parents: list[str]) -> None:
+        """Raises MemoryLocked, and records the refusal, when the flow policy served with the
+        quarantine's rules holds the agent making this change back from the store, for what
+        entered it (wake.flow). Only rules that name stores apply. A policy that can't be
+        used, or a check that fails, refuses every change. Without a quarantine, or with no
+        policy in its rules, nothing is checked."""
+        if not flow.enforcing(self._quarantine):
+            return
+        outcome = f"this memory {action} wasn't made"
+        try:
+            acting = self._handler._acting()
+        except Exception:
+            log.warning("wake: couldn't tell which agent is changing %s/%s", store, entry, exc_info=True)
+            acting = None
+        if acting is None:
+            # Which agent is acting can't be told, so it counts as one with every origin: any
+            # rule naming this store refuses it, whatever agents the rule names.
+            refused = flow.refusal(self._quarantine, "the agent acting", None, store=store, outcome=outcome)
+        else:
+            agent, who, names = acting
+            refused = flow.refusal(self._quarantine, who, agent, names, store=store, outcome=outcome)
+        if refused is None:
+            return
+        self._refused(action, store, entry, refused.halt, parents=parents, flowed=flow.payload(refused))
+        log.warning("wake: refused a memory %s to %s/%s: %s", action, store, entry, refused.reason)
+        raise MemoryLocked(refused.halt, store, entry)
 
     def _gated(
         self,
@@ -497,11 +539,15 @@ class Memory:
         return list(link.parents) if link is not None else []
 
     def _refused(
-        self, action: str, store: str, entry: str, quarantine: str, *, parents: list[str], error: str | None = None
+        self, action: str, store: str, entry: str, quarantine: str, *, parents: list[str], error: str | None = None,
+        flowed: Mapping[str, Any] | None = None,
     ) -> None:
-        """Records what the quarantine or the gate refused, as a denied event, with why the gate
+        """Records what the quarantine, the flow policy or the gate refused, as a denied event:
+        with the origins behind it the flow policy kept from the store, and why every origin
+        counted, when it did, as for any flow denial (flow.payload); and with why the gate
         couldn't judge it, if it couldn't."""
-        payload = {"store": store, "entry": entry, "refused": action, "quarantine": quarantine}
+        payload: dict[str, Any] = {"store": store, "entry": entry, "refused": action, "quarantine": quarantine,
+                                   **(flowed or {})}
         if error is not None:
             payload["error"] = error
         try:

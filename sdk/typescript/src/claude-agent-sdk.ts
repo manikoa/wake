@@ -53,7 +53,7 @@ import { ROOT_CONTEXT, SpanStatusCode, trace, type Context, type Span } from "@o
 
 import * as events from "./events.ts";
 import { entered } from "./flow.ts";
-import { contextOf, EventGraph, failed, Recent, unique } from "./graph.ts";
+import { contextOf, EventGraph, failed, Recent, unique, type Acting } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
 import { now, type Recorder } from "./recorder.ts";
@@ -978,6 +978,31 @@ export class WakeClaudeAgent extends EventGraph {
     // Known from the stream, or from the agent_id its hook named. Before either, the instance is
     // left out rather than guessed: one the stream hasn't shown may be calling.
     return this.#toolInstances.get(link.eventId) ?? [undefined, []];
+  }
+
+  /**
+   * Who is acting, for a memory change an in-process tool makes, as the tool call's own check
+   * names them (_halting). Undefined while the call is one of several alike Wake can't tell
+   * apart, which may be different agents'. A subagent whose instance Wake hasn't placed yet
+   * could be any instance its session started, or one they started, so a rule for any of them
+   * applies.
+   */
+  override _acting(): Acting | undefined {
+    const link = links.current();
+    if (link === undefined) return super._acting();
+    if (this.#ambiguous.has(link.eventId)) return undefined;
+    const caller = this.#toolAgents.get(link.eventId) ?? this._recorder.agent;
+    const names = [this._recorder.agent, caller];
+    const placed = this.#toolInstances.get(link.eventId);
+    if (placed !== undefined) return { caller, who: placed[0], lineage: [...names, placed[0], ...placed[1]] };
+    if (caller !== this._recorder.agent) {
+      // Within its session when Wake knows it, and across every session when it doesn't.
+      const session = [...this.#tools.values()].find((t) => t.eventId === link.eventId)?.run?.sessionId;
+      for (const [s, , instance, lineage] of this.#spawned.values()) {
+        if (session === undefined || s === session || s === undefined) names.push(instance, ...lineage);
+      }
+    }
+    return { caller, who: caller, lineage: names };
   }
 
   /** Under the tool call or message that started this run, if any. */

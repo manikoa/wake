@@ -19,8 +19,9 @@ import { z } from "zod";
 
 import { links, Recorder } from "../src/index.ts";
 import { WakeClaudeAgent } from "../src/claude-agent-sdk.ts";
-import { entered, parsePolicy, UNREADABLE, type FlowPolicy } from "../src/flow.ts";
-import { Memory } from "../src/memory.ts";
+import { entered, parsePolicy, UNKNOWN, UNREADABLE, type FlowPolicy } from "../src/flow.ts";
+import { Memory, MemoryLocked } from "../src/memory.ts";
+import type { Quarantine } from "../src/quarantine.ts";
 import { UNCHECKED } from "../src/stop.ts";
 import { caller, fakeClaudeCode, type FakeClaudeCode } from "./claude-fakes.ts";
 import { attr, id, origins, parents, parentSpanId, payload, recorded, wakeEvents } from "./helpers.ts";
@@ -725,37 +726,65 @@ test("a memory write by a subagent Wake can't place yet names no instance", asyn
   assert.deepEqual(identity(lookup), ["support/researcher#toolu_r2", ["support"]], "named once the stream said");
 });
 
-test("calls alike by two copies at once name no instance in what they write", async () => {
-  // Two researchers call the in-process tool with the same arguments at once, and the second's
-  // call runs first. Nothing tells the tool which call it's running.
-  const { recorder, spans } = recorded("support");
-  const claude = new WakeClaudeAgent(recorder);
-  const memory = new Memory(claude);
-  const dir = await mkdtemp(join(tmpdir(), "wake-claude-"));
+/**
+ * Two researchers call the in-process tool with the same arguments at once, and the second's
+ * call runs first. Nothing tells the tool which call it's running.
+ */
+async function twoCallsAlike(cli: FakeClaudeCode): Promise<void> {
   const asks: [string, string][] = [
     ["toolu_r1", "Look order 1234 up"],
     ["toolu_r2", "Look it up too"],
   ];
   const order = { order: "1234" };
-  const script = async (cli: FakeClaudeCode) => {
-    cli.emit(INIT);
-    cli.assistant("msg_1", asks.map(([use, ask]) => ({ type: "tool_use", id: use, name: "Agent", input: research(ask) })));
-    for (const [use, ask] of await started(cli, asks)) cli.user([{ type: "text", text: ask }], use);
-    for (const [use] of asks) {
-      cli.assistant(`msg_${use}`, [{ type: "tool_use", id: `${use}_order`, name: "mcp__crm__lookup_order", input: order }], use);
-      await cli.hook("PreToolUse", `${use}_order`, { tool_name: "mcp__crm__lookup_order", tool_input: order, ...caller({ agent: "researcher", agentId: `agent-${use}` }) });
-    }
-    const outputs = [await cli.callTool("crm", "lookup_order", order), await cli.callTool("crm", "lookup_order", order, false)];
-    for (const [i, [use]] of [...asks].reverse().entries()) cli.user([{ type: "tool_result", tool_use_id: `${use}_order`, content: outputs[i] }], use);
-    for (const [use] of asks) cli.user([{ type: "tool_result", tool_use_id: use, content: [{ type: "text", text: ORDER }] }]);
-    cli.assistant("msg_2", [{ type: "text", text: ANSWER }]);
-    cli.emit(result(ANSWER));
-  };
-  await runSupport(claude, script, [lookupOrder(() => memory.writeFile(join(dir, "notes.md"), ORDER))]);
+  cli.emit(INIT);
+  cli.assistant("msg_1", asks.map(([use, ask]) => ({ type: "tool_use", id: use, name: "Agent", input: research(ask) })));
+  for (const [use, ask] of await started(cli, asks)) cli.user([{ type: "text", text: ask }], use);
+  for (const [use] of asks) {
+    cli.assistant(`msg_${use}`, [{ type: "tool_use", id: `${use}_order`, name: "mcp__crm__lookup_order", input: order }], use);
+    await cli.hook("PreToolUse", `${use}_order`, { tool_name: "mcp__crm__lookup_order", tool_input: order, ...caller({ agent: "researcher", agentId: `agent-${use}` }) });
+  }
+  const outputs = [await cli.callTool("crm", "lookup_order", order), await cli.callTool("crm", "lookup_order", order, false)];
+  for (const [i, [use]] of [...asks].reverse().entries()) cli.user([{ type: "tool_result", tool_use_id: `${use}_order`, content: outputs[i] }], use);
+  for (const [use] of asks) cli.user([{ type: "tool_result", tool_use_id: use, content: [{ type: "text", text: ORDER }] }]);
+  cli.assistant("msg_2", [{ type: "text", text: ANSWER }]);
+  cli.emit(result(ANSWER));
+}
+
+test("calls alike by two copies at once name no instance in what they write", async () => {
+  const { recorder, spans } = recorded("support");
+  const claude = new WakeClaudeAgent(recorder);
+  const memory = new Memory(claude);
+  const dir = await mkdtemp(join(tmpdir(), "wake-claude-"));
+  await runSupport(claude, twoCallsAlike, [lookupOrder(() => memory.writeFile(join(dir, "notes.md"), ORDER))]);
   const writes = wakeEvents(await spans(), "memory_write");
   assert.equal(writes.length, 2);
   assert.ok(writes.every((w) => attr(w, "wake.agent.id") === "support/researcher"));
   assert.ok(writes.every((w) => identity(w).every((v) => v === undefined)), "either could be either copy's");
+});
+
+test("a memory change in calls alike Wake can't tell apart counts as every origin, under any rule naming its store", async () => {
+  // Calls alike may be different agents', so which is writing can't be told.
+  const policy = parsePolicy({ rules: [{ id: "notes-from-billing", callers: ["billing"], stores: ["file"], allow_origins: ["tool:lookup_order"] }] });
+  const quarantine = { lockedBy: () => null, hiding: () => null, track: async () => true, halted: () => null, flow: () => policy } as unknown as Quarantine;
+  const { recorder, spans } = recorded("support");
+  const claude = new WakeClaudeAgent(recorder);
+  const memory = new Memory(claude, { quarantine });
+  const dir = await mkdtemp(join(tmpdir(), "wake-claude-"));
+  const refused: unknown[] = [];
+  await runSupport(claude, twoCallsAlike, [lookupOrder(() => memory.writeFile(join(dir, "notes.md"), ORDER).catch((e: unknown) => void refused.push(e)))]);
+  assert.equal(refused.length, 2, "whatever agents the rule names");
+  assert.ok(refused.every((e) => e instanceof MemoryLocked && e.quarantine === "policy:notes-from-billing"));
+  const denied = wakeEvents(await spans(), "denied");
+  assert.equal(denied.length, 2);
+  for (const d of denied) {
+    assert.deepEqual(payload(d).origins, ["*"]);
+    assert.equal(payload(d).every_origin, UNKNOWN);
+  }
+  // A store no rule names takes it all the same.
+  const notes = new Memory(claude, { quarantine: { ...quarantine, flow: () => parsePolicy({ rules: [{ id: "x", stores: ["facts"], forbid_origins: ["*"] }] }) } as unknown as Quarantine });
+  const ran: unknown[] = [];
+  await runSupport(claude, twoCallsAlike, [lookupOrder(() => notes.writeFile(join(dir, "other.md"), ORDER).then(() => void ran.push(true)))]);
+  assert.equal(ran.length, 2);
 });
 
 // Flow policies, applied in the agent's own process. Each test names its agent apart, since

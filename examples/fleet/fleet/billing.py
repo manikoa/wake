@@ -7,8 +7,9 @@ the brake's quarantines: it fetches its rules from wake-proxy every couple of se
 is how the brake confirms the adapter has a halt's memory lock. It also keeps a sandbox at
 E2B (the fleet's stand-in), found by its metadata, which a halt freezes.
 
-With FLEET_MODELS=real and ANTHROPIC_API_KEY set it runs on Claude Code itself; otherwise
-on a scripted stand-in that speaks the same protocol.
+With FLEET_MODELS=real and an Anthropic key given to the fleet it runs on Claude Code
+itself, its model calls through agentgateway; otherwise on a scripted stand-in that speaks
+the same protocol.
 """
 
 import os
@@ -55,7 +56,16 @@ async def issue_refund(arguments):
 
 
 server = create_sdk_mcp_server(NAME, tools=claude.tools([issue_refund]))
-real = os.environ.get("FLEET_MODELS") == "real" and os.environ.get("ANTHROPIC_API_KEY")
+real = os.environ.get("FLEET_MODELS") == "real" and os.environ.get("FLEET_ANTHROPIC")
+# Claude Code's model calls go through agentgateway like every other call: it names billing
+# by this header, as for its MCP and A2A calls, and adds Anthropic's key, which billing never
+# holds. Nothing else of Claude Code's goes out: billing's network reaches only the fleet.
+MODELS = {
+    "ANTHROPIC_BASE_URL": f"{common.GATEWAY}/models/anthropic",
+    "ANTHROPIC_API_KEY": "from-agentgateway",
+    "ANTHROPIC_CUSTOM_HEADERS": f"{common.AGENT_HEADER}: {NAME}",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+}
 
 
 class Billing(AgentExecutor):
@@ -67,6 +77,7 @@ class Billing(AgentExecutor):
             allowed_tools=[f"mcp__{NAME}__issue_refund"],
             tools=[],
             max_turns=4,
+            env=MODELS if real else {},
         ))
         transport = None if real else scripted.ClaudeCode(prompt, NAME, "issue_refund")
         answer = ""

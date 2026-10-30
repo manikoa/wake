@@ -1,15 +1,16 @@
 """The research agent, on the OpenAI Agents SDK: reads web pages to answer questions,
 served over A2A. Its page reads go to the fleet's MCP server through agentgateway.
 
-With FLEET_MODELS=real and OPENAI_API_KEY set it runs on the SDK's default OpenAI model;
-otherwise on the scripted one.
+With FLEET_MODELS=real and an OpenAI key given to the fleet it runs on the SDK's default
+OpenAI model, through agentgateway; otherwise on the scripted one.
 """
 
 import os
 
 from a2a.helpers.proto_helpers import new_text_message
 from a2a.server.agent_execution import AgentExecutor
-from agents import Agent, Runner, function_tool
+from agents import Agent, Runner, function_tool, set_default_openai_client, set_trace_processors
+from openai import AsyncOpenAI
 
 from fleet import common, scripted
 from wake import a2a as wake_a2a
@@ -17,7 +18,9 @@ from wake.openai_agents import install
 
 NAME = "research"
 recorder = common.recorder(NAME)
-install(recorder)
+# The fleet's traces go to Wake alone: the SDK's own exporter would send them to OpenAI,
+# which research's network doesn't reach.
+set_trace_processors([install(recorder)])
 
 
 @function_tool
@@ -26,7 +29,12 @@ async def fetch_page(url: str) -> str:
     return await common.call_tool(NAME, "fetch_page", {"url": url})
 
 
-real = os.environ.get("FLEET_MODELS") == "real" and os.environ.get("OPENAI_API_KEY")
+real = os.environ.get("FLEET_MODELS") == "real" and os.environ.get("FLEET_OPENAI")
+if real:
+    # Model calls go through agentgateway like every other call: it names research by this
+    # header, as for its MCP and A2A calls, and adds OpenAI's key, which research never holds.
+    set_default_openai_client(AsyncOpenAI(base_url=f"{common.GATEWAY}/models/openai/v1", api_key="from-agentgateway",
+                                          default_headers={common.AGENT_HEADER: NAME}), use_for_tracing=False)
 agent = Agent(
     name=NAME,
     instructions="Answer questions about shop policy. Read the pages they name with fetch_page, and quote what they say.",

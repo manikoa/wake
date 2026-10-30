@@ -88,6 +88,16 @@ export function unique(ids: Iterable<string>): string[] {
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any
 type Constructor = abstract new (...args: any[]) => object;
 
+/** Who is acting, as an integration's own checks name them, for the flow policy (flow.ts). */
+export interface Acting {
+  /** The agent, whose origins count. */
+  readonly caller: string;
+  /** Who it is as told, its instance when it has one. */
+  readonly who: string;
+  /** The names a rule's callers may match: the agent, its instance and those that started it, and the recorder's agent. */
+  readonly lineage: readonly string[];
+}
+
 /**
  * Bookkeeping shared by the capture integrations, added to a base class, such as LangChain's
  * callback handler. Subclasses set _recorder, record events with it, and call
@@ -140,6 +150,26 @@ export function Graph<TBase extends Constructor>(Base: TBase) {
      */
     _currentInstance(): [string | undefined, readonly string[]] {
       return [undefined, []];
+    }
+
+    /**
+     * Who is acting now, for the flow policy's check of a memory change they make, named as
+     * this integration's own checks name them. Undefined when the integration can't tell which
+     * agent is acting.
+     */
+    _acting(): Acting | undefined {
+      const caller = this._currentAgent();
+      const [instance, lineage] = this._currentInstance();
+      return { caller, who: instance ?? caller, lineage: [this._recorder.agent, caller, ...lineage, ...(instance !== undefined ? [instance] : [])] };
+    }
+
+    /**
+     * Resolves once what entered the current agent so far is noted, for a check about to decide
+     * on it, such as the memory adapter's: true, or false if the integration couldn't see it in
+     * time, and the check should refuse, as one that failed.
+     */
+    async _settled(): Promise<boolean> {
+      return true;
     }
 
     _rememberOutput(traceId: string, eventId: string, text: string): void {

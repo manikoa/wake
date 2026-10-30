@@ -1,13 +1,14 @@
 # The reference fleet on the staging recorder (deploy/compose.yaml): agents on three
 # frameworks, in Python and TypeScript, and the tools they call, all through agentgateway,
 # all recorded by Wake, with stand-ins for the identity provider and E2B the brake pulls
-# levers on. run.sh brings it up and sends one request through it. Each agent and the tools
-# server reaches the rest of the fleet only through agentgateway (networks.yaml). See
-# README.md.
+# levers on. run.sh brings it up and sends one request through it, then the same request
+# under a flow policy (policy.json). Each agent and the tools server reaches the rest of the
+# fleet, and the model providers, only through agentgateway (networks.yaml, models.yaml).
+# See README.md.
 name: wake-fleet
 
 include:
-  - path: [../../deploy/compose.yaml, networks.yaml]
+  - path: [../../deploy/compose.yaml, networks.yaml, models.yaml]
     env_file: fleet.env
 
 x-image: &image
@@ -35,8 +36,10 @@ x-fleet: &fleet
     FLEET_CANARY: ${FLEET_CANARY:-}
     # And a credential it holds beside the canary, which the recorders must replace.
     FLEET_CREDENTIAL: ${FLEET_CREDENTIAL:-}
-    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    # With FLEET_MODELS=real, research's and billing's model calls go through agentgateway,
+    # which holds the providers' keys (models.yaml). An agent only learns whether there's one.
+    FLEET_OPENAI: ${OPENAI_API_KEY:+set}
+    FLEET_ANTHROPIC: ${ANTHROPIC_API_KEY:+set}
   # Agents get the CA certificate to reach the collector over TLS, and nothing else from
   # the recorder: no keys, no identity. Each also gets its own credentials from the
   # stand-ins, in a volume no other service but the stand-in issuing them mounts.

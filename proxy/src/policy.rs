@@ -5,7 +5,9 @@
 //! A rule decides on what entered the caller through the proxy within the policy's window
 //! (origins.rs), never on anything the caller sends: an agent can't leave a header out, or
 //! send one, to get past a rule. Rules that name MCP tools are checked by the MCP hook,
-//! which sees the tool; the rest by ext_authz, on every request.
+//! which sees the tool; rules that name memory stores hold writes through the SDKs' memory
+//! adapters, which never pass the proxy, so it checks none of its calls against them; the
+//! rest are checked by ext_authz, on every request.
 //!
 //! Like `Halts`, a policy fails closed: a `--policy-file` that can't be read, or isn't a
 //! valid policy, denies every call under `policy:unreadable-policy` until it's fixed. The
@@ -52,6 +54,12 @@ pub struct FlowRule {
     /// tool's or prompt's name, a resource's URI. Exact, or a prefix ending in `*`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// The memory stores it applies to: a write, a delete or a rollback through an SDK's
+    /// memory adapter, by the store's name. Exact, or a prefix ending in `*`. Those never
+    /// pass the proxy, so it serves these rules to the SDKs and holds none of its own calls
+    /// to them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stores: Vec<String>,
     /// Origins that may not be behind a call it targets: denied when any origin that
     /// entered the caller matches one. Exact, or a prefix ending in `*`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -217,9 +225,10 @@ impl FlowPolicy {
             Who::Nobody => None,
         };
         for rule in &self.rules {
-            // The MCP hook checks the rules that name tools, and ext_authz the rest.
+            // The MCP hook checks the rules that name tools, and ext_authz the rest, but for
+            // the rules that name memory stores, which hold only the SDKs' memory writes.
             let names_tools = !rule.tools.is_empty();
-            if (at == At::Mcp) != names_tools || !rule.targets(target, agents) {
+            if !rule.stores.is_empty() || (at == At::Mcp) != names_tools || !rule.targets(target, agents) {
                 continue;
             }
             let (origins, every) = match seen {
@@ -283,11 +292,19 @@ impl FlowRule {
                 "rule {id} names tools with receivers or path_prefixes: the MCP hook, which sees the tool, sees neither"
             ));
         }
+        if !self.stores.is_empty()
+            && (!self.tools.is_empty() || !self.receivers.is_empty() || !self.path_prefixes.is_empty())
+        {
+            return Err(format!(
+                "rule {id} names stores with tools, receivers or path_prefixes: a memory write has none of them"
+            ));
+        }
         let lists = [
             ("callers", &self.callers, false),
             ("receivers", &self.receivers, false),
             ("path_prefixes", &self.path_prefixes, false),
             ("tools", &self.tools, true),
+            ("stores", &self.stores, true),
             ("forbid_origins", &self.forbid_origins, true),
             ("allow_origins", &self.allow_origins, true),
         ];
@@ -508,6 +525,25 @@ mod tests {
                 path: None,
                 tool: None,
             };
+            if case["store"].is_string() {
+                // A memory write never passes the proxy: the SDKs' memory adapters decide these
+                // cases. Here no rule naming stores may hold a call the proxy sees instead.
+                let tool = Target {
+                    tool: Some("write_memory"),
+                    ..call
+                };
+                for (at, target) in [(At::Authz, &call), (At::Mcp, &tool)] {
+                    let denial = p.deciding(at, target, &seen, &none);
+                    assert!(
+                        denial.is_none_or(|d| !p
+                            .rules
+                            .iter()
+                            .any(|r| !r.stores.is_empty() && d.halt.id == format!("policy:{}", r.id))),
+                        "{name}"
+                    );
+                }
+                continue;
+            }
             let denial = match (case["tool"].as_str(), case["receiver"].as_str()) {
                 (Some(tool), None) => p.deciding(At::Authz, &call, &seen, &none).or_else(|| {
                     p.deciding(
@@ -549,6 +585,30 @@ mod tests {
                 case["name"]
             );
         }
+    }
+
+    #[test]
+    fn rules_for_memory_stores_never_hold_a_call_through_the_proxy() {
+        let p = policy(r#"{"rules": [{"id": "no-web-into-facts", "stores": ["facts"], "forbid_origins": ["*"]}]}"#);
+        let call = Target {
+            caller: Who::Agent("research"),
+            token: None,
+            receiver: Some("support"),
+            path: Some("/agents/support"),
+            tool: None,
+        };
+        let none = Agents::none();
+        for seen in [Seen::Every("every origin"), Seen::These(vec!["tool:fetch_page".into()])] {
+            assert_eq!(p.deciding(At::Authz, &call, &seen, &none), None);
+            let tool = Target {
+                tool: Some("facts"),
+                ..call
+            };
+            assert_eq!(p.deciding(At::Mcp, &tool, &seen, &none), None);
+        }
+        // They're served, so the SDKs hold the writes the proxy never sees.
+        let served = serde_json::to_value(Policy::fixed(p).served().unwrap()).unwrap();
+        assert_eq!(served["rules"][0]["stores"], serde_json::json!(["facts"]));
     }
 
     #[test]

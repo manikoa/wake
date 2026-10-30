@@ -441,12 +441,15 @@ class BrokenHalts:
         raise RuntimeError("the rules can't be read")
 
 
-def guarded_run(agent, quarantine):
+def guarded_run(agent, quarantine, **run_config):
+    from agents import RunConfig
+
     exporter = InMemorySpanExporter()
     processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter), quarantine=quarantine)
     set_trace_processors([processor])
     try:
-        result = asyncio.run(Runner.run(processor.guard(agent), "Check our refund terms."))
+        result = asyncio.run(Runner.run(processor.guard(agent), "Check our refund terms.",
+                                        run_config=RunConfig(**run_config)))
     finally:
         set_trace_processors([])
     processor._recorder.flush()
@@ -699,7 +702,7 @@ def test_a_halted_agents_computer_does_nothing_and_its_run_ends(made):
     assert attrs(events_[1])["wake.origins"] == ()
 
 
-def test_guard_raises_rather_than_leave_a_tool_it_cant_refuse_and_leaves_hosted_tools_be():
+def test_guard_raises_rather_than_leave_a_tool_it_cant_refuse_and_checks_hosted_tools_around_the_model_call():
     from agents import WebSearchTool
 
     class Gadget:
@@ -708,7 +711,8 @@ def test_guard_raises_rather_than_leave_a_tool_it_cant_refuse_and_leaves_hosted_
     triage = Agent(name="triage", tools=[WebSearchTool()])
     processor = WakeTracingProcessor(Recorder(agent="support", exporter=InMemorySpanExporter()), quarantine=Halts())
     processor.guard(triage)
-    assert isinstance(triage.tools[0], WebSearchTool), "a hosted tool runs at OpenAI: nothing here to refuse"
+    assert isinstance(triage.tools[0], WebSearchTool), "a hosted tool runs at OpenAI: it's checked before each model call"
+    assert getattr(triage.hooks.on_llm_start, "_wake", False)
     ops = Agent(name="ops")
     ops.tools.append(Gadget())  # a kind of tool this version of Wake doesn't know
     with pytest.raises(TypeError, match="Gadget"):
@@ -1044,3 +1048,367 @@ def test_without_a_policy_nothing_is_refused(served):
     billing = Agent(name="billing", tools=[fetching(), paying(paid)], model=FakeModel([[FETCH], [PAY], [say("Done.")]]))
     _, events_, _ = guarded_run(billing, served(None, "billing"))
     assert paid == ["1234"] and "denied" not in kinds_of(events_)
+
+
+# Hosted tools: they run at OpenAI, inside the model call.
+
+
+def searched(query="Acme invoice"):
+    from openai.types.responses.response_function_web_search import ActionSearch, ResponseFunctionWebSearch
+
+    return ResponseFunctionWebSearch(type="web_search_call", id=f"ws_{uuid.uuid4().hex[:8]}", status="completed",
+                                     action=ActionSearch(type="search", query=query))
+
+
+def asking(name="lookup_order", arguments='{"order": "1234"}'):
+    """A hosted MCP tool asking to call the MCP server's tool name."""
+    from openai.types.responses.response_output_item import McpApprovalRequest
+
+    return McpApprovalRequest(type="mcp_approval_request", id=f"mcpr_{uuid.uuid4().hex[:8]}", arguments=arguments,
+                              name=name, server_label="crm")
+
+
+def mcp_called(name="lookup_order", output="Order 1234: paid in full."):
+    from openai.types.responses.response_output_item import McpCall
+
+    return McpCall(type="mcp_call", id=f"mcp_{uuid.uuid4().hex[:8]}", arguments='{"order": "1234"}', name=name,
+                   server_label="crm", output=output, status="completed")
+
+
+def crm(require_approval=None, on_approval_request=None):
+    """A hosted MCP server's tools."""
+    from agents import HostedMCPTool
+
+    config = {"type": "mcp", "server_label": "crm", "server_url": "https://crm.example/mcp"}
+    if require_approval is not None:
+        config["require_approval"] = require_approval
+    return HostedMCPTool(tool_config=config, on_approval_request=on_approval_request)
+
+
+def interpreter():
+    from agents import CodeInterpreterTool
+
+    return CodeInterpreterTool(tool_config={"type": "code_interpreter", "container": {"type": "auto"}})
+
+
+class Asked(FakeModel):
+    """Answers from a script, keeping the input of each model call it was asked."""
+
+    def __init__(self, turns) -> None:
+        super().__init__(turns)
+        self.inputs = []
+
+    async def get_response(self, system_instructions, input, *args, **kwargs):
+        self.inputs.append(input)
+        return await super().get_response(system_instructions, input, *args, **kwargs)
+
+
+def approvals(model: Asked) -> list[dict]:
+    """The answers to hosted MCP tools' requests, each once, in the inputs of the model calls."""
+    answers = {item["approval_request_id"]: {k: item[k] for k in ("approve", "reason") if k in item}
+               for turn in model.inputs if isinstance(turn, list)
+               for item in turn if isinstance(item, dict) and item.get("type") == "mcp_approval_response"}
+    return list(answers.values())
+
+
+def halted_run(agent, quarantine, **run_config):
+    """Runs the guarded agent until it raises AgentHalted: the refusal, the events and the processor."""
+    from agents import RunConfig
+
+    from wake.stop import AgentHalted
+
+    exporter = InMemorySpanExporter()
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter), quarantine=quarantine)
+    set_trace_processors([processor])
+    try:
+        with pytest.raises(AgentHalted) as refused:
+            asyncio.run(Runner.run(processor.guard(agent), "Check our refund terms.", run_config=RunConfig(**run_config)))
+    finally:
+        set_trace_processors([])
+    processor._recorder.flush()
+    return refused.value, wake_events(exporter.get_finished_spans()), processor
+
+
+NO_PAY_AFTER_SEARCH = {"rules": [{"id": "no-pay-after-search", "callers": ["billing"], "tools": ["pay"],
+                                  "forbid_origins": ["tool:web_search", "tool:lookup_order"]}]}
+
+
+@pytest.mark.parametrize("sensitive", [True, False])
+def test_a_hosted_search_enters_before_a_tool_from_the_same_response_is_checked(served, sensitive):
+    from agents import WebSearchTool
+
+    paid = []
+    billing = Agent(name="billing", tools=[WebSearchTool(), paying(paid)], model=FakeModel([[searched(), PAY],
+                                                                                            [say("Done.")]]))
+    result, events_, _ = guarded_run(billing, served(NO_PAY_AFTER_SEARCH, "billing"),
+                                     trace_include_sensitive_data=sensitive)
+    assert paid == [] and result.final_output == "Done.", "the payment from the response that searched never ran"
+    denied, payload = denied_in(events_)
+    assert attrs(denied)["gen_ai.tool.name"] == "pay"
+    assert attrs(denied)["wake.brake.halt_id"] == "policy:no-pay-after-search"
+    assert payload["origins"] == ["tool:web_search"]
+
+
+@pytest.mark.parametrize("sensitive", [True, False])
+def test_without_the_response_in_the_trace_every_hosted_tool_offered_enters(served, sensitive):
+    from agents import WebSearchTool
+
+    from wake import flow
+
+    # The response searched nothing. Only with the response in the trace can Wake tell.
+    paid = []
+    billing = Agent(name="billing", tools=[WebSearchTool(), interpreter(), crm("never"), paying(paid)],
+                    model=FakeModel([[PAY], [say("Done.")]]))
+    _, events_, _ = guarded_run(billing, served(NO_PAY_AFTER_SEARCH, "billing"), trace_include_sensitive_data=sensitive)
+    entered = flow.entered().seen("billing").origins
+    if sensitive:
+        assert paid == ["1234"] and entered == ("tool:pay",)
+        return
+    assert paid == [] and set(entered) == {"tool:code_interpreter", "tool:web_search"}, "but no hosted MCP tool"
+    _, payload = denied_in(events_)
+    assert payload["origins"] == ["tool:web_search"]
+
+
+def shell_called(call_id="call_sh"):
+    from openai.types.responses import ResponseFunctionShellToolCall
+
+    return ResponseFunctionShellToolCall(type="shell_call", id=f"sh_{uuid.uuid4().hex[:8]}", call_id=call_id,
+                                         status="completed", action={"commands": ["cat /srv/orders.csv"]})
+
+
+def test_a_shell_call_enters_with_its_response_only_when_the_shell_runs_at_openai(served):
+    from agents import ShellTool
+
+    # Hosted: what it read enters as the response comes in, before the payment it asked for.
+    paid = []
+    hosted = ShellTool(environment={"type": "container_auto"})
+    billing = Agent(name="billing", tools=[hosted, paying(paid)], model=FakeModel([[shell_called(), PAY], [say("Done.")]]))
+    no_pay = {"rules": [{"id": "no-pay-after-shell", "tools": ["pay"], "forbid_origins": ["tool:shell"]}]}
+    _, events_, _ = guarded_run(billing, served(no_pay, "billing"))
+    assert paid == [] and denied_in(events_)[1]["origins"] == ["tool:shell"]
+    # Local: it enters once it has run, so it's checked before anything of it entered.
+    ran = []
+    local = ShellTool(executor=lambda request: ran.append(request.data.action.commands) or "ok")
+    ops = Agent(name="ops", tools=[local], model=FakeModel([[shell_called()], [say("Done.")]]))
+    one_shell = {"rules": [{"id": "one-shell", "tools": ["shell"], "forbid_origins": ["tool:shell"]}]}
+    _, events_, _ = guarded_run(ops, served(one_shell, "ops"))
+    assert ran == [["cat /srv/orders.csv"]] and "denied" not in kinds_of(events_)
+
+
+def test_hosted_calls_enter_by_the_name_the_agent_offers_them_by(served):
+    from agents import FileSearchTool, ImageGenerationTool, WebSearchTool
+
+    from wake import flow
+
+    billing = Agent(name="billing", tools=[FileSearchTool(vector_store_ids=["vs_1"]), crm("never"), WebSearchTool(),
+                                           ImageGenerationTool(tool_config={"type": "image_generation"})],
+                    model=FakeModel([[mcp_called("refund_order"), searched(), say("Done.")]]))
+    guarded_run(billing, served({"rules": []}, "billing"))
+    # Only what the response ran, a hosted MCP call by its MCP tool's own name.
+    assert set(flow.entered().seen("billing").origins) == {"tool:refund_order", "tool:web_search"}
+
+
+NO_SEARCH_AFTER_WEB = {"rules": [{"id": "no-hosted-after-web", "callers": ["billing"],
+                                  "tools": ["web_search", "code_interpreter"], "forbid_origins": ["tool:fetch_page"]}]}
+
+
+def test_a_model_call_that_could_run_a_hosted_tool_held_back_isnt_made_and_the_run_ends(served):
+    from agents import FileSearchTool, WebSearchTool
+
+    model = Asked([[FETCH], [say("Searched.")]])
+    billing = Agent(name="billing", model=model, tools=[fetching(), WebSearchTool(), interpreter(),
+                                                        FileSearchTool(vector_store_ids=["vs_1"])])
+    refused, events_, _ = halted_run(billing, served(NO_SEARCH_AFTER_WEB, "billing"))
+    assert len(model.inputs) == 1, "the model call after the fetch wasn't made"
+    assert refused.halt == "policy:no-hosted-after-web"
+    assert str(refused) == ("Wake's flow policy (policy:no-hosted-after-web) holds billing back after tool:fetch_page, "
+                            "so its model call, which could run web_search at OpenAI, wasn't made.")
+    first, fetch, *denied = events_
+    assert kinds_of([first, fetch]) == ["model_call", "tool_call"]
+    assert [(attrs(e)["wake.event.kind"], attrs(e)["gen_ai.tool.name"], attrs(e)["wake.brake.halt_id"]) for e in denied] == [
+        ("denied", "web_search", "policy:no-hosted-after-web"), ("denied", "code_interpreter", "policy:no-hosted-after-web"),
+    ], "each hosted tool held back, and only those"
+    for event in denied:
+        name, payload = attrs(event)["gen_ai.tool.name"], json.loads(attrs(event)["wake.payload"])
+        assert payload["origins"] == ["tool:fetch_page"] and "every_origin" not in payload
+        assert payload["output"].endswith(f"so its model call, which could run {name} at OpenAI, wasn't made.")
+        assert attrs(event)["wake.agent.id"] == "billing" and attrs(event)["wake.origins"] == ()
+        assert attrs(event)["wake.parents"] == (attrs(first)["wake.event.id"],), "the agent's last response"
+
+
+def test_every_origin_holds_back_a_model_call_and_says_why(served):
+    from agents import WebSearchTool
+
+    from wake import flow
+
+    for i in range(flow.MAX_ORIGINS + 1):
+        flow.note("billing", f"tool:t{i}")
+    billing = Agent(name="billing", tools=[WebSearchTool()], model=FakeModel([[say("Done.")]]))
+    refused, events_, _ = halted_run(billing, served(NO_SEARCH_AFTER_WEB, "billing"))
+    assert str(refused) == ("Wake's flow policy (policy:no-hosted-after-web) holds billing back, because more origins "
+                            "entered it than Wake keeps, so its model call, which could run web_search at OpenAI, "
+                            "wasn't made.")
+    _, payload = denied_in(events_)
+    assert payload["origins"] == ["*"] and payload["every_origin"] == flow.SATURATED
+
+
+def test_a_halt_stops_the_model_calls_of_an_agent_that_offers_hosted_tools():
+    from agents import WebSearchTool
+
+    model = Asked([[say("Searched.")]])
+    billing = Agent(name="billing", tools=[WebSearchTool(), interpreter()], model=model)
+    refused, events_, _ = halted_run(billing, Halts({"id": "halt-billing", "agents": ["billing"]}))
+    assert model.inputs == [], "no model call was made"
+    assert str(refused) == ("Wake halted billing (halt-billing), so its model call, which could run web_search at "
+                            "OpenAI, wasn't made.")
+    assert [(attrs(e)["gen_ai.tool.name"], attrs(e)["wake.brake.halt_id"]) for e in events_] == [
+        ("web_search", "halt-billing"), ("code_interpreter", "halt-billing")]
+    # Stale rules, and a check that fails, refuse it too.
+    from wake.quarantine import Quarantine
+
+    for rules, halt in ((Quarantine("http://127.0.0.1:9", agent="support", start=False), "stale-rules"),
+                        (BrokenHalts(), "halt-check-failed")):
+        billing = Agent(name="billing", tools=[WebSearchTool()], model=FakeModel([[say("Searched.")]]))
+        assert halted_run(billing, rules)[0].halt == halt
+
+
+class Hooks:
+    """An app's own hooks for its agent, noting what they're called for."""
+
+    def __init__(self) -> None:
+        from agents import AgentHooks
+
+        noted = self.noted = []
+
+        class Noting(AgentHooks):
+            async def on_start(self, context, agent):
+                noted.append("start")
+
+            async def on_llm_start(self, context, agent, system_prompt, input_items):
+                noted.append("llm_start")
+
+            async def on_llm_end(self, context, agent, response):
+                noted.append("llm_end")
+
+        self.hooks = Noting()
+
+
+def test_the_agents_own_hooks_are_kept_and_called_and_an_agent_without_hosted_tools_keeps_its_own():
+    from agents import WebSearchTool
+
+    own = Hooks()
+    billing = Agent(name="billing", tools=[WebSearchTool()], hooks=own.hooks, model=FakeModel([[say("Done.")]]))
+    plain = Agent(name="plain", model=FakeModel([[say("Done.")]]))
+    result, _, processor = guarded_run(billing, Halts())
+    processor.guard(plain)
+    assert result.final_output == "Done."
+    assert billing.hooks is own.hooks and own.noted == ["start", "llm_start", "llm_end"]
+    assert plain.hooks is None, "no hosted tools: nothing to check before its model calls"
+    # Once held back, the agent's own hook isn't told a model call is starting.
+    own = Hooks()
+    billing = Agent(name="billing", tools=[WebSearchTool()], hooks=own.hooks, model=FakeModel([[say("Done.")]]))
+    halted_run(billing, Halts({"id": "halt-billing", "agents": ["billing"]}))
+    assert own.noted == ["start"]
+
+
+NO_CRM_AFTER_WEB = {"rules": [{"id": "no-crm-after-web", "callers": ["billing"], "tools": ["lookup_order"],
+                               "forbid_origins": ["tool:fetch_page"]}]}
+
+
+def test_a_hosted_mcp_call_held_back_is_rejected_and_recorded(served):
+    from wake import flow
+
+    model = Asked([[FETCH], [asking()], [say("Couldn't look it up.")]])
+    tool = crm("never")
+    billing = Agent(name="billing", tools=[fetching(), tool], model=model)
+    result, events_, _ = guarded_run(billing, served(NO_CRM_AFTER_WEB, "billing"))
+    assert result.final_output == "Couldn't look it up."
+    reason = ("Wake's flow policy (policy:no-crm-after-web) holds billing back after tool:fetch_page, so this tool call "
+              "wasn't run.")
+    assert approvals(model) == [{"approve": False, "reason": reason}], "rejected, with why"
+    assert tool.tool_config["require_approval"] == "always", "every call asks first"
+    denied, payload = denied_in(events_)
+    assert attrs(denied)["gen_ai.tool.name"] == "lookup_order"
+    assert attrs(denied)["wake.brake.halt_id"] == "policy:no-crm-after-web"
+    assert payload["origins"] == ["tool:fetch_page"] and payload["input"] == '{"order": "1234"}'
+    assert payload["output"] == reason
+    asked = [e for e in events_ if attrs(e)["wake.event.kind"] == "model_call"][1]
+    assert attrs(denied)["wake.parents"] == (attrs(asked)["wake.event.id"],), "the response that asked"
+    assert "tool:lookup_order" not in flow.entered().seen("billing").origins, "nothing came back from it"
+
+
+def test_a_hosted_mcp_call_allowed_is_approved_and_its_result_enters_then(served):
+    from wake import flow
+
+    entered = []
+
+    class Answering(Asked):
+        async def get_response(self, *args, **kwargs):
+            entered.append(flow.entered().seen("billing").origins)
+            return await super().get_response(*args, **kwargs)
+
+    paid = []
+    model = Answering([[asking()], [mcp_called(), PAY], [say("Done.")]])
+    billing = Agent(name="billing", tools=[crm("never"), paying(paid)], model=model)
+    policy = {"rules": [*NO_CRM_AFTER_WEB["rules"], *NO_PAY_AFTER_SEARCH["rules"]]}
+    _, events_, _ = guarded_run(billing, served(policy, "billing"), trace_include_sensitive_data=False)
+    assert approvals(model) == [{"approve": True}]
+    assert entered[1] == ("tool:lookup_order",), "noted as approved, before the call that runs it"
+    assert paid == [], "what it brought back keeps billing from paying, the trace or not"
+    assert denied_in(events_)[1]["origins"] == ["tool:lookup_order"]
+
+
+def test_a_hosted_mcp_call_allowed_gets_the_tools_own_answer_when_its_setting_would_have_asked(served):
+    from wake import flow
+
+    asked = []
+
+    def own(request):
+        asked.append(request.data.name)
+        return {"approve": request.data.name != "refund_order", "reason": "Refunds need a person."}
+
+    setting = {"never": {"tool_names": ["lookup_order"]}}
+    model = Asked([[asking("lookup_order"), asking("refund_order")], [say("Done.")]])
+    tool = crm(setting, own)
+    billing = Agent(name="billing", tools=[tool], model=model)
+    guarded_run(billing, served({"rules": []}, "billing"))
+    assert asked == ["refund_order"], "only what its own setting asks about"
+    assert approvals(model) == [{"approve": True}, {"approve": False, "reason": "Refunds need a person."}]
+    assert flow.entered().seen("billing").origins == ("tool:lookup_order",), "a rejected call brings nothing"
+    assert tool.tool_config["require_approval"] == "always"
+
+
+@pytest.mark.parametrize("setting, name, asks", [
+    ("never", "lookup_order", False),
+    ("always", "lookup_order", True),
+    (None, "lookup_order", True),  # OpenAI asks by default
+    ({"never": {"tool_names": ["lookup_order"]}}, "lookup_order", False),
+    ({"never": {"tool_names": ["lookup_order"]}}, "refund_order", True),
+    ({"never": {"tool_names": ["lookup_order"], "read_only": True}}, "lookup_order", True),  # a hint Wake can't see
+    ({"never": {"read_only": True}}, "lookup_order", True),
+    ({"always": {"tool_names": ["refund_order"]}}, "lookup_order", True),
+    ({"always": {"tool_names": ["lookup_order"]}, "never": {"tool_names": ["lookup_order"]}}, "lookup_order", True),
+])
+def test_whether_a_hosted_mcp_tools_own_setting_would_have_asked(setting, name, asks):
+    from wake.openai_agents import _asks
+
+    assert _asks(setting, name) is asks
+
+
+def test_a_hosted_mcp_tool_the_app_approves_through_interruptions_is_left_as_it_is():
+    for setting in ("always", None, {"never": {"tool_names": ["lookup_order"]}}):
+        tool = crm(setting)
+        config = dict(tool.tool_config)
+        processor = WakeTracingProcessor(Recorder(agent="support", exporter=InMemorySpanExporter()), quarantine=Halts())
+        processor.guard(Agent(name="billing", tools=[tool]))
+        assert tool.tool_config == config and tool.on_approval_request is None, setting
+
+
+def test_a_halt_rejects_every_hosted_mcp_call():
+    model = Asked([[asking()], [say("Done.")]])
+    billing = Agent(name="billing", tools=[crm(on_approval_request=lambda request: {"approve": True})], model=model)
+    _, events_, _ = guarded_run(billing, Halts({"id": "halt-billing", "agents": ["billing"]}))
+    assert approvals(model) == [{"approve": False,
+                                 "reason": "Wake halted billing (halt-billing), so this tool call wasn't run."}]
+    denied, _ = denied_in(events_)
+    assert (attrs(denied)["gen_ai.tool.name"], attrs(denied)["wake.brake.halt_id"]) == ("lookup_order", "halt-billing")

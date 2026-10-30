@@ -18,6 +18,7 @@ import {
   OVERFLOWED,
   parsePolicy,
   SATURATED,
+  UNKNOWN,
   UNREADABLE,
   type FlowCall,
   type Seen,
@@ -32,6 +33,7 @@ type Case = {
   lineage: string[];
   tool?: string;
   receiver?: string;
+  store?: string;
   origins: string[] | "*";
   denied_by: string | null;
   kept: string[];
@@ -44,14 +46,38 @@ const VECTORS: { policies: Record<string, unknown>; cases: Case[]; invalid: { na
 
 test("decides as the shared vectors say", () => {
   assert.ok(VECTORS.cases.length >= 20);
+  assert.ok(VECTORS.cases.some((c) => c.store !== undefined), "changes to memory stores among them");
   for (const c of VECTORS.cases) {
     const policy = parsePolicy(VECTORS.policies[c.policy]);
     assert.equal(policy.unreadable, null, c.name);
+    assert.equal([c.tool, c.receiver, c.store].filter((x) => x !== undefined).length, 1, `${c.name}: a tool call, an agent reached or a store changed`);
     const seen: Seen = c.origins === "*" ? new Every("every origin") : c.origins;
-    const call: FlowCall = { caller: c.caller, lineage: c.lineage, tool: c.tool, receiver: c.receiver };
+    const call: FlowCall = { caller: c.caller, lineage: c.lineage, tool: c.tool, receiver: c.receiver, store: c.store };
     const denial = policy.deciding(call, seen);
     assert.equal(denial?.halt ?? null, c.denied_by, c.name);
     assert.deepEqual(denial?.origins ?? [], c.kept, c.name);
+  }
+});
+
+test("no rule naming stores decides a tool call or an agent reached, nor any other rule a change to a store", () => {
+  for (const c of VECTORS.cases) {
+    const policy = parsePolicy(VECTORS.policies[c.policy]);
+    const naming = new Set(policy.rules.filter((r) => r.stores.length > 0).map((r) => `policy:${r.id}`));
+    const others = new Set(policy.rules.filter((r) => r.stores.length === 0).map((r) => `policy:${r.id}`));
+    const seen: Seen = c.origins === "*" ? new Every("every origin") : c.origins;
+    // The case's own call, and the same caller's calls of every other kind, named for the case's target.
+    const target = c.tool ?? c.receiver ?? c.store!;
+    const lineage = c.lineage;
+    for (const call of [
+      { caller: c.caller, lineage, tool: target },
+      { caller: c.caller, lineage, receiver: target },
+      { caller: c.caller, lineage, tool: "write_memory" },
+    ]) {
+      const halt = policy.deciding(call, seen)?.halt;
+      assert.ok(halt === undefined || !naming.has(halt), `${c.name}: ${JSON.stringify(call)} denied by ${halt}`);
+    }
+    const halt = policy.deciding({ caller: c.caller, lineage, store: target }, seen)?.halt;
+    assert.ok(halt === undefined || !others.has(halt), `${c.name}: a change to ${target} denied by ${halt}`);
   }
 });
 
@@ -60,7 +86,7 @@ test("refuses every call under a policy the shared vectors say is invalid", () =
   for (const c of VECTORS.invalid) {
     const policy = parsePolicy(c.policy);
     assert.notEqual(policy.unreadable, null, c.name);
-    for (const call of [{ caller: "billing", tool: "pay" }, { caller: "support", receiver: "billing" }]) {
+    for (const call of [{ caller: "billing", tool: "pay" }, { caller: "support", receiver: "billing" }, { caller: "research", store: "facts" }]) {
       assert.deepEqual(policy.deciding(call, []), { halt: UNREADABLE, origins: [], unreadable: true }, c.name);
     }
   }
@@ -76,8 +102,11 @@ test("reads the policy as wake-proxy serves it", () => {
   assert.equal(policy.unreadable, null);
   assert.equal(policy.windowSeconds, 600);
   assert.deepEqual(policy.rules, [
-    { id: "no-pay-after-web", callers: ["billing"], receivers: [], path_prefixes: [], tools: ["pay"], forbid_origins: ["tool:fetch_page"], allow_origins: [] },
+    { id: "no-pay-after-web", callers: ["billing"], receivers: [], path_prefixes: [], tools: ["pay"], stores: [], forbid_origins: ["tool:fetch_page"], allow_origins: [] },
   ], "a list left out is empty, as wake-proxy serves it");
+  const stores = parsePolicy({ rules: [{ id: "no-web-into-facts", stores: ["facts", "customers/*"], forbid_origins: ["tool:fetch_page"] }] });
+  assert.equal(stores.unreadable, null);
+  assert.deepEqual(stores.rules[0].stores, ["facts", "customers/*"], "a rule may name memory stores");
   assert.equal(parsePolicy({}).windowSeconds, 900, "the window wake-proxy takes when none is set");
   assert.deepEqual(parsePolicy({}).rules, []);
   assert.match(parsePolicy({ unreadable: true }).unreadable!, /can't use its policy file/, "what wake-proxy serves when it can't use its file");
@@ -99,9 +128,14 @@ test("reads the policy as wake-proxy serves it", () => {
     { rules: [{ id: "x", path_prefixes: ["/a*"], forbid_origins: ["*"] }] },
     { rules: [{ id: "x", tools: [""], forbid_origins: ["*"] }] },
     { rules: [{ id: "é", forbid_origins: ["*"] }] },
+    { rules: [{ id: "x", stores: "facts", forbid_origins: ["*"] }] },
+    { rules: [{ id: "x", stores: ["facts", 5], forbid_origins: ["*"] }] },
+    { rules: [{ id: "x", stores: ["*s"], forbid_origins: ["*"] }] },
+    { rules: [{ id: "x", stores: ["facts"] }] },
   ]) {
     assert.notEqual(parsePolicy(bad).unreadable, null, JSON.stringify(bad));
   }
+  assert.match(parsePolicy({ rules: [{ id: "x", stores: ["facts"], tools: ["pay"], forbid_origins: ["*"] }] }).unreadable!, /names stores with tools, receivers or path_prefixes/);
 });
 
 test("a pattern is a prefix when it ends in *, and * is every origin", () => {
@@ -109,6 +143,28 @@ test("a pattern is a prefix when it ends in *, and * is every origin", () => {
   for (const [tool, denied] of [["wire_eur", true], ["wire_", true], ["wire", false], ["pay", true], ["payout", false]] as const) {
     assert.equal(policy.deciding({ caller: "billing", tool }, ["anything:at-all"]) !== undefined, denied, tool);
   }
+  const stores = parsePolicy({ rules: [{ id: "r", stores: ["customers/*", "facts"], forbid_origins: ["*"] }] });
+  for (const [store, denied] of [["customers/42", true], ["customers/", true], ["customers", false], ["facts", true], ["facts/1", false], ["*", false]] as const) {
+    assert.equal(stores.deciding({ caller: "billing", store }, ["anything:at-all"]) !== undefined, denied, store);
+  }
+  assert.equal(parsePolicy({ rules: [{ id: "r", stores: ["*"], forbid_origins: ["*"] }] }).deciding({ caller: "a", store: "any/store" }, ["x"])?.halt, "policy:r", "* alone is every store");
+});
+
+test("a caller Wake can't tell has every origin, and any rule's callers could be it", () => {
+  const halts = serving({
+    rules: [
+      { id: "scratch-from-billing", callers: ["flow-billing"], stores: ["scratch"], allow_origins: ["tool:lookup_order"] },
+      { id: "ledger-from-billing", callers: ["flow-billing"], stores: ["ledger"], allow_origins: ["tool:lookup_order"] },
+    ],
+  });
+  assert.deepEqual(flowRefusal(halts, "the agent acting", { caller: undefined, store: "ledger" }, "this memory write wasn't made"), [
+    "policy:ledger-from-billing",
+    "Wake's flow policy (policy:ledger-from-billing) holds the agent acting back, because Wake can't tell which agent is acting, so this memory write wasn't made.",
+    { origins: ["*"], every_origin: UNKNOWN },
+  ]);
+  assert.equal(UNKNOWN, "Wake can't tell which agent is acting");
+  assert.equal(flowRefusal(halts, "the agent acting", { caller: undefined, store: "notes" }), undefined, "unless no rule names the store");
+  assert.equal(flowRefusal(halts, "flow-support", { caller: "flow-support", store: "ledger" }), undefined, "a caller Wake can tell is held only by the rules for it");
 });
 
 /** A tracker on a clock the test moves, in seconds. */

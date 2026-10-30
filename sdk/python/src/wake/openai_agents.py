@@ -32,16 +32,31 @@ by a tool input guardrail. One to a tool the agent runs itself, a shell, an edit
 computer or a custom tool, is refused as it starts. Either way it's recorded as denied, and
 a refused agent tool starts no run. A handoff is offered only while neither the agent
 offering it nor the one it hands off to is halted, and one the model picked before a halt
-landed is refused as it starts. Hosted tools run at OpenAI, and can't be refused here. It's
-a cooperative stop: it holds only while the agent's code does.
+landed is refused as it starts. It's a cooperative stop: it holds only while the agent's
+code does.
+
+Hosted tools run at OpenAI, inside the model call, so they're checked around it. Before each
+model call of an agent that offers hosted tools other than hosted MCP (web search, file
+search, code interpreter, image generation, tool search, programmatic tool calling, a shell in
+a hosted container), each is checked as a call by the agent to a tool of its name: if any is
+held back, the model call isn't made, each held back is recorded as denied, and the run ends
+with AgentHalted. A hosted MCP tool is made to ask before every call, and Wake answers each:
+a call held back is rejected with why, and recorded as denied. One allowed gets the answer of
+the tool's own approval callback when its own setting would have asked, and is approved
+otherwise. A hosted MCP tool whose calls the app approves itself, through run interruptions,
+is left as it is: Wake can't answer for a person.
 
 The same checks apply the flow policy wake-proxy serves with those rules (wake.flow), once
 no halt refuses the call: a tool call is refused when a rule holds its agent back for what
 entered it, a call to an agent used as a tool when one holds it back from reaching that
 agent, and a handoff likewise, which is then neither offered nor made. A tool's result
 enters the agent that called it as tool:<name>, an MCP server's tool by its MCP name. A
-handoff brings what had entered the agent handing off into the one it hands off to, as
-agent:<that agent> with the rest. So does a call to an agent used as a tool, or any run
+hosted tool's call enters as tool:<name> as the response holding it comes in, before
+anything that follows from that response is checked, a hosted MCP call by its MCP tool's own
+name. Without sensitive data the trace doesn't say which hosted tools ran, so every hosted
+tool the agent offered that call enters, but hosted MCP, which enters as each call Wake
+answers for is approved. A handoff brings what had entered the agent handing off into the one it hands off to,
+as agent:<that agent> with the rest. So does a call to an agent used as a tool, or any run
 started inside a tool call, and what the run's agent said last brings what entered it back.
 """
 
@@ -52,6 +67,7 @@ import inspect
 import logging
 import types
 import uuid
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from opentelemetry import trace
@@ -66,10 +82,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("wake")
 
-# Tools that run at OpenAI, where nothing in the agent's process can refuse them. A shell
-# runs there too when its environment isn't local.
+# Tools that run at OpenAI, inside the model call, where nothing in the agent's process can
+# refuse one call at a time. A shell runs there too when its environment isn't local.
 _HOSTED = ("FileSearchTool", "WebSearchTool", "HostedMCPTool", "ImageGenerationTool", "CodeInterpreterTool",
            "ToolSearchTool", "ProgrammaticToolCallingTool")
+# A hosted tool's call in a response, and the name of the tool that made it, as agents offer
+# it. A hosted MCP call is by its MCP tool's own name, and a hosted shell's by its tool's.
+_HOSTED_CALLS = {"web_search_call": "web_search", "file_search_call": "file_search",
+                 "code_interpreter_call": "code_interpreter", "image_generation_call": "image_generation",
+                 "tool_search_call": "tool_search", "program": "programmatic_tool_calling"}
 
 # What the SDK asks of a computer while it carries out a computer call.
 _COMPUTER_ACTIONS = ("click", "double_click", "drag", "keypress", "move", "screenshot", "scroll", "type", "wait")
@@ -152,6 +173,23 @@ def _hosted(tool: Any) -> bool:
     return _kind(tool, "ShellTool") and isinstance(environment, dict) and environment.get("type", "local") != "local"
 
 
+def _asks(setting: Any, name: str) -> bool:
+    """Whether a hosted MCP tool's own require_approval would ask before a call to the MCP
+    tool name, as OpenAI applies it: always unless it's "never", and under a filter unless the
+    filter's never names the tool. Left out, OpenAI asks. A filter on tools' read-only hints
+    can't be applied here, so a call it would cover counts as asking."""
+    if setting == "never":
+        return False
+    if not isinstance(setting, Mapping):
+        return True
+    always, never = setting.get("always"), setting.get("never")
+    if isinstance(always, Mapping) and name in (always.get("tool_names") or ()):
+        return True
+    if not isinstance(never, Mapping) or never.get("read_only") is not None:
+        return True
+    return name not in (never.get("tool_names") or ())
+
+
 class _Stopped(NamedTuple):
     """A tool call or handoff refused as it started: the refusal, the call's id when the SDK
     gives it, and the agent a handoff would have started."""
@@ -218,6 +256,9 @@ class WakeTracingProcessor(EventGraph):
         self._tool_instances = _Recent()  # tool call event id -> the instance making it, and its lineage
         self._tool_runs = _Recent()  # tool call event id -> the run making it
         self._tools_since = _Recent()  # (trace, run, agent) -> tool calls since its last response, when inputs are hidden
+        self._agent_data = _Recent()  # sdk span id of an agent span -> its data, which names the tools offered each call
+        self._hosted_names = _Recent()  # agent guard() covers -> its hosted tools but hosted MCP, by name
+        self._shells = _Recent()  # agent guard() covers -> its shell tool's name, and whether it runs at OpenAI
 
     # TracingProcessor.
 
@@ -257,6 +298,7 @@ class WakeTracingProcessor(EventGraph):
             caller = None
             with self._lock:
                 self._agent_span[span.span_id] = data.name
+                self._agent_data[span.span_id] = data
                 # The first agent span under a parent starts a run; the rest are its next
                 # agents, after a handoff.
                 run = self._firsts.get((span.trace_id, span.parent_id))
@@ -337,7 +379,14 @@ class WakeTracingProcessor(EventGraph):
         AgentHalted as it starts. Bare agents in handoffs become the handoff the SDK would make
         of them. A tool the agent would run itself that Wake can't make refuse raises
         TypeError, rather than run unstopped. The flow policy served with the halts refuses
-        the same calls and handoffs the same ways (wake.flow)."""
+        the same calls and handoffs the same ways (wake.flow).
+
+        Hosted tools run at OpenAI, inside the model call. Each model call of an agent that
+        offers hosted tools other than hosted MCP is checked first, by the agent's hooks
+        (on_llm_start, the agent's own still called): when a halt or the flow policy holds back
+        any of them, the call isn't made, and AgentHalted ends the run. Each hosted MCP tool is
+        made to ask before every call, and Wake answers: see _answer_mcp. One whose calls the
+        app approves itself, through run interruptions, is left as it is."""
         from agents import Agent, FunctionTool, Handoff, handoff
         from agents.tool_guardrails import ToolInputGuardrail
 
@@ -353,7 +402,7 @@ class WakeTracingProcessor(EventGraph):
             if id(current) in seen:
                 continue
             seen.add(id(current))
-            tools = []
+            tools, hosted = [], []
             for tool in current.tools:
                 if isinstance(tool, FunctionTool):
                     if self._guardrail not in (tool.tool_input_guardrails or []):
@@ -362,10 +411,24 @@ class WakeTracingProcessor(EventGraph):
                         todo.append(tool._agent_instance)
                         # A call to it starts that agent's run, which the flow policy checks too.
                         self._agent_tools[(current.name, tool.name)] = tool._agent_instance.name
-                elif not _hosted(tool):
+                elif _kind(tool, "HostedMCPTool"):
+                    self._guard_hosted_mcp(tool, current.name)
+                elif _hosted(tool):
+                    hosted.append(tool)
+                else:
                     tool = self._guard_local(tool, current.name)
                 tools.append(tool)
             current.tools = tools
+            shell = next((t for t in tools if _kind(t, "ShellTool")), None)
+            with self._lock:
+                # What a model call of it may run at OpenAI, for when the trace doesn't say, by
+                # any agent of its name.
+                self._hosted_names[current.name] = self._hosted_names.get(current.name, frozenset()) | {
+                    t.name for t in hosted}
+                if shell is not None:
+                    self._shells[current.name] = (shell.name, _hosted(shell))
+            if hosted:
+                self._guard_model_calls(current)
             for server in getattr(current, "mcp_servers", None) or []:
                 if hasattr(server, "tool_input_guardrails") and self._guardrail not in (server.tool_input_guardrails or []):
                     server.tool_input_guardrails = [*(server.tool_input_guardrails or []), self._guardrail]
@@ -499,6 +562,110 @@ class WakeTracingProcessor(EventGraph):
             item.on_invoke_handoff = on_invoke_handoff
         return item
 
+    def _guard_model_calls(self, agent) -> None:
+        """Has each model call of agent check first the hosted tools it offers, other than
+        hosted MCP, through the agent's hooks: on_llm_start raises AgentHalted, before the
+        call is made, when any is held back (_check_model_call), then calls the agent's own
+        on_llm_start. Hooks that can't be given that raise TypeError, rather than leave the
+        model calls unchecked."""
+        from agents import AgentHooks
+
+        hooks = agent.hooks if agent.hooks is not None else AgentHooks()
+        start = getattr(hooks, "on_llm_start", None)
+        if getattr(start, "_wake", False):
+            agent.hooks = hooks
+            return
+        owner = agent.name
+
+        async def on_llm_start(context, agent, system_prompt, input_items):
+            self._check_model_call(agent, owner)
+            if callable(start):
+                started = start(context, agent, system_prompt, input_items)
+                if inspect.isawaitable(started):
+                    await started
+
+        on_llm_start._wake = True  # type: ignore[attr-defined]
+        try:
+            hooks.on_llm_start = on_llm_start
+        except (AttributeError, TypeError) as e:
+            raise TypeError(f"guard() can't check the model calls of {owner}, whose hosted tools run at OpenAI: "
+                            f"its hooks, {type(hooks).__name__}, can't be wrapped ({e})") from e
+        agent.hooks = hooks
+
+    def _check_model_call(self, agent, owner: str) -> None:
+        """Before a model call of agent: checks each hosted tool it offers, other than hosted
+        MCP, as a call by the agent to a tool of its name, halts first, then the flow policy.
+        They run inside the call, with no check of their own, so if any is held back, this
+        raises AgentHalted and the call isn't made. Each held back is recorded as denied, under
+        the agent's run. A check that fails refuses."""
+        name = getattr(agent, "name", None) or owner
+        span = _current_span()
+        held = None
+        for tool in list(getattr(agent, "tools", None) or []):
+            if not _hosted(tool) or _kind(tool, "HostedMCPTool"):
+                continue
+            tool_name = getattr(tool, "name", None) or type(tool).__name__
+            refused = self._refusal(name, span, tool=tool_name,
+                                    outcome=f"its model call, which could run {tool_name} at OpenAI, wasn't made")
+            if refused is None:
+                continue
+            try:
+                if getattr(span, "span_id", None) is not None:
+                    self._refused_alone(span, name, tool_name, None, None, refused)
+            except Exception:
+                # Refused all the same; only its record may say less.
+                log.warning("wake: failed to record a refused model call", exc_info=True)
+                failed(self._recorder, "a refused model call")
+            log.warning("wake: refused a model call of %s, which could run %s at OpenAI: %s", name, tool_name,
+                        refused.halt)
+            held = held or refused
+        if held is not None:
+            raise stop.AgentHalted(held)
+
+    def _guard_hosted_mcp(self, tool, owner: str) -> None:
+        """A hosted MCP tool, made to ask before every call so that Wake answers each
+        (_answer_mcp). owner is the agent guard() found it on, which a call is checked as when
+        no span says who's calling. A tool whose own setting asks before some calls and that
+        has no callback is approved by the app, through run interruptions: Wake can't answer
+        for a person, or interrupt, so it's left as it is."""
+        callback = tool.on_approval_request
+        if getattr(callback, "_wake", False):
+            return
+        config = tool.tool_config if isinstance(tool.tool_config, Mapping) else {}
+        setting = config.get("require_approval")
+        if callback is None and setting != "never":
+            return
+
+        async def on_approval_request(request):
+            return await self._answer_mcp(request, owner, setting, callback)
+
+        on_approval_request._wake = True  # type: ignore[attr-defined]
+        tool.tool_config = {**config, "require_approval": "always"}
+        tool.on_approval_request = on_approval_request
+
+    async def _answer_mcp(self, request, owner: str, setting: Any, callback) -> dict[str, Any]:
+        """The answer to a hosted MCP tool's request to make a call: rejected, with why, when a
+        halt covers the agent making it or the flow policy holds the agent back from the MCP
+        tool, by its own name, and recorded as denied. Otherwise the tool's own callback's
+        answer, when its own setting would have asked before this call, or else approved. Once
+        approved, tool:<MCP tool> enters the agent: the call's result comes back in the next
+        response, and noting it now doesn't depend on the trace."""
+        data = getattr(request, "data", None)
+        name = _field(data, "name") or "mcp"
+        agent = self._caller(None, owner)
+        refused = self._refuse_call(agent, name, _field(data, "arguments"), _field(data, "id"))
+        if refused is not None:
+            return {"approve": False, "reason": refused.reason}
+        if callback is not None and _asks(setting, name):
+            answer = callback(request)
+            if inspect.isawaitable(answer):
+                answer = await answer
+        else:
+            answer = {"approve": True}
+        if _field(answer, "approve"):
+            flow.note(agent, f"tool:{name}")
+        return answer
+
     def _check_tool_call(self, data):
         """The guardrail: refuses a call a halt covers, telling the model why."""
         from agents.tool_guardrails import ToolGuardrailFunctionOutput
@@ -567,7 +734,7 @@ class WakeTracingProcessor(EventGraph):
         raise stop.AgentHalted(refused)
 
     def _refusal(self, agent: str, span: Any = None, *, tool: str | None = None, target: str | None = None,
-                 starts: str | None = None) -> "stop.Refusal | None":
+                 starts: str | None = None, outcome: str | None = None) -> "stop.Refusal | None":
         """The refusal of what a run of agent is about to do, if a halt covers it: by its name,
         the instance the run is and those that started it. With target, a handoff to target is
         refused too when a halt covers it, or the instance of it the handoff would start in
@@ -577,10 +744,11 @@ class WakeTracingProcessor(EventGraph):
 
         Then the flow policy (wake.flow), on what entered agent: a call to tool, and the run of
         starts it begins, for an agent used as a tool; or a handoff to target. A rule for any
-        agent a halt here could name applies. Never raises: a check that fails refuses."""
+        agent a halt here could name applies. outcome is what the refusal says didn't happen,
+        by default the tool call or the handoff. Never raises: a check that fails refuses."""
         if self._quarantine is None:
             return None
-        outcome = f"the handoff to {target} wasn't made" if target else "this tool call wasn't run"
+        outcome = outcome or (f"the handoff to {target} wasn't made" if target else "this tool call wasn't run")
         try:
             span = span if span is not None else _current_span()
             sid = getattr(span, "span_id", None)
@@ -649,6 +817,9 @@ class WakeTracingProcessor(EventGraph):
             otel.end()
 
     def _response_ended(self, span, data) -> None:
+        # The SDK ends the response span before any tool from that response runs, so what its
+        # hosted tools brought in is noted before anything that follows from it is checked.
+        self._note_hosted(span, data)
         response = data.response
         output = list(getattr(response, "output", None) or [])
         self._model_call(
@@ -658,6 +829,64 @@ class WakeTracingProcessor(EventGraph):
             output_items=output,
             response_id=getattr(response, "id", None),
         )
+
+    def _note_hosted(self, span, data) -> None:
+        """Notes that each hosted tool call in a response brought its result into the agent
+        whose response it is, as tool:<name>, now (wake.flow): a hosted MCP call by its MCP
+        tool's own name. Without sensitive data the response isn't on the span, so every hosted
+        tool the agent offered that call, but hosted MCP, is noted instead. Never raises: when
+        the response can't be read, that's what's noted too."""
+        agent = self._agent_for(span)
+        try:
+            response = getattr(data, "response", None)
+            names = self._offered_hosted(span, agent) if response is None else self._hosted_calls(
+                agent, list(getattr(response, "output", None) or []))
+        except Exception:
+            log.warning("wake: couldn't read which hosted tools a response ran; noting every one offered",
+                        exc_info=True)
+            try:
+                names = self._offered_hosted(span, agent)
+            except Exception:
+                failed(self._recorder, "hosted tool results")
+                return
+        for name in dict.fromkeys(names):
+            flow.note(agent, f"tool:{name}")
+
+    def _hosted_calls(self, agent: str, output: list) -> list[str]:
+        """The hosted tools a response's output items say ran, by name. A shell call ran at
+        OpenAI when the agent's shell is hosted, as guard() found it, or, for an agent it
+        didn't, when the call names a hosted environment or the response holds its output."""
+        with self._lock:
+            shell = self._shells.get(agent)
+        ran_there = {_field(i, "call_id") for i in output if _field(i, "type") == "shell_call_output"}
+        names = []
+        for item in output:
+            kind = _field(item, "type")
+            if kind in _HOSTED_CALLS:
+                names.append(_HOSTED_CALLS[kind])
+            elif kind == "mcp_call" and _field(item, "name"):
+                names.append(_field(item, "name"))
+            elif kind == "shell_call":
+                environment = _field(_field(item, "environment"), "type")
+                hosted = shell[1] if shell is not None else (
+                    environment not in (None, "local") or _field(item, "call_id") in ran_there)
+                if hosted:
+                    names.append(shell[0] if shell is not None else "shell")
+        return names
+
+    def _offered_hosted(self, span, agent: str) -> list[str]:
+        """The hosted tools, but hosted MCP, the agent offered the model call span is, by name:
+        those guard() found on it, or for an agent it didn't, those of the SDK's own hosted
+        tools' names the agent's span says it offered."""
+        with self._lock:
+            agent_sid = self._agent_above(span.parent_id)
+            data = self._agent_data.get(agent_sid) if agent_sid is not None else None
+            known = self._hosted_names.get(agent)
+        offered = getattr(data, "tools", None)
+        offered = set(offered) if isinstance(offered, list) else None
+        if known is not None:
+            return sorted(n for n in known if offered is None or n in offered)
+        return [n for n in _HOSTED_CALLS.values() if offered is not None and n in offered]
 
     def _generation_ended(self, span, data) -> None:
         # Chat Completions models report generations rather than responses.
@@ -769,7 +998,8 @@ class WakeTracingProcessor(EventGraph):
         if not refused:
             # What it returned enters the agent that called it (wake.flow), and what each run
             # inside it said last brings what entered that run's agent. A hosted tool, such as
-            # web search, runs at OpenAI with no span of its own, so its result isn't noted.
+            # web search, runs at OpenAI with no span of its own: its result is noted as the
+            # response holding it comes in (_note_hosted).
             flow.note(agent, f"tool:{data.name}")
             for answered in answering:
                 flow.message(answered, agent)

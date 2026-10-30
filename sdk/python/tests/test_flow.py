@@ -17,15 +17,57 @@ def seen_in(case) -> flow.Seen:
     return flow.Seen((), "every origin") if case["origins"] == "*" else flow.Seen(tuple(case["origins"]))
 
 
+def call_in(case) -> dict:
+    """The call a case makes: a tool call, reaching an agent, or a change to a store."""
+    return {kind: case[kind] for kind in ("tool", "receiver", "store") if kind in case}
+
+
+def names_stores(policy: flow.Policy, halt: str) -> bool:
+    return any(f"policy:{r.id}" == halt and r.stores for r in policy.rules)
+
+
 def test_decides_as_the_shared_vectors_say():
     cases = VECTORS["cases"]
     assert len(cases) >= 20
+    assert sum("store" in case for case in cases) >= 5
     for case in cases:
         policy = flow.parse(VECTORS["policies"][case["policy"]])
-        denial = policy.deciding(case["caller"], case["lineage"], seen_in(case), tool=case.get("tool"),
-                                 receiver=case.get("receiver"))
+        call = call_in(case)
+        assert len(call) == 1, case["name"]
+        denial = policy.deciding(case["caller"], case["lineage"], seen_in(case), **call)
         assert (denial.halt if denial else None) == case["denied_by"], case["name"]
         assert list(denial.origins if denial else []) == case["kept"], case["name"]
+        if denial is not None:
+            # Only a rule naming stores decides a change to a store, and only a change to one.
+            assert names_stores(policy, denial.halt) == ("store" in case), case["name"]
+
+
+def test_a_rule_naming_stores_never_decides_a_tool_call_or_reaching_an_agent():
+    # Every case's caller, with every origin, calling a tool or reaching an agent named like
+    # each store a rule names: whatever denies it, it's never a rule for stores.
+    for case in VECTORS["cases"]:
+        policy = flow.parse(VECTORS["policies"][case["policy"]])
+        named = [p.rstrip("*") or "x" for r in policy.rules for p in r.stores] + ["write_memory"]
+        for name in named:
+            for call in ({"tool": name}, {"receiver": name}):
+                for seen in (seen_in(case), flow.Seen((), "every origin")):
+                    denial = policy.deciding(case["caller"], case["lineage"], seen, **call)
+                    assert denial is None or not names_stores(policy, denial.halt), (case["name"], call)
+    # And a rule naming no stores never decides a change to one, whatever it names.
+    for policy in map(flow.parse, VECTORS["policies"].values()):
+        unrelated = flow.Policy([r for r in policy.rules if not r.stores], policy.window_seconds)
+        for store in ("facts", "ledger", "customers/42", "pay", "billing", "/agents/billing"):
+            for caller in ("billing", "research", "support", "notify"):
+                assert unrelated.deciding(caller, [], flow.Seen((), "every origin"), store=store) is None
+
+
+def test_a_change_by_an_agent_wake_cant_name_meets_every_rule_naming_its_store():
+    policy = flow.parse(VECTORS["policies"]["memory"])
+    every = flow.Seen((), flow.UNKNOWN)
+    # The ledger's rule names billing, but the agent writing could be billing.
+    assert policy.deciding(None, [], every, store="ledger") == ("policy:ledger-from-orders-only", ("*",), flow.UNKNOWN)
+    assert policy.deciding(None, [], every, store="customers/7").halt == "policy:no-web-into-facts"
+    assert policy.deciding(None, [], every, store="scratch") is None, "a store no rule names takes it"
 
 
 def test_every_policy_the_shared_vectors_call_invalid_is_refused_and_refuses_every_call():
@@ -34,7 +76,7 @@ def test_every_policy_the_shared_vectors_call_invalid_is_refused_and_refuses_eve
             flow.parse(case["policy"])
         policy = flow.served(case["policy"])
         assert policy.unreadable, case["name"]
-        for call in ({"tool": "pay"}, {"receiver": "billing"}):
+        for call in ({"tool": "pay"}, {"receiver": "billing"}, {"store": "facts"}):
             assert policy.deciding("billing", [], flow.Seen(), **call).halt == flow.UNREADABLE, case["name"]
 
 
@@ -56,6 +98,10 @@ def test_every_policy_the_shared_vectors_call_invalid_is_refused_and_refuses_eve
     {"rules": [{"id": "x", "receivers": ["bill*"], "forbid_origins": ["*"]}]},
     {"rules": [{"id": "x", "path_prefixes": ["/a2a*"], "forbid_origins": ["*"]}]},
     {"rules": [{"id": "x", "receivers": [""], "forbid_origins": ["*"]}]},
+    {"rules": [{"id": "x", "stores": ["*facts"], "forbid_origins": ["*"]}]},
+    {"rules": [{"id": "x", "stores": "facts", "forbid_origins": ["*"]}]},
+    {"rules": [{"id": "x", "stores": [7], "forbid_origins": ["*"]}]},
+    {"rules": [{"id": "x", "stores": ["facts"]}]},
     {"unreadable": False},
 ], ids=lambda bad: json.dumps(bad))
 def test_a_policy_wake_proxy_wouldnt_take_is_refused(bad):
@@ -71,8 +117,11 @@ def test_reads_the_policy_as_wake_proxy_serves_it():
     assert (policy.version, policy.window_seconds, policy.unreadable) == ("ab" * 32, 600, None)
     (rule,) = policy.rules
     assert rule.callers == ("billing",) and rule.receivers == () and rule.tools == ("pay", "wire_*")
+    assert rule.stores == ()
     empty = flow.parse({})
     assert (empty.rules, empty.window_seconds) == ((), flow.DEFAULT_WINDOW)
+    (facts, ledger) = [r for r in flow.parse(VECTORS["policies"]["memory"]).rules if r.stores]
+    assert facts.stores == ("facts", "customers/*") and ledger.stores == ("ledger",)
 
 
 def test_a_bare_star_matches_every_origin_and_a_prefix_its_rest():
@@ -265,6 +314,34 @@ def test_a_refusal_names_the_rule_who_it_holds_back_and_after_what(clock):
                               "tool:fetch_page, so the handoff to billing wasn't made.")
 
 
+def test_a_change_to_a_store_is_held_back_for_what_entered_the_agent_making_it(clock):
+    rules = Rules(VECTORS["policies"]["memory"])
+    outcome = "this memory write wasn't made"
+    flow.note("research", "tool:search")
+    assert flow.refusal(rules, "research", "research", store="facts", outcome=outcome) is None
+    clock.now += 1
+    flow.note("research", "tool:fetch_page")
+    refused = flow.refusal(rules, "research", "research", store="facts", outcome=outcome)
+    assert refused == ("policy:no-web-into-facts", "Wake's flow policy (policy:no-web-into-facts) holds research back "
+                       "after tool:fetch_page, so this memory write wasn't made.")
+    assert flow.payload(refused) == {"origins": ["tool:fetch_page"]}
+    assert flow.refusal(rules, "research", "research", store="scratch", outcome=outcome) is None
+    assert flow.refusal(rules, "research", "research", tool="summarize") is None, "a rule for stores holds no tool call"
+    # A rule naming the store's writers holds a run they started, by its lineage.
+    flow.note("billing", "agent:research")
+    assert flow.refusal(rules, "billing", "billing", store="ledger", outcome=outcome).halt == "policy:ledger-from-orders-only"
+    flow.note("refunds", "agent:research")
+    assert flow.refusal(rules, "refunds#run-2", "refunds", store="ledger") is None
+    held = flow.refusal(rules, "refunds#run-2", "refunds", ["billing#run-1"], store="ledger", outcome=outcome)
+    assert held.halt == "policy:ledger-from-orders-only" and held.origins == ["agent:research"]
+    # An agent Wake can't name has every origin, and any rule naming the store could hold it.
+    unknown = flow.refusal(rules, "the agent acting", None, store="ledger", outcome=outcome)
+    assert unknown == ("policy:ledger-from-orders-only", "Wake's flow policy (policy:ledger-from-orders-only) holds the "
+                       "agent acting back, because Wake can't tell which agent is acting, so this memory write wasn't made.")
+    assert flow.payload(unknown) == {"origins": ["*"], "every_origin": flow.UNKNOWN}
+    assert flow.refusal(rules, "the agent acting", None, store="scratch") is None
+
+
 def test_a_rule_for_an_agent_holds_its_subagents_and_instances(clock):
     rules = Rules(PAY)
     flow.note("billing/refunds", "tool:fetch_page")
@@ -305,7 +382,8 @@ class Broken:
 ], ids=["unreadable", "invalid", "check_fails"])
 def test_a_policy_that_cant_be_used_refuses_every_call(rules):
     for call, outcome in (({"tool": "lookup_order"}, "this tool call wasn't run"),
-                          ({"receiver": "notify"}, "this run of notify wasn't started")):
+                          ({"receiver": "notify"}, "this run of notify wasn't started"),
+                          ({"store": "scratch"}, "this memory write wasn't made")):
         refused = flow.refusal(rules, "billing", "billing", outcome=outcome, **call)
         assert refused == (flow.UNREADABLE, f"Wake's flow policy can't be read, so {outcome}.")
         assert flow.payload(refused) == {"origins": []}
@@ -316,4 +394,8 @@ def test_no_rules_or_no_policy_checks_nothing():
     assert flow.refusal(None, "billing", "billing", tool="pay") is None
     assert flow.refusal(Rules(None), "billing", "billing", tool="pay") is None
     assert flow.refusal(object(), "billing", "billing", tool="pay") is None, "rules that can't say carry none"
+    assert flow.refusal(Rules(None), "billing", None, store="facts") is None, "nor a change to a store"
+    assert [flow.enforcing(rules) for rules in (None, Rules(None), object())] == [False, False, False]
+    assert flow.enforcing(Rules(PAY)) and flow.enforcing(Rules({"unreadable": True}))
+    assert flow.enforcing(Broken()), "rules that can't say are checked, and the check fails closed"
     assert flow.payload(stop.Refusal("halt-billing", "Wake halted billing (halt-billing), so this tool call wasn't run.")) == {}

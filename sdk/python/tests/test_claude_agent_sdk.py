@@ -959,10 +959,22 @@ def test_a_memory_write_in_a_subagents_tool_names_the_instance(tmp_path):
     assert identity(lookup) == identity(write) == ("support/researcher#toolu_agent", ("support",))
 
 
-def remembering(memory, path):
+def remembering(memory, path, acting=None, refused=None):
+    """The lookup tool, noting its order in a memory file. It notes who Wake says is acting as
+    it writes, in acting, and the halt of each write refused, in refused."""
+
     @tool("lookup_order", "Look an order up", {"order": str})
     async def remembering_lookup(arguments):
-        memory.write_file(path, ORDER)
+        from wake.quarantine import MemoryLocked
+
+        if acting is not None:
+            acting.append(memory._handler._acting())
+        try:
+            memory.write_file(path, ORDER)
+        except MemoryLocked as e:
+            if refused is None:
+                raise
+            refused.append(e.quarantine)
         return {"content": [{"type": "text", "text": ORDER}]}
 
     return remembering_lookup
@@ -976,7 +988,7 @@ def test_a_memory_write_by_a_subagent_wake_cant_place_yet_names_no_instance(tmp_
     exporter = InMemorySpanExporter()
     recorder = Recorder(agent="support", exporter=exporter)
     claude = WakeClaudeAgent(recorder)
-    read = []
+    read, acting = [], []
     first, second, order = research("Look order 1234 up"), research("Look order 1234 up again"), {"order": "1234"}
 
     async def script(cli: FakeClaudeCode) -> None:
@@ -1001,8 +1013,8 @@ def test_a_memory_write_by_a_subagent_wake_cant_place_yet_names_no_instance(tmp_
         await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
                         "is_error": False, "num_turns": 2, "session_id": "session-1", "result": ANSWER})
 
-    asyncio.run(run_support(claude, script=script, tools=[remembering(Memory(claude), tmp_path / "notes.md")],
-                            read=read))
+    asyncio.run(run_support(claude, script=script, read=read,
+                            tools=[remembering(Memory(claude), tmp_path / "notes.md", acting)]))
     recorder.flush()
     spans = exporter.get_finished_spans()
     lookup = by_name(spans, "execute_tool mcp__crm__lookup_order")
@@ -1011,45 +1023,75 @@ def test_a_memory_write_by_a_subagent_wake_cant_place_yet_names_no_instance(tmp_
     assert write.attributes["wake.agent.id"] == "support/researcher"
     assert identity(write) == (None, None), "not guessed to be the copy the stream had shown"
     assert identity(lookup) == ("support/researcher#toolu_r2", ("support",)), "named once the stream said"
+    # For the flow policy, as for its tool call's check: a rule for any copy it could be applies.
+    assert acting == [("support/researcher", "support/researcher",
+                       frozenset({"support", "support/researcher", "support/researcher#toolu_r1"}))]
+
+
+ALIKE = {"toolu_r1": research("Look order 1234 up"), "toolu_r2": research("Look it up too")}
+
+
+async def two_copies_call_alike(cli: FakeClaudeCode) -> None:
+    """Two researchers call the in-process tool with the same arguments at once, and the
+    second's call runs first. Nothing tells the tool which call it's running."""
+    order = {"order": "1234"}
+    await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
+    await cli.assistant("msg_1", *[{"type": "tool_use", "id": use, "name": "Agent", "input": ask}
+                                   for use, ask in ALIKE.items()])
+    for use, ask in ALIKE.items():
+        assert await cli.allowed(use, "Agent", ask, {})
+        await cli.user({"type": "text", "text": ask["prompt"]}, parent=use)
+    for use in ALIKE:
+        await cli.assistant(f"msg_{use}", {"type": "tool_use", "id": f"{use}_order", "name": "mcp__crm__lookup_order",
+                                           "input": order}, parent=use)
+        await cli.hook("PreToolUse", f"{use}_order", tool_name="mcp__crm__lookup_order", tool_input=order,
+                       **caller("researcher", f"agent-{use}"))
+    outputs = [await call_lookup(cli), await call_lookup(cli, first=False)]
+    for use, output in zip(reversed(list(ALIKE)), outputs):
+        await cli.user({"type": "tool_result", "tool_use_id": f"{use}_order", "content": output}, parent=use)
+    for use in ALIKE:
+        await cli.user({"type": "tool_result", "tool_use_id": use, "content": [{"type": "text", "text": ORDER}]})
+    await cli.assistant("msg_2", {"type": "text", "text": ANSWER})
+    await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
+                    "is_error": False, "num_turns": 2, "session_id": "session-1", "result": ANSWER})
 
 
 def test_calls_alike_by_two_copies_at_once_name_no_instance_in_what_they_write(tmp_path):
-    # Two researchers call the in-process tool with the same arguments at once, and the second's
-    # call runs first. Nothing tells the tool which call it's running.
     from wake.memory import Memory
 
     exporter = InMemorySpanExporter()
     recorder = Recorder(agent="support", exporter=exporter)
     claude = WakeClaudeAgent(recorder)
-    asks, order = {"toolu_r1": research("Look order 1234 up"), "toolu_r2": research("Look it up too")}, {"order": "1234"}
-
-    async def script(cli: FakeClaudeCode) -> None:
-        await cli.emit({"type": "system", "subtype": "init", "session_id": "session-1", "uuid": "u0"})
-        await cli.assistant("msg_1", *[{"type": "tool_use", "id": use, "name": "Agent", "input": ask}
-                                       for use, ask in asks.items()])
-        for use, ask in asks.items():
-            assert await cli.allowed(use, "Agent", ask, {})
-            await cli.user({"type": "text", "text": ask["prompt"]}, parent=use)
-        for use in asks:
-            await cli.assistant(f"msg_{use}", {"type": "tool_use", "id": f"{use}_order", "name": "mcp__crm__lookup_order",
-                                               "input": order}, parent=use)
-            await cli.hook("PreToolUse", f"{use}_order", tool_name="mcp__crm__lookup_order", tool_input=order,
-                           **caller("researcher", f"agent-{use}"))
-        outputs = [await call_lookup(cli), await call_lookup(cli, first=False)]
-        for use, output in zip(reversed(list(asks)), outputs):
-            await cli.user({"type": "tool_result", "tool_use_id": f"{use}_order", "content": output}, parent=use)
-        for use in asks:
-            await cli.user({"type": "tool_result", "tool_use_id": use, "content": [{"type": "text", "text": ORDER}]})
-        await cli.assistant("msg_2", {"type": "text", "text": ANSWER})
-        await cli.emit({"type": "result", "subtype": "success", "duration_ms": 10, "duration_api_ms": 8,
-                        "is_error": False, "num_turns": 2, "session_id": "session-1", "result": ANSWER})
-
-    asyncio.run(run_support(claude, script=script, tools=[remembering(Memory(claude), tmp_path / "notes.md")]))
+    asyncio.run(run_support(claude, script=two_copies_call_alike,
+                            tools=[remembering(Memory(claude), tmp_path / "notes.md")]))
     recorder.flush()
     writes = [e for e in wake_events(exporter.get_finished_spans()) if e.attributes["wake.event.kind"] == "memory_write"]
     assert len(writes) == 2
     assert all(w.attributes["wake.agent.id"] == "support/researcher" for w in writes)
     assert all(identity(w) == (None, None) for w in writes), "either could be either copy's"
+
+
+def test_a_write_by_one_of_two_calls_alike_counts_as_by_an_agent_with_every_origin(served, tmp_path):
+    # Which call is running, and so which agent is writing, can't be told: any rule naming the
+    # store could hold it back, whatever agents it names.
+    from wake import flow
+    from wake.memory import Memory
+
+    policy = {"rules": [{"id": "notes-from-billing-only", "callers": ["support/billing"], "stores": ["file"],
+                         "forbid_origins": ["tool:fetch_page"]}]}
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    claude = WakeClaudeAgent(recorder)
+    acting, refused = [], []
+    memory = Memory(claude, served(policy, "support"))
+    asyncio.run(run_support(claude, script=two_copies_call_alike,
+                            tools=[remembering(memory, tmp_path / "notes.md", acting, refused)]))
+    recorder.flush()
+    assert acting == [None, None] and refused == ["policy:notes-from-billing-only"] * 2
+    assert not (tmp_path / "notes.md").exists()
+    denied = [json.loads(e.attributes["wake.payload"]) for e in wake_events(exporter.get_finished_spans())
+              if e.attributes["wake.event.kind"] == "denied"]
+    assert [(d["origins"], d["every_origin"]) for d in denied] == [(["*"], flow.UNKNOWN)] * 2
 
 
 # Flow policies.

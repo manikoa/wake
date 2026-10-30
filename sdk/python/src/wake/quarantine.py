@@ -29,7 +29,7 @@ refuse their tool calls, and the runs they'd start (halted, wake.stop). That rea
 the proxy deny can't, such as built-in tools and subagents that call with their parent's
 credentials, but like the rest of this it holds only while the agent's code does. They
 carry the flow policy wake-proxy enforces too, when it enforces one (flow), which those
-integrations apply to the same calls (wake.flow).
+integrations apply to the same calls, and the memory adapter to memory writes (wake.flow).
 
 The proxy notes each fetch by the agent and the process it names, which is how the brake
 confirms an adapter, or an integration's stop, has a quarantine or a halt: only once every

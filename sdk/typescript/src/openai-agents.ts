@@ -32,9 +32,16 @@
  * One to a tool the agent runs itself, a shell, an editor or a computer, is refused as it
  * starts. Either way it's recorded as denied, and a refused agent tool starts no run. A handoff
  * is offered only while neither the agent offering it nor the one it hands off to is halted,
- * and one the model picked before a halt landed is refused as it starts. Hosted tools run at
- * OpenAI, and can't be refused here. It's a cooperative stop: it holds only while the agent's
- * code does.
+ * and one the model picked before a halt landed is refused as it starts. It's a cooperative
+ * stop: it holds only while the agent's code does.
+ *
+ * Hosted tools run at OpenAI, inside the model call, so they can't be refused one call at a
+ * time. Before each model call of an agent that offers any but hosted MCP, guard() checks each
+ * as a tool call by that agent, and if one is held back the call isn't made: each is recorded
+ * as denied, and the run ends with AgentHalted. guard() has each hosted MCP tool ask before
+ * every call, and answers itself, rejecting a call it holds back, unless the app answers its
+ * calls through run interruptions: Wake can't answer for a person, so that tool is left as it
+ * is.
  *
  * At the same points, guard() applies the flow policy the rules carry (flow.ts), once no halt
  * covers the call: a tool call, or a handoff by the agent it reaches, is refused the same way,
@@ -46,7 +53,16 @@
  * agent used as a tool, starts with what had entered the agent calling it, and gives back what
  * entered it with its answer. So they're noted only while the SDK traces, as Wake records.
  * The SDK doesn't say which agent an agent tool runs, so a rule for that agent as a receiver
- * isn't checked when it starts, only its own calls are; hosted tools' results aren't noted.
+ * isn't checked when it starts, only its own calls are.
+ *
+ * Each hosted tool call a response reports enters its agent as tool:<the tool's name> when the
+ * response's span ends, a hosted MCP call by the MCP tool's own name. Without sensitive data the
+ * span leaves the response out, so every hosted tool but MCP that the call offered enters, and
+ * a hosted MCP call enters when Wake approves it. The SDK hands spans to its trace processors
+ * one after another, so Wake can see a response's end after a tool from it has started: each
+ * check Wake makes for an agent, guard()'s and the memory adapter's, first waits until Wake has
+ * seen the end of each response of that agent's run whose start it saw, at most
+ * RESPONSE_WAIT_MILLIS, and refuses past that, as a check that failed.
  */
 
 import { randomUUID } from "node:crypto";
@@ -62,6 +78,9 @@ import {
   type Agent,
   type ComputerTool,
   type HandoffEnabledFunction,
+  type HostedTool,
+  type RunContext,
+  type RunToolApprovalItem,
   type Tool,
   type ToolGuardrailFunctionOutput,
   type ToolInputGuardrailData,
@@ -112,6 +131,72 @@ const WAKE = Symbol("wake");
 
 /** What the SDK asks of a computer while it carries out a computer call. */
 const COMPUTER_ACTIONS = ["click", "doubleClick", "drag", "keypress", "move", "screenshot", "scroll", "type", "wait"];
+
+/**
+ * How long a check guard() makes for an agent waits, at most, to see the end of each response
+ * of that agent's run whose start it saw, in milliseconds. Past it, the check refuses, as one
+ * that failed.
+ */
+export const RESPONSE_WAIT_MILLIS = 5_000;
+
+/**
+ * The kind of hosted tool, as its providerData's type and its name by default, that makes each
+ * call a response reports. A shell in a hosted container and hosted MCP are told apart in
+ * #hostedEntering.
+ */
+const HOSTED_CALLS: Record<string, string> = {
+  web_search_call: "web_search",
+  file_search_call: "file_search",
+  code_interpreter_call: "code_interpreter",
+  image_generation_call: "image_generation",
+  tool_search_call: "tool_search",
+  program: "programmatic_tool_calling",
+};
+
+/** A hosted MCP tool's provider data, as far as guard() reads and changes it. */
+interface McpData {
+  type: "mcp";
+  server_label?: string;
+  require_approval?: unknown;
+  on_approval?: McpApproval;
+}
+
+type McpApproval = (context: RunContext<any>, item: RunToolApprovalItem) => Promise<{ approve: boolean; reason?: string }>;
+
+/** A hosted MCP tool: it runs at OpenAI, a call at a time, and can ask before each. */
+function isHostedMcp(tool: Tool<any>): tool is HostedTool & { providerData: McpData } {
+  return tool.type === "hosted_tool" && (tool.providerData as { type?: unknown } | undefined)?.type === "mcp";
+}
+
+/**
+ * A tool OpenAI runs inside the model call, out of the agent's process, with no call of its
+ * own to refuse: a hosted tool but hosted MCP, or a shell in a hosted container.
+ */
+function ranInModelCall(tool: Tool<any>): boolean {
+  return (tool.type === "hosted_tool" && !isHostedMcp(tool)) || (tool.type === "shell" && !("shell" in tool && tool.shell));
+}
+
+/** The kind of a tool ranInModelCall: its providerData's type, a shell's "shell". */
+function hostedKind(tool: Tool<any>): string {
+  if (tool.type === "shell") return "shell";
+  const type = (tool as HostedTool).providerData?.type;
+  return type === "web_search_preview" ? "web_search" : String(type ?? tool.name);
+}
+
+/**
+ * Whether a hosted MCP tool's own approval setting would have asked about a call to the MCP
+ * tool named name. Only a never filter naming the tool by name, with no readOnly in it, says
+ * it wouldn't: whether a tool is read-only is the server's to say, and Wake can't see it.
+ */
+function wouldAsk(setting: unknown, name: string): boolean {
+  if (setting === undefined || setting === "never") return false;
+  if (setting === null || typeof setting !== "object") return true;
+  const never = (setting as { never?: Record<string, unknown> }).never;
+  if (never === null || typeof never !== "object") return true;
+  const names = never.tool_names ?? never.toolNames;
+  const readOnly = never.read_only ?? never.readOnly;
+  return !(Array.isArray(names) && names.includes(name) && readOnly === undefined);
+}
 
 /**
  * Adds Wake as a trace processor for every OpenAI Agents SDK run in this process. With
@@ -199,9 +284,22 @@ interface Stopped {
   receiver?: string;
 }
 
+/**
+ * A response span Wake saw start and not yet end: its agent, the agent span its run is in,
+ * the tools ranInModelCall its call offered, as far as guard() saw, and its end.
+ */
+interface Open {
+  agent: string;
+  agentSid: string | undefined;
+  offered: Tool<any>[] | undefined;
+  ended: Promise<void>;
+  end: () => void;
+}
+
 /** An OpenAI Agents SDK TracingProcessor that records Wake events. */
 export class WakeTracingProcessor extends EventGraph {
   readonly #agentSpan = new Recent<string, string>(); // sdk span id of an agent span -> agent name
+  readonly #agentData = new Recent<string, SdkSpan["spanData"]>(); // sdk span id of an agent span -> its data, which names the tools each call offers
   // A run is told apart from other runs of its agent, and from other copies of it, by its first
   // agent span: the agent spans of one run, after handoffs too, share a parent, the task span
   // the SDK opens for each run. Its steps are linked, and their content matched, within the run.
@@ -229,7 +327,12 @@ export class WakeTracingProcessor extends EventGraph {
   readonly #halted = new Recent<string, Stopped>(); // sdk span id of a tool call or handoff -> what refused it as it started
   readonly #refused = new Recent<string, true>(); // sdk span id of a tool call or handoff refused, which nothing of entered
   readonly #instances = new Recent<string, [string, string[]]>(); // instance -> its agent and lineage, for each Wake has seen start
+  readonly #open = new Recent<string, Open>(); // sdk span id of a response span Wake saw start and not end -> what checks wait on
+  readonly #endedFirst = new Recent<string, true>(1024); // sdk span id of a response span whose end Wake saw before its start
+  readonly #offeredFor = new Recent<string, Tool<any>[]>(); // sdk span id a model call is made under -> the tools ranInModelCall it offers
   #guardrail: ToolInputGuardrailDefinition | undefined; // the tool input guardrail guard() adds, made once
+  /** How long a check waits for the responses its agent has open, at most (RESPONSE_WAIT_MILLIS). */
+  _waitMillis = RESPONSE_WAIT_MILLIS;
 
   constructor(recorder: Recorder, { quarantine }: { quarantine?: Halts } = {}) {
     super(recorder);
@@ -252,6 +355,11 @@ export class WakeTracingProcessor extends EventGraph {
    * as tools too. A tool the agent would run itself that Wake can't make refuse throws a
    * TypeError, rather than run unstopped. Each refuses what the flow policy the rules carry
    * keeps too, and a handoff it would refuse isn't offered.
+   *
+   * Hosted tools run at OpenAI. An agent that offers any but hosted MCP has its instructions
+   * wrapped, to check each before every model call, which isn't made if one is held back. Each
+   * hosted MCP tool asks before every call, and Wake answers, unless the app answers its calls
+   * through run interruptions, which leaves it as it is.
    */
   guard<A extends Agent<any, any>>(agent: A, ...others: Agent<any, any>[]): A {
     if (this.#quarantine === undefined) throw new Error("guard() needs the brake's rules: install(recorder, { quarantine })");
@@ -268,10 +376,15 @@ export class WakeTracingProcessor extends EventGraph {
           if (!(tool.inputGuardrails ?? []).includes(guardrail)) tool.inputGuardrails = [...(tool.inputGuardrails ?? []), guardrail];
           return tool;
         }
-        // Hosted tools run at OpenAI, a shell too when it has no local shell.
-        if (tool.type === "hosted_tool" || (tool.type === "shell" && !("shell" in tool && tool.shell))) return tool;
+        if (isHostedMcp(tool)) {
+          this.#guardHostedMcp(tool);
+          return tool;
+        }
+        // Checked before each model call that offers it (#guardModelCalls).
+        if (ranInModelCall(tool)) return tool;
         return this.#guardLocal(tool, owner);
       });
+      this.#guardModelCalls(current);
       for (const server of current.mcpServers as { toolInputGuardrails?: ToolInputGuardrailDefinition<any>[] }[]) {
         if (!(server.toolInputGuardrails ?? []).includes(guardrail)) server.toolInputGuardrails = [...(server.toolInputGuardrails ?? []), guardrail];
       }
@@ -344,7 +457,8 @@ export class WakeTracingProcessor extends EventGraph {
 
   /**
    * target, its methods refusing a call a halt covers as it starts: answer(refusal) is what they
-   * give instead. describe(...args) gives the call's arguments and id, for its record.
+   * give instead. describe(...args) gives the call's arguments and id, for its record. Each
+   * resolves to what the method does, as the SDK awaits it.
    */
   #refusing<T extends object>(
     target: T,
@@ -360,14 +474,16 @@ export class WakeTracingProcessor extends EventGraph {
         if (property === WAKE) return true;
         const value = Reflect.get(object, property) as unknown;
         if (typeof property !== "string" || !methods.includes(property) || typeof value !== "function") return value;
-        return (...args: unknown[]) => {
+        return async (...args: unknown[]) => {
           let described: [unknown, string | undefined] = [undefined, undefined];
           try {
             described = describe(...args);
           } catch {
             // Refused or not all the same; only its record may say less.
           }
-          const refused = this.#refuseCall(undefined, name, described[0], described[1], owner);
+          const span = currentSpan();
+          const settled = await this.#settled(this.#agentAt(span?.spanId) ?? owner, span);
+          const refused = this.#refuseCall(undefined, name, described[0], described[1], { owner, span, settled });
           return refused === undefined ? (value as (...a: unknown[]) => unknown).apply(object, args) : answer(refused);
         };
       },
@@ -383,8 +499,13 @@ export class WakeTracingProcessor extends EventGraph {
     const enabled = item.isEnabled as HandoffEnabledFunction<any> & { wake?: true };
     if (!enabled.wake) {
       item.isEnabled = Object.assign(
-        async (args: Parameters<HandoffEnabledFunction<any>>[0]) =>
-          this._refusal(args.agent?.name ?? this._recorder.agent, { target: item.agentName }) === undefined && (await enabled(args)),
+        async (args: Parameters<HandoffEnabledFunction<any>>[0]) => {
+          const source = args.agent?.name ?? this._recorder.agent;
+          const span = currentSpan();
+          // One Wake can't check isn't offered.
+          if (!(await this.#settled(source, span))) return false;
+          return this._refusal(source, { span, target: item.agentName }) === undefined && (await enabled(args));
+        },
         { wake: true as const },
       );
     }
@@ -392,7 +513,7 @@ export class WakeTracingProcessor extends EventGraph {
     if (!invoke.wake) {
       item.onInvokeHandoff = Object.assign(
         async (...args: Parameters<Handoff<any, any>["onInvokeHandoff"]>) => {
-          this.#refuseHandoff(item.agentName, owner);
+          await this.#refuseHandoff(item.agentName, owner);
           return invoke.apply(item, args);
         },
         { wake: true as const },
@@ -401,10 +522,100 @@ export class WakeTracingProcessor extends EventGraph {
     return item;
   }
 
+  /**
+   * Has the agent's model calls check, before each, every tool it offers that OpenAI runs inside
+   * the call, if it offers any: its instructions become a function the SDK calls once before
+   * every model call, which checks, then gives what the instructions gave.
+   */
+  #guardModelCalls(agent: Agent<any, any>): void {
+    const instructions = agent.instructions as Agent<any, any>["instructions"];
+    if (wrapped(instructions) || !agent.tools.some(ranInModelCall)) return;
+    agent.instructions = Object.assign(
+      async (context: RunContext<any>, current: Agent<any, any>) => {
+        await this.#checkModelCall(current ?? agent);
+        return typeof instructions === "function" ? instructions(context, current) : instructions;
+      },
+      { [WAKE]: true as const },
+    );
+  }
+
+  /**
+   * Checks each tool an agent's model call offers that OpenAI would run inside it, as a tool call
+   * by the agent: the halts, then the flow policy. The provider would run any of them with no
+   * check, so if one is held back the call isn't made: each held back is recorded as denied, and
+   * AgentHalted ends the run. Notes what the call offers, for its response's end.
+   */
+  async #checkModelCall(agent: Agent<any, any>): Promise<void> {
+    const span = currentSpan();
+    const offered = agent.tools.filter(ranInModelCall);
+    this.#safely("tools a model call offers", () => {
+      if (span !== undefined) this.#offeredFor.set(span.spanId, offered);
+    });
+    if (offered.length === 0 || this.#quarantine === undefined) return;
+    const settled = await this.#settled(agent.name, span);
+    let first: Refusal | undefined;
+    for (const tool of offered) {
+      const outcome = `its model call, which could run ${tool.name} at OpenAI, wasn't made`;
+      const refused = settled ? this._refusal(agent.name, { span, tool: tool.name, outcome }) : unchecked(outcome);
+      if (refused === undefined) continue;
+      first ??= refused;
+      this.#safely("refused model call", () => {
+        if (span !== undefined) this.#refusedAlone(span, agent.name, tool.name, null, undefined, refused);
+      });
+      log.warn(`refused a model call of ${agent.name}, which could run ${tool.name}: ${refused[0]}`);
+    }
+    if (first !== undefined) throw new AgentHalted(first);
+  }
+
+  /**
+   * Has a hosted MCP tool ask before every call, Wake answering each (#approveMcpCall), unless
+   * the app answers its calls itself through run interruptions: its setting asks for some calls
+   * and it has no callback. Wake can't answer for a person, and can't interrupt, so that tool
+   * is left as it is.
+   */
+  #guardHostedMcp(tool: HostedTool & { providerData: McpData }): void {
+    const data = tool.providerData;
+    const callback = data.on_approval;
+    if (wrapped(callback)) return;
+    const setting = data.require_approval ?? "never";
+    if (callback === undefined && setting !== "never") return;
+    data.require_approval = "always";
+    data.on_approval = Object.assign(async (context: RunContext<any>, item: RunToolApprovalItem) => this.#approveMcpCall(context, item, setting, callback), {
+      [WAKE]: true as const,
+    });
+  }
+
+  /**
+   * Answers a hosted MCP tool's request to call the MCP tool item names: the halts, then the
+   * flow policy, for a tool call by the agent with that name. A refusal rejects it with the
+   * refusal as its reason, recorded as denied. Otherwise the tool's own callback answers, when
+   * its own setting would have asked about the call, and Wake approves when it wouldn't. An
+   * approved call's result comes back in the next response, which a trace without sensitive data
+   * leaves out, so it's noted entering the agent now.
+   */
+  async #approveMcpCall(context: RunContext<any>, item: RunToolApprovalItem, setting: unknown, callback: McpApproval | undefined): Promise<{ approve: boolean; reason?: string }> {
+    const raw = item.rawItem as { name?: unknown; id?: unknown; providerData?: Record<string, unknown> };
+    const request = raw.providerData ?? {};
+    const name = [raw.name, request.name].find((n): n is string => typeof n === "string" && n !== "") ?? "mcp";
+    const agent = item.agent?.name ?? this._recorder.agent;
+    const span = currentSpan();
+    const settled = await this.#settled(agent, span);
+    const id = [request.id, raw.id].find((i): i is string => typeof i === "string" && i !== "");
+    const server = typeof request.server_label === "string" ? request.server_label : undefined;
+    const refused = this.#refuseCall(agent, name, request.arguments, id, { span, settled, server });
+    if (refused !== undefined) return { approve: false, reason: refused[1] };
+    const answer = callback !== undefined && wouldAsk(setting, name) ? await callback(context, item) : { approve: true };
+    if (answer.approve) entered.note(agent, `tool:${name}`);
+    return answer;
+  }
+
   /** The guardrail: refuses a call a halt covers, telling the model why. */
   async #checkToolCall(data: ToolInputGuardrailData): Promise<ToolGuardrailFunctionOutput> {
     const call = data.toolCall as { name?: string; arguments?: string; callId?: string } | undefined;
-    const refused = this.#refuseCall(data.agent?.name ?? this._recorder.agent, call?.name ?? "tool", call?.arguments, call?.callId);
+    const agent = data.agent?.name ?? this._recorder.agent;
+    const span = currentSpan();
+    const settled = await this.#settled(agent, span);
+    const refused = this.#refuseCall(agent, call?.name ?? "tool", call?.arguments, call?.callId, { span, settled });
     if (refused === undefined) return ToolGuardrailFunctionOutputFactory.allow();
     return ToolGuardrailFunctionOutputFactory.rejectContent(refused[1], { halt: refused[0] });
   }
@@ -414,16 +625,23 @@ export class WakeTracingProcessor extends EventGraph {
    * policy keeps it from what entered them: agent, as the SDK says, or else the agent whose run
    * the SDK's current span is in, or owner. It's noted on the call's span, to be recorded as
    * denied when that ends, or recorded as denied now if the SDK opened none for it, as for a
-   * guardrail run before the call's approval. Never throws: a check that fails refuses.
+   * guardrail run before the call's approval, or a hosted MCP call, whose server is named.
+   * Unsettled, Wake didn't see the end of a response the call may follow from, and it refuses,
+   * as a check that failed. Never throws: a check that fails refuses.
    */
-  #refuseCall(agent: string | undefined, name: string, args: unknown, callId: string | undefined, owner?: string): Refusal | undefined {
+  #refuseCall(
+    agent: string | undefined,
+    name: string,
+    args: unknown,
+    callId: string | undefined,
+    { owner, span = currentSpan(), settled = true, server }: { owner?: string; span?: SdkSpan; settled?: boolean; server?: string } = {},
+  ): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
-    const span = currentSpan();
     let who = agent ?? owner ?? this._recorder.agent;
     let refused: Refusal | undefined;
     try {
       who = agent ?? this.#agentAt(span?.spanId) ?? who;
-      refused = this._refusal(who, { span, tool: name });
+      refused = settled ? this._refusal(who, { span, tool: name }) : unchecked();
     } catch (error) {
       log.warn("couldn't check the halts for a tool call; refusing it", error);
       refused = unchecked();
@@ -435,7 +653,7 @@ export class WakeTracingProcessor extends EventGraph {
       if (span === undefined) return;
       this.#refused.set(span.spanId, true);
       if (this.#pending.has(span.spanId)) this.#halted.set(span.spanId, { refusal: stopped, call: callId });
-      else this.#refusedAlone(span, who, name, args, callId, stopped);
+      else this.#refusedAlone(span, who, name, args, callId, stopped, server);
     });
     log.warn(`refused a ${name} call of ${who}: ${refused[0]}`);
     return refused;
@@ -446,11 +664,12 @@ export class WakeTracingProcessor extends EventGraph {
    * halt covers the agent handing off or the one it would hand off to, or the flow policy keeps
    * the handoff from what entered the agent handing off.
    */
-  #refuseHandoff(target: string, owner: string): void {
+  async #refuseHandoff(target: string, owner: string): Promise<void> {
     const span = currentSpan();
     const handing = span?.spanData.type === "handoff" ? span : undefined;
     const source = (handing?.spanData.from_agent as string | undefined) ?? owner;
-    const refused = this._refusal(source, { span, target });
+    const settled = await this.#settled(source, span);
+    const refused = settled ? this._refusal(source, { span, target }) : unchecked(`the handoff to ${target} wasn't made`);
     if (refused === undefined) return;
     this.#safely("refused handoff", () => {
       if (handing !== undefined) this.#refused.set(handing.spanId, true);
@@ -467,12 +686,16 @@ export class WakeTracingProcessor extends EventGraph {
    * The run is the one span is in, by default the SDK's current span, as for its events. While
    * Wake can't place it, a halt on any run of the agent Wake has seen refuses it. Then the flow
    * policy, on what entered agent: a call to tool, or a handoff to target, it keeps is refused
-   * too, its rules for callers holding the run's lineage as the halts do. Never throws: a check
-   * that fails refuses.
+   * too, its rules for callers holding the run's lineage as the halts do. outcome says what a
+   * refusal stops, by default the tool call or the handoff. Never throws: a check that fails
+   * refuses.
    */
-  _refusal(agent: string, { span = currentSpan(), target, tool }: { span?: SdkSpan; target?: string; tool?: string } = {}): Refusal | undefined {
+  _refusal(
+    agent: string,
+    { span = currentSpan(), target, tool, outcome }: { span?: SdkSpan; target?: string; tool?: string; outcome?: string } = {},
+  ): Refusal | undefined {
     if (this.#quarantine === undefined) return undefined;
-    const outcome = target !== undefined ? `the handoff to ${target} wasn't made` : "this tool call wasn't run";
+    outcome ??= target !== undefined ? `the handoff to ${target} wasn't made` : "this tool call wasn't run";
     try {
       const names = new Set([this._recorder.agent, agent]);
       const unplaced: string[] = [];
@@ -514,10 +737,11 @@ export class WakeTracingProcessor extends EventGraph {
 
   /**
    * Records a tool call refused where the SDK opened no span for it, as for a guardrail run
-   * before the call's approval: denied, under its agent's run, the response that asked for it
-   * its parent.
+   * before the call's approval, a hosted MCP call, with its server, or a hosted tool a model call
+   * would have offered: denied, under its agent's run, the response that asked for it, or the
+   * agent's latest, its parent.
    */
-  #refusedAlone(span: SdkSpan, agent: string, name: string, args: unknown, callId: string | undefined, refused: Refusal): void {
+  #refusedAlone(span: SdkSpan, agent: string, name: string, args: unknown, callId: string | undefined, refused: Refusal, server?: string): void {
     const run = this.#runAt(span.spanId);
     const requested = typeof args === "string" ? this.#call.get(key(span.traceId, run ?? null, name, args)) : undefined;
     const parent = requested?.[1] ?? this.#lastResponse.get(key(span.traceId, run ?? null, agent));
@@ -528,6 +752,7 @@ export class WakeTracingProcessor extends EventGraph {
       "gen_ai.operation.name": "execute_tool",
       "gen_ai.tool.name": name,
       "wake.brake.halt_id": refused[0],
+      ...(server !== undefined ? { "wake.mcp.server": server } : {}),
     }, { input: args ?? null, output: refused[1], ...keptOf(refused) });
     if (callId) this.#eventByCall.set(callId, eventId);
     this.#remember(otel.spanContext().traceId, run, eventId, refused[1]);
@@ -561,10 +786,12 @@ export class WakeTracingProcessor extends EventGraph {
       spanParents.set(span.spanId, span.parentId);
       const data = span.spanData;
       const kind = data.type;
+      if (kind === "response") this.#opened(span);
       if (!["agent", "response", "generation", "function", "handoff"].includes(kind)) return;
       let attributes = {};
       if (kind === "agent") {
         this.#agentSpan.set(span.spanId, String(data.name));
+        this.#agentData.set(span.spanId, data);
         // The first agent span under a parent starts a run; the rest are its next agents, after
         // a handoff.
         let run = this.#firsts.get(key(span.traceId, span.parentId));
@@ -622,33 +849,81 @@ export class WakeTracingProcessor extends EventGraph {
   }
 
   async onSpanEnd(span: SdkSpan): Promise<void> {
-    this.#safely("what entered", () => this.#entering(span));
-    this.#safely("onSpanEnd", () => {
-      const data = span.spanData;
-      switch (data.type) {
-        case "agent":
-          return this.#agentEnded(span);
-        case "response":
-          return this.#responseEnded(span);
-        case "generation":
-          return this.#generationEnded(span);
-        case "function":
-          return this.#functionEnded(span);
-        case "handoff":
-          return this.#handoffEnded(span);
-      }
-    });
+    // The checks waiting on a response go on once what it brought in is noted, and it's recorded.
+    let open: Open | undefined;
+    if (span.spanData.type === "response") {
+      open = this.#open.pop(span.spanId);
+      // Its start and end reach Wake by separate ways, so its end may come first.
+      if (open === undefined) this.#endedFirst.set(span.spanId, true);
+    }
+    try {
+      this.#safely("what entered", () => this.#entering(span, open));
+      this.#safely("onSpanEnd", () => {
+        const data = span.spanData;
+        switch (data.type) {
+          case "agent":
+            return this.#agentEnded(span);
+          case "response":
+            return this.#responseEnded(span);
+          case "generation":
+            return this.#generationEnded(span);
+          case "function":
+            return this.#functionEnded(span);
+          case "handoff":
+            return this.#handoffEnded(span);
+        }
+      });
+    } finally {
+      open?.end();
+    }
+  }
+
+  /**
+   * Notes a response span starting, which the checks for its agent's run wait to see end, with
+   * what its call offered that OpenAI runs inside it, as far as guard() saw (#checkModelCall).
+   */
+  #opened(span: SdkSpan): void {
+    if (this.#endedFirst.pop(span.spanId)) return;
+    let end = () => {};
+    const ended = new Promise<void>((resolve) => (end = resolve));
+    const offered = span.parentId !== null ? this.#offeredFor.get(span.parentId) : undefined;
+    this.#open.set(span.spanId, { agent: this.#agentFor(span), agentSid: this.#agentAbove(span.parentId), offered, ended, end });
+  }
+
+  /**
+   * Resolves true once Wake has seen the end of each response span of agent's run whose start
+   * it saw, the run span is in, or each of agent's when that isn't known; false if that takes
+   * longer than _waitMillis. The SDK hands each span to its trace processors one after another,
+   * so one before Wake can hold up Wake's sight of a response's end until after a tool from it
+   * has started.
+   */
+  async #settled(agent: string, span: SdkSpan | undefined): Promise<boolean> {
+    const at = span === undefined ? undefined : this.#agentSpan.has(span.spanId) ? span.spanId : this.#agentAbove(span.parentId);
+    const open = [...this.#open.values()].filter((o) => o.agent === agent && (at === undefined || o.agentSid === undefined || o.agentSid === at));
+    if (open.length === 0) return true;
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(false), this._waitMillis)));
+    try {
+      const settled = await Promise.race([Promise.all(open.map((o) => o.ended)).then(() => true), late]);
+      if (!settled) log.warn(`Wake didn't see a response of ${agent} end within ${this._waitMillis}ms; refusing what its check would decide`);
+      return settled;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
    * Notes what a span that ended brought into an agent (flow.ts): a tool's result enters the
    * agent that called it, unless Wake refused the call; a handoff that was made enters its
-   * target from its source; and the answer of a run inside a tool call goes back to the agent
-   * that called the tool, with what had entered the run.
+   * target from its source; the answer of a run inside a tool call goes back to the agent that
+   * called the tool, with what had entered the run; and what a response's hosted tools brought
+   * enters its agent.
    */
-  #entering(span: SdkSpan): void {
+  #entering(span: SdkSpan, open?: Open): void {
     const data = span.spanData;
-    if (data.type === "function") {
+    if (data.type === "response") {
+      this.#hostedEntering(span, open);
+    } else if (data.type === "function") {
       if (!this.#refused.has(span.spanId)) entered.note(this.#agentFor(span), `tool:${String(data.name ?? "")}`);
     } else if (data.type === "handoff") {
       // The SDK names the target once the handoff is made, and never for one refused.
@@ -657,6 +932,51 @@ export class WakeTracingProcessor extends EventGraph {
       const tool = this.#toolAbove(span.parentId);
       if (tool !== undefined) entered.message(String(data.name), this.#agentAt(tool[0]) ?? this._recorder.agent);
     }
+  }
+
+  /**
+   * Notes each hosted tool call a response reports entering its agent, as tool:<the tool's name>,
+   * by the name the agent offers it under when guard() saw the call's tools, else the kind's own,
+   * such as web_search: a hosted MCP call by the MCP tool's name, and a shell call when it ran
+   * at OpenAI. Without sensitive data the span leaves the response out, so every tool the call
+   * offered that OpenAI runs inside it enters, hosted MCP aside, which Wake notes as it
+   * approves each call: as guard() saw them, or for an agent it doesn't cover, those of the
+   * SDK's own hosted tools' names the agent's span says it offers.
+   */
+  #hostedEntering(span: SdkSpan, open: Open | undefined): void {
+    const agent = open?.agent ?? this.#agentFor(span);
+    const offered = open?.offered ?? (span.parentId !== null ? this.#offeredFor.get(span.parentId) : undefined);
+    const response = span.spanData._response;
+    const names = new Set<string>();
+    if ((response === undefined || response === null) && offered !== undefined) {
+      for (const tool of offered) names.add(tool.name);
+    } else if (response === undefined || response === null) {
+      const listed = this.#agentData.get(this.#agentAbove(span.parentId) ?? "")?.tools;
+      for (const kind of Object.values(HOSTED_CALLS)) if (Array.isArray(listed) && listed.includes(kind)) names.add(kind);
+    } else {
+      const output = field(response, "output");
+      const items = Array.isArray(output) ? output : [];
+      const shell = offered?.find((t) => t.type === "shell");
+      const ranThere = new Set(items.filter((i) => field(i, "type") === "shell_call_output").map((i) => field(i, "call_id", "callId")));
+      for (const item of items) {
+        const type = field(item, "type");
+        if (type === "mcp_call") {
+          const name = field(item, "name");
+          if (typeof name === "string" && name) names.add(name);
+        } else if (type === "shell_call") {
+          // At OpenAI when the agent's shell is hosted, as guard() saw the call's tools, or for a
+          // call it didn't see, when the call names a hosted environment or the response holds its
+          // output.
+          const environment = field(field(item, "environment"), "type");
+          const hosted = offered !== undefined ? shell !== undefined : (environment !== undefined && environment !== "local") || ranThere.has(field(item, "call_id", "callId"));
+          if (hosted) names.add(shell?.name ?? "shell");
+        } else if (typeof type === "string" && Object.hasOwn(HOSTED_CALLS, type)) {
+          const kind = HOSTED_CALLS[type];
+          names.add(offered?.find((t) => t.type === "hosted_tool" && hostedKind(t) === kind)?.name ?? kind);
+        }
+      }
+    }
+    for (const name of names) entered.note(agent, `tool:${name}`);
   }
 
   async shutdown(): Promise<void> {
@@ -985,6 +1305,11 @@ export class WakeTracingProcessor extends EventGraph {
   override _currentInstance(): [string | undefined, readonly string[]] {
     const link = links.current();
     return (link !== undefined ? this.#toolInstances.get(link.eventId) : undefined) ?? [undefined, []];
+  }
+
+  /** Waits for the responses of the agent whose tool call is running, for the memory adapter's check of a write it makes (#settled). */
+  override _settled(): Promise<boolean> {
+    return this.#settled(this._currentAgent(), currentSpan());
   }
 
   /** Under the closest enclosing span Wake opened, else the workflow's root. */

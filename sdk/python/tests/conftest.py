@@ -17,13 +17,14 @@ def nothing_entered_yet(monkeypatch):
 @pytest.fixture
 def served():
     """The brake's rules for an agent, fetched from a stand-in for wake-proxy's memory endpoint
-    (test_quarantine.Rules) that serves them with this flow policy, or with none."""
+    (test_quarantine.Rules) that serves them with this flow policy, or with none, and any more
+    fields given, such as locked_by."""
     from test_quarantine import Rules
 
     stand_in = Rules()
 
-    def rules(policy, agent: str) -> Quarantine:
-        stand_in.rules = {"version": 1, "quarantines": [], "halts": []}
+    def rules(policy, agent: str, **more) -> Quarantine:
+        stand_in.rules = {"version": 1, "quarantines": [], "halts": [], **more}
         if policy is not None:
             stand_in.rules["flow"] = policy
         quarantine = Quarantine(stand_in.url, agent, start=False)

@@ -918,3 +918,30 @@ class WakeClaudeAgent(EventGraph):
             # Known from the stream, or from the agent_id its hook named. Before either, the
             # instance is left out rather than guessed: one the stream hasn't shown may be calling.
             return self._tool_instances.get(link.event_id) or (None, ())
+
+    def _acting(self) -> "tuple[str, str, frozenset[str]] | None":
+        """Who is acting, for a memory change an in-process tool makes, as the tool call's own
+        check named it (_halting). A subagent whose instance Wake hasn't placed yet could be any
+        instance its session started, or one they started, so a rule for any of them applies.
+        None while the call is one of several alike that Wake can't tell apart, which may be
+        different agents' (wake.flow counts that as every origin)."""
+        link = links.current()
+        if link is None:
+            return super()._acting()
+        with self._lock:
+            if link.event_id in self._ambiguous:
+                return None
+            agent = self._tool_agents.get(link.event_id) or self._recorder.agent
+            names = {self._recorder.agent, agent}
+            placed = self._tool_instances.get(link.event_id)
+            if placed:
+                instance, lineage = placed
+                return agent, instance, frozenset({*names, instance, *lineage})
+            if agent != self._recorder.agent:
+                # As its tool check does while it can't place the caller (_halting), within its
+                # session when Wake knows it, and across every session when it doesn't.
+                tool = next((t for t in self._tools.values() if t.event_id == link.event_id), None)
+                session = tool.run.session_id if tool is not None and tool.run is not None else None
+                names.update(name for s, _, instance, lineage in self._spawned.values()
+                             if session is None or s in (session, None) for name in (instance, *lineage))
+        return agent, agent, frozenset(names)

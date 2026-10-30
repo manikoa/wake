@@ -9,8 +9,10 @@
  * what entered the calling agent within the policy's window, which Entered keeps for every
  * agent in the process, as wake-proxy's origins.rs does for what passes it: a tool's result,
  * another agent's message, handoff or result, and what a memory read brings in. Never what
- * the user asked: their prompt isn't an origin. sdk/testdata/flow_policy.json pins the
- * decisions, which wake-proxy and the Python SDK make alike.
+ * the user asked: their prompt isn't an origin. Rules naming memory stores hold only the
+ * changes the memory adapter makes to them, which never pass the proxy (memory.ts).
+ * sdk/testdata/flow_policy.json pins the decisions, which wake-proxy and the Python SDK make
+ * alike.
  *
  * Like the halts, this runs in the agent's own process, so it holds only while the agent's
  * code does. wake-proxy, and a network that lets agents out only through it, stay the
@@ -38,6 +40,8 @@ export const SATURATED = "more origins entered it than Wake keeps";
 export const OVERFLOWED = "too many agents to remember this one";
 /** Why an agent has every origin once content from one that does reached it. */
 export const CARRIED = "a message or reply reached it from one with every origin";
+/** Why the agent acting has every origin when Wake can't tell which agent it is. */
+export const UNKNOWN = "Wake can't tell which agent is acting";
 
 /** One rule, as wake-proxy serves it: the calls it targets, and the origins it keeps from them. */
 export interface FlowRule {
@@ -50,21 +54,32 @@ export interface FlowRule {
   readonly path_prefixes: readonly string[];
   /** The tools it applies to, each exact or a prefix ending in *. */
   readonly tools: readonly string[];
+  /**
+   * The memory stores it applies to, each exact or a prefix ending in *: a write, a delete or a
+   * rollback through the memory adapter, and nothing else.
+   */
+  readonly stores: readonly string[];
   /** Origins that may not be behind a call it targets. */
   readonly forbid_origins: readonly string[];
   /** The only origins that may be behind a call it targets, when given. */
   readonly allow_origins: readonly string[];
 }
 
-/** A call as a rule targets it: who makes it and the agents it acts under, and the tool it calls or the agent it reaches. */
+/**
+ * A call as a rule targets it: who makes it and the agents it acts under, and the tool it
+ * calls, the agent it reaches or the memory store it changes.
+ */
 export interface FlowCall {
-  readonly caller: string;
+  /** The agent making the call, or undefined when Wake can't tell which it is: any rule's callers could be it. */
+  readonly caller: string | undefined;
   /** The agents the caller acts under, such as the agent that started a sub-agent. */
   readonly lineage?: Iterable<string>;
   /** The tool called, for a tool call. */
   readonly tool?: string;
   /** The agent reached, for a handoff, or a sub-agent or a run being started. */
   readonly receiver?: string;
+  /** The memory store changed, for a write, a delete or a rollback through the memory adapter. */
+  readonly store?: string;
 }
 
 /** That an agent counts as having every origin, and why. */
@@ -109,22 +124,27 @@ export class FlowPolicy {
    * ext_authz applies them to every call, then the rules naming its tool, as its MCP hook does,
    * each in file order. An agent reached meets the rules naming no tools or path prefixes whose
    * receivers are empty or name it: rules with path prefixes only ever meet requests at the
-   * proxy. A rule applies when its callers are empty or name the caller or an agent it acts
-   * under, and the first that keeps any origin from the call denies it.
+   * proxy. A change to a memory store meets the rules naming that store, in file order, and
+   * only those: a rule naming stores meets nothing else. A rule applies when its callers are
+   * empty or name the caller or an agent it acts under, or the caller can't be told, and the
+   * first that keeps any origin from the call denies it.
    */
   deciding(call: FlowCall, seen: Seen): Denial | undefined {
     if (this.unreadable !== null) return { halt: UNREADABLE, origins: [], unreadable: true };
-    const { receiver, tool } = call;
-    const names = new Set([call.caller, ...(call.lineage ?? [])]);
+    const { caller, receiver, store, tool } = call;
+    const names = new Set([...(caller !== undefined ? [caller] : []), ...(call.lineage ?? [])]);
+    const rules = this.rules.filter((r) => r.stores.length === 0);
     const meets =
-      receiver !== undefined
-        ? this.rules.filter((r) => r.tools.length === 0 && r.path_prefixes.length === 0 && (r.receivers.length === 0 || r.receivers.includes(receiver)))
-        : [
-            ...this.rules.filter((r) => r.tools.length === 0 && r.receivers.length === 0 && r.path_prefixes.length === 0),
-            ...(tool !== undefined ? this.rules.filter((r) => r.tools.some((p) => matches(p, tool))) : []),
-          ];
+      store !== undefined
+        ? this.rules.filter((r) => r.stores.some((p) => matches(p, store)))
+        : receiver !== undefined
+          ? rules.filter((r) => r.tools.length === 0 && r.path_prefixes.length === 0 && (r.receivers.length === 0 || r.receivers.includes(receiver)))
+          : [
+              ...rules.filter((r) => r.tools.length === 0 && r.receivers.length === 0 && r.path_prefixes.length === 0),
+              ...(tool !== undefined ? rules.filter((r) => r.tools.some((p) => matches(p, tool))) : []),
+            ];
     for (const rule of meets) {
-      if (rule.callers.length > 0 && !rule.callers.some((c) => names.has(c))) continue;
+      if (caller !== undefined && rule.callers.length > 0 && !rule.callers.some((c) => names.has(c))) continue;
       if (seen instanceof Every) return { halt: `policy:${rule.id}`, origins: ["*"], every: seen.why };
       const kept = seen.filter(
         (o) => rule.forbid_origins.some((p) => matches(p, o)) || (rule.allow_origins.length > 0 && !rule.allow_origins.some((p) => matches(p, o))),
@@ -147,6 +167,7 @@ const LISTS = [
   ["receivers", false],
   ["path_prefixes", false],
   ["tools", true],
+  ["stores", true],
   ["forbid_origins", true],
   ["allow_origins", true],
 ] as const;
@@ -156,10 +177,10 @@ const RULE_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 /**
  * The policy wake-proxy serves, read as wake-proxy reads its file: any field it doesn't know,
  * a value of the wrong type, a rule with no origins to keep, tools with receivers or path
- * prefixes, a repeated or malformed id, an empty entry or a * anywhere but at the end of a
- * pattern, or a window outside 1 to 86,400 seconds makes it unusable. So does what wake-proxy
- * serves when it can't use its own file, {"unreadable": true}. Never throws: a policy that
- * can't be used refuses every call.
+ * prefixes, stores with tools, receivers or path prefixes, a repeated or malformed id, an
+ * empty entry or a * anywhere but at the end of a pattern, or a window outside 1 to 86,400
+ * seconds makes it unusable. So does what wake-proxy serves when it can't use its own file,
+ * {"unreadable": true}. Never throws: a policy that can't be used refuses every call.
  */
 export function parsePolicy(served: unknown): FlowPolicy {
   try {
@@ -211,6 +232,7 @@ function ruleOf(value: unknown): FlowRule {
     receivers: list("receivers"),
     path_prefixes: list("path_prefixes"),
     tools: list("tools"),
+    stores: list("stores"),
     forbid_origins: list("forbid_origins"),
     allow_origins: list("allow_origins"),
   };
@@ -219,6 +241,9 @@ function ruleOf(value: unknown): FlowRule {
   }
   if (rule.tools.length > 0 && (rule.receivers.length > 0 || rule.path_prefixes.length > 0)) {
     throw new Error(`rule ${id} names tools with receivers or path_prefixes, which no call has together`);
+  }
+  if (rule.stores.length > 0 && (rule.tools.length > 0 || rule.receivers.length > 0 || rule.path_prefixes.length > 0)) {
+    throw new Error(`rule ${id} names stores with tools, receivers or path_prefixes: a memory write has none of them`);
   }
   for (const [name, patterns] of LISTS) {
     for (const entry of rule[name]) {
