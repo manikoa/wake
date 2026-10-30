@@ -2,6 +2,7 @@ package hook
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,19 @@ type Action struct {
 	// Rest holds the event's fields that none of the above took, kept in the payload so
 	// nothing the host said is lost.
 	Rest map[string]any
+
+	flow flowAct // what it means for the flow policy, beyond the tool it calls (flow.go)
+}
+
+// flowAct is what an action means for the flow policy, beyond the tool it calls: a
+// subagent it starts, a subagent's answer, or a subagent that stopped.
+type flowAct struct {
+	starts     bool   // it starts a subagent of type subagent, or its result is that subagent's answer
+	subagent   string // the type of subagent it starts
+	onlyStarts bool   // it starts one and calls no tool, as Cursor's subagentStart
+	background bool   // the subagent runs on in the background, and answers when it stops
+	agentID    string // the id the background subagent's hooks name it by
+	stopped    bool   // a subagent stopped: if it ran in the background, its answer arrives
 }
 
 // A Host reads one product's hook events and answers them its way.
@@ -35,17 +49,74 @@ type Host struct {
 	refuse func(a Action, reason string) []byte
 	// allow is what a host needs to hear when a gate lets an action through, if anything.
 	allow func(a Action) []byte
+	// ownName is a tool's own name, given the host's name for it, for the flow policy: an
+	// MCP tool's, as wake-proxy names it. The host's name for it when nil.
+	ownName func(tool string) string
+	// subagents says the host names the subagent making each call, and starts one with a
+	// tool whose input and result Wake reads, as Claude Code does. The flow policy then
+	// holds each type of subagent as an agent of its own. Elsewhere, a session is one
+	// agent to the flow policy, its subagents included.
+	subagents bool
+}
+
+// toolName is a tool's name as a flow rule names it, and as its result enters an agent.
+func (h *Host) toolName(tool string) string {
+	if h.ownName == nil {
+		return tool
+	}
+	return h.ownName(tool)
 }
 
 // Hosts are the products wake-hook reads, by the name given on its command line.
 var Hosts = map[string]*Host{
-	"claude-code": {Name: "claude-code", parse: parseClaude, refuse: refuseClaude},
-	// Codex took Claude Code's hooks: the same events, fields and answers.
-	"codex":       {Name: "codex", parse: parseClaude, refuse: refuseClaude},
-	"cursor":      {Name: "cursor", parse: parseCursor, refuse: refuseCursor, allow: allowCursor},
+	"claude-code": {Name: "claude-code", parse: parseClaude, refuse: refuseClaude, ownName: mcpToolName, subagents: true},
+	// Codex took Claude Code's hooks: the same events, fields and answers, but for its subagents.
+	"codex":       {Name: "codex", parse: parseCodex, refuse: refuseClaude, ownName: mcpToolName},
+	"cursor":      {Name: "cursor", parse: parseCursor, refuse: refuseCursor, allow: allowCursor, ownName: cursorToolName},
 	"grok":        {Name: "grok", parse: parseGrok, refuse: refuseDecision},
 	"gemini":      {Name: "gemini", parse: parseGemini, refuse: refuseDecision},
 	"antigravity": {Name: "antigravity", parse: parseAntigravity, refuse: refuseDecision, allow: allowAntigravity},
+}
+
+// mcpToolName is an MCP tool's own name, which Claude Code and Codex call
+// mcp__<server>__<tool>.
+func mcpToolName(name string) string {
+	if parts := strings.SplitN(name, "__", 3); len(parts) == 3 && parts[0] == "mcp" {
+		return parts[2]
+	}
+	return name
+}
+
+// cursorToolName is an MCP tool's own name, which Cursor's tool hooks call MCP:<tool>.
+// Its MCP hooks give the tool's own name already.
+func cursorToolName(name string) string {
+	return strings.TrimPrefix(name, "MCP:")
+}
+
+// subagentTools are the tools Claude Code starts a subagent with; older versions call it Task.
+var subagentTools = map[string]bool{"Agent": true, "Task": true}
+
+// launched is what the Agent tool's result says of a subagent it left running in the background.
+var launched = map[string]bool{"async_launched": true, "remote_launched": true}
+
+// subagentCall reads a call to Claude Code's Agent tool: the type of subagent it starts,
+// and, from its result, whether it runs on in the background, and the id its hooks name
+// it by.
+func (a *Action) subagentCall(result any) {
+	if !subagentTools[a.Tool] {
+		return
+	}
+	a.flow.starts, a.flow.subagent = true, "general-purpose"
+	if input, ok := a.Input.(map[string]any); ok {
+		if t, ok := input["subagent_type"].(string); ok && t != "" {
+			a.flow.subagent = t
+		}
+	}
+	if r, ok := result.(map[string]any); ok {
+		status, _ := r["status"].(string)
+		a.flow.background = launched[status]
+		a.flow.agentID, _ = r["agentId"].(string)
+	}
 }
 
 // fields hands out an event's fields one at a time, so whatever's left can be kept.
@@ -99,23 +170,39 @@ func parseClaude(f fields, _ string) (Action, bool) {
 	case "PreToolUse":
 		a.Gate = true
 		a.toolCall(f)
+		a.subagentCall(nil)
 	case "PostToolUse":
 		a.Kind = "tool_call"
 		a.toolCall(f)
 		a.Output = f.take("tool_response")
 		a.Duration = f.millis("duration_ms")
+		a.subagentCall(a.Output)
 	case "PostToolUseFailure":
 		a.Kind = "tool_call"
 		a.toolCall(f)
 		a.Output = map[string]any{"error": f.take("error")}
 		a.Duration = f.millis("duration_ms")
+		a.subagentCall(nil)
 	case "UserPromptSubmit":
 		a.Kind, a.Gate, a.Prompt = "agent_message", true, true
 		a.Input = f.take("prompt")
+	case "SubagentStop":
+		// Nothing new to record, but a subagent left in the background answers now.
+		a.flow.stopped = true
 	default:
 		return a, false
 	}
 	return a, true
+}
+
+// Codex's hooks. It starts a subagent with spawn_agent, whose input and result its docs
+// don't give, so what a subagent starts with and answers can't be told apart from its
+// session's. Its subagents' hooks name their session's id, so the flow policy holds them
+// as their session's agent: what enters one enters the other.
+func parseCodex(f fields, event string) (Action, bool) {
+	a, ok := parseClaude(f, event)
+	a.flow = flowAct{}
+	return a, ok
 }
 
 func refuseClaude(a Action, reason string) []byte {
@@ -172,8 +259,13 @@ func parseCursor(f fields, _ string) (Action, bool) {
 		a.Kind, a.Gate, a.Prompt = "agent_message", true, true
 		a.Input = f.take("prompt")
 	case "subagentStart":
+		// The subagent's own events name a conversation of their own, which nothing ties to
+		// this one, so only its start is checked against what entered the agent starting it.
 		a.Gate, a.Tool = true, "subagent"
-		a.Input = map[string]any{"subagent_type": f.take("subagent_type"), "task": f.take("task")}
+		subagent := f.take("subagent_type")
+		a.Input = map[string]any{"subagent_type": subagent, "task": f.take("task")}
+		a.flow.starts, a.flow.onlyStarts = true, true
+		a.flow.subagent, _ = subagent.(string)
 	default:
 		return a, false
 	}

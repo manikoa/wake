@@ -13,7 +13,7 @@ Each of them, though, runs a command of the user's choosing on its hook events: 
 `wake-hook` ([`hook/`](../hook)) is a capture component, like an SDK. The agent's host runs it on each hook event:
 
 - It records the event as an unsigned Wake event with `wake.capture` `hook`. The collector signs it on arrival, as it signs SDK events ([signing.md](signing.md)).
-- Given the brake's rules, it refuses the calls a halt covers, as the SDKs do in an agent's own process (Denied calls in [events.md](events.md)).
+- Given the brake's rules, it refuses the calls a halt covers, as the SDKs do in an agent's own process (Denied calls in [events.md](events.md)), and those wake-proxy's flow policy holds back ([below](#the-flow-policy)).
 
 One command covers all six, since they've converged on Claude Code's contract: a JSON event on stdin, and a decision on stdout. Cursor and Grok Build can even load Claude Code's hooks. Each still names its events and fields its own way, so the host is the command's first argument: `wake-hook claude-code`, `codex`, `cursor`, `grok`, `gemini` or `antigravity`.
 
@@ -21,7 +21,7 @@ Antigravity's input doesn't say which event fired, so each of its hooks is told 
 
 ## Why it's capture only
 
-It runs on the agent's machine, under the user's account, where an agent with a shell can reach it. So it holds no key, and a hook event is only as honest as that machine, as an SDK event is only as honest as the agent's process. The proxy's own record of MCP calls stays the independent check. The halt check, too, holds only while the machine does. The proxy deny and the token levers don't depend on it.
+It runs on the agent's machine, under the user's account, where an agent with a shell can reach it. So it holds no key, and a hook event is only as honest as that machine, as an SDK event is only as honest as the agent's process. The proxy's own record of MCP calls stays the independent check. The halt and flow checks, too, hold only while the machine does: what entered each agent is kept in files an agent with a shell could remove. The proxy deny, the proxy's own flow check and the token levers don't depend on them.
 
 ## Recording never blocks
 
@@ -31,11 +31,23 @@ The spool holds at most 10,000 events or 512 MiB. Past that, an event is dropped
 
 ## The brake fails closed
 
-With `--rules`, `serve` fetches the brake's rules from wake-proxy every 2 seconds for each agent. It names the agent and its own process, as the SDKs do, so the brake can confirm a halt reached the machine.
+With `--rules`, wake-proxy's address, `serve` fetches the brake's rules from its `/v1/memory` every 2 seconds for each agent. It names the agent and its own process, as the SDKs do, so the brake can confirm a halt reached the machine. The agents are those given with `--agent`, those a hook asks for, and, after a restart, each whose rules it finds on disk.
 
-With `--stop`, the hook reads the rules `serve` last wrote. It refuses a call when a halt covers the agent, the session or the subagent making it. It refuses every call while the rules are missing or older than 30 seconds (`stale-rules`), or can't be read (`halt-check-failed`).
+With `--stop`, the hook reads the rules `serve` last wrote. It refuses a call when a halt covers the agent, the session or the subagent making it. It refuses every call while the rules are missing or older than 30 seconds (`stale-rules`), or can't be read (`halt-check-failed`), as when `halts` is `null`. Only a wake-proxy that sends no `halts` at all, being older than stops in the agent's process, leaves nothing to check. While the rules are missing, stale or can't be read, the hook asks `serve` to fetch them.
 
-The hosts fail open on a hook that crashes or times out: Claude Code, Codex and Grok Build always, and Cursor unless `failClosed` is set. Gemini CLI's and Antigravity's docs don't say. So `wake-hook` never exits with an error, and anything that goes wrong while checking a halt refuses the call. A hook that's missing altogether still fails open, which is why it's installed where agents can't change it.
+The hosts fail open on a hook that crashes or times out: Claude Code, Codex and Grok Build always, Cursor unless `failClosed` is set, and Gemini CLI on any exit code but 0 and 2. Antigravity's docs don't say. So, answering an event, `wake-hook` exits 0, says each refusal in the host's own words, and refuses the call when anything goes wrong while checking. The one exception is an event it can't read at all: one that isn't JSON, or is over 64 MiB, as a huge tool input can make it. It can't tell what's being asked, or how the host wants a refusal said, so with `--stop` it exits 2, the reason on stderr, which each host but Antigravity documents as a refusal. A hook that's missing altogether still fails open, which is why it's installed where agents can't change it.
+
+## The flow policy
+
+wake-proxy serves the flow policy it enforces with the brake's rules ([flow-everywhere.md](flow-everywhere.md)). With `--stop`, the hook applies it, after the halts, to the calls its host makes, which never pass wake-proxy. It decides as wake-proxy and the SDKs do: the same patterns, the rules in file order, the first that refuses named as `policy:<rule id>`. `sdk/testdata/flow_policy.json` pins the decisions all of them make.
+
+- **What's checked:** each tool call a hook can refuse, by the tool's own name, and each start of a subagent, as reaching it. A Claude Code `Agent` call is both: a tool call, and reaching `<agent>/<subagent_type>`, `general-purpose` when it names none. Cursor's `subagentStart` reaches `<agent>/<subagent_type>`. Rules naming `path_prefixes` or `stores` never apply here. A prompt is never checked: it isn't a call, and the user's prompt isn't an origin.
+- **Who:** the agent, or `<agent>/<agent type>` for a subagent Claude Code names. A rule naming the agent holds its sessions and subagents too.
+- **What enters:** each tool call recorded, and each Cursor read let through, enters the agent that made it as `tool:<name>`, failed calls and calls whose output the host doesn't send included. An MCP tool enters by its own name, as wake-proxy names it: Claude Code's and Codex's `mcp__crm__lookup_order`, and Cursor's `MCP:lookup_order`, enter as `tool:lookup_order`. A Claude Code subagent starts with what had entered the agent starting it, and its answer brings back what entered it, each as `agent:<sender>`. A subagent left in the background answers when `SubagentStop` names it. Every hook notes this, `--stop` or not, so the hooks that check see what the others noted.
+- **Where it's kept:** in `flow/` in the hooks' directory, a file per origin for each agent of each session, saying when it last entered. Only what entered within the policy's window counts. `serve` removes a session nothing has entered for a day, the longest window a policy can set.
+- **Limits:** past 256 origins within the window, an agent counts as having every origin until the window passes, so any rule that applies to it refuses. So does an agent whose event names no session, since nothing is known of what entered it.
+- **Fails closed:** a policy wake-proxy can't use, one that isn't valid, or a check that fails refuses every tool call and subagent start, under `policy:unreadable-policy`.
+- **Recorded** as a `denied` event under `policy:<rule id>`. Its payload adds `origins`, the origins the rule keeps from the call, or `["*"]`, and `every_origin`, why the agent counted as having every origin, when it did.
 
 ## Installed where agents can't change it
 
@@ -63,7 +75,7 @@ A project's hooks file is one the agent can edit, and an agent that can edit it 
 | Gemini CLI | `AfterTool` as `tool_call`, failed calls included; `BeforeAgent` as an `agent_message` | `BeforeTool`, `BeforeAgent` |
 | Antigravity | `PostToolUse` as `tool_call` | `PreToolUse` |
 
-A call is recorded once it's done, with its input and output. A refused call is recorded as a `denied` event instead, as the SDKs record theirs. Cursor's general tool hooks and its shell and MCP hooks can describe the same call, so register one set: the examples use the general ones.
+A call is recorded once it's done, with its input and output. A refused call is recorded as a `denied` event instead, as the SDKs record theirs. Cursor's general tool hooks and its shell and MCP hooks can describe the same call, so register one set: the examples use the general ones. Claude Code's and Codex's `SubagentStop` records nothing: it tells the flow policy that a subagent left in the background has answered.
 
 - **Who:**
   - `wake.agent.id` is the name the brake halts the agent by, given with `--agent`. It defaults to the host's name.
@@ -81,12 +93,14 @@ A call is recorded once it's done, with its input and output. A refused call is 
 
 - **Model calls.** Hooks show no model input or output, so a tool call's parent is the prompt, not the model call that chose it.
 - **A call that never finishes.** A call is recorded when its after-event fires, so one whose session dies first isn't recorded, unless it was refused. Pairing each before-event with its after-event in `serve`, as the proxy pairs requests with responses, would close this.
-- **Tools the vendor runs**, such as hosted web search, and anything the agent does outside its tools.
+- **Tools the vendor runs**, such as hosted web search, and anything the agent does outside its tools. What they bring in enters the agent as no origin.
+- **Codex's subagents:** it starts one with `spawn_agent`, whose input and result its docs don't give, and a subagent's hooks name its session's id. So the flow policy holds a Codex session and its subagents as one agent: what enters either holds both back, at once. That's stricter than the SDKs, which carry it only when a subagent starts or answers.
 - **Cursor:**
   - Tab completions. On cloud agents, the MCP and session hooks, and user hooks.
   - Its docs don't say whether `{}` from a permission hook means no opinion. `wake-hook` answers `{}` rather than `allow`, which might skip Cursor's own approval. Check this on a real Cursor before rolling out.
+  - A subagent's own events name a conversation of their own, which nothing ties to the one that started it. Its docs don't say, and its users report a new id with no link back. So a subagent doesn't start with what had entered the agent starting it, and what enters the subagent isn't carried back to that agent. Only the subagent's start is checked against what had entered the agent starting it.
 - **Grok Build:** its docs name `hookEventName`, `sessionId`, `cwd`, `workspaceRoot`, `toolName` and `toolInput`, but no field for a tool's result. So its tool calls keep the result under `hook`, wherever Grok Build puts it, rather than in `output`.
-- **Gemini CLI:** its events name no subagent, so a subagent's calls are recorded as its session's.
+- **Gemini CLI:** its events name no subagent, so a subagent's calls are recorded as its session's, and the flow policy holds them as its session's agent.
 - **Antigravity:**
   - Its docs name no field for a tool's result, only an error when a call fails, so a call's output is recorded only when it failed.
   - Its hooks see no prompt, so its tool calls have none for a parent, and nothing it's asked can be refused before it starts.

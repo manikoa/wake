@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
@@ -24,6 +25,8 @@ const (
 	batchEvents   = 100
 	batchBytes    = 8 << 20
 	maxRulesBytes = 8 << 20 // the SDKs' limit on the brake's rules
+	// How often what entered the agents of sessions idle for a day is swept away.
+	sweepEvery = 10 * time.Minute
 )
 
 // A Server sends the events hooks spool to the collector, and fetches the brake's rules
@@ -31,7 +34,7 @@ const (
 type Server struct {
 	Dir       string
 	Collector string   // the collector's OTLP/HTTP endpoint, such as https://collector:4318
-	Rules     string   // wake-proxy's rules, such as http://wake-proxy:9003; none fetched when empty
+	Rules     string   // wake-proxy's address, such as http://wake-proxy:9003; no rules are fetched when empty
 	Agents    []string // agents to fetch rules for from the start; a hook asks for any other
 	Client    *http.Client
 	Log       *log.Logger
@@ -41,6 +44,7 @@ type Server struct {
 	opts    Options
 	process string
 	agents  map[string]string // agent -> the last error fetching its rules, so each new one is logged once
+	swept   time.Time
 }
 
 // NewClient is the client serve talks to the collector and wake-proxy with: it trusts
@@ -74,6 +78,15 @@ func (s *Server) init() {
 	for _, a := range s.Agents {
 		s.agents[a] = ""
 	}
+	// And every agent a hook asked for before a restart, whose rules it goes on reading.
+	files, _ := filepath.Glob(filepath.Join(s.Dir, rulesDir, "*.json"))
+	for _, path := range files {
+		var f rulesFile
+		if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &f) == nil &&
+			f.Agent != "" && filepath.Base(path) == filepath.Base(rulesPath(s.Dir, f.Agent)) {
+			s.agents[f.Agent] = ""
+		}
+	}
 	if s.Log == nil {
 		s.Log = log.New(os.Stderr, "wake-hook: ", log.LstdFlags)
 	}
@@ -93,7 +106,8 @@ func (s *Server) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Pass counts what the hooks marked, fetches the brake's rules, then sends what's spooled.
+// Pass counts what the hooks marked, fetches the brake's rules, sends what's spooled, then
+// forgets the sessions idle for a day.
 func (s *Server) Pass(ctx context.Context) {
 	s.init()
 	s.count()
@@ -103,6 +117,7 @@ func (s *Server) Pass(ctx context.Context) {
 	if s.Collector != "" {
 		s.send(ctx)
 	}
+	s.sweep()
 }
 
 // count logs and clears the hooks' marks: events dropped because the spool was full, and
@@ -155,11 +170,14 @@ func (s *Server) fetchRules(ctx context.Context) {
 	}
 }
 
+// fetch fetches one agent's rules from wake-proxy's /v1/memory, where the SDKs fetch theirs,
+// given wake-proxy's address.
 func (s *Server) fetch(ctx context.Context, agent string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	query := url.Values{"agent": {agent}, "process": {s.process}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.Rules+"?"+query.Encode(), nil)
+	address := strings.TrimRight(s.Rules, "/") + "/v1/memory?" + query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
 		return err
 	}
@@ -182,8 +200,38 @@ func (s *Server) fetch(ctx context.Context, agent string) error {
 	if err := json.Unmarshal(body, &rules); err != nil {
 		return fmt.Errorf("unexpected rules: %v", err)
 	}
+	if rules == nil {
+		return errors.New("unexpected rules: not a JSON object")
+	}
 	data, _ := json.Marshal(rulesFile{Agent: agent, Fetched: s.opts.Now().UnixNano(), Rules: body})
 	return write(rulesPath(s.Dir, agent), data, s.opts.hex)
+}
+
+// sweep forgets what entered the agents of each session nothing has entered for a day,
+// the longest a flow policy's window can be. It looks every ten minutes.
+func (s *Server) sweep() {
+	now := s.opts.Now()
+	if !s.swept.IsZero() && now.Sub(s.swept) < sweepEvery {
+		return
+	}
+	s.swept = now
+	root := filepath.Join(s.Dir, flowDir)
+	sessions, _ := readNames(root)
+	for _, n := range sessions {
+		dir := filepath.Join(root, n)
+		var newest time.Time
+		filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+			if err == nil {
+				if info, err := d.Info(); err == nil && info.ModTime().After(newest) {
+					newest = info.ModTime()
+				}
+			}
+			return nil
+		})
+		if now.Sub(newest) > maxWindow*time.Second {
+			os.RemoveAll(dir)
+		}
+	}
 }
 
 // send posts the spool to the collector, oldest first, in batches. Sent events are

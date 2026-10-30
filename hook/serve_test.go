@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // collector stands in for the collector's OTLP/HTTP receiver, answering each request
@@ -108,13 +110,28 @@ func TestServeSetsAsideAnEventTheCollectorRefuses(t *testing.T) {
 	}
 }
 
-func TestServeFetchesTheRules(t *testing.T) {
+// wakeProxy stands in for wake-proxy's rules, served where the SDKs fetch them, answering
+// each fetch with body.
+func wakeProxy(t *testing.T, body string) (*httptest.Server, *[]url.Values) {
+	var mu sync.Mutex
 	var queries []url.Values
-	rules := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/memory" {
+			t.Errorf("fetched %s, want /v1/memory", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
 		queries = append(queries, r.URL.Query())
-		w.Write([]byte(`{"halts":[{"id":"h9","agents":["claude-code"]}]}`))
+		mu.Unlock()
+		w.Write([]byte(body))
 	}))
-	defer rules.Close()
+	t.Cleanup(srv.Close)
+	return srv, &queries
+}
+
+func TestServeFetchesTheRules(t *testing.T) {
+	rules, fetched := wakeProxy(t, `{"halts":[{"id":"h9","agents":["claude-code"]}]}`)
 	o := options(t)
 	o.Stop = true
 
@@ -122,8 +139,10 @@ func TestServeFetchesTheRules(t *testing.T) {
 	if out := handle(t, o, "claude-code", "pre_tool"); !strings.Contains(out, refusal(StaleRules)) {
 		t.Fatalf("told the host %q before any rules", out)
 	}
-	s := &Server{Dir: o.Dir, Rules: rules.URL, Client: rules.Client(), Log: quiet(), Now: o.Now}
+	// Given wake-proxy's address, as the SDKs are, a slash at its end or not.
+	s := &Server{Dir: o.Dir, Rules: rules.URL + "/", Client: rules.Client(), Log: quiet(), Now: o.Now}
 	s.Pass(context.Background())
+	queries := *fetched
 	if len(queries) != 1 || queries[0].Get("agent") != "claude-code" || queries[0].Get("process") == "" {
 		t.Fatalf("fetched rules with %v, want the agent and this process named", queries)
 	}
@@ -135,7 +154,59 @@ func TestServeFetchesTheRules(t *testing.T) {
 	}
 	// It goes on fetching the agent's rules on every pass.
 	s.Pass(context.Background())
-	if len(queries) != 2 {
-		t.Errorf("fetched %d times over two passes", len(queries))
+	if len(*fetched) != 2 {
+		t.Errorf("fetched %d times over two passes", len(*fetched))
+	}
+}
+
+// A serve that restarted fetches the rules of every agent a hook asked for before, though
+// the hooks asked only once: theirs would go stale, and every call be refused, for good.
+func TestServeFetchesForTheAgentsWhoseRulesItFinds(t *testing.T) {
+	rules, fetched := wakeProxy(t, `{"halts":[]}`)
+	o := options(t)
+	o.Stop, o.Agent = true, "payments-team"
+	writeRules(t, o, "payments-team", time.Minute, `{"halts":[]}`)
+	write(filepath.Join(o.Dir, rulesDir, "junk.json"), []byte("{"), o.hex)
+	(&Server{Dir: o.Dir, Rules: rules.URL, Client: rules.Client(), Log: quiet(), Now: o.Now}).Pass(context.Background())
+	if len(*fetched) != 1 || (*fetched)[0].Get("agent") != "payments-team" {
+		t.Fatalf("fetched %v, want the rules of the agent it found", *fetched)
+	}
+	if out := handle(t, o, "cursor", "pre_tool"); out != "{}" {
+		t.Errorf("told the host %q, want the call let through with fresh rules", out)
+	}
+}
+
+func TestServeRefusesRulesThatArentAnObject(t *testing.T) {
+	rules, _ := wakeProxy(t, `null`)
+	o := options(t)
+	var logged bytes.Buffer
+	(&Server{Dir: o.Dir, Rules: rules.URL, Agents: []string{"claude-code"}, Client: rules.Client(), Log: log.New(&logged, "", 0), Now: o.Now}).Pass(context.Background())
+	if _, err := os.Stat(rulesPath(o.Dir, "claude-code")); !os.IsNotExist(err) {
+		t.Error("kept rules of null")
+	}
+	if !strings.Contains(logged.String(), "not a JSON object") {
+		t.Errorf("logged %q", logged.String())
+	}
+}
+
+// What entered the agents of a session nothing has entered for a day is swept away: no
+// policy's window is longer.
+func TestServeForgetsSessionsIdleForADay(t *testing.T) {
+	o := options(t)
+	Handle(Hosts["claude-code"], fetch, o)
+	handle(t, o, "cursor", "read_file")
+	idle := o.flowStore("claude-code", "s1", 0).dir
+	busy := o.flowStore("cursor", "conv-8f2a", 0).dir
+	now := time.Now()
+	filepath.WalkDir(idle, func(path string, _ fs.DirEntry, _ error) error {
+		return os.Chtimes(path, now, now.Add(-25*time.Hour))
+	})
+	s := &Server{Dir: o.Dir, Log: quiet(), Now: func() time.Time { return now }}
+	s.Pass(context.Background())
+	if _, err := os.Stat(idle); !os.IsNotExist(err) {
+		t.Error("kept a session idle for a day")
+	}
+	if _, err := os.Stat(busy); err != nil {
+		t.Errorf("swept a session in use: %v", err)
 	}
 }

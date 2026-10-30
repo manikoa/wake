@@ -355,6 +355,30 @@ func TestRefusesWhatAHaltCovers(t *testing.T) {
 	}
 }
 
+// An event that can't be read could be any, a tool call or a prompt, so with --stop it's
+// refused the one way the hosts share: on stderr, with exit code 2.
+func TestRefusesAnEventItCantRead(t *testing.T) {
+	for _, in := range []string{"", "not json", "null", "[1]", `"PreToolUse"`, `{"hook_event_name":"PreToolUse","tool_name":`} {
+		o := options(t)
+		if out, stderr := Answer(Hosts["claude-code"], []byte(in), o); out != nil || stderr != "" {
+			t.Errorf("%q: answered %q, %q without --stop", in, out, stderr)
+		}
+		o.Stop = true
+		if out, stderr := Answer(Hosts["claude-code"], []byte(in), o); out != nil || stderr != Unreadable {
+			t.Errorf("%q: answered %q, %q with --stop", in, out, stderr)
+		}
+		if names, _ := readNames(filepath.Join(o.Dir, unknownDir)); len(names) != 2 {
+			t.Errorf("%q: counted %v", in, names)
+		}
+	}
+	// Anything it can read is answered on stdout.
+	o := options(t)
+	o.Stop = true
+	if out, stderr := Answer(Hosts["claude-code"], event(t, "claude-code", "pre_tool"), o); stderr != "" || !strings.Contains(string(out), refusal(StaleRules)) {
+		t.Errorf("answered %q, %q", out, stderr)
+	}
+}
+
 // Antigravity's hooks are told their event on the command line. One that isn't can't tell
 // what it's answering: it records nothing, and where it would check halts it refuses.
 func TestAntigravityHooksNameTheirEvent(t *testing.T) {
@@ -385,20 +409,33 @@ func TestFailsClosed(t *testing.T) {
 			t.Errorf("told the host %q, want a refusal under %s", out, halt)
 		}
 	}
-	refused(StaleRules) // no rules yet
-	if _, err := os.Stat(wantPath(o.Dir, "claude-code")); err != nil {
-		t.Error("serve wasn't asked for the agent's rules")
+	asked := func(why string) {
+		t.Helper()
+		if _, err := os.Stat(wantPath(o.Dir, "claude-code")); err != nil {
+			t.Errorf("serve wasn't asked for the agent's rules %s", why)
+		}
+		os.Remove(wantPath(o.Dir, "claude-code"))
 	}
+	refused(StaleRules)
+	asked("before it had any")
+	// A serve that restarted might not know the agent: stale rules ask again.
 	writeRules(t, o, "claude-code", 31*time.Second, `{"halts":[]}`)
 	refused(StaleRules)
+	asked("once they went stale")
 	writeRules(t, o, "claude-code", 0, `{"halts":[{"id":"h1","fleet":"yes"}]}`)
+	refused(HaltCheckFailed)
+	writeRules(t, o, "claude-code", 0, `{"halts":null}`)
+	refused(HaltCheckFailed)
+	writeRules(t, o, "claude-code", 0, `null`)
 	refused(HaltCheckFailed)
 	if err := write(rulesPath(o.Dir, "claude-code"), []byte("{"), o.hex); err != nil {
 		t.Fatal(err)
 	}
 	refused(HaltCheckFailed)
+	asked("when it couldn't read them")
 
-	// A wake-proxy older than stops in the agent's process says nothing of halts.
+	// A wake-proxy older than stops in the agent's process says nothing of halts: only a
+	// missing field means that.
 	writeRules(t, o, "claude-code", 0, `{"quarantines":[]}`)
 	if out := handle(t, o, "claude-code", "pre_tool"); out != "" {
 		t.Errorf("told the host %q with no halts to go on", out)

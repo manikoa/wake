@@ -1,7 +1,7 @@
 // Package hook records what coding agents do through their hooks, and refuses what the
-// brake's halts cover. The agent's host runs wake-hook on each hook event; it writes the
-// event to a spool and answers at once, and wake-hook serve sends the spool to the
-// collector. See docs/hooks.md.
+// brake's halts cover or its flow policy holds back. The agent's host runs wake-hook on
+// each hook event; it writes the event to a spool and answers at once, and wake-hook serve
+// sends the spool to the collector. See docs/hooks.md.
 package hook
 
 import (
@@ -31,10 +31,12 @@ const (
 // Options configure the hook for one event.
 type Options struct {
 	Agent string // the agent's name, as the brake halts it; the host's name when empty
-	Dir   string // where events wait for serve, and where serve leaves the brake's rules
+	// Dir is where events wait for serve, where serve leaves the brake's rules, and where
+	// what entered each agent is kept.
+	Dir   string
 	Event string // the hook event, for a host whose input doesn't name it (Antigravity)
-	// Stop refuses what the brake's halts cover, and every gated call while the rules
-	// serve leaves are missing, stale or unreadable.
+	// Stop refuses what the brake's halts cover and its flow policy holds back, and every
+	// gated call while the rules serve leaves are missing, stale or unreadable.
 	Stop bool
 	TTL  time.Duration // how old the rules may be; 30 seconds when zero, as in the SDKs
 	Now  func() time.Time
@@ -56,49 +58,97 @@ func (o *Options) defaults(host *Host) {
 	}
 }
 
-// Handle answers one hook event from host, read from in, and returns what to print. The
-// exit code is always 0: hosts fail open on a hook that errors, so a refusal is always
-// said in the host's own words, and nothing here is allowed to fail any other way.
-func Handle(host *Host, in []byte, o Options) (out []byte) {
+// Unreadable is what a hook run with Stop says on stderr, with exit code 2, of an event
+// it can't read.
+const Unreadable = "Wake couldn't read the hook's event, so this was refused."
+
+// Handle answers one hook event from host, read from in, and returns what to print.
+func Handle(host *Host, in []byte, o Options) []byte {
+	stdout, _ := Answer(host, in, o)
+	return stdout
+}
+
+// Answer answers one hook event from host, read from in: what to print on stdout, or,
+// for an event it can't read while it checks halts, what to say on stderr with exit code
+// 2. That event, one that isn't JSON or was cut at the size limit, could be any, a tool
+// call or a prompt, so there's no telling how its host wants to hear it refused, but the
+// hosts document exit code 2 as a refusal. Otherwise the exit code is 0: hosts fail open
+// on a hook that errors, so a refusal is said in the host's own words, and nothing here
+// is allowed to fail any other way.
+func Answer(host *Host, in []byte, o Options) (stdout []byte, stderr string) {
 	o.defaults(host)
 	var a Action
 	defer func() {
 		if recover() != nil {
 			// Whatever broke, a gate that should check halts refuses.
-			out = nil
+			stdout, stderr = nil, ""
 			if a.Gate && o.Stop {
-				out = host.refuse(a, refusal(HaltCheckFailed))
+				stdout = host.refuse(a, refusal(HaltCheckFailed))
 			}
 		}
 	}()
 	var f fields
 	if json.Unmarshal(in, &f) != nil || f == nil {
 		o.mark(unknownDir, host.Name+".unreadable")
-		return nil
+		if o.Stop {
+			return nil, Unreadable
+		}
+		return nil, ""
 	}
 	a, ok := host.parse(f, o.Event)
 	if !ok {
 		o.mark(unknownDir, host.Name+"."+a.Event)
 		if a.Gate && o.Stop {
-			return host.refuse(a, refusal(HaltCheckFailed))
+			return host.refuse(a, refusal(HaltCheckFailed)), ""
 		}
-		return nil
+		return nil, ""
 	}
 	a.Rest = f
 	w := identify(o.Agent, a)
+	by := flowAgent(host, o.Agent, a)
 	if a.Gate && o.Stop {
-		if halt := o.halted(w); halt != "" {
-			o.record(host, a, w, halt)
-			return host.refuse(a, refusal(halt))
+		if r := o.check(host, a, w, by); r != nil {
+			o.record(host, a, w, r)
+			return host.refuse(a, r.reason), ""
 		}
 	}
+	o.entered(host, a, by)
 	if a.Kind != "" {
-		o.record(host, a, w, "")
+		o.record(host, a, w, nil)
 	}
 	if a.Gate && host.allow != nil {
-		return host.allow(a)
+		return host.allow(a), ""
 	}
-	return nil
+	return nil, ""
+}
+
+// refused is why a gated action is refused: the halt it's refused under, and what the
+// host is told. A refusal by the flow policy says the origins behind the call that its
+// rule keeps from it, or * for every origin, and why every origin counted, when it did.
+type refused struct {
+	halt    string
+	reason  string
+	flow    bool
+	origins []string
+	every   string
+}
+
+// check is what refuses a gated action, if anything does: the halts first, then, for a
+// tool call or a subagent's start, the flow policy. by is the agent making it, as the
+// flow policy names it. A prompt isn't a call, and the user's prompt isn't an origin, so
+// the flow policy never checks one.
+func (o Options) check(host *Host, a Action, w who, by string) *refused {
+	rules, halt := o.rules(w.agent)
+	if halt == "" {
+		halt = halted(rules, w)
+	}
+	if halt != "" {
+		return &refused{halt: halt, reason: refusal(halt)}
+	}
+	if a.Prompt {
+		return nil
+	}
+	return o.flowRefusal(host, a, w, by, rules)
 }
 
 func refusal(halt string) string {
@@ -138,12 +188,12 @@ func identify(agent string, a Action) who {
 	return w
 }
 
-// record spools an action as a Wake event: a denied event when halt names what refused
-// it. Recording never fails the hook: a dropped event is counted, and that's all.
-func (o Options) record(host *Host, a Action, w who, halt string) {
+// record spools an action as a Wake event: a denied event when r says what refused it.
+// Recording never fails the hook: a dropped event is counted, and that's all.
+func (o Options) record(host *Host, a Action, w who, r *refused) {
 	id := o.uuid()
 	kind := a.Kind
-	if halt != "" {
+	if r != nil {
 		kind = "denied"
 	}
 	s := span{
@@ -171,10 +221,16 @@ func (o Options) record(host *Host, a Action, w who, halt string) {
 
 	payload := map[string]any{}
 	switch {
-	case halt != "":
+	case r != nil:
 		// The call the agent tried, with the refusal as its output, as the SDKs record theirs.
-		s.str("wake.brake.halt_id", halt)
-		payload["input"], payload["output"] = a.Input, refusal(halt)
+		s.str("wake.brake.halt_id", r.halt)
+		payload["input"], payload["output"] = a.Input, r.reason
+		if r.flow {
+			payload["origins"] = r.origins
+			if r.every != "" {
+				payload["every_origin"] = r.every
+			}
+		}
 	case kind == "agent_message":
 		s.strs("wake.origins", []string{"user"})
 		payload["from"], payload["to"], payload["content"] = "user", w.agent, a.Input
@@ -204,7 +260,7 @@ func (o Options) record(host *Host, a Action, w who, halt string) {
 	if err != nil || o.spool(data) != nil {
 		return
 	}
-	if a.Prompt && halt == "" {
+	if a.Prompt && r == nil {
 		o.setLastPrompt(host.Name, a.Session, id)
 	}
 }

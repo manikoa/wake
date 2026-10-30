@@ -23,6 +23,7 @@ const (
 	rejectedDir = "rejected" // events the collector refused, kept for a person to look at
 	sessionsDir = "sessions" // the latest prompt of each session, a parent for what follows it
 	rulesDir    = "rules"    // the brake's rules for each agent, and the agents a hook wants rules for
+	flowDir     = "flow"     // what entered each agent of each session, for the flow policy (flow.go)
 )
 
 // The spool's bounds. Past them an event is dropped and counted, so a collector that's
@@ -159,47 +160,71 @@ func wantPath(dir, agent string) string {
 	return filepath.Join(dir, rulesDir, name(agent)+".want")
 }
 
-// halted names the halt that stops w, or "" when none does. It fails closed: missing or
-// stale rules are StaleRules, and rules it can't read are HaltCheckFailed.
-func (o Options) halted(w who) (halt string) {
+// brakeRules is what the hook reads of the rules wake-proxy serves: the halts in force,
+// and the flow policy (flow.go).
+type brakeRules struct {
+	Halts json.RawMessage `json:"halts"`
+	Flow  json.RawMessage `json:"flow"`
+}
+
+// rules reads the brake's rules serve last left for agent. While they can't be used,
+// problem names the halt every gated call is refused under: StaleRules while they're
+// missing or too old, and HaltCheckFailed when they can't be read. It fails closed.
+func (o Options) rules(agent string) (rules *brakeRules, problem string) {
+	data, err := os.ReadFile(rulesPath(o.Dir, agent))
+	if errors.Is(err, fs.ErrNotExist) {
+		o.want(agent)
+		return nil, StaleRules
+	}
+	var f rulesFile
+	if err != nil || json.Unmarshal(data, &f) != nil || f.Agent != agent {
+		o.want(agent)
+		return nil, HaltCheckFailed
+	}
+	age := o.Now().Sub(time.Unix(0, f.Fetched))
+	if age > o.TTL || age < -o.TTL {
+		o.want(agent)
+		return nil, StaleRules
+	}
+	rules = &brakeRules{}
+	if _, ok := object(f.Rules); !ok || json.Unmarshal(f.Rules, rules) != nil {
+		return nil, HaltCheckFailed
+	}
+	return rules, ""
+}
+
+// want asks serve to fetch agent's rules, unless it's been asked already. A serve that
+// restarted knows only the agents it's told of and those whose rules it finds, so the
+// hook asks whenever the rules it reads are missing, stale or can't be read.
+func (o Options) want(agent string) {
+	if _, err := os.Stat(wantPath(o.Dir, agent)); err != nil {
+		write(wantPath(o.Dir, agent), []byte(agent), o.hex)
+	}
+}
+
+// halted names the halt in rules that stops w, or "" when none does. Halts it can't read
+// are HaltCheckFailed.
+func halted(rules *brakeRules, w who) (halt string) {
 	defer func() {
 		if recover() != nil {
 			halt = HaltCheckFailed
 		}
 	}()
-	data, err := os.ReadFile(rulesPath(o.Dir, w.agent))
-	if errors.Is(err, fs.ErrNotExist) {
-		// Ask serve to fetch this agent's rules, in case it isn't already.
-		write(wantPath(o.Dir, w.agent), []byte(w.agent), o.hex)
-		return StaleRules
-	}
-	if err != nil {
-		return HaltCheckFailed
-	}
-	var f rulesFile
-	if json.Unmarshal(data, &f) != nil || f.Agent != w.agent {
-		return HaltCheckFailed
-	}
-	age := o.Now().Sub(time.Unix(0, f.Fetched))
-	if age > o.TTL || age < -o.TTL {
-		return StaleRules
-	}
-	var rules struct {
-		Halts *[]struct {
-			ID     string   `json:"id"`
-			Fleet  bool     `json:"fleet"`
-			Agents []string `json:"agents"`
-		} `json:"halts"`
-	}
-	if json.Unmarshal(f.Rules, &rules) != nil {
-		return HaltCheckFailed
-	}
 	if rules.Halts == nil {
 		// A wake-proxy older than stops in the agent's process says nothing of halts:
-		// there's nothing to go on here, and the proxy deny still holds.
+		// there's nothing to go on here, and the proxy deny still holds. Only a missing
+		// field means that: halts of null are halts that can't be read.
 		return ""
 	}
-	for _, h := range *rules.Halts {
+	var halts []struct {
+		ID     string   `json:"id"`
+		Fleet  bool     `json:"fleet"`
+		Agents []string `json:"agents"`
+	}
+	if !startsWith(rules.Halts, '[') || json.Unmarshal(rules.Halts, &halts) != nil {
+		return HaltCheckFailed
+	}
+	for _, h := range halts {
 		if h.ID == "" {
 			return HaltCheckFailed
 		}

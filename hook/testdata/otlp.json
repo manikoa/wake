@@ -99,8 +99,8 @@
               "spanId": "8d8c8542dcb8a994",
               "name": "tool_call Write",
               "kind": 1,
-              "startTimeUnixNano": "1793275199991000000",
-              "endTimeUnixNano": "1793275200003000000",
+              "startTimeUnixNano": "1793275199992000000",
+              "endTimeUnixNano": "1793275200004000000",
               "attributes": [
                 {
                   "key": "wake.event.id",
@@ -205,8 +205,8 @@
               "spanId": "e3eb28cb670f0e97",
               "name": "denied Bash",
               "kind": 1,
-              "startTimeUnixNano": "1793275200007000000",
-              "endTimeUnixNano": "1793275200007000000",
+              "startTimeUnixNano": "1793275200008000000",
+              "endTimeUnixNano": "1793275200008000000",
               "attributes": [
                 {
                   "key": "wake.event.id",

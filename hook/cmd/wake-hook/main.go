@@ -21,8 +21,9 @@ import (
 // version is set when a release is built.
 var version = "dev"
 
-// The largest hook event read. Cursor sends a file's content with beforeReadFile.
-const maxEvent = 64 << 20
+// The largest hook event read. Cursor sends a file's content with beforeReadFile. One
+// larger can't be read whole, so it isn't read at all.
+var maxEvent int64 = 64 << 20
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -71,16 +72,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	o := hook.Options{}
 	flags.StringVar(&o.Agent, "agent", os.Getenv("WAKE_AGENT"), "the agent's name, as the brake halts it (default: the host's name)")
 	flags.StringVar(&o.Dir, "dir", defaultDir(), "where events wait for wake-hook serve")
-	flags.BoolVar(&o.Stop, "stop", false, "refuse what the brake's halts cover, failing closed without fresh rules from wake-hook serve")
+	flags.BoolVar(&o.Stop, "stop", false, "refuse what the brake's halts and flow policy cover, failing closed without fresh rules from wake-hook serve")
 	flags.StringVar(&o.Event, "event", "", "the hook event, for a host whose input doesn't name it (antigravity)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return 1
 	}
-	in, err := io.ReadAll(io.LimitReader(stdin, maxEvent))
-	if err != nil {
+	in, err := io.ReadAll(io.LimitReader(stdin, maxEvent+1))
+	if err != nil || int64(len(in)) > maxEvent {
 		in = nil
 	}
-	stdout.Write(hook.Handle(host, in, o))
+	out, refused := hook.Answer(host, in, o)
+	if refused != "" {
+		// An event it can't read could be any, so with --stop it's refused the one way
+		// the hosts share.
+		fmt.Fprintln(stderr, refused)
+		return 2
+	}
+	stdout.Write(out)
 	return 0
 }
 
@@ -95,7 +103,7 @@ func serve(args []string, stderr io.Writer) int {
 	flags.StringVar(&s.Dir, "dir", defaultDir(), "where the hooks spool events")
 	flags.StringVar(&s.Collector, "collector", os.Getenv("WAKE_ENDPOINT"), "the collector's OTLP/HTTP endpoint, such as https://collector:4318")
 	flags.StringVar(&ca, "ca", os.Getenv("WAKE_CA_FILE"), "a PEM file of the roots to trust for the collector and wake-proxy")
-	flags.StringVar(&s.Rules, "rules", "", "wake-proxy's rules endpoint, such as http://wake-proxy:9003, for hooks run with --stop")
+	flags.StringVar(&s.Rules, "rules", "", "wake-proxy's address for the brake's rules, such as http://wake-proxy:9003, for hooks run with --stop")
 	flags.Var(&agents, "agent", "an agent to fetch rules for from the start (repeatable)")
 	flags.BoolVar(&once, "once", false, "make one pass and exit")
 	if err := flags.Parse(args); err != nil {
