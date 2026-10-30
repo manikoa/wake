@@ -10,7 +10,7 @@ The roadmap says events are "signed at the source" and also that "agents never h
 
 Events are signed at the **first hop outside the agent's process**:
 
-- **SDK and memory adapter events** are sent unsigned over TLS to the out of band collector. The collector's Go processor signs them on arrival.
+- **SDK and memory adapter events** are sent unsigned over TLS to the out of band collector. The collector's Go processor signs them on arrival. So are the events `wake-hook` captures through a coding agent's hooks, on the agent's machine ([hooks.md](hooks.md)).
 - **Proxy events** are signed by the proxy itself. It runs as a separate process with its own short lived SPIFFE identity, so it is a source agents can't reach.
 - The collector checks the proxy's signatures, then appends every signed event to the log.
 
@@ -26,9 +26,9 @@ An SDK event is only as honest as the agent process that emitted it. That's true
 
 ## What it means for each component
 
-- **SDK and memory adapter:** never sign anything and never load key material. Send over TLS to the collector.
+- **SDK, memory adapter and `wake-hook`:** never sign anything and never load key material. Send over TLS to the collector.
 - **Proxy:** signs each event it captures with its SPIFFE identity's key before sending it. "The proxy" means agentgateway plus the Wake processor it calls; the processor holds the key.
-- **Collector:** signs unsigned SDK and memory adapter events, verifies proxy signatures, and records events whose signatures fail instead of dropping them. Before signing an event, it redacts the credentials in its payload (see Secrets in [events.md](events.md)), and it redacts those of the events it records as invalid too. The proxy does the same before signing its own: the collector can't change an event the proxy validly signed without breaking its signature.
+- **Collector:** signs unsigned SDK, memory adapter and hook events, verifies proxy signatures, and records events whose signatures fail instead of dropping them. Before signing an event, it redacts the credentials in its payload (see Secrets in [events.md](events.md)), and it redacts those of the events it records as invalid too. The proxy does the same before signing its own: the collector can't change an event the proxy validly signed without breaking its signature.
 - **Keys:** the collector's signing key lives in cloud KMS, or keys the customer holds. A self hosted log can use a local key file.
 - **Proxy keys:** the proxy signs with its own X.509-SVID key, ECDSA P-256. The SVID travels with each event and into its log entry. The collector checks it against the SPIRE trust bundles in its `trust_bundles` config, as of when it received the event, and only accepts the SPIFFE IDs its `trusted_signers` config lists for the event's capture: agents' SVIDs chain to the same bundle. See [proxy.md](proxy.md).
 

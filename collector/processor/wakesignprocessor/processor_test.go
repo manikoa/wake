@@ -124,6 +124,36 @@ func TestSignsSDKEventsAndChecksProxyEvents(t *testing.T) {
 	}
 }
 
+// What wake-hook serve sends for a short session (hook/testdata/otlp.json): a prompt, a
+// tool call and a refusal, captured by a coding agent's hooks.
+func TestSignsHookEvents(t *testing.T) {
+	s, _, collectorTrust := setup(t)
+	data, err := os.ReadFile("../../../hook/testdata/otlp.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td, err := (&ptrace.JSONUnmarshaler{}).UnmarshalTraces(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.processTraces(context.Background(), td); err != nil {
+		t.Fatal(err)
+	}
+	spans := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	if spans.Len() != 3 {
+		t.Fatalf("read %d spans, want 3", spans.Len())
+	}
+	for i := 0; i < spans.Len(); i++ {
+		span := spans.At(i)
+		if capture, _ := span.Attributes().Get(event.Capture); capture.Str() != "hook" {
+			t.Errorf("%s captured by %q", span.Name(), capture.Str())
+		}
+		if !valid(span) || event.Verify(span, wakelog.Trust{Keys: collectorTrust}) != nil {
+			t.Errorf("%s wasn't signed by the collector: %s", span.Name(), reason(span))
+		}
+	}
+}
+
 // spanFromWire decodes one span the way the receiver does, keeping whatever attributes
 // the sender put on it, repeated keys included.
 func spanFromWire(t *testing.T, attributes string) (ptrace.Traces, ptrace.Span) {

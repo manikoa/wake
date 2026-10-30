@@ -12,6 +12,7 @@ Wake is a thin capture layer inside the customer's agent stack plus an out of ba
 **In the agent stack (capture only):**
 - An SDK in each agent that records model calls, tool calls and handoffs.
 - An MCP and A2A proxy that sees every call between agents and their tools.
+- `wake-hook`, which coding agents with no SDK (Claude Code, Codex, Cursor, Grok Build, Gemini CLI, Antigravity) run on each hook event. It records what they do and applies the brake's halts, as the SDKs do in-process (`docs/hooks.md`).
 - A memory adapter that records every read and write and tags each write with its origin.
 
 **Out of band (agents hold no keys here):**

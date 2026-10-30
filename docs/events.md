@@ -13,7 +13,7 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.agent.id` | string | The agent that did it |
 | `wake.agent.instance` | string | The running instance of the agent that did it, for an agent that can run as several at once, such as a subagent. Absent otherwise. See Instances |
 | `wake.agent.lineage` | string[] | With `wake.agent.instance`: the agent and instances that started it, outermost first |
-| `wake.capture` | string | What recorded it: `sdk`, `proxy` or `memory_adapter` |
+| `wake.capture` | string | What recorded it: `sdk`, `proxy`, `memory_adapter`, or `hook` for a coding agent's hooks ([hooks.md](hooks.md)) |
 | `wake.token.subject` | string | Set by the proxy when the caller presented a JWT whose `sub` it could read: whom the token acts for. For a delegated token, often a user or the agent that delegated, while `wake.agent.id` names the agent acting. See Tokens |
 | `wake.token.actors` | string[] | With a delegated token: the agents acting under it, the one acting now first, then each before it (its nested `act` claims) |
 | `wake.token.actors_cut` | bool | Set, to true, when the chain went on past what `wake.token.actors` keeps: its earliest actors are unknown |
@@ -67,6 +67,7 @@ What makes an instance, by integration:
 - **Claude Agent SDK:** each subagent the Agent tool starts, `<agent>/<subagent type>#<the Agent tool use id>`. The `agent_message` handing it its task is recorded once it has started, so an Agent tool call refused before then, as by a halt, makes no instance: it's recorded as the refused tool call it is. One the tool leaves running in the background, as it does by default, stays that instance until Claude Code says it has finished, in later turns too, and its answer is recorded then.
 - **OpenAI Agents SDK:** an agent run inside a tool call, as with `agent.as_tool()`, `<agent>#<the tool call's span id>` (the SDK's own span id), started by the agent that made the call. A response can call one agent as a tool several times at once, so each run inside a tool call is also linked as a workflow of its own: one copy's steps never take another's as parents, whatever their arguments. An agent a handoff reaches inside such a run is an instance of that run too. Runs of the workflow's own, handoffs included, aren't instances.
 - **LangChain and LangGraph:** a named run (`handler.agent(name)`) started inside another agent's run, `<name>#<its invoke_agent span id>`, started by that run. A LangGraph node is a step of the agent running the graph, not an agent of its own, so a node run several times at once isn't an instance.
+- **Coding agents' hooks:** each session, `<agent>#<the host's session id>`, started by the agent. A subagent that Claude Code or Codex names on its events is an instance too, `<agent>/<agent type>#<its agent id>`, started by its session. See [hooks.md](hooks.md).
 
 These come from the SDK, inside the agent's process, so they say what the agent reported, like the rest of an SDK event. Instances of one agent share its process and credentials, so the proxy sees them as that agent.
 
@@ -112,6 +113,8 @@ An SDK that stops an agent in its own process records each call it refuses as a 
 - **Its halt:** `wake.brake.halt_id` names the halt that covered the call, or `stale-rules` while the SDK's rules are stale, or `halt-check-failed` when it couldn't check them: it fails closed.
 - **No `wake.origins`:** nothing entered at the denial. The tool never ran, so nothing of it reached the agent, and a later step's chain doesn't count it.
 - **A refused run:** a LangChain run refused before it started is recorded as the `agent_message` that would have handed it its task, in the name of the run that tried, with `wake.brake.receiver` naming the run refused, and no `wake.origins` either.
+
+`wake-hook` refuses the same way for the coding agents whose hooks it reads, and records each refusal as a `denied` event captured by `hook` ([hooks.md](hooks.md)).
 
 ## Memory
 

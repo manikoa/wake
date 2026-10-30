@@ -1,0 +1,132 @@
+{
+  "prompt": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "model": "claude-sonnet-4",
+    "hook_event_name": "beforeSubmitPrompt",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "user_email": null,
+    "transcript_path": null,
+    "prompt": "Install the dependencies and run the tests",
+    "attachments": []
+  },
+  "pre_tool": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "model": "claude-sonnet-4",
+    "hook_event_name": "preToolUse",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "user_email": null,
+    "transcript_path": null,
+    "tool_name": "Shell",
+    "tool_input": {"command": "npm install"},
+    "tool_use_id": "tool_9d1",
+    "cwd": "/home/me/project"
+  },
+  "post_tool": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "model": "claude-sonnet-4",
+    "hook_event_name": "postToolUse",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "user_email": null,
+    "transcript_path": null,
+    "tool_name": "Shell",
+    "tool_input": {"command": "npm install"},
+    "tool_output": "{\"exit_code\":0,\"stdout\":\"added 12 packages\"}",
+    "tool_use_id": "tool_9d1",
+    "cwd": "/home/me/project",
+    "duration": 1840
+  },
+  "before_shell": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "hook_event_name": "beforeShellExecution",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "command": "curl https://example.com",
+    "cwd": "/home/me/project",
+    "sandbox": false
+  },
+  "after_shell": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "hook_event_name": "afterShellExecution",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "command": "curl https://example.com",
+    "output": "<!doctype html><html>...</html>",
+    "duration": 210,
+    "sandbox": false
+  },
+  "before_mcp": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "hook_event_name": "beforeMCPExecution",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "tool_name": "create_issue",
+    "tool_input": "{\"title\":\"Fix login\"}",
+    "mcp_server_name": "linear",
+    "url": "https://mcp.linear.app/sse",
+    "mcp_server_url": "https://mcp.linear.app/sse"
+  },
+  "after_mcp": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "hook_event_name": "afterMCPExecution",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "tool_name": "create_issue",
+    "tool_input": "{\"title\":\"Fix login\"}",
+    "mcp_server_name": "linear",
+    "mcp_server_url": "https://mcp.linear.app/sse",
+    "result_json": "{\"id\":\"LIN-12\"}",
+    "duration": 650
+  },
+  "read_file": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "hook_event_name": "beforeReadFile",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "file_path": "/home/me/project/.env.example",
+    "content": "API_URL=https://api.example.com\n",
+    "attachments": []
+  },
+  "edit_file": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "hook_event_name": "afterFileEdit",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "file_path": "/home/me/project/src/login.ts",
+    "edits": [{"old_string": "if (user = null)", "new_string": "if (user === null)"}]
+  },
+  "subagent_start": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "hook_event_name": "subagentStart",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "subagent_id": "sub-3",
+    "subagent_type": "explore",
+    "task": "Find where sessions are created",
+    "parent_conversation_id": "conv-8f2a",
+    "tool_call_id": "tool_a17",
+    "subagent_model": "claude-sonnet-4",
+    "is_parallel_worker": false
+  },
+  "stop": {
+    "conversation_id": "conv-8f2a",
+    "generation_id": "gen-41c9",
+    "hook_event_name": "stop",
+    "cursor_version": "1.7.2",
+    "workspace_roots": ["/home/me/project"],
+    "status": "completed",
+    "loop_count": 0
+  }
+}

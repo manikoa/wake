@@ -153,11 +153,13 @@ func (s *signer) process(span ptrace.Span) {
 	case signed:
 		// Keep events whose signatures fail: they're evidence too.
 		err = event.Verify(span, s.trust)
-	case capture.Str() == "sdk" || capture.Str() == "memory_adapter":
+	case capture.Str() == "sdk" || capture.Str() == "memory_adapter" || capture.Str() == "hook":
+		// Captured where the agent runs, so they arrive unsigned, and this is the first hop
+		// outside the agent's reach.
 		err = event.Sign(span, s.key)
 	default:
 		// Proxies sign their own events, so an unsigned one can't be trusted.
-		err = fmt.Errorf("unsigned, and the collector only signs sdk and memory_adapter events, not %q", capture.Str())
+		err = fmt.Errorf("unsigned, and the collector only signs sdk, memory_adapter and hook events, not %q", capture.Str())
 	}
 	if err != nil {
 		// Invalid, it still goes to the log, so its payload's credentials are replaced

@@ -2,7 +2,7 @@
 
 An OpenTelemetry Collector with two Wake components:
 
-- **`wakesign` processor:** signs SDK and memory adapter events as they arrive and checks the signatures of events that arrive signed, such as the proxy's. An event signed with an X.509-SVID only counts when `trusted_signers` lists its SPIFFE ID for the event's `wake.capture`, since agents' SVIDs chain to the same trust bundle as the proxy's, and its SVID is checked as of when the event arrived. An event that fails is kept, marked invalid with the reason in `wake.signature.error`; one bad event never fails the rest of its request. See [docs/signing.md](../docs/signing.md).
+- **`wakesign` processor:** signs SDK, memory adapter and hook events as they arrive and checks the signatures of events that arrive signed, such as the proxy's. An event signed with an X.509-SVID only counts when `trusted_signers` lists its SPIFFE ID for the event's `wake.capture`, since agents' SVIDs chain to the same trust bundle as the proxy's, and its SVID is checked as of when the event arrived. An event that fails is kept, marked invalid with the reason in `wake.signature.error`; one bad event never fails the rest of its request. See [docs/signing.md](../docs/signing.md).
 - **`wakelog` exporter:** appends each signed event to the self hosted signed log in [`log/`](../log).
 
 ## Run it locally

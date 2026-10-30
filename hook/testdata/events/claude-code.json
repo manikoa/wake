@@ -1,0 +1,66 @@
+{
+  "prompt": {
+    "session_id": "abc123",
+    "transcript_path": "/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+    "cwd": "/Users/me/proj",
+    "permission_mode": "default",
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "Write a function to calculate the factorial of a number"
+  },
+  "pre_tool": {
+    "session_id": "abc123",
+    "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+    "transcript_path": "/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+    "cwd": "/Users/me/proj",
+    "permission_mode": "default",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {"command": "npm test", "description": "Run test suite", "timeout": 120000, "run_in_background": false},
+    "tool_use_id": "toolu_01ABC123"
+  },
+  "post_tool": {
+    "session_id": "abc123",
+    "transcript_path": "/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+    "cwd": "/Users/me/proj",
+    "permission_mode": "default",
+    "hook_event_name": "PostToolUse",
+    "tool_name": "Write",
+    "tool_input": {"file_path": "/Users/me/proj/factorial.py", "content": "def factorial(n):\n    return 1 if n < 2 else n * factorial(n - 1)\n"},
+    "tool_response": {"filePath": "/Users/me/proj/factorial.py", "type": "create"},
+    "tool_use_id": "toolu_01DEF456",
+    "duration_ms": 12
+  },
+  "post_tool_failure": {
+    "session_id": "abc123",
+    "transcript_path": "/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+    "cwd": "/Users/me/proj",
+    "permission_mode": "default",
+    "hook_event_name": "PostToolUseFailure",
+    "tool_name": "Bash",
+    "tool_input": {"command": "npm test", "description": "Run test suite"},
+    "tool_use_id": "toolu_01ABC123",
+    "error": "Exit code 1\nError: Cannot find module 'express'",
+    "is_interrupt": false,
+    "duration_ms": 4187
+  },
+  "subagent_post_tool": {
+    "session_id": "abc123",
+    "transcript_path": "/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+    "cwd": "/Users/me/proj",
+    "permission_mode": "default",
+    "hook_event_name": "PostToolUse",
+    "agent_id": "agent-abc123",
+    "agent_type": "Explore",
+    "tool_name": "Read",
+    "tool_input": {"file_path": "/Users/me/proj/README.md"},
+    "tool_response": {"type": "text", "file": {"filePath": "/Users/me/proj/README.md", "content": "# proj\n"}},
+    "tool_use_id": "toolu_01GHI789"
+  },
+  "session_start": {
+    "session_id": "abc123",
+    "transcript_path": "/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+    "cwd": "/Users/me/proj",
+    "hook_event_name": "SessionStart",
+    "source": "startup"
+  }
+}

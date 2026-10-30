@@ -31,6 +31,23 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
+  hook:
+    name: hook (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hook
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: hook/go.mod
+          # The standard library only, so there's no go.sum to key a cache on.
+          cache: false
+      - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - run: go test -race ./...
+
   collector:
     name: collector (Go)
     runs-on: ubuntu-latest

@@ -1,0 +1,25 @@
+{
+  "prompt": {
+    "hookEventName": "UserPromptSubmit",
+    "sessionId": "s-5e1f",
+    "cwd": "/home/me/app",
+    "workspaceRoot": "/home/me/app",
+    "prompt": "Clean the build and rebuild"
+  },
+  "pre_tool": {
+    "hookEventName": "PreToolUse",
+    "sessionId": "s-5e1f",
+    "cwd": "/home/me/app",
+    "workspaceRoot": "/home/me/app",
+    "toolName": "Bash",
+    "toolInput": {"command": "rm -rf build"}
+  },
+  "post_tool": {
+    "hookEventName": "PostToolUse",
+    "sessionId": "s-5e1f",
+    "cwd": "/home/me/app",
+    "workspaceRoot": "/home/me/app",
+    "toolName": "Bash",
+    "toolInput": {"command": "rm -rf build"}
+  }
+}
