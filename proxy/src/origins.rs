@@ -1,20 +1,25 @@
 //! What entered each agent through the proxy, for flow policies (policy.rs): the tools it
 //! called, whose results come back to it, and the agents whose messages and replies reached
-//! it. A flow policy decides on these, never on anything the caller says about itself, so
-//! an agent can't talk its way past one: leaving a header out, or sending one, changes
-//! nothing.
+//! it, with whatever had entered them. A flow policy decides on these, never on anything the
+//! caller says about itself, so an agent can't talk its way past one: leaving a header out,
+//! or sending one, changes nothing.
 //!
 //! It's coarse on purpose. The proxy sees what reached an agent, not which of it feeds a
 //! given call, so a policy treats everything that entered an agent within its window as
-//! behind each call it makes. It's coarse across delegation too: content crosses one both
-//! ways where the proxy can't see it, a parent's task into the sub-agent it delegates to,
-//! and the sub-agent's result back. So what enters a caller is noted under every agent its
-//! token says the call is made under, and a call is checked against what entered any of
-//! them: a sub-agent can't take an action its parent is kept from, with the parent's
-//! content, or hand its parent content to take one with. Where it doesn't know, it assumes the worst: for one window
-//! after the proxy starts or the window grows, for an agent past its bound of origins, and
-//! once too many agents are tracked to remember another, an agent counts as having every
-//! origin.
+//! behind each call it makes. A message or a reply is treated the same way: it carries
+//! everything that had entered the agent it comes from, so one agent can't fetch a page and
+//! hand it to another to act on. What it carries keeps the time it entered, so passing
+//! content on never makes it newer, and agents talking back and forth don't keep it alive.
+//! It's coarse across delegation too: content crosses one both ways where the proxy can't
+//! see it, a parent's task into the sub-agent it delegates to, and the sub-agent's result
+//! back. So what enters a caller is noted under every agent its token says the call is made
+//! under, and a call is checked against what entered any of them: a sub-agent can't take an
+//! action its parent is kept from, with the parent's content, or hand its parent content to
+//! take one with. Where it doesn't know, it assumes the worst: for one window after the
+//! proxy starts or the window grows, for an agent past its bound of origins, once too many
+//! agents are tracked to remember another, and for a caller the agents file doesn't list
+//! and its token doesn't place, an agent counts as having every origin, and so does an
+//! agent its messages or replies reach.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -85,9 +90,47 @@ pub fn under<'a>(agents: &'a Agents, token: Option<&'a Token>) -> Vec<Who<'a>> {
         .unwrap_or_default()
 }
 
+/// Whether a caller the identity map doesn't list is placed by token: the token is its own
+/// (the agent it names as acting now is the caller), its chain is whole, and the chain or
+/// whom it acts for is an agent the map lists. It acts under that agent then, by the
+/// identity provider's word, as halts.rs decides too.
+pub fn placed(agents: &Agents, identity: &str, token: Option<&Token>) -> bool {
+    token.is_some_and(|t| {
+        !t.cut && t.actors.first().is_some_and(|a| a == identity) && t.under().any(|a| agents.knows(a))
+    })
+}
+
+/// The agents whose origins are behind a call, or a message, from caller with token: the
+/// caller and the agents its token places it under (under). Err, with why, when it could be
+/// any agent, so what entered it isn't known: its token's chain was cut, or the identity map
+/// doesn't list it and its own token doesn't place it, as the halts treat a caller nobody
+/// can name. Without a map every identity is an agent's name, so no caller is unlisted.
+pub fn behind<'a>(agents: &'a Agents, caller: Who<'a>, token: Option<&'a Token>) -> Result<Vec<Who<'a>>, &'static str> {
+    if token.is_some_and(|t| t.cut) {
+        return Err(CUT_CHAIN);
+    }
+    if let Who::Unlisted(identity) = caller
+        && !agents.is_empty()
+        && !placed(agents, identity, token)
+    {
+        return Err(UNPLACED);
+    }
+    let mut whos = under(agents, token);
+    whos.insert(0, caller);
+    Ok(whos)
+}
+
 /// Why a call whose token's chain was cut counts as having every origin: what entered
 /// the agents it didn't keep isn't known.
 pub const CUT_CHAIN: &str = "the caller's token acts under more agents than wake-proxy keeps";
+/// Why a caller the agents file doesn't list, and its own token doesn't place, counts as
+/// having every origin: it could be any agent.
+pub const UNPLACED: &str = "the agents file doesn't list the caller, and its token doesn't place it";
+/// Why an agent counts as having every origin once a message or reply from one that does
+/// reached it.
+pub const CARRIED: &str = "a message or reply reached the agent from one with every origin";
+/// Why an agent counts as having every origin past MAX_ORIGINS.
+const SATURATED: &str = "more origins entered the agent than wake-proxy keeps";
 
 /// What entered an agent within a window.
 #[derive(Clone, Debug, PartialEq)]
@@ -102,8 +145,9 @@ pub enum Seen {
 struct Agent {
     /// Each origin, and when it last entered, Unix nanoseconds.
     origins: HashMap<String, u64>,
-    /// When the agent last had more origins than MAX_ORIGINS within the window.
-    saturated_at: Option<u64>,
+    /// When the agent last came to have every origin, and why: more origins than
+    /// MAX_ORIGINS within the window, or content from an agent with every origin.
+    saturated: Option<(u64, &'static str)>,
 }
 
 impl Agent {
@@ -111,9 +155,31 @@ impl Agent {
         self.origins
             .values()
             .copied()
-            .chain(self.saturated_at)
+            .chain(self.saturated.map(|(at, _)| at))
             .max()
             .unwrap_or(0)
+    }
+
+    /// Notes that origin entered at, forgetting origins older than oldest. Past
+    /// MAX_ORIGINS, the agent has every origin from then.
+    fn note(&mut self, origin: &str, at: u64, oldest: u64) {
+        if let Some(seen) = self.origins.get_mut(origin) {
+            *seen = (*seen).max(at);
+            return;
+        }
+        self.origins.retain(|_, seen| *seen >= oldest);
+        if self.origins.len() >= MAX_ORIGINS {
+            self.saturate(at, SATURATED);
+            return;
+        }
+        self.origins.insert(origin.to_string(), at);
+    }
+
+    /// Notes that the agent has every origin from at, for why, unless it does from later.
+    fn saturate(&mut self, at: u64, why: &'static str) {
+        if self.saturated.is_none_or(|(since, _)| since <= at) {
+            self.saturated = Some((at, why));
+        }
     }
 }
 
@@ -126,6 +192,54 @@ struct Inner {
     /// Since when everything that entered is known: when the proxy started, or when the
     /// window last grew, since less than the new window was kept before.
     known_since: u64,
+}
+
+impl Inner {
+    /// The agent who is remembered under, made room for if need be. None for nobody, and
+    /// when it can't be remembered: MAX_AGENTS others had something enter them within the
+    /// window.
+    fn agent(&mut self, who: Who<'_>, at: u64) -> Option<&mut Agent> {
+        let key = who.key()?;
+        if !self.agents.contains_key(key) && self.agents.len() >= MAX_AGENTS {
+            // Agents nothing has entered for a window can be forgotten.
+            let oldest = at.saturating_sub(self.window);
+            self.agents.retain(|_, a| a.newest() >= oldest);
+            if self.agents.len() >= MAX_AGENTS {
+                self.overflowed_at = Some(at);
+                return None;
+            }
+        }
+        Some(self.agents.entry(key.to_string()).or_default())
+    }
+
+    /// What entered any of whos since since, each origin with when it last entered any of
+    /// them. Err when that's every origin for any of them, with why and since when: at, now,
+    /// for a caller with no identity.
+    fn entered(&self, whos: &[Who<'_>], since: u64, at: u64) -> Result<HashMap<&str, u64>, (&'static str, u64)> {
+        if self.known_since > since {
+            return Err(("wake-proxy hasn't watched for a whole window yet", self.known_since));
+        }
+        let mut newest: HashMap<&str, u64> = HashMap::new();
+        for who in whos {
+            let Some(key) = who.key() else {
+                return Err(("the caller has no identity", at));
+            };
+            let Some(agent) = self.agents.get(key) else {
+                if let Some(overflowed) = self.overflowed_at.filter(|t| *t >= since) {
+                    return Err(("too many agents to remember this one", overflowed));
+                }
+                continue;
+            };
+            if let Some((saturated, why)) = agent.saturated.filter(|(t, _)| *t >= since) {
+                return Err((why, saturated));
+            }
+            for (origin, seen) in agent.origins.iter().filter(|(_, seen)| **seen >= since) {
+                let at = newest.entry(origin).or_default();
+                *at = (*at).max(*seen);
+            }
+        }
+        Ok(newest)
+    }
 }
 
 /// What entered each agent, shared by the hooks that see deliveries and the checks that
@@ -167,28 +281,55 @@ impl Observed {
     /// Notes that origin entered who at, Unix nanoseconds. A delivery to nobody is noted
     /// nowhere: a caller with no identity counts as having every origin anyway.
     pub fn note(&self, who: Who<'_>, origin: &str, at: u64) {
-        let Some(key) = who.key() else { return };
         let mut inner = self.lock();
         let oldest = at.saturating_sub(inner.window);
-        if !inner.agents.contains_key(key) && inner.agents.len() >= MAX_AGENTS {
-            // Agents nothing has entered for a window can be forgotten.
-            inner.agents.retain(|_, a| a.newest() >= oldest);
-            if inner.agents.len() >= MAX_AGENTS {
-                inner.overflowed_at = Some(at);
-                return;
+        if let Some(agent) = inner.agent(who, at) {
+            agent.note(origin, at, oldest);
+        }
+    }
+
+    /// Notes that content from from, a message or a reply, reached each of to at: whatever
+    /// had entered any of from within the window entered each of to too. Each origin keeps
+    /// when it last entered them, so passing content on never makes it newer. When that's
+    /// every origin, each of to has every origin too, from when from did. What came from
+    /// one of to isn't carried back to them: an agent's own content, or its chain's, isn't
+    /// an origin of theirs.
+    pub fn carry(&self, from: &[Who<'_>], to: &[Who<'_>], at: u64) {
+        let mut inner = self.lock();
+        let since = at.saturating_sub(inner.window);
+        let own: Vec<String> = to.iter().filter_map(Who::key).map(|k| format!("agent:{k}")).collect();
+        let carried = inner.entered(from, since, at).map(|entered| {
+            entered
+                .into_iter()
+                .filter(|(origin, _)| !own.iter().any(|o| o == origin))
+                .map(|(origin, seen)| (origin.to_string(), seen))
+                .collect::<Vec<_>>()
+        });
+        if carried.as_ref().is_ok_and(Vec::is_empty) {
+            return;
+        }
+        for who in to {
+            let Some(agent) = inner.agent(*who, at) else { continue };
+            match &carried {
+                Ok(origins) => {
+                    for (origin, seen) in origins {
+                        agent.note(origin, *seen, since);
+                    }
+                }
+                Err((_, every_since)) => agent.saturate(*every_since, CARRIED),
             }
         }
-        let agent = inner.agents.entry(key.to_string()).or_default();
-        if let Some(seen) = agent.origins.get_mut(origin) {
-            *seen = (*seen).max(at);
-            return;
+    }
+
+    /// Notes that content nothing is known of reached each of to at, such as a message from
+    /// a caller nobody can name or place: each has every origin from then.
+    pub fn saturate(&self, to: &[Who<'_>], at: u64) {
+        let mut inner = self.lock();
+        for who in to {
+            if let Some(agent) = inner.agent(*who, at) {
+                agent.saturate(at, CARRIED);
+            }
         }
-        agent.origins.retain(|_, seen| *seen >= oldest);
-        if agent.origins.len() >= MAX_ORIGINS {
-            agent.saturated_at = Some(at);
-            return;
-        }
-        agent.origins.insert(origin.to_string(), at);
     }
 
     /// What entered who in the window_secs up to at.
@@ -201,31 +342,14 @@ impl Observed {
     pub fn seen_by(&self, whos: &[Who<'_>], at: u64, window_secs: u64) -> Seen {
         let since = at.saturating_sub(window_secs.clamp(1, MAX_WINDOW_SECS) * NANOS);
         let inner = self.lock();
-        if inner.known_since > since {
-            return Seen::Every("wake-proxy hasn't watched for a whole window yet");
-        }
-        let mut newest: HashMap<&str, u64> = HashMap::new();
-        for who in whos {
-            let Some(key) = who.key() else {
-                return Seen::Every("the caller has no identity");
-            };
-            let Some(agent) = inner.agents.get(key) else {
-                if inner.overflowed_at.is_some_and(|t| t >= since) {
-                    return Seen::Every("too many agents to remember this one");
-                }
-                continue;
-            };
-            if agent.saturated_at.is_some_and(|t| t >= since) {
-                return Seen::Every("more origins entered the agent than wake-proxy keeps");
-            }
-            for (origin, seen) in agent.origins.iter().filter(|(_, seen)| **seen >= since) {
-                let at = newest.entry(origin).or_default();
-                *at = (*at).max(*seen);
+        match inner.entered(whos, since, at) {
+            Err((why, _)) => Seen::Every(why),
+            Ok(newest) => {
+                let mut origins: Vec<(&str, u64)> = newest.into_iter().collect();
+                origins.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                Seen::These(origins.into_iter().map(|(o, _)| o.to_string()).collect())
             }
         }
-        let mut origins: Vec<(&str, u64)> = newest.into_iter().collect();
-        origins.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        Seen::These(origins.into_iter().map(|(o, _)| o.to_string()).collect())
     }
 }
 
@@ -428,6 +552,120 @@ mod tests {
         assert_eq!(
             o.seen(Who::Agent("newcomer"), after_start(WINDOW + 11), WINDOW),
             Seen::These(vec!["tool:t".into()])
+        );
+    }
+
+    #[test]
+    fn content_carries_what_entered_the_agent_it_comes_from() {
+        let o = Observed::starting(START, WINDOW);
+        let (research, billing, support) = (Who::Agent("research"), Who::Agent("billing"), Who::Agent("support"));
+        o.note(research, "tool:fetch_page", after_start(0));
+        o.note(research, "agent:billing", after_start(5));
+        // Research replies to billing: the page comes with it, as of when research fetched
+        // it, and billing's own message isn't carried back to it.
+        o.note(billing, "agent:research", after_start(100));
+        o.carry(&[research], &[billing], after_start(100));
+        assert_eq!(
+            o.seen(billing, after_start(101), WINDOW),
+            Seen::These(vec!["agent:research".into(), "tool:fetch_page".into()])
+        );
+        // Passing it on never makes it newer: it leaves each of them when it leaves research,
+        // however they pass it around.
+        o.carry(&[billing], &[support], after_start(200));
+        assert_eq!(
+            o.seen(support, after_start(201), WINDOW),
+            Seen::These(vec!["agent:research".into(), "tool:fetch_page".into()])
+        );
+        o.carry(&[support], &[billing], after_start(800));
+        o.carry(&[billing], &[research], after_start(850));
+        for who in [research, billing, support] {
+            assert!(
+                matches!(o.seen(who, after_start(901), WINDOW), Seen::These(seen) if !seen.contains(&"tool:fetch_page".to_string())),
+                "{who:?}"
+            );
+        }
+        // From several agents, it's what entered any of them, into each it reaches.
+        let child = Who::Unlisted("support/researcher#toolu_1");
+        o.note(child, "tool:search", after_start(1_000));
+        o.carry(&[child, support], &[research, billing], after_start(1_001));
+        for who in [research, billing] {
+            assert!(
+                matches!(o.seen(who, after_start(1_002), WINDOW), Seen::These(seen) if seen.contains(&"tool:search".to_string()))
+            );
+        }
+        // Nothing to carry makes no agent.
+        o.carry(&[Who::Agent("idle")], &[Who::Agent("listener")], after_start(1_003));
+        assert!(!o.lock().agents.contains_key("listener"));
+    }
+
+    #[test]
+    fn content_from_an_agent_with_every_origin_gives_every_origin() {
+        let o = Observed::starting(START, WINDOW);
+        let (a, b, c) = (Who::Agent("a"), Who::Agent("b"), Who::Agent("c"));
+        // Just started, nothing is known; what a passes on then isn't known past that window.
+        o.carry(&[a], &[b], START + 10 * S);
+        assert_eq!(o.seen(b, START + 901 * S, WINDOW), Seen::These(vec![]));
+        // An agent past its bound of origins passes that on, until its own window ends.
+        for i in 0..=MAX_ORIGINS {
+            o.note(a, &format!("tool:t{i}"), after_start(0));
+        }
+        o.carry(&[a], &[b], after_start(500));
+        o.carry(&[b], &[c], after_start(600));
+        assert_eq!(o.seen(c, after_start(601), WINDOW), Seen::Every(CARRIED));
+        o.carry(&[c], &[a], after_start(700));
+        assert_eq!(
+            o.seen(a, after_start(901), WINDOW),
+            Seen::These(vec![]),
+            "nor kept alive"
+        );
+        assert_eq!(o.seen(c, after_start(901), WINDOW), Seen::These(vec![]));
+        // Content from nobody, or that nothing is known of, is every origin from when it
+        // arrives.
+        o.carry(&[Who::Nobody], &[b], after_start(1_000));
+        assert_eq!(o.seen(b, after_start(1_899), WINDOW), Seen::Every(CARRIED));
+        assert_eq!(o.seen(b, after_start(1_901), WINDOW), Seen::These(vec![]));
+        o.saturate(&[c, Who::Nobody], after_start(2_000));
+        assert_eq!(o.seen(c, after_start(2_899), WINDOW), Seen::Every(CARRIED));
+        assert_eq!(o.seen(c, after_start(2_901), WINDOW), Seen::These(vec![]));
+    }
+
+    #[test]
+    fn a_caller_the_map_doesnt_list_or_place_could_be_any_agent() {
+        let agents = Agents::from_json(br#"{"support": ["0oa1support"]}"#).unwrap();
+        let child = "spiffe://wake.local/agent/support/researcher";
+        assert_eq!(behind(&agents, Who::of(&agents, Some(child)), None), Err(UNPLACED));
+        let own = Token {
+            subject: "0oa1support".into(),
+            actors: vec![child.into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            behind(&agents, Who::of(&agents, Some(child)), Some(&own)),
+            Ok(vec![Who::Unlisted(child), Who::Unlisted(child), Who::Agent("support")]),
+            "its own token places it under support"
+        );
+        let anothers = Token {
+            actors: vec!["support/other#toolu_2".into()],
+            ..own.clone()
+        };
+        assert_eq!(
+            behind(&agents, Who::of(&agents, Some(child)), Some(&anothers)),
+            Err(UNPLACED)
+        );
+        let cut = Token {
+            cut: true,
+            ..own.clone()
+        };
+        assert_eq!(behind(&agents, Who::Agent("support"), Some(&cut)), Err(CUT_CHAIN));
+        // A caller the map lists is itself, and without a map, every identity is an agent.
+        assert_eq!(
+            behind(&agents, Who::of(&agents, Some("0oa1support")), None),
+            Ok(vec![Who::Agent("support")])
+        );
+        let none = Agents::none();
+        assert_eq!(
+            behind(&none, Who::of(&none, Some(child)), None),
+            Ok(vec![Who::Agent(child)])
         );
     }
 

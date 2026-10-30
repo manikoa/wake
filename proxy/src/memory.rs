@@ -3,7 +3,7 @@
 //! can reach it without reaching the control API.
 //!
 //! ```text
-//! GET /v1/memory?agent=<id>&process=<id>   {"version", "locked_by", "hidden_by", "quarantines": [...], "halts": [...]}
+//! GET /v1/memory?agent=<id>&process=<id>&ttl=<seconds>&stops=1   {"version", "locked_by", "hidden_by", "quarantines": [...], "halts": [...]}
 //! ```
 //!
 //! The halts let an SDK stop its agent, or one instance of it such as an in-process
@@ -12,11 +12,13 @@
 //!
 //! Each fetch is noted, under the agent and the process the SDK names, and the brake reads
 //! the notes from the control API to confirm an agent's SDK has a quarantine or halt: in
-//! every process of the agent still fetching, not only the first to fetch it. The agent
-//! names itself, so that confirmation trusts the agent's process, as the adapter's
-//! enforcement does; the proxy deny doesn't. Agents can reach this port, so it caps its
-//! connections and how long each stays open (listen::MEMORY), and the notes are bounded
-//! (halts.rs).
+//! every process of the agent still fetching, not only the first to fetch it. The SDK says
+//! how long it acts on the rules it has (`ttl`, its stale-after setting), which is how long
+//! the process holds its agent back, and whether its integration refuses the calls of
+//! halted instances (`stops=1`). The agent names itself, so that confirmation trusts the
+//! agent's process, as the adapter's enforcement does; the proxy deny doesn't. Agents can
+//! reach this port, so it caps its connections and how long each stays open
+//! (listen::MEMORY), and the notes are bounded (halts.rs).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +29,7 @@ use axum::{Json, Router};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use crate::halts::{Halts, MemoryRules};
+use crate::halts::{Fetcher, Halts, MemoryRules};
 use crate::listen::{self, Limits};
 
 async fn rules(State(halts): State<Arc<Halts>>, Query(query): Query<HashMap<String, String>>) -> Json<MemoryRules> {
@@ -38,7 +40,11 @@ async fn rules(State(halts): State<Arc<Halts>>, Query(query): Query<HashMap<Stri
     // noted as the process with no name.
     let process = query.get("process").map(String::as_str).unwrap_or("");
     let process = if process.len() <= 128 { process } else { "" };
-    Json(halts.memory_rules(agent, process))
+    let fetcher = Fetcher::new(
+        query.get("ttl").map(String::as_str),
+        query.get("stops").is_some_and(|s| s == "1"),
+    );
+    Json(halts.memory_rules_for(agent, process, fetcher))
 }
 
 pub fn router(halts: Arc<Halts>) -> Router {

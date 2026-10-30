@@ -72,10 +72,10 @@ func TestRedactionVectors(t *testing.T) {
 }
 
 // Anything an agent sends, inside a JSON payload, as encoding/json writes it and as the SDKs
-// do, with non-ASCII escaped: it stays JSON, and so does the JSON in its string, redacting
-// twice changes nothing more, and every kind listed names a placeholder. In JSON or not,
-// what's replaced is what the regexps alone would replace. go test runs the seeds; go test
-// -fuzz=FuzzRedact explores.
+// do, with non-ASCII escaped, and marked truncated or not: it stays JSON, and so does the
+// JSON in its string, redacting twice changes nothing more, and every kind listed names a
+// placeholder. In JSON or not, what's replaced is what the regexps alone would replace. go
+// test runs the seeds; go test -fuzz=FuzzRedact explores.
 func FuzzRedact(f *testing.F) {
 	data, err := os.ReadFile(filepath.Join("testdata", "redaction.json"))
 	if err != nil {
@@ -94,23 +94,32 @@ func FuzzRedact(f *testing.F) {
 	f.Fuzz(func(t *testing.T, text string) {
 		redactsAsRegexps(t, text)
 		inner, _ := json.Marshal(map[string]string{"text": text})
-		plain, _ := json.Marshal(map[string]string{"output": text, "nested": string(inner)})
-		escaped, _ := json.Marshal(map[string]string{"output": text, "nested": ascii(inner)})
-		for _, payload := range []string{string(plain), ascii(escaped)} {
-			out, kinds := redactsAsRegexps(t, payload)
-			var doc map[string]string
-			if err := json.Unmarshal([]byte(out), &doc); err != nil {
-				t.Fatalf("not JSON: %s", out)
+		for _, truncated := range []bool{false, true} {
+			doc := func(nested string) map[string]any {
+				d := map[string]any{"output": text, "nested": nested}
+				if truncated {
+					d["truncated"] = true // so the output is taken for cut short
+				}
+				return d
 			}
-			if !json.Valid([]byte(doc["nested"])) {
-				t.Fatalf("the JSON in it isn't JSON: %s", out)
-			}
-			if again, _ := Redact(out); again != out {
-				t.Fatalf("not idempotent:\n%s\n%s", out, again)
-			}
-			for _, k := range kinds {
-				if !strings.Contains(out, "[redacted "+k+" sha256:") {
-					t.Fatalf("%s listed but not in %s", k, out)
+			plain, _ := json.Marshal(doc(string(inner)))
+			escaped, _ := json.Marshal(doc(ascii(inner)))
+			for _, payload := range []string{string(plain), ascii(escaped)} {
+				out, kinds := redactsAsRegexps(t, payload)
+				var got map[string]any
+				if err := json.Unmarshal([]byte(out), &got); err != nil {
+					t.Fatalf("not JSON: %s", out)
+				}
+				if nested, _ := got["nested"].(string); !json.Valid([]byte(nested)) {
+					t.Fatalf("the JSON in it isn't JSON: %s", out)
+				}
+				if again, _ := Redact(out); again != out {
+					t.Fatalf("not idempotent:\n%s\n%s", out, again)
+				}
+				for _, k := range kinds {
+					if !strings.Contains(out, "[redacted "+k+" sha256:") && !strings.Contains(out, "[redacted "+k+"]") {
+						t.Fatalf("%s listed but not in %s", k, out)
+					}
 				}
 			}
 		}
@@ -198,6 +207,7 @@ func redactByRegexp(payload string) (string, []string) {
 		payload = out.String()
 		kinds = append(kinds, r.kind)
 	}
+	payload, kinds = redactCuts(payload, kinds)
 	sort.Strings(kinds)
 	return payload, kinds
 }
@@ -291,6 +301,10 @@ func TestRedactionTakesLinearTime(t *testing.T) {
 		"llm starts in a run":   strings.Repeat("-sk-ant-", 1<<19),
 		// Every pattern's literals, so none is skipped.
 		"every pattern": strings.Repeat(` eyJ ghp_ AIza ya29. xoxb- sk- sk_live_ Bearer Basic \\u00ab ://a:b secretAccessKey=`, 1<<14),
+		// A cut at the end of a run that holds a literal everywhere, but never where a word
+		// starts, and a cut, with a credential cut short at it, many times over.
+		"a cut through a run": `{"truncated":true,"prefix":"` + strings.Repeat("aeyJ", 1<<20) + `"}`,
+		"many cuts":           `{"truncated":true` + strings.Repeat(`,"input":"sk-"`, 1<<18) + `}`,
 	} {
 		// The budget catches a pattern that backtracks, or a run measured again from each start
 		// in it, which would take most of an hour or more on a payload this size, not a slow

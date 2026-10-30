@@ -332,7 +332,7 @@ def _type(item):
     return item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
 
 
-def two_researchers(memory=None):
+def researcher_agent(memory=None):
     @function_tool
     async def lookup(q: str) -> str:
         """Look a question up."""
@@ -341,21 +341,27 @@ def two_researchers(memory=None):
             memory.write_file(memory_dir / f"{uuid.uuid4().hex}.md", f"Found: {q}")
         return f"Found: {q}"
 
-    researcher = Agent(name="researcher", tools=[lookup], model=ResearcherModel())
-    research = researcher.as_tool(tool_name="research", tool_description="Research one question.")
+    return Agent(name="researcher", tools=[lookup], model=ResearcherModel())
+
+
+def two_researchers(memory=None, question="refund window"):
+    research = researcher_agent(memory).as_tool(tool_name="research", tool_description="Research one question.")
     # The same question twice: nothing in the arguments tells the copies apart.
     return Agent(name="triage", tools=[research], model=FakeModel([
-        [call("research", json.dumps({"input": "refund window"}), "call_a"),
-         call("research", json.dumps({"input": "refund window"}), "call_b")],
+        [call("research", json.dumps({"input": question}), "call_a"),
+         call("research", json.dumps({"input": question}), "call_b")],
         [say("Both answered.")],
     ]))
 
 
 memory_dir = None
+# Long enough that content matching would link two copies' steps, as their answers match.
+LONG_QUESTION = "What is the refund window for damaged items?"
 
 
+@pytest.mark.parametrize("question", ["refund window", LONG_QUESTION], ids=["short", "long"])
 @pytest.mark.parametrize("sensitive", [True, False])
-def test_an_agent_called_twice_as_a_tool_is_two_instances_that_never_cross(sensitive, tmp_path):
+def test_an_agent_called_twice_as_a_tool_is_two_instances_that_never_cross(sensitive, question, tmp_path):
     from agents import RunConfig
     from wake.memory import Memory
 
@@ -365,7 +371,7 @@ def test_an_agent_called_twice_as_a_tool_is_two_instances_that_never_cross(sensi
     processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter))
     set_trace_processors([processor])
     try:
-        asyncio.run(Runner.run(two_researchers(Memory(processor)), "Check our refund terms.",
+        asyncio.run(Runner.run(two_researchers(Memory(processor), question), "Check our refund terms.",
                                run_config=RunConfig(trace_include_sensitive_data=sensitive)))
     finally:
         set_trace_processors([])
@@ -556,3 +562,295 @@ def test_guard_reaches_agents_used_as_tools_and_handed_off_to_once():
     assert triage.tools[0].tool_input_guardrails == guarded, "the agent tool itself: a spawn"
     with pytest.raises(ValueError):
         WakeTracingProcessor(Recorder(agent="support", exporter=InMemorySpanExporter())).guard(triage)
+
+
+# Tools the agent runs in its own process.
+
+
+class Editor:
+    """An apply_patch editor that notes each change it makes."""
+
+    def __init__(self, ran) -> None:
+        self.ran = ran
+
+    def create_file(self, operation):
+        self.ran.append(operation.path)
+        return "created"
+
+    def update_file(self, operation):
+        self.ran.append(operation.path)
+        return "updated"
+
+    def delete_file(self, operation):
+        self.ran.append(operation.path)
+        return "deleted"
+
+
+def local_tool(kind, ran):
+    """A tool the agent runs itself, and the model's call to it."""
+    from agents import ApplyPatchTool, CustomTool, LocalShellTool, ShellTool
+    from openai.types.responses import ResponseApplyPatchToolCall, ResponseCustomToolCall, ResponseFunctionShellToolCall
+    from openai.types.responses.response_output_item import LocalShellCall, LocalShellCallAction
+
+    if kind == "local_shell":
+        return LocalShellTool(executor=lambda request: ran.append(request.data.action.command) or "ok"), LocalShellCall(
+            type="local_shell_call", id="lsh_1", call_id="call_x", status="completed",
+            action=LocalShellCallAction(type="exec", command=["rm", "-rf", "/srv/orders"], env={}))
+    if kind == "shell":
+        return ShellTool(executor=lambda request: ran.append(request.data.action.commands) or "ok"), ResponseFunctionShellToolCall(
+            type="shell_call", id="sh_1", call_id="call_x", status="completed", action={"commands": ["rm -rf /srv/orders"]})
+    if kind == "run_sql":
+        return CustomTool(name="run_sql", description="Run SQL.", on_invoke_tool=lambda ctx, text: ran.append(text) or "ok"), \
+            ResponseCustomToolCall(type="custom_tool_call", id="ctc_1", call_id="call_x", name="run_sql", input="DELETE FROM orders")
+    return ApplyPatchTool(editor=Editor(ran)), ResponseApplyPatchToolCall(
+        type="apply_patch_call", id="ap_1", call_id="call_x", status="completed",
+        operation={"type": "delete_file", "path": "orders.db"})
+
+
+@pytest.mark.parametrize("kind", ["local_shell", "shell", "run_sql", "apply_patch"])
+def test_a_halted_agents_own_tools_are_refused_as_they_start(kind):
+    ran = []
+    tool, requested = local_tool(kind, ran)
+    triage = Agent(name="triage", tools=[tool], model=FakeModel([[requested], [say("Done.")]]))
+    result, events_, _ = guarded_run(triage, Halts({"id": "halt-triage", "agents": ["triage"]}))
+    assert ran == [], "the tool never ran"
+    assert result.final_output == "Done."
+    first, denied, second = events_
+    assert kinds_of(events_) == ["model_call", "denied", "model_call"]
+    assert attrs(denied)["wake.brake.halt_id"] == "halt-triage"
+    assert attrs(denied)["gen_ai.tool.name"] == kind
+    assert attrs(denied)["wake.agent.id"] == "triage"
+    assert attrs(denied)["wake.origins"] == (), "the tool never ran: nothing of it entered"
+    assert attrs(denied)["wake.parents"] == (attrs(first)["wake.event.id"],), "the response that asked for it"
+    assert attrs(denied)["wake.event.id"] in attrs(second)["wake.parents"], "the model read the refusal"
+    reason = "Wake halted triage (halt-triage), so this tool call wasn't run."
+    assert reason in attrs(second)["wake.payload"], "the refusal is the tool's output"
+    # Without a halt the tool runs.
+    ran.clear()
+    tool, requested = local_tool(kind, ran)
+    triage = Agent(name="triage", tools=[tool], model=FakeModel([[requested], [say("Done.")]]))
+    _, events_, _ = guarded_run(triage, Halts())
+    assert len(ran) == 1 and "denied" not in kinds_of(events_)
+
+
+class Screen:
+    """A computer that notes each action it carries out."""
+
+    def __init__(self) -> None:
+        self.did = []
+
+    def screenshot(self) -> str:
+        self.did.append("screenshot")
+        return "iVBORw0KGgo="
+
+    def click(self, x, y, button) -> None:
+        self.did.append(("click", x, y))
+
+    def double_click(self, x, y) -> None:
+        self.did.append(("double_click", x, y))
+
+    def scroll(self, x, y, scroll_x, scroll_y) -> None:
+        self.did.append("scroll")
+
+    def type(self, text) -> None:
+        self.did.append(("type", text))
+
+    def wait(self) -> None:
+        self.did.append("wait")
+
+    def move(self, x, y) -> None:
+        self.did.append("move")
+
+    def keypress(self, keys) -> None:
+        self.did.append(("keypress", keys))
+
+    def drag(self, path) -> None:
+        self.did.append("drag")
+
+
+@pytest.mark.parametrize("made", [False, True], ids=["computer", "made_per_run"])
+def test_a_halted_agents_computer_does_nothing_and_its_run_ends(made):
+    from agents import Computer, ComputerTool
+    from openai.types.responses import ResponseComputerToolCall
+
+    from wake.stop import AgentHalted
+
+    screen = type("RealScreen", (Screen, Computer), {})()
+    tool = ComputerTool(computer=(lambda **_: screen) if made else screen)
+    clicked = ResponseComputerToolCall(type="computer_call", id="cu_1", call_id="call_x", status="completed",
+                                       pending_safety_checks=[], action={"type": "click", "x": 1, "y": 2, "button": "left"})
+    triage = Agent(name="triage", tools=[tool], model=FakeModel([[clicked], [say("Done.")]]))
+    exporter = InMemorySpanExporter()
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter),
+                                     quarantine=Halts({"id": "halt-triage", "agents": ["triage"]}))
+    set_trace_processors([processor])
+    try:
+        with pytest.raises(AgentHalted) as refused:
+            asyncio.run(Runner.run(processor.guard(triage), "Click it."))
+    finally:
+        set_trace_processors([])
+    processor._recorder.flush()
+    assert screen.did == [], "the computer did nothing"
+    assert refused.value.halt == "halt-triage"
+    events_ = wake_events(exporter.get_finished_spans())
+    assert kinds_of(events_) == ["model_call", "denied"]
+    assert attrs(events_[1])["wake.brake.halt_id"] == "halt-triage"
+    assert attrs(events_[1])["wake.origins"] == ()
+
+
+def test_guard_raises_rather_than_leave_a_tool_it_cant_refuse_and_leaves_hosted_tools_be():
+    from agents import WebSearchTool
+
+    class Gadget:
+        name = "gadget"
+
+    triage = Agent(name="triage", tools=[WebSearchTool()])
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=InMemorySpanExporter()), quarantine=Halts())
+    processor.guard(triage)
+    assert isinstance(triage.tools[0], WebSearchTool), "a hosted tool runs at OpenAI: nothing here to refuse"
+    ops = Agent(name="ops")
+    ops.tools.append(Gadget())  # a kind of tool this version of Wake doesn't know
+    with pytest.raises(TypeError, match="Gadget"):
+        processor.guard(ops)
+
+
+# Handoffs.
+
+
+@pytest.mark.parametrize("halted", ["triage", "billing"])
+def test_a_handoff_to_or_from_a_halted_agent_isnt_offered(halted):
+    model = OfferedModel()
+    billing = Agent(name="billing", model=FakeModel([[say("Paid.")]]))
+    triage = Agent(name="triage", handoffs=[billing], model=model)
+    guarded_run(triage, Halts({"id": f"halt-{halted}", "agents": [halted]}))
+    assert model.offered == []
+
+
+class HaltDuringTurn(FakeModel):
+    """The halt lands while the model is answering the turn that hands off."""
+
+    def __init__(self, turns, halts, halt):
+        super().__init__(turns)
+        self.halts, self.halt = halts, halt
+
+    async def get_response(self, *args, **kwargs):
+        self.halts.halts.append(self.halt)
+        return await super().get_response(*args, **kwargs)
+
+
+@pytest.mark.parametrize("halted", ["triage", "billing"])
+def test_a_handoff_picked_before_a_halt_landed_is_refused_as_it_starts(halted):
+    from wake.stop import AgentHalted
+
+    halts, paid = Halts(), []
+
+    @function_tool
+    def pay(order: str) -> str:
+        """Pay an order."""
+        paid.append(order)
+        return "Paid."
+
+    billing = Agent(name="billing", tools=[pay], model=FakeModel([
+        [call("pay", json.dumps({"order": "1234"}), "call_pay")], [say("Paid.")]]))
+    triage = Agent(name="triage", handoffs=[billing], model=HaltDuringTurn(
+        [[call("transfer_to_billing", "{}", "call_h")]], halts, {"id": f"halt-{halted}", "agents": [halted]}))
+    exporter = InMemorySpanExporter()
+    processor = WakeTracingProcessor(Recorder(agent="support", exporter=exporter), quarantine=halts)
+    set_trace_processors([processor])
+    try:
+        with pytest.raises(AgentHalted) as refused:
+            asyncio.run(Runner.run(processor.guard(triage), "Refund 1234."))
+    finally:
+        set_trace_processors([])
+    processor._recorder.flush()
+    assert paid == [], "billing never ran"
+    assert refused.value.halt == f"halt-{halted}"
+    assert str(refused.value).endswith("so the handoff to billing wasn't made.")
+    response, denied = wake_events(exporter.get_finished_spans())
+    assert kinds_of([response, denied]) == ["model_call", "denied"]
+    assert denied.name == "agent_message triage -> billing"
+    assert attrs(denied)["wake.agent.id"] == "triage", "recorded as what tried to hand off"
+    assert attrs(denied)["wake.brake.receiver"] == "billing"
+    assert attrs(denied)["wake.brake.halt_id"] == f"halt-{halted}"
+    assert attrs(denied)["wake.parents"] == (attrs(response)["wake.event.id"],)
+    assert attrs(denied)["wake.origins"] == (), "nothing reached billing"
+
+
+# Runs of one agent at once.
+
+
+def researching_twice_in_one_tool():
+    researcher = researcher_agent()
+
+    @function_tool
+    async def research_twice(question: str) -> str:
+        """Research a question twice over."""
+        answers = await asyncio.gather(*(Runner.run(researcher, question) for _ in range(2)))
+        return "\n".join(a.final_output for a in answers)
+
+    return Agent(name="triage", tools=[research_twice], model=FakeModel([
+        [call("research_twice", json.dumps({"question": LONG_QUESTION}), "call_twice")],
+        [say("Both answered.")],
+    ]))
+
+
+def test_two_runs_of_one_agent_inside_one_tool_call_are_two_instances_that_never_cross():
+    events_ = run(researching_twice_in_one_tool())
+    by_instance: dict[str, list] = {}
+    for e in events_:
+        if attrs(e)["wake.agent.id"] == "researcher":
+            assert attrs(e)["wake.agent.lineage"] == ("triage",)
+            by_instance.setdefault(attrs(e)["wake.agent.instance"], []).append(e)
+    assert len(by_instance) == 2, list(by_instance)
+    tool = next(e for e in events_ if attrs(e).get("gen_ai.tool.name") == "research_twice")
+    triage_ids = {attrs(e)["wake.event.id"] for e in events_ if attrs(e)["wake.agent.id"] == "triage"}
+    last_answers = set()
+    for instance, own in by_instance.items():
+        assert sorted(kinds_of(own)) == ["model_call", "model_call", "tool_call"], instance
+        own_ids = {attrs(e)["wake.event.id"] for e in own}
+        for e in own:
+            crossed = set(attrs(e)["wake.parents"]) - own_ids - triage_ids
+            assert not crossed, f"{instance} {attrs(e)['wake.event.kind']} links to the other copy: {crossed}"
+        first, last = sorted((e for e in own if attrs(e)["wake.event.kind"] == "model_call"), key=lambda e: e.start_time)
+        assert attrs(tool)["wake.event.id"] in attrs(first)["wake.parents"], "each run descends from the tool call"
+        last_answers.add(attrs(last)["wake.event.id"])
+    # What both runs said last is what the tool returned, which triage's next response read.
+    answer = [e for e in events_ if attrs(e)["wake.agent.id"] == "triage" and attrs(e)["wake.event.kind"] == "model_call"][-1]
+    assert last_answers <= set(attrs(answer)["wake.parents"])
+
+
+def test_two_runs_of_one_agent_at_the_top_of_one_trace_never_cross():
+    from agents import trace as sdk_trace
+
+    exporter = InMemorySpanExporter()
+    recorder = Recorder(agent="support", exporter=exporter)
+    set_trace_processors([WakeTracingProcessor(recorder)])
+
+    async def both():
+        with sdk_trace("research"):
+            await asyncio.gather(*(Runner.run(researcher_agent(), LONG_QUESTION) for _ in range(2)))
+
+    try:
+        asyncio.run(both())
+    finally:
+        set_trace_processors([])
+    recorder.flush()
+    spans = exporter.get_finished_spans()
+    by_span = {s.context.span_id: s for s in spans}
+
+    def run_of(e):
+        s = e
+        while s.attributes.get("gen_ai.operation.name") != "invoke_agent":
+            s = by_span[s.parent.span_id]
+        return s.context.span_id
+
+    runs: dict[int, list] = {}
+    for e in wake_events(spans):
+        assert "wake.agent.instance" not in attrs(e), "the workflow's own runs aren't instances"
+        runs.setdefault(run_of(e), []).append(e)
+    assert len(runs) == 2
+    for own in runs.values():
+        own_ids = {attrs(e)["wake.event.id"] for e in own}
+        assert all(set(attrs(e)["wake.parents"]) <= own_ids for e in own), "each run links only within itself"
+        first = min((e for e in own if attrs(e)["wake.event.kind"] == "model_call"), key=lambda e: e.start_time)
+        assert attrs(first)["wake.origins"] == ("user",), "each run's question enters at its first response"

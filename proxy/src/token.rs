@@ -34,7 +34,8 @@ pub struct Token {
     pub subject: String,
     /// The agents acting under it, the one acting now first, then each before it.
     pub actors: Vec<String>,
-    /// Its `jti`.
+    /// Its `jti`, or, for a token without one, its `uti`: Microsoft Entra access tokens carry
+    /// that instead.
     pub id: Option<String>,
     /// Its `exp`, in Unix seconds.
     pub expires: Option<i64>,
@@ -53,12 +54,12 @@ impl Token {
         }
     }
 
-    /// The token the gateway config described in these fields: `sub`, `jti`, `exp`, `act`
-    /// and `cnf`. None when the caller presented no JWT, which the config describes with
-    /// every claim empty. A JWT whose `sub` can't be read, missing or too long, keeps its
-    /// other claims, and its chain is marked cut: whom it acts for is unknown.
+    /// The token the gateway config described in these fields: `sub`, `jti`, `uti`, `exp`,
+    /// `act` and `cnf`. None when the caller presented no JWT, which the config describes
+    /// with every claim empty. A JWT whose `sub` can't be read, missing or too long, keeps
+    /// its other claims, and its chain is marked cut: whom it acts for is unknown.
     pub fn from_struct(s: &Struct) -> Option<Token> {
-        if !["sub", "jti", "exp", "act", "cnf"]
+        if !["sub", "jti", "uti", "exp", "act", "cnf"]
             .iter()
             .any(|k| claimed(s.fields.get(*k)))
         {
@@ -91,10 +92,15 @@ impl Token {
             s.fields.get("cnf").and_then(|c| c.kind.as_ref()),
             Some(Kind::BoolValue(true))
         );
+        // A jti too long to keep is left out, as any claim is, not stood in for by the uti.
+        let id = match s.fields.get("jti") {
+            jti if claimed(jti) => identifier(jti),
+            _ => identifier(s.fields.get("uti")),
+        };
         Some(Token {
             subject: subject.unwrap_or_default(),
             actors,
-            id: identifier(s.fields.get("jti")),
+            id,
             expires,
             bound,
             cut,
@@ -193,10 +199,34 @@ mod tests {
         facts(&[
             ("sub", text("")),
             ("jti", text("")),
+            ("uti", text("")),
             ("exp", number(0.0)),
             ("act", facts(&[])),
             ("cnf", boolean(false)),
         ])
+    }
+
+    #[test]
+    fn a_token_without_a_jti_is_known_by_its_uti() {
+        // As a Microsoft Entra access token, which carries uti instead, through the gateway.
+        let entra = |jti: &str| {
+            Token::from_value(&facts(&[
+                ("sub", text("support")),
+                ("jti", text(jti)),
+                ("uti", text("rq3PfvYh8kSxyz")),
+                ("exp", number(1_793_226_604.0)),
+                ("act", facts(&[])),
+                ("cnf", boolean(false)),
+            ]))
+            .unwrap()
+        };
+        assert_eq!(entra("").id.as_deref(), Some("rq3PfvYh8kSxyz"));
+        assert_eq!(entra("tok-1").id.as_deref(), Some("tok-1"), "a jti comes first");
+        assert_eq!(
+            entra(&"x".repeat(MAX_LEN + 1)).id,
+            None,
+            "a jti too long to keep is left out, not stood in for"
+        );
     }
 
     #[test]

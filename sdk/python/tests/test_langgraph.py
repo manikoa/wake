@@ -468,3 +468,98 @@ def test_a_halt_check_that_fails_refuses_the_call():
     assert result["messages"][-2].content == "Wake couldn't check its halts, so this tool call wasn't run."
     (denied,) = [e for e in events_() if e.attributes["wake.event.kind"] == "denied"]
     assert denied.attributes["wake.brake.halt_id"] == "halt-check-failed"
+
+
+class ToolCallingModel(GenericFakeChatModel):
+    """A scripted model an agent can bind tools to."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+def wiring_model():
+    return ToolCallingModel(messages=iter([
+        AIMessage(content="", tool_calls=[{"name": "wire", "args": {"account": "123"}, "id": "call_wire"}]),
+        AIMessage(content="Done."),
+    ]))
+
+
+def refused_once(events_, halt="halt-clavr"):
+    """The one denied event a refused call is recorded as, checked."""
+    found = events_()
+    (denied,) = [e for e in found if e.attributes["wake.event.kind"] == "denied"]
+    assert not [e for e in found if e.attributes["wake.event.kind"] == "tool_call"], "the tool never started"
+    assert denied.attributes["wake.brake.halt_id"] == halt
+    assert denied.attributes["gen_ai.tool.name"] == "wire"
+    assert denied.attributes["wake.origins"] == ()
+    assert json.loads(denied.attributes["wake.payload"])["input"] == {"account": "123"}
+    return found, denied
+
+
+@pytest.mark.filterwarnings("ignore:create_react_agent has been moved")
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_tool_call_outside_a_wrapped_tool_node_is_refused_as_it_starts(asynchronous):
+    # create_react_agent builds its own ToolNode, without the wrappers: the handler refuses the
+    # call as the tool starts, and the ToolNode passes the refusal on, ending the run.
+    from langgraph.prebuilt import create_react_agent
+
+    from wake.langchain import AgentHalted
+
+    wired.clear()
+    handler, events_ = guarded(Halts({"id": "halt-clavr", "agents": ["clavr"]}))
+    graph = create_react_agent(wiring_model(), [wire])
+    inputs, config = {"messages": [HumanMessage("Wire the refund")]}, {"callbacks": [handler]}
+    with pytest.raises(AgentHalted) as refused:
+        asyncio.run(graph.ainvoke(inputs, config=config)) if asynchronous else graph.invoke(inputs, config=config)
+    assert wired == [], "the tool never ran"
+    assert str(refused.value) == "Wake halted clavr (halt-clavr), so this tool call wasn't run."
+    found, denied = refused_once(events_)
+    (first,) = [e for e in found if e.attributes["wake.event.kind"] == "model_call"]
+    assert tuple(denied.attributes["wake.parents"]) == (first.attributes["wake.event.id"],), "the call that asked for it"
+
+
+def test_a_tool_node_that_catches_errors_answers_the_model_with_the_refusal():
+    wired.clear()
+    handler, events_ = guarded(Halts({"id": "halt-clavr", "agents": ["clavr"]}))
+    model = wiring_model()
+
+    def agent(state: MessagesState):
+        return {"messages": [model.invoke(state["messages"])]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("agent", agent)
+    builder.add_node("tools", ToolNode([wire], handle_tool_errors=True))
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", tools_condition)
+    builder.add_edge("tools", "agent")
+    result = builder.compile().invoke({"messages": [HumanMessage("Wire the refund")]}, config={"callbacks": [handler]})
+    assert wired == []
+    refusal = result["messages"][-2]
+    assert refusal.status == "error" and "Wake halted clavr (halt-clavr), so this tool call wasn't run." in refusal.content
+    found, denied = refused_once(events_)
+    assert denied.attributes["wake.event.id"] in found[-1].attributes["wake.parents"], "the model read the refusal"
+
+
+def test_a_tool_invoked_directly_is_refused_as_it_starts():
+    from wake.langchain import AgentHalted
+
+    wired.clear()
+    halts = Halts()
+    handler, events_ = guarded(halts)
+    with handler.agent("email"):
+        halts.halts.append({"id": "halt-email", "agents": ["email"]})  # lands once the run has started
+        with pytest.raises(AgentHalted):
+            wire.invoke({"account": "123"}, config={"callbacks": [handler]})
+    assert wired == []
+    _, denied = refused_once(events_, "halt-email")
+    assert denied.attributes["wake.agent.id"] == "email"
+
+
+def test_a_call_a_wrapped_tool_node_refuses_is_recorded_once():
+    # The ToolNode's wrapper refuses it, so the tool never starts and the handler's own check
+    # never sees it.
+    wired.clear()
+    handler, events_ = guarded(Halts({"id": "halt-clavr", "agents": ["clavr"]}))
+    wire_it(handler)
+    assert wired == []
+    refused_once(events_)

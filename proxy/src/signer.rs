@@ -44,11 +44,11 @@ impl Signer {
         &self.id
     }
 
-    /// Signs an event. Its payload's secrets are replaced first (redact.rs), so they never
-    /// reach the log, and wake.payload.redacted lists their kinds. Then it sets the payload's
-    /// digest, from the payload itself, so the signature commits to exactly what's kept. The
-    /// certificate travels with the event so anyone holding the trust bundle can check it
-    /// later.
+    /// Signs an event. The credentials redact.rs recognizes in its payload are replaced first,
+    /// so those never reach the log, and wake.payload.redacted lists their kinds. Then it sets
+    /// the payload's digest, from the payload itself, so the signature commits to exactly
+    /// what's kept. The certificate travels with the event so anyone holding the trust bundle
+    /// can check it later.
     pub fn sign(&self, event: &mut Event) {
         event.attributes.remove(REDACTED);
         let redacted = match event.attributes.get("wake.payload") {

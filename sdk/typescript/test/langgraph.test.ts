@@ -371,3 +371,87 @@ test("a halt check that fails refuses the call", async () => {
   const denied = (await events()).filter((e) => attr(e, "wake.event.kind") === "denied");
   assert.deepEqual(denied.map((e) => attr(e, "wake.brake.halt_id")), [UNCHECKED]);
 });
+
+/** A scripted model an agent can bind tools to. */
+class ToolCallingModel extends ScriptedChatModel {
+  override bindTools(): this {
+    return this;
+  }
+}
+
+function wiringModel() {
+  return new ToolCallingModel([new AIMessage({ content: "", tool_calls: [{ name: "wire", args: { account: "123" }, id: "call_wire" }] }), "Done."]);
+}
+
+const REFUSAL = "Wake halted clavr (halt-clavr), so this tool call wasn't run.";
+
+/** The one denied event a refused call is recorded as, checked. */
+function refusedOnce(found: Awaited<ReturnType<ReturnType<typeof guarded>["events"]>>, halt = "halt-clavr") {
+  const denied = found.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1, "recorded once");
+  assert.ok(!found.some((e) => attr(e, "wake.event.kind") === "tool_call"), "the tool never started");
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), halt);
+  assert.equal(attr(denied[0], "gen_ai.tool.name"), "wire");
+  assert.deepEqual(origins(denied[0]), []);
+  assert.deepEqual(JSON.parse(attr(denied[0], "wake.payload") as string).input, { account: "123" });
+  return denied[0];
+}
+
+test("a tool call outside a WakeToolNode is refused as it starts", async () => {
+  // createReactAgent builds its own ToolNode: the handler refuses the call as the tool starts,
+  // and the ToolNode answers the model with the refusal, as it does any error by default.
+  const { createReactAgent } = await import("@langchain/langgraph/prebuilt");
+  wired.length = 0;
+  const { handler, events } = guarded(new Halts({ id: "halt-clavr", agents: ["clavr"] }));
+  const graph = createReactAgent({ llm: wiringModel(), tools: [wire] });
+  const result = await graph.invoke({ messages: [new HumanMessage("Wire the refund")] }, { callbacks: [handler] });
+  assert.deepEqual(wired, [], "the tool never ran");
+  const refusal = result.messages.at(-2) as ToolMessage;
+  assert.equal(refusal.status, "error");
+  assert.ok(String(refusal.content).includes(REFUSAL), String(refusal.content));
+  const found = await events();
+  const denied = refusedOnce(found);
+  const [first, second] = found.filter((e) => attr(e, "wake.event.kind") === "model_call");
+  assert.deepEqual(parents(denied), [id(first)], "the call that asked for it");
+  assert.ok(parents(second).includes(id(denied)), "the model read the refusal");
+});
+
+test("a ToolNode that passes errors on ends the run with the refusal", async () => {
+  wired.length = 0;
+  const { handler, events } = guarded(new Halts({ id: "halt-clavr", agents: ["clavr"] }));
+  const model = wiringModel();
+  const graph = new StateGraph(MessagesAnnotation)
+    .addNode("agent", async (state) => ({ messages: [await model.invoke(state.messages)] }))
+    .addNode("tools", new ToolNode([wire], { handleToolErrors: false }))
+    .addEdge(START, "agent")
+    .addConditionalEdges("agent", toolsCondition)
+    .addEdge("tools", "agent")
+    .compile();
+  await assert.rejects(
+    graph.invoke({ messages: [new HumanMessage("Wire the refund")] }, { callbacks: [handler] }),
+    (error: unknown) => error instanceof AgentHalted && error.message === REFUSAL,
+  );
+  assert.deepEqual(wired, []);
+  refusedOnce(await events());
+});
+
+test("a tool invoked directly is refused as it starts", async () => {
+  wired.length = 0;
+  const halts = new Halts();
+  const { handler, events } = guarded(halts);
+  await handler.agent("email", async () => {
+    halts.halts = [{ id: "halt-email", agents: ["email"] }]; // lands once the run has started
+    await assert.rejects(wire.invoke({ account: "123" }, { callbacks: [handler] }), AgentHalted);
+  });
+  assert.deepEqual(wired, []);
+  assert.equal(attr(refusedOnce(await events(), "halt-email"), "wake.agent.id"), "email");
+});
+
+test("a call a WakeToolNode refuses is recorded once", async () => {
+  // The node refuses it, so the tool never starts and the handler's own check never sees it.
+  wired.length = 0;
+  const { handler, events } = guarded(new Halts({ id: "halt-clavr", agents: ["clavr"] }));
+  await wireIt(handler);
+  assert.deepEqual(wired, []);
+  refusedOnce(await events());
+});

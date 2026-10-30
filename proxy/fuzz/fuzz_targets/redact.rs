@@ -1,6 +1,6 @@
-//! Redacting any payload: a JSON payload stays JSON, and so does the JSON in its strings,
-//! nothing redacted is redacted again, and every kind listed names a placeholder in the
-//! payload.
+//! Redacting any payload, marked truncated or not: a JSON payload stays JSON, and so does
+//! the JSON in its strings, nothing redacted is redacted again, and every kind listed names
+//! a placeholder in the payload.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use wake_proxy::redact::redact;
@@ -23,21 +23,29 @@ fn ascii(json: &str) -> String {
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data).into_owned();
     // As the proxy sees it: anything an agent sends, inside a JSON payload, with non-ASCII as
-    // it is, and escaped, as an MCP server in Python sends it.
+    // it is, and escaped, as an MCP server in Python sends it. Marked truncated, the output is
+    // taken for cut short.
     let nested = serde_json::json!({"text": text}).to_string();
-    let plain = serde_json::json!({"output": text, "nested": nested}).to_string();
-    let escaped = ascii(&serde_json::json!({"output": text, "nested": ascii(&nested)}).to_string());
-    for payload in [plain, escaped] {
-        let (out, kinds) = redact(&payload);
-        let doc: serde_json::Value = serde_json::from_str(&out).expect("a redacted JSON payload is JSON");
-        let nested = doc["nested"].as_str().expect("nested is a string");
-        serde_json::from_str::<serde_json::Value>(nested).expect("the JSON in its string is still JSON");
-        assert_eq!(redact(&out).0, out, "redacting twice changes nothing more");
-        for kind in &kinds {
-            assert!(
-                out.contains(&format!("[redacted {kind} sha256:")),
-                "{kind} listed but not in the payload"
-            );
+    for truncated in [false, true] {
+        let doc = |nested: String| {
+            let mut doc = serde_json::json!({"output": text, "nested": nested});
+            if truncated {
+                doc["truncated"] = true.into();
+            }
+            doc.to_string()
+        };
+        for payload in [doc(nested.clone()), ascii(&doc(ascii(&nested)))] {
+            let (out, kinds) = redact(&payload);
+            let doc: serde_json::Value = serde_json::from_str(&out).expect("a redacted JSON payload is JSON");
+            let nested = doc["nested"].as_str().expect("nested is a string");
+            serde_json::from_str::<serde_json::Value>(nested).expect("the JSON in its string is still JSON");
+            assert_eq!(redact(&out).0, out, "redacting twice changes nothing more");
+            for kind in &kinds {
+                assert!(
+                    out.contains(&format!("[redacted {kind} sha256:")) || out.contains(&format!("[redacted {kind}]")),
+                    "{kind} listed but not in the payload"
+                );
+            }
         }
     }
     // Raw, not JSON: still never panics, and still idempotent.

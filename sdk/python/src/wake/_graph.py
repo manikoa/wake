@@ -5,11 +5,13 @@ origins, so a memory write can be labeled with the origins upstream of it."""
 import logging
 import threading
 from collections import OrderedDict, deque
+from collections.abc import Hashable
 from functools import wraps
 
 from opentelemetry import trace
 
 from wake import links
+from wake.stop import AgentHalted
 
 log = logging.getLogger("wake")
 
@@ -22,12 +24,15 @@ _KEPT_OUTPUT = 2000
 
 def never_raise(method):
     """Recording must never break the agent: a hook that fails is logged, counted in the
-    recorder's health, and returns None."""
+    recorder's health, and returns None. A hook that refuses a call the brake's halt covers
+    raises AgentHalted on purpose, and that reaches the agent."""
 
     @wraps(method)
     def wrapper(self, *args, **kwargs):
         try:
             return method(self, *args, **kwargs)
+        except AgentHalted:
+            raise
         except Exception:
             log.warning("wake: failed to record %s", method.__name__, exc_info=True)
             failed(self._recorder, method.__name__)
@@ -66,7 +71,7 @@ class EventGraph:
     def __init__(self, recorder) -> None:
         self._recorder = recorder
         self._lock = threading.Lock()
-        self._outputs = _Recent(limit=256)  # trace id -> recent (event id, output text)
+        self._outputs = _Recent(limit=256)  # trace id, or a part of one such as a run in it -> recent (event id, output text)
         self._lineage = _Recent()  # event id -> (parents, origins), for memory labels
 
     def _remember_lineage(self, event_id: str, parents: list[str], origins: list[str]) -> None:
@@ -112,7 +117,7 @@ class EventGraph:
         several that can run at once (docs/events.md). None for an agent that runs as one."""
         return None, ()
 
-    def _remember_output(self, trace_id: int, event_id: str, text: str) -> None:
+    def _remember_output(self, trace_id: Hashable, event_id: str, text: str) -> None:
         text = text.strip()
         if len(text) < _MIN_MATCH:
             return
@@ -123,7 +128,7 @@ class EventGraph:
                 self._outputs[trace_id] = outputs
             outputs.append((event_id, text[:_KEPT_OUTPUT]))
 
-    def _matching_outputs(self, trace_id: int, text: str) -> list[str]:
+    def _matching_outputs(self, trace_id: Hashable, text: str) -> list[str]:
         """Earlier events in this trace whose output appears in this text, or that contain all of it."""
         text = text.strip()
         whole = len(text) >= _MIN_MATCH
@@ -135,7 +140,7 @@ class EventGraph:
             if output[:_SNIPPET] in text or (whole and text in output)
         ]
 
-    def _outputs_containing(self, trace_id: int, arguments: list[str]) -> list[str]:
+    def _outputs_containing(self, trace_id: Hashable, arguments: list[str]) -> list[str]:
         """Earlier events in this trace whose output contains one of these arguments."""
         with self._lock:
             outputs = list(self._outputs.get(trace_id, ()))

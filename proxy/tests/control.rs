@@ -409,6 +409,18 @@ async fn the_brake_halts_a_token_and_sees_who_has_called() {
     );
 }
 
+/// What the brake reads of the memory adapters' fetches.
+async fn memory_seen(brake: &reqwest::Client, url: &str) -> serde_json::Value {
+    brake
+        .get(format!("{url}/v1/memory/seen"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn a_quarantine_reaches_the_memory_adapters() {
     let c = control().await;
@@ -431,25 +443,29 @@ async fn a_quarantine_reaches_the_memory_adapters() {
         c.halts.clone(),
         std::future::pending(),
     ));
-    let rules: serde_json::Value = reqwest::get(format!("{memory}/v1/memory?agent=billing&process=7.a1b2c3"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // Its SDK says how long it acts on the rules, and that it stops halted instances.
+    let rules: serde_json::Value = reqwest::get(format!(
+        "{memory}/v1/memory?agent=billing&process=7.a1b2c3&ttl=30&stops=1"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
     assert_eq!(rules["locked_by"], "q1");
     assert_eq!(rules["quarantines"][0]["selection"]["origins"][0], "tool:fetch_page");
 
-    // The brake sees that billing's adapter has it.
-    let seen: serde_json::Value = brake
-        .get(format!("{}/v1/memory/seen", c.url))
-        .send()
-        .await
-        .unwrap()
-        .json()
+    // The brake sees that billing's adapter has it, and that billing's one process stops
+    // halted instances.
+    let seen = memory_seen(&brake, &c.url).await;
+    assert_eq!(seen["billing"]["version"], state["version"]);
+    assert_eq!(seen["billing"]["stops"], true);
+    // Until another process of billing fetches, whose SDK doesn't say so.
+    reqwest::get(format!("{memory}/v1/memory?agent=billing&process=8.d4e5f6"))
         .await
         .unwrap();
-    assert_eq!(seen["billing"]["version"], state["version"]);
+    let seen = memory_seen(&brake, &c.url).await;
+    assert!(seen["billing"].get("stops").is_none(), "{seen}");
 
     let empty = brake
         .put(format!("{}/v1/quarantines/q2", c.url))

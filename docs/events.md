@@ -17,7 +17,7 @@ Start with these fields. Add one only when the provenance view or a design partn
 | `wake.token.subject` | string | Set by the proxy when the caller presented a JWT whose `sub` it could read: whom the token acts for. For a delegated token, often a user or the agent that delegated, while `wake.agent.id` names the agent acting. See Tokens |
 | `wake.token.actors` | string[] | With a delegated token: the agents acting under it, the one acting now first, then each before it (its nested `act` claims) |
 | `wake.token.actors_cut` | bool | Set, to true, when the chain went on past what `wake.token.actors` keeps: its earliest actors are unknown |
-| `wake.token.id` | string | The token's `jti`, when it has one |
+| `wake.token.id` | string | The token's `jti`, or, for a token without one, its `uti`, which Microsoft Entra access tokens carry instead. Left out when it has neither |
 | `wake.token.expires_unix` | int | The token's `exp`, in Unix seconds |
 | `wake.token.bound` | bool | Whether the token is bound to its holder's key (it has a `cnf` claim, as DPoP and mTLS-bound tokens do), rather than usable by whoever holds a copy. Set on every event that records a token, so it, not `wake.token.subject`, says whether the caller presented one |
 | `wake.call.ok` | bool | Set by the proxy on a call it saw answered: whether it went well. On an MCP `tool_call`, a result came back that doesn't say `isError`; a call with no response seen didn't (agentgateway skips the response hook on a JSON-RPC error). On an A2A reply, the receiver answered with a 2xx, a result, no JSON-RPC error and no task that failed, was rejected or was canceled. Left out when the answer was cut short or can't be read. A run charter's checks that it's done count only calls that went well |
@@ -65,7 +65,7 @@ When an SDK can't tell which instance made a call, it leaves the instance out ra
 What makes an instance, by integration:
 
 - **Claude Agent SDK:** each subagent the Agent tool starts, `<agent>/<subagent type>#<the Agent tool use id>`. The `agent_message` handing it its task is recorded once it has started, so an Agent tool call refused before then, as by a halt, makes no instance: it's recorded as the refused tool call it is. One the tool leaves running in the background, as it does by default, stays that instance until Claude Code says it has finished, in later turns too, and its answer is recorded then.
-- **OpenAI Agents SDK:** an agent run inside a tool call, as with `agent.as_tool()`, `<agent>#<the tool call's span id>` (the SDK's own span id), started by the agent that made the call. A response can call one agent as a tool several times at once, so each run inside a tool call is also linked as a workflow of its own: one copy's steps never take another's as parents, whatever their arguments. An agent a handoff reaches inside such a run is an instance of that run too. Runs of the workflow's own, handoffs included, aren't instances.
+- **OpenAI Agents SDK:** an agent run inside a tool call, as with `agent.as_tool()`, `<agent>#<its first agent span's id>` (the SDK's own span id), started by the agent that made the call. A response can call one agent as a tool several times at once, and a tool can run it several times, so each run is linked as a workflow of its own, its content matched within it: one copy's steps never take another's as parents, whatever their arguments or output. What a run inside a tool call said last is a parent of the step that reads the tool's result. An agent a handoff reaches inside such a run is an instance of that run too, under the same id. Runs of the workflow's own, handoffs included, aren't instances, but two at once in one trace are linked apart all the same. Runs are told apart by the task span the SDK opens for each, as it does by default; with those turned off, the runs inside one tool call, or at the top of one trace, share one instance and one set of links.
 - **LangChain and LangGraph:** a named run (`handler.agent(name)`) started inside another agent's run, `<name>#<its invoke_agent span id>`, started by that run. A LangGraph node is a step of the agent running the graph, not an agent of its own, so a node run several times at once isn't an instance.
 - **Coding agents' hooks:** each session, `<agent>#<the host's session id>`, started by the agent. A subagent that Claude Code or Codex names on its events is an instance too, `<agent>/<agent type>#<its agent id>`, started by its session. See [hooks.md](hooks.md).
 
@@ -86,7 +86,7 @@ A message from agent A to agent B is an `agent_message` event in B's run, record
 - `wake.parents` are the events in A whose output the message carries.
 - `wake.payload` is `{"from": "<A>", "to": "<B>", "content": ...}`.
 
-The message is a parent of B's next event. An answer going back from B to A is another `agent_message`, this time in A's run, and it's a parent of the step in A that reads it. How the link travels between processes is in [linking.md](linking.md).
+The message is a parent of B's next event. An answer going back from B to A is another `agent_message`, this time in A's run, and it's a parent of the step in A that reads it. Where an SDK sees both ends, as for LangChain named runs in one process, the sender's latest event is a parent too, so a message the app words its own way still descends from what the sender did. How the link travels between processes is in [linking.md](linking.md).
 
 ## Denied calls
 
@@ -108,11 +108,11 @@ A call already under way when a halt lands is **cut**, and recorded the same way
 - **Its MCP form:** the `method` is the MCP method and the `host` the MCP server. The event's parent is the call's own `tool_call`, which records what the tool returned, though the caller never got it.
 - **What the exchange carried before the cut** is recorded as usual.
 
-An SDK that stops an agent in its own process records each call it refuses as a `denied` event of its own, captured by `sdk`. The Claude Agent SDK, OpenAI Agents SDK and LangChain integrations do, in both SDKs (see their READMEs).
-- **What it records:** the tool call the agent tried, with its arguments and the refusal as its output. Its parent is the model call that asked for it, and the model's next call reads the refusal.
+An SDK that stops an agent in its own process records each call it refuses as a `denied` event of its own, captured by `sdk`, once however many of its checks see the call. The Claude Agent SDK, OpenAI Agents SDK and LangChain integrations do, in both SDKs (see their READMEs).
+- **What it records:** the tool call the agent tried, with its arguments and the refusal as its output. That holds for a tool the agent runs itself, such as a shell or an editor, and for a call refused before the framework opened a span for it. Its parent is the model call that asked for it, and the model's next call reads the refusal.
 - **Its halt:** `wake.brake.halt_id` names the halt that covered the call, or `stale-rules` while the SDK's rules are stale, or `halt-check-failed` when it couldn't check them: it fails closed.
 - **No `wake.origins`:** nothing entered at the denial. The tool never ran, so nothing of it reached the agent, and a later step's chain doesn't count it.
-- **A refused run:** a LangChain run refused before it started is recorded as the `agent_message` that would have handed it its task, in the name of the run that tried, with `wake.brake.receiver` naming the run refused, and no `wake.origins` either.
+- **A refused run:** a LangChain run refused before it started, or an OpenAI Agents handoff refused as it started, is recorded as the `agent_message` that would have handed the run its task, in the name of what tried, with `wake.brake.receiver` naming the run refused, and no `wake.origins` either. A Claude Agent tool call that would start a halted subagent type is recorded as the refused tool call it is.
 
 `wake-hook` refuses the same way for the coding agents whose hooks it reads, and records each refusal as a `denied` event captured by `hook` ([hooks.md](hooks.md)).
 
@@ -156,10 +156,12 @@ Each credential becomes a placeholder naming its kind and the first 12 hex digit
 [redacted jwt sha256:56aec5e5c6aa jti:tok-7]
 ```
 
+A password in a URL and Basic credentials get no digest, as `[redacted url_password]` and `[redacted basic_auth]`: a person often chooses them, and the digest of one could be checked against a list of likely passwords.
+
 | Kind | What it matches |
 |---|---|
 | `private_key` | A PEM private key block, `-----BEGIN … PRIVATE KEY-----`, or an OpenPGP `-----BEGIN PGP PRIVATE KEY BLOCK-----`, to its END line, or as far as its body runs if it's cut short. Its line breaks can be raw or escaped for JSON at any depth, as in a key in JSON held in a string in the payload, and so can the `+`, `/` and `=` some encoders escape: .NET writes `+` as `\u002B`, PHP `/` as `\/` |
-| `jwt` | A signed JWT: three base64url parts, the first two JSON objects (`eyJ…`). Its placeholder keeps the token's `jti` when that's a plain id (up to 128 of `A-Z a-z 0-9 . _ : -`) that doesn't itself look like a credential, so it can be matched to `wake.token.id` |
+| `jwt` | A signed JWT: three base64url parts, the first two JSON objects (`eyJ…`). Its placeholder keeps the token's `jti` when that's a plain id (up to 128 of `A-Z a-z 0-9 . _ : -`) that doesn't itself look like a credential, so it can be matched to `wake.token.id`. A token with no `jti`, such as an Entra access token, whose `wake.token.id` is its `uti`, keeps none |
 | `github_token` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` tokens and `github_pat_` tokens |
 | `google_api_key`, `google_oauth_token` | `AIza…` keys and `ya29.…` access tokens |
 | `slack_token` | `xoxa-`, `xoxb-`, `xoxp-`, `xoxo-`, `xoxs-`, `xoxr-` tokens and `xapp-` app tokens |
@@ -171,6 +173,23 @@ Each credential becomes a placeholder naming its kind and the first 12 hex digit
 | `aws_secret_key` | An AWS secret access key, 40 characters of base64, right after `aws_secret_access_key`, `AWS_SECRET_ACCESS_KEY`, `SecretAccessKey` or `secretAccessKey` and then `=`, `:` or `>` (STS's XML), with any quotes and spaces between |
 
 Only formats that name themselves are matched, so ordinary text is never taken for a secret. Not caught: a password or key in a form nothing identifies, and an AWS secret access key on its own or under another name, since 40 characters of base64 could be anything. A secret is matched only where a word starts: at the start of the payload, after a whole JSON escape such as `\n` or `\u00e9`, or after a character that can't be part of a word, other than the `]` that ends a placeholder. So `task-` followed by an MD5 isn't taken for an `sk-` key, and a match never starts inside an escape: the SDKs send `®yJ…` as `\u00aeyJ…`, which holds no JWT. What's replaced never holds a quote or part of an escape, so a JSON payload stays JSON, however deep its strings nest JSON, and redacting twice changes nothing more. `wake.payload.redacted` lists only what the signer replaced: a placeholder already in the payload, whatever put it there, isn't counted. The patterns run in order, in time linear in the payload whatever an agent sends: Rust's regex crate in the proxy, and Go's regexp in the collector, which matches a secret that starts a word by hand, only where one of its literals is, since Go's regexp would step through every byte to find a word start. A test holds those to the regexps. `collector/event/testdata/redaction.json` holds both to the same output, byte for byte, and both are fuzzed, with non-ASCII as it is and escaped, as the SDKs send it.
+
+**A payload cut short.** A payload too large to send whole keeps its start, as a string, and says `"truncated": true` (see `wake.payload`): the SDKs' `prefix`, and the proxy's `input`, `output` or `content`. A credential the cut goes through keeps its own start, which can be too short to match: `sk_live_` and 20 characters isn't a Stripe key, though the rest of one may have been cut off. So at the end of each of those strings, in a JSON object whose `truncated` is `true`, a credential cut short is replaced too. It's one of these starts, where a whole one could start, followed only by the characters its kind is made of, up to the cut:
+
+| Kind | Starts with | Then only |
+|---|---|---|
+| `jwt` | `eyJ` | base64url (`A-Z a-z 0-9 _ -`) and `.` |
+| `github_token` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or `github_pat_` | `A-Z a-z 0-9 _` |
+| `google_api_key`, `google_oauth_token` | `AIza`, `ya29.` | base64url |
+| `slack_token` | `xoxa-`, `xoxb-`, `xoxp-`, `xoxo-`, `xoxs-`, `xoxr-` or `xapp-` | `A-Z a-z 0-9 -` |
+| `llm_api_key` | `sk-` | base64url |
+| `stripe_key` | `sk_live_` or `rk_live_` | `A-Z a-z 0-9` |
+| `bearer_token` | `Bearer` (or `bearer`, `BEARER`) and spaces | a token's characters, `A-Z a-z 0-9 . _ ~ + / -`, and `=` |
+| `basic_auth` | `Basic` (or `basic`, `BASIC`) and spaces | base64 and `=`. What's left isn't checked for a colon, since it may not decode |
+| `url_password` | `scheme://user:` | a password's characters. Only those are replaced |
+| `aws_secret_key` | one of its names, then what may come before the key, as above | base64, fewer than 40 characters. Only those are replaced |
+
+The kinds are tried in the order the patterns run, and the first found is replaced, with the digest of what's left of it. A private key cut short is matched by its own pattern, as far as its body runs. The proxy says a payload was truncated, not which part it cut, so an `input` or `output` it kept whole as a string, because it isn't JSON, is read as cut too. Both signers find these by hand, back from the cut, and the same vectors hold them to the same output.
 
 A payload is text: a string, or bytes, which the collector reads as the bytes they hold, so they're redacted, digested and logged like a string. A value of any other type has no text to redact, since a map or a list shows bytes inside it as base64: the collector won't sign an event that has one, and never logs it.
 
