@@ -23,6 +23,18 @@
 //
 // It exits 1 if the log doesn't hold together or any entry is in the last two classes,
 // including one whose payload is missing or doesn't match its signed digest.
+//
+// One run shows the log agrees with the latest checkpoint it's served. An older checkpoint
+// put back passes, with the entries after it gone, and so does a history re-signed by
+// whoever holds the log's key. -save keeps the checkpoint a run checked, and -earlier holds
+// a later run to it, so keep it where the log's host can't write:
+//
+//	wake-log verify -log ./log -log-key keys/log.pub -key keys/collector.pub -save last.checkpoint
+//	wake-log verify -log ./log -log-key keys/log.pub -key keys/collector.pub -earlier last.checkpoint -save last.checkpoint
+//
+// A checkpoint given to -earlier must be signed by the log's key, the log must hold at
+// least its entries, and they must hash to its root, or the run exits 1. A run that doesn't
+// pass leaves the file -save names as it was.
 package main
 
 import (
@@ -62,7 +74,7 @@ type finding struct {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] != "verify" {
-		fmt.Fprintln(stderr, "usage: wake-log verify -log <dir or url> -log-key <file> [-key <file>]... [-bundle <file>]... [-signer <capture>=<id>]... [-entries]")
+		fmt.Fprintln(stderr, "usage: wake-log verify -log <dir or url> -log-key <file> [-key <file>]... [-bundle <file>]... [-signer <capture>=<id>]... [-earlier <file>]... [-save <file>] [-entries]")
 		return 2
 	}
 	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
@@ -70,10 +82,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	location := flags.String("log", "", "the log's directory, or an http(s) URL it's served from")
 	logKey := flags.String("log-key", "", "the log's checkpoint public key")
 	entries := flags.Bool("entries", false, "print every entry as a JSON line")
-	var keys, bundles, signers files
+	save := flags.String("save", "", "after a run that passes, write the checkpoint it checked to this file, for -earlier")
+	var keys, bundles, signers, earlier files
 	flags.Var(&keys, "key", "an event signer's public key (repeatable)")
 	flags.Var(&bundles, "bundle", "a PEM trust bundle for X.509-SVID signers (repeatable)")
 	flags.Var(&signers, "signer", "who may sign a capture, as <capture>=<SPIFFE ID or prefix ending in />, such as proxy=spiffe://wake.local/proxy (repeatable)")
+	flags.Var(&earlier, "earlier", "a checkpoint kept from an earlier run: the log must still hold what it signed (repeatable)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return 2
 	}
@@ -121,6 +135,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if len(bundles) > 0 && len(signers) == 0 {
 		fmt.Fprintln(stderr, "-bundle needs -signer: a bundle vouches for every workload in its trust domain, so say who may sign each capture, such as -signer proxy=spiffe://wake.local/proxy")
 		return 2
+	}
+	var kept [][]byte
+	for _, path := range earlier {
+		// A checkpoint that's gone fails the run, or deleting it would let a rollback pass.
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(stderr, "-earlier: %v\n", err)
+			return 2
+		}
+		kept = append(kept, data)
 	}
 	reader, err := open(*location)
 	if err != nil {
@@ -174,12 +198,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	checked, err := wakelog.Verify(ctx, reader, verifier, trust, each)
+	checked, err := wakelog.Verify(ctx, reader, verifier, trust, each, kept...)
 	if err != nil {
 		fmt.Fprintf(stderr, "the log doesn't verify: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(stderr, "%s: %d entries, all in the signed tree\n", checked.Origin, checked.Size)
+	if len(kept) > 0 {
+		fmt.Fprintf(stderr, "it holds what %d earlier checkpoints signed\n", len(kept))
+	} else {
+		fmt.Fprintln(stderr, "no earlier checkpoint to compare with, so a log cut back or rewritten with its key would pass (see -earlier)")
+	}
 	if len(invalid) > 0 {
 		report(stderr, invalid, "%d entries were logged invalid and still don't check. The collector recorded them as evidence:")
 	}
@@ -193,7 +222,31 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(stderr, "every entry checks as the collector logged it")
+	if *save != "" {
+		if err := saveCheckpoint(*save, checked.Checkpoint); err != nil {
+			fmt.Fprintf(stderr, "-save: %v\n", err)
+			return 1
+		}
+	}
 	return 0
+}
+
+// saveCheckpoint puts data at path by renaming a finished file into place, so a failure
+// never leaves the kept checkpoint half written.
+func saveCheckpoint(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // report prints a class of findings, up to ten of them.

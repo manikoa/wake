@@ -31,7 +31,7 @@ The spool holds at most 10,000 events or 512 MiB. Past that, an event is dropped
 
 ## The brake fails closed
 
-With `--rules`, wake-proxy's address, `serve` fetches the brake's rules from its `/v1/memory` every 2 seconds for each agent. It names the agent and its own process, as the SDKs do, so the brake can confirm a halt reached the machine. The agents are those given with `--agent`, those a hook asks for, and, after a restart, each whose rules it finds on disk.
+With `--rules`, wake-proxy's address, `serve` fetches the brake's rules from its `/v1/memory` every 2 seconds for each agent. It names the agent and its own process and says how long its hooks act on the rules they have, as the SDKs do, so the brake can confirm a halt reached the machine. Once a hook run with `--stop` has gated a call by an agent, `serve` adds `stops=1` to that agent's fetches, which the brake needs before it counts a stop on this machine as confirmed. `serve` can't see the hosts' settings, so that's only ever a hook's word, and a hook run without `--stop` takes it back: the brake never counts on a machine that only records. Confirmed still means this machine's own word, as it does for the SDKs: an agent with a shell can lie to it. The agents are those given with `--agent`, those a hook asks for, and, after a restart, each whose rules it finds on disk.
 
 With `--stop`, the hook reads the rules `serve` last wrote. It refuses a call when a halt covers the agent, the session or the subagent making it. It refuses every call while the rules are missing or older than 30 seconds (`stale-rules`), or can't be read (`halt-check-failed`), as when `halts` is `null`. Only a wake-proxy that sends no `halts` at all, being older than stops in the agent's process, leaves nothing to check. While the rules are missing, stale or can't be read, the hook asks `serve` to fetch them.
 
@@ -65,7 +65,7 @@ A project's hooks file is one the agent can edit, and an agent that can edit it 
 | Gemini CLI | `/etc/gemini-cli/settings.json`, its system settings. Its docs rank these below user and project settings, and let a user turn hooks off with `/hooks disable`. So this holds only as far as each user's own settings do |
 | Antigravity | None documented. Its global hooks file, `~/.gemini/config/hooks.json`, is in the user's home, where the agent can write. Until it has a managed one, its record and stop are only as strong as that file |
 
-`serve` runs as a service for each user, from the same installer. The proxy notes its rule fetches by agent and process, the same signal the brake already uses for the SDKs' stops, so a machine whose `serve` goes quiet drops out of what the brake counts as confirmed. A hook removed from a host's settings isn't something `wake-hook` can notice. The census of agents seen against the inventory, in Brake, is where that shows.
+Each release ships `wake-hook` for Linux, macOS and Windows ([releases.md](releases.md)). There's no installer yet: put the binary and the host's settings in place with what manages your machines, and run `serve` as a service for each user. The proxy notes its rule fetches by agent and process, the same signal the brake already uses for the SDKs' stops, so a machine whose `serve` goes quiet drops out of what the brake counts as confirmed. A hook removed from a host's settings isn't something `wake-hook` can notice. The census of agents seen against the inventory, in Brake, is where that shows.
 
 ## Events
 

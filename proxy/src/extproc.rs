@@ -126,6 +126,7 @@ pub struct Exchange {
     reply_span: [u8; 8],
     request_body: Vec<u8>,
     request_truncated: bool,
+    request_ended: bool, // the whole request reached the processor
     request: Option<a2a::Request>,
     message_emitted: bool,
     started_at: u64,
@@ -300,9 +301,13 @@ impl Exchange {
         }
         let mut events = Vec::new();
         let answer = match request.request {
-            Some(Phase::RequestHeaders(h)) => Answer::RequestHeaders(self.request_headers(&h, now)),
+            Some(Phase::RequestHeaders(h)) => {
+                self.request_ended |= h.end_of_stream;
+                Answer::RequestHeaders(self.request_headers(&h, now))
+            }
             Some(Phase::RequestBody(b)) => {
                 let full_duplex = self.request_mode == BodySendMode::FullDuplexStreamed as i32;
+                self.request_ended |= b.end_of_stream;
                 if self.recorded {
                     // Again for each part, with what entered the sender since the last.
                     self.note_delivery(true, now);
@@ -316,7 +321,7 @@ impl Exchange {
                     // A buffered body is held until this answer, so the forwarded request
                     // still takes headers: link the receiver in the trace just read.
                     if self.request.is_none()
-                        && let Some(t) = a2a::parse_request(&self.request_body).trace
+                        && let Some(t) = self.read_request().trace
                     {
                         self.join(t);
                     }
@@ -358,7 +363,10 @@ impl Exchange {
                 }
                 Answer::ResponseBody(body_answer(full_duplex, b.body, b.end_of_stream))
             }
-            Some(Phase::RequestTrailers(_)) => Answer::RequestTrailers(TrailersResponse::default()),
+            Some(Phase::RequestTrailers(_)) => {
+                self.request_ended = true;
+                Answer::RequestTrailers(TrailersResponse::default())
+            }
             Some(Phase::ResponseTrailers(_)) => {
                 self.ended = true;
                 events.extend(self.finish(now));
@@ -510,27 +518,50 @@ impl Exchange {
         (answer, Some(mode))
     }
 
+    /// Whether what's kept of the request is only its start: past what's kept, the budget's
+    /// room, or the gateway's buffer, which hands over a prefix and no end of stream.
+    fn request_cut(&self) -> bool {
+        self.request_truncated || (!self.request_ended && !self.request_body.is_empty())
+    }
+
+    fn read_request(&self) -> a2a::Request {
+        if self.request_cut() {
+            a2a::parse_prefix(&self.request_body)
+        } else {
+            a2a::parse_request(&self.request_body)
+        }
+    }
+
+    /// Whether the request carries a message. One cut short does, whatever the part kept
+    /// says: what it goes on to say is out of sight, and padding must never hide a message.
+    fn is_message(&self) -> bool {
+        self.request_cut()
+            || self
+                .request
+                .as_ref()
+                .and_then(|r| r.method.as_deref())
+                .is_some_and(|m| a2a::MESSAGE_METHODS.contains(&m))
+    }
+
     fn replies(&self) -> bool {
-        self.request
-            .as_ref()
-            .and_then(|r| r.method.as_deref())
-            .is_some_and(a2a::replies)
+        self.is_message()
+            || self
+                .request
+                .as_ref()
+                .and_then(|r| r.method.as_deref())
+                .is_some_and(a2a::replies)
     }
 
     fn finish_request(&mut self, now: SystemTime) -> Vec<Event> {
         if !self.recorded || self.request.is_some() {
             return vec![];
         }
-        let request = a2a::parse_request(&self.request_body);
+        let request = self.read_request();
         if let (None, Some(t)) = (self.header_trace, request.trace) {
             self.join(t);
         }
-        let is_message = request
-            .method
-            .as_deref()
-            .is_some_and(|m| a2a::MESSAGE_METHODS.contains(&m));
         self.request = Some(request);
-        if !is_message {
+        if !self.is_message() {
             // tasks/get, GetTask and the like: no message goes out, but the reply still brings
             // content back.
             self.message_emitted = self.replies();
@@ -598,7 +629,7 @@ impl Exchange {
                 &self.receiver,
                 &self.request_body,
                 false,
-                self.request_truncated,
+                self.request_cut(),
             )),
         );
         e
@@ -614,9 +645,7 @@ impl Exchange {
         let reply = a2a::parse_reply(&self.response_body, self.response_streamed);
         let (ok, state) = (reply.ok(self.response_status, self.response_truncated), reply.state);
         let request = self.request.as_ref();
-        let answers_message = request
-            .and_then(|r| r.method.as_deref())
-            .is_some_and(|m| a2a::MESSAGE_METHODS.contains(&m));
+        let answers_message = self.is_message();
         if let (true, Some(task), Some(tasks)) = (answers_message, &reply.task_id, &self.tasks) {
             tasks.remember(&self.receiver, task, &self.message_id);
         }
@@ -858,7 +887,8 @@ impl ExternalProcessor for Processor {
                 }
             };
             // Ends the exchange: agentgateway fails a call whose processor errs once the
-            // body is under way, and doesn't forward one that errs before.
+            // body is under way. Before that, a failClosed route fails it too, and a failOpen
+            // one forwards it, as the shipped A2A routes would (docs/proxy.md).
             let cut = |exchange: &Exchange, covering: &[Halt]| {
                 counters.cut.fetch_add(1, Ordering::Relaxed);
                 events.send(exchange.cut_event(covering, SystemTime::now()));
@@ -1640,20 +1670,128 @@ mod tests {
         assert_eq!(payload["content"], r#"{"a":"ghp_"#);
     }
 
+    /// The message's event from a request too large to keep whole, and the reply's after it.
+    fn recorded(x: &mut Exchange, mut events: Vec<Event>) -> (Event, Event) {
+        x.handle(
+            phase(Phase::ResponseHeaders(headers(&[
+                (":status", "200"),
+                ("content-type", "application/json"),
+            ]))),
+            t(5),
+        )
+        .1
+        .into_iter()
+        .for_each(|e| events.push(e));
+        events.extend(x.handle(phase(Phase::ResponseBody(body(REPLY, true))), t(6)).1);
+        let [message, reply] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        (message.clone(), reply.clone())
+    }
+
     #[test]
     fn a_body_over_the_gateways_buffer_is_recorded_from_its_prefix() {
         let mut x = Exchange::default();
         x.handle(first(&[(":method", "POST")]), t(0));
         // bufferedPartial over the limit: the prefix, with no end of stream.
-        let (_, events) = x.handle(phase(Phase::RequestBody(body(&SEND[..40], false))), t(1));
-        assert!(events.is_empty());
-        let (_, events) = x.handle(
-            phase(Phase::ResponseHeaders(headers(&[("content-type", "application/json")]))),
-            t(2),
+        let (_, events) = x.handle(phase(Phase::RequestBody(body(&SEND[..120], false))), t(1));
+        assert!(events.is_empty(), "the rest may still come");
+        let (message, reply) = recorded(&mut x, events);
+        assert_eq!(s(&message, "wake.a2a.method"), "message/send");
+        assert_eq!(s(&message, "wake.a2a.message_id"), "m1");
+        let payload: serde_json::Value = serde_json::from_str(s(&message, "wake.payload")).unwrap();
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["content"], String::from_utf8_lossy(&SEND[..120]).as_ref());
+        // Its reply follows from it.
+        assert_eq!(
+            reply.attributes["wake.parents"],
+            Value::Strs(vec![s(&message, "wake.event.id").to_string()])
         );
-        assert!(
-            events.is_empty(),
-            "a prefix that doesn't parse isn't known to be a message"
+    }
+
+    /// A message over what's kept reaches its receiver all the same, so it's recorded from the
+    /// part kept, and its reply with it.
+    #[test]
+    fn a_message_over_what_is_kept_is_recorded_from_its_start() {
+        let mut big = br#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","parts":[{"text":""#.to_vec();
+        big.extend(vec![b'a'; MAX_CAPTURE + 10]);
+        big.extend(br#""}]}}}"#);
+        let mut x = Exchange::default();
+        x.handle(first(&[(":method", "POST"), ("wake-parents", "e1")]), t(0));
+        let (_, events) = x.handle(phase(Phase::RequestBody(body(&big, true))), t(1));
+        assert_eq!(events.len(), 1, "recorded once the whole body has passed");
+        let (message, reply) = recorded(&mut x, events);
+        assert_eq!(s(&message, "wake.a2a.method"), "message/send");
+        assert_eq!(message.attributes["wake.parents"], Value::Strs(vec!["e1".into()]));
+        let payload: serde_json::Value = serde_json::from_str(s(&message, "wake.payload")).unwrap();
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["content"].as_str().unwrap().len(), MAX_CAPTURE);
+        assert_eq!(s(&reply, "wake.agent.id"), "spiffe://wake.local/agent/planner");
+    }
+
+    /// What the part kept says doesn't excuse a body cut short: a sender could start with a
+    /// method that's never recorded, and name the message's method past the cut.
+    #[test]
+    fn padding_cant_hide_a_message() {
+        for start in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t1","pad":""#,
+            r#"{"pad":""#,
+            r#"not json at all "#,
+        ] {
+            let mut padded = start.as_bytes().to_vec();
+            padded.extend(vec![b'a'; MAX_CAPTURE]);
+            let mut x = Exchange::default();
+            x.handle(first(&[(":method", "POST")]), t(0));
+            let (_, events) = x.handle(phase(Phase::RequestBody(body(&padded, true))), t(1));
+            let (message, _reply) = recorded(&mut x, events);
+            let payload: serde_json::Value = serde_json::from_str(s(&message, "wake.payload")).unwrap();
+            assert_eq!(payload["truncated"], true, "{start}");
+        }
+    }
+
+    /// With the shared budget spent, nothing of a message can be kept. It's still recorded.
+    #[test]
+    fn a_message_past_the_budget_is_recorded_without_its_content() {
+        let budget = Budget::new(100);
+        let others = budget.take(100).unwrap();
+        let mut x = Exchange::default().with_budget(budget.clone());
+        x.handle(first(&[(":method", "POST")]), t(0));
+        let (_, events) = x.handle(phase(Phase::RequestBody(body(SEND, true))), t(1));
+        drop(others);
+        let (message, _reply) = recorded(&mut x, events);
+        let payload: serde_json::Value = serde_json::from_str(s(&message, "wake.payload")).unwrap();
+        assert_eq!(
+            (&payload["truncated"], &payload["content"]),
+            (&serde_json::json!(true), &serde_json::json!(""))
         );
+    }
+
+    /// A trace only a body cut short carries still links the message.
+    #[test]
+    fn a_message_cut_short_joins_the_trace_its_start_names() {
+        let trace = "0102030405060708090a0b0c0d0e0f10";
+        let start = format!(
+            r#"{{"method":"message/send","params":{{"message":{{"messageId":"m1","metadata":{{"traceparent":"00-{trace}-1112131415161718-01","dev.wake/parents":["e7"]}},"parts":[{{"text":""#
+        );
+        let mut x = Exchange::default();
+        x.handle(first(&[(":method", "POST")]), t(0));
+        let (answer, events) = x.handle(phase(Phase::RequestBody(body(start.as_bytes(), false))), t(1));
+        let Some(Answer::RequestBody(b)) = &answer.response else {
+            panic!("{answer:?}")
+        };
+        let linked = b.response.as_ref().and_then(|c| c.header_mutation.as_ref()).unwrap();
+        let traceparent = linked.set_headers[0].header.as_ref().unwrap();
+        assert!(String::from_utf8_lossy(&traceparent.raw_value).contains(trace));
+        let (message, _reply) = recorded(&mut x, events);
+        assert_eq!(message.attributes["wake.parents"], Value::Strs(vec!["e7".into()]));
+        assert_eq!(hex::encode(message.trace_id), trace);
+    }
+
+    /// A sender that stops after its headers delivered nothing: there's no message to record.
+    #[test]
+    fn a_request_that_never_sent_a_body_is_no_message() {
+        let mut x = Exchange::default();
+        x.handle(first(&[(":method", "POST")]), t(0));
+        assert!(x.finish(t(1)).is_empty());
     }
 }

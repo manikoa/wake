@@ -14,7 +14,7 @@ go run ./cmd/wake-keygen -name wake-log -out keys/log
 
 ## Checking a log
 
-Anyone with a log's public keys can check it without trusting Wake. `wake-log verify` checks the checkpoint's signature, that every entry is in the signed tree, and every event's signature and payload. It checks one checkpoint, so it can't see a log cut back to an earlier one, or rewritten with the log's own key: that takes an earlier checkpoint to compare. `-entries` also prints each entry as a JSON line.
+Anyone with a log's public keys can check it without trusting Wake. `wake-log verify` checks the checkpoint's signature, that every entry is in the signed tree, and every event's signature and payload. One run checks one checkpoint, so it can't see a log cut back to an earlier one, or rewritten with the log's own key: that takes an earlier checkpoint to compare, which `-earlier` does ([below](#comparing-with-an-earlier-checkpoint)). `-entries` also prints each entry as a JSON line.
 
 ```bash
 go run ./cmd/wake-log verify -log ./data/log -log-key keys/log.pub \
@@ -30,6 +30,21 @@ Each entry is compared with the collector's check when it appended it, and repor
 - **Logged invalid, but passing now:** this check trusts more than the collector did.
 
 It exits 1 if the log doesn't hold together or any entry is in the last two groups.
+
+### Comparing with an earlier checkpoint
+
+One run shows the log agrees with the latest checkpoint it's served, which isn't everything. Whoever can write the log's storage can put back an older checkpoint: its signature is good, its entries hash to its root, and the entries after it are gone unseen. Whoever holds the log's key can sign a different history outright. Only a checkpoint kept from before tells either from the real thing.
+
+`-save` writes the checkpoint a run checked to a file, once the run passes. `-earlier` holds a later run to such a file, and repeats. So a check that runs on a schedule keeps its own record:
+
+```bash
+wake-log verify -log ./data/log -log-key keys/log.pub -key keys/collector.pub -save last.checkpoint   # the first run
+wake-log verify -log ./data/log -log-key keys/log.pub -key keys/collector.pub -earlier last.checkpoint -save last.checkpoint
+```
+
+A checkpoint given to `-earlier` must be signed by the log's key, the log must hold at least the entries it signed (otherwise: `the log was cut back`), and they must hash to its root (otherwise: `the log was rewritten`). Each exits 1 and leaves the file `-save` names as it was. A file `-earlier` names that's gone exits 2, so deleting it can't let a rollback pass. In Go, `Verify` takes earlier checkpoints as its last arguments, and returns `ErrCutBack` or `ErrRewritten`; `Checked.Checkpoint` is the one to keep.
+
+A checkpoint vouches only for the entries it covers: what was appended after it, and what never reached the log, it can't speak for. And it protects only as well as it's kept, so keep it where neither the log's host nor whoever holds the log's key can write, such as with whoever audits the log. Two auditors comparing what they've kept also catch a log that shows each a different history.
 
 ## Reading entries
 

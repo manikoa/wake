@@ -75,8 +75,10 @@ routes:
       processors:
       - kind: remote
         host: "unix:/run/wake/proxy.sock"
-        # Recording never blocks: if wake-proxy is down, calls go through unrecorded.
-        failureMode: failOpen
+        # This hook also holds each call to the flow rules that name tools and a charter's
+        # limits, so a call it can't answer for is refused, not sent on unchecked. Recording
+        # still never blocks: with wake-proxy up, the hook answers whatever becomes of the record.
+        failureMode: failClosed
         methods:
           tools/call: full
           resources/read: full

@@ -38,17 +38,20 @@ type Options struct {
 	// Stop refuses what the brake's halts cover and its flow policy holds back, and every
 	// gated call while the rules serve leaves are missing, stale or unreadable.
 	Stop bool
-	TTL  time.Duration // how old the rules may be; 30 seconds when zero, as in the SDKs
+	TTL  time.Duration // how old the rules may be; rulesTTL when zero
 	Now  func() time.Time
 	Rand io.Reader
 }
+
+// rulesTTL is how old the rules a hook acts on may be, as in the SDKs.
+const rulesTTL = 30 * time.Second
 
 func (o *Options) defaults(host *Host) {
 	if o.Agent == "" {
 		o.Agent = host.Name
 	}
 	if o.TTL == 0 {
-		o.TTL = 30 * time.Second
+		o.TTL = rulesTTL
 	}
 	if o.Now == nil {
 		o.Now = time.Now
@@ -109,6 +112,9 @@ func Answer(host *Host, in []byte, o Options) (stdout []byte, stderr string) {
 	}
 	w := identify(o.Agent, a)
 	by := flowAgent(host, o.Agent, a)
+	if a.Gate {
+		o.sayIfStopping(w.agent)
+	}
 	if a.Gate && o.Stop {
 		if r := o.check(host, a, w, by); r != nil {
 			o.record(host, a, w, r)

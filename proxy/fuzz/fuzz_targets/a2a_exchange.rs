@@ -14,6 +14,7 @@ use wake_proxy::extproc::pb::ext_proc::{
 
 fuzz_target!(|data: &[u8]| {
     let _ = a2a::parse_request(data);
+    let _ = a2a::parse_prefix(data);
     let _ = a2a::parse_reply(data, false);
     let _ = a2a::parse_reply(data, true);
 

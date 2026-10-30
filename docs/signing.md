@@ -22,7 +22,9 @@ A key inside the agent's process is one a compromised agent can use to forge sig
 
 ## The trade-off
 
-An SDK event is only as honest as the agent process that emitted it. That's true of any capture that runs inside the agent, signed or not. The proxy's own signed record of the same MCP and A2A calls is the independent check: calls the proxy saw but the SDK didn't report, or reported differently, are a signal worth raising.
+An SDK event is only as honest as whatever sent it. That's true of any capture that runs inside the agent, signed or not, and it goes further here: the collector authenticates no sender, so anything that reaches it can have an unsigned event signed in any agent's name, and logged valid. A compromised agent can send one as another agent. So the collector's signature on an SDK, memory adapter or hook event says it received those bytes, and that they haven't changed since. It doesn't say who sent them, or that it happened. The proxy's own signed record of the same MCP and A2A calls is the independent check: calls the proxy saw but the SDK didn't report, or reported differently, are a signal worth raising, and only the proxy's record can stop an agent.
+
+Binding a sender to the agent it names isn't built: the collector would need each sender's identity, which the SDKs, `wake-hook` and the proxy don't present to it today.
 
 ## What it means for each component
 

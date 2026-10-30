@@ -1,7 +1,7 @@
 # Releases the open source core when a vX.Y.Z tag is pushed: the collector and
 # wake-proxy images on GHCR, wake-log and wake-keygen for checking a log without Wake,
-# the Python SDK on PyPI and the TypeScript SDK on npm. Every artifact is signed with
-# Sigstore, keyless, by this workflow's own identity, and gets SLSA build provenance and
+# wake-hook for coding agents, the Python SDK on PyPI and the TypeScript SDK on npm. Every
+# artifact is signed with Sigstore, keyless, by this workflow's own identity, and gets SLSA build provenance and
 # an SBOM; the release lists every file's SHA-256 in a signed SHA256SUMS. How to cut a
 # release and how to verify one are in docs/releases.md. Actions are pinned to commit SHAs.
 name: Release
@@ -158,6 +158,61 @@ jobs:
           name: cli
           path: log/dist/*
 
+  hook:
+    name: wake-hook
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        working-directory: hook
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: hook/go.mod
+          cache: false
+      # Coding agents run on developers' machines, Windows among them.
+      - name: Build
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*} arch=${target#*/}
+            dir="wake-hook_${VERSION}_${os}_${arch}"
+            ext=""
+            if [ "$os" = windows ]; then ext=.exe; fi
+            mkdir -p "dist/$dir"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "dist/$dir/wake-hook$ext" ./cmd/wake-hook
+            cp ../LICENSE ../NOTICE "dist/$dir/"
+            tar -C dist -czf "dist/$dir.tar.gz" "$dir"
+            rm -rf "dist/$dir"
+          done
+      - name: SLSA build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: hook/dist/*.tar.gz
+      - name: SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: hook
+          format: spdx-json
+          output-file: hook/dist/wake-hook_${{ needs.version.outputs.version }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: hook/dist/*.tar.gz
+          sbom-path: hook/dist/wake-hook_${{ needs.version.outputs.version }}.spdx.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hook
+          path: hook/dist/*
+
   sdk:
     name: Python SDK
     needs: version
@@ -247,7 +302,7 @@ jobs:
 
   release:
     name: GitHub release
-    needs: [version, images, cli, sdk, sdk-typescript]
+    needs: [version, images, cli, hook, sdk, sdk-typescript]
     runs-on: ubuntu-latest
     permissions:
       contents: write

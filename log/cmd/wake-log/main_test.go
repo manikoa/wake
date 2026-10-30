@@ -36,10 +36,11 @@ func event(id string) []byte {
 
 // testLog is a log being written for a test, with the collector's key.
 type testLog struct {
-	t    *testing.T
-	dir  string
-	key  note.Signer
-	args []string
+	t      *testing.T
+	dir    string
+	key    note.Signer
+	logKey string // the log's key file, once it's been written
+	args   []string
 }
 
 func newTestLog(t *testing.T) *testLog {
@@ -88,11 +89,15 @@ func (l *testLog) entry(ev []byte, f wakelog.Fields) []byte {
 // append writes the log with these entries, and payload stored next to the tiles.
 func (l *testLog) append(entries ...[]byte) {
 	l.t.Helper()
-	logPrivate, logPublic, err := wakelog.GenerateKey("test-log")
-	if err != nil {
-		l.t.Fatal(err)
+	if l.logKey == "" {
+		logPrivate, logPublic, err := wakelog.GenerateKey("test-log")
+		if err != nil {
+			l.t.Fatal(err)
+		}
+		l.logKey = l.write("log.key", logPrivate)
+		l.args = append(l.args, "-log-key", l.write("log.pub", logPublic))
 	}
-	w, err := wakelog.Open(wakelog.Config{Dir: filepath.Join(l.dir, "log"), KeyFile: l.write("log.key", logPrivate)})
+	w, err := wakelog.Open(wakelog.Config{Dir: filepath.Join(l.dir, "log"), KeyFile: l.logKey})
 	if err != nil {
 		l.t.Fatal(err)
 	}
@@ -106,7 +111,6 @@ func (l *testLog) append(entries ...[]byte) {
 	if err := w.Close(ctx); err != nil {
 		l.t.Fatal(err)
 	}
-	l.args = append(l.args, "-log-key", l.write("log.pub", logPublic))
 }
 
 func (l *testLog) verify(extra ...string) (code int, stdout, stderr string) {
@@ -214,6 +218,72 @@ func TestVerifyComparesEachEntryWithWhatWasLogged(t *testing.T) {
 	l.append(l.entry(event("e1"), wakelog.Fields{Valid: false}))
 	if code, _, stderr := l.verify(); code != 1 || !strings.Contains(stderr, "logged invalid but check now") {
 		t.Errorf("an entry logged invalid that checks: exit %d: %s", code, stderr)
+	}
+}
+
+// A run keeps the checkpoint it checked, and a later run holds the log to it.
+func TestVerifyHoldsALogToTheCheckpointItKept(t *testing.T) {
+	l := newTestLog(t)
+	l.append(l.entry(event("e1"), wakelog.Fields{Valid: true}))
+	current := filepath.Join(l.dir, "log", "checkpoint")
+	older, err := os.ReadFile(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.append(l.entry(event("e2"), wakelog.Fields{Valid: true}))
+
+	kept := filepath.Join(l.dir, "kept.checkpoint")
+	if code, _, stderr := l.verify("-save", kept); code != 0 || !strings.Contains(stderr, "no earlier checkpoint to compare with") {
+		t.Fatalf("first run: exit %d: %s", code, stderr)
+	}
+	whole, err := os.ReadFile(kept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Split(string(whole), "\n"); len(lines) < 2 || lines[1] != "2" {
+		t.Fatalf("kept %q", whole)
+	}
+	code, _, stderr := l.verify("-earlier", kept, "-save", kept)
+	if code != 0 || !strings.Contains(stderr, "it holds what 1 earlier checkpoints signed") {
+		t.Fatalf("the log as it was: exit %d: %s", code, stderr)
+	}
+
+	// Whoever can write the log's storage puts the older checkpoint back. Alone, the log
+	// looks whole, one entry shorter.
+	if err := os.WriteFile(current, older, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := l.verify(); code != 0 || !strings.Contains(stderr, "1 entries, all in the signed tree") {
+		t.Fatalf("with nothing to compare: exit %d: %s", code, stderr)
+	}
+	code, _, stderr = l.verify("-earlier", kept, "-save", kept)
+	if code != 1 || !strings.Contains(stderr, "the log was cut back") {
+		t.Fatalf("a log cut back: exit %d: %s", code, stderr)
+	}
+	// What it kept is still there to compare with next time.
+	saved, err := os.ReadFile(kept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(saved, whole) {
+		t.Fatal("a run that failed moved the kept checkpoint")
+	}
+}
+
+func TestAnEarlierCheckpointThatsGoneFailsTheRun(t *testing.T) {
+	l := writeLog(t)
+	code, _, stderr := l.verify("-earlier", filepath.Join(l.dir, "gone.checkpoint"))
+	if code != 2 || !strings.Contains(stderr, "-earlier") {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+}
+
+func TestAnEarlierCheckpointMustBeTheLogsOwn(t *testing.T) {
+	l := writeLog(t)
+	other := writeLog(t)
+	code, _, stderr := l.verify("-earlier", filepath.Join(other.dir, "log", "checkpoint"))
+	if code != 1 || !strings.Contains(stderr, "earlier checkpoint") {
+		t.Fatalf("exit %d: %s", code, stderr)
 	}
 }
 

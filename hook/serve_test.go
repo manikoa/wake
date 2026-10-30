@@ -159,6 +159,43 @@ func TestServeFetchesTheRules(t *testing.T) {
 	}
 }
 
+// The brake counts a stop in the agent's own process only with stops=1, so serve says so
+// only on the word of a hook that refuses what a halt covers, and takes it back when a hook
+// runs without --stop, as once it's taken out of the host's settings.
+func TestServeSaysItsHooksStopOnlyOnTheirWord(t *testing.T) {
+	rules, fetched := wakeProxy(t, `{"halts":[]}`)
+	o := options(t)
+	s := &Server{Dir: o.Dir, Rules: rules.URL, Agents: []string{"claude-code"}, Client: rules.Client(), Log: quiet(), Now: o.Now}
+	fetch := func() url.Values {
+		t.Helper()
+		s.Pass(context.Background())
+		return (*fetched)[len(*fetched)-1]
+	}
+
+	if q := fetch(); q.Has("stops") || q.Get("ttl") != "30" {
+		t.Fatalf("no hook has run, and fetched with %v", q)
+	}
+	handle(t, o, "claude-code", "pre_tool")
+	if q := fetch(); q.Has("stops") {
+		t.Fatalf("a hook without --stop ran, and fetched with %v", q)
+	}
+	o.Stop = true
+	handle(t, o, "claude-code", "pre_tool")
+	if q := fetch(); q.Get("stops") != "1" || q.Get("agent") != "claude-code" {
+		t.Fatalf("a hook with --stop ran, and fetched with %v", q)
+	}
+	// A hook that only records, such as after a tool ran, doesn't change that.
+	o.Stop = false
+	handle(t, o, "claude-code", "post_tool")
+	if q := fetch(); q.Get("stops") != "1" {
+		t.Fatalf("a hook gating nothing took it back: %v", q)
+	}
+	handle(t, o, "claude-code", "pre_tool")
+	if q := fetch(); q.Has("stops") {
+		t.Fatalf("the hook on the next call has no --stop, and fetched with %v", q)
+	}
+}
+
 // A serve that restarted fetches the rules of every agent a hook asked for before, though
 // the hooks asked only once: theirs would go stale, and every call be refused, for good.
 func TestServeFetchesForTheAgentsWhoseRulesItFinds(t *testing.T) {

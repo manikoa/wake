@@ -5,9 +5,12 @@
 //! Both protocol versions in use are read: v0.3 (message/send, a bare Message or Task as
 //! the result) and v1.0 (SendMessage, the result wrapping a message, task or update).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::Mutex;
 
+use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::mcp::{TraceParent, parse_traceparent};
@@ -67,11 +70,92 @@ pub fn parse_request(body: &[u8]) -> Request {
         message_id: field("messageId"),
         context_id: field("contextId"),
         task_id: field("taskId").or(asked_about),
-        trace: metadata
-            .and_then(|m| m.get(META_TRACEPARENT))
-            .and_then(Value::as_str)
-            .and_then(parse_traceparent),
+        trace: trace_in(metadata),
         parents: parents_in(metadata),
+    }
+}
+
+/// Reads what it can of a request cut short, which won't parse whole: the fields written
+/// before the cut, and nothing past anything it can't read.
+pub fn parse_prefix(body: &[u8]) -> Request {
+    let mut read = Prefix::default();
+    let mut json = serde_json::Deserializer::from_slice(body);
+    let _ = PrefixLevel {
+        level: Level::Request,
+        read: &mut read,
+    }
+    .deserialize(&mut json);
+    Request {
+        method: read.method,
+        message_id: read.message_id,
+        context_id: read.context_id,
+        task_id: read.task_id,
+        trace: trace_in(read.metadata.as_ref()),
+        parents: parents_in(read.metadata.as_ref()),
+    }
+}
+
+/// The fields of a request read so far, each as it's reached.
+#[derive(Default)]
+struct Prefix {
+    method: Option<String>,
+    message_id: Option<String>,
+    context_id: Option<String>,
+    task_id: Option<String>,
+    metadata: Option<Value>,
+}
+
+/// Which object of a request is being read.
+#[derive(Clone, Copy)]
+enum Level {
+    Request,
+    Params,
+    Message,
+}
+
+/// Reads one object of a request in the order it's written, keeping each field as it passes.
+struct PrefixLevel<'a> {
+    level: Level,
+    read: &'a mut Prefix,
+}
+
+impl<'de> DeserializeSeed<'de> for PrefixLevel<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for PrefixLevel<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("an object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            match (self.level, key.as_ref()) {
+                (Level::Request, "method") => self.read.method = map.next_value()?,
+                (Level::Request, "params") => map.next_value_seed(PrefixLevel {
+                    level: Level::Params,
+                    read: self.read,
+                })?,
+                (Level::Params, "message") => map.next_value_seed(PrefixLevel {
+                    level: Level::Message,
+                    read: self.read,
+                })?,
+                (Level::Message, "messageId") => self.read.message_id = map.next_value()?,
+                (Level::Message, "contextId") => self.read.context_id = map.next_value()?,
+                (Level::Message, "taskId") => self.read.task_id = map.next_value()?,
+                (Level::Message, "metadata") => self.read.metadata = map.next_value()?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -199,6 +283,13 @@ fn task_id_of(payload: &Value, is_task: bool) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty() && s.len() <= 256)
         .map(str::to_string)
+}
+
+fn trace_in(metadata: Option<&Value>) -> Option<TraceParent> {
+    metadata
+        .and_then(|m| m.get(META_TRACEPARENT))
+        .and_then(Value::as_str)
+        .and_then(parse_traceparent)
 }
 
 fn parents_in(metadata: Option<&Value>) -> Vec<String> {
@@ -352,6 +443,37 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_request_cut_short_up_to_the_cut() {
+        let whole = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{
+            "messageId":"m1","contextId":"c1","taskId":"t1",
+            "metadata":{"traceparent":"00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01","dev.wake/parents":["e1"]},
+            "parts":[{"kind":"text","text":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}}"#;
+        let cut = &whole.as_bytes()[..whole.find("aaaa").unwrap() + 2];
+        assert_eq!(parse_request(cut), Request::default(), "it doesn't parse whole");
+        let r = parse_prefix(cut);
+        assert_eq!(r.method.as_deref(), Some("message/send"));
+        assert_eq!(
+            (r.message_id.as_deref(), r.context_id.as_deref(), r.task_id.as_deref()),
+            (Some("m1"), Some("c1"), Some("t1"))
+        );
+        assert_eq!(r.parents, vec!["e1"]);
+        assert!(r.trace.is_some());
+        // Whole, it reads the same.
+        assert_eq!(parse_prefix(whole.as_bytes()), parse_request(whole.as_bytes()));
+
+        // What's past the cut, or inside it, isn't there.
+        let early = parse_prefix(br#"{"method":"message/send","params":{"message":{"metadata":{"dev.wake/par"#);
+        assert_eq!(early.method.as_deref(), Some("message/send"));
+        assert_eq!(early.parents, Vec::<String>::new());
+        assert_eq!(parse_prefix(br#"{"meth"#), Request::default());
+        assert_eq!(parse_prefix(b"not json"), Request::default());
+        assert_eq!(parse_prefix(b""), Request::default());
+        // It stops at what it can't read, keeping what came before.
+        let wrong = parse_prefix(br#"{"method":"message/send","params":7,"id":1}"#);
+        assert_eq!(wrong.method.as_deref(), Some("message/send"));
+    }
+
+    #[test]
     fn reads_a_replys_parents_from_messages_and_streams() {
         let parents = |body: &[u8], streamed| parse_reply(body, streamed).parents;
         let message = br#"{"jsonrpc":"2.0","id":1,"result":{"kind":"message","messageId":"r1","metadata":{"dev.wake/parents":["b1"]}}}"#;
@@ -442,6 +564,7 @@ mod tests {
         #[test]
         fn never_panics(body in proptest::collection::vec(any::<u8>(), 0..512)) {
             let _ = parse_request(&body);
+            let _ = parse_prefix(&body);
             let _ = parse_reply(&body, false);
             let _ = parse_reply(&body, true);
         }
@@ -449,7 +572,22 @@ mod tests {
         #[test]
         fn never_panics_on_json_shaped_input(s in r#"\{"(method|params|result|message|task|statusUpdate|metadata|status|id)":(\{.{0,40}\}|"[^"]{0,10}"|\[\]|null)\}"#) {
             let _ = parse_request(s.as_bytes());
+            let _ = parse_prefix(s.as_bytes());
             let _ = parse_reply(s.as_bytes(), false);
+        }
+
+        /// However a message is cut, the fields written before the cut are read.
+        #[test]
+        fn a_cut_loses_nothing_before_it(cut in 0usize..200) {
+            let whole = br#"{"method":"message/send","params":{"message":{"messageId":"m1","contextId":"c1","parts":[{"text":"hello there"}]}}}"#;
+            let cut = cut.min(whole.len());
+            let r = parse_prefix(&whole[..cut]);
+            if cut >= r#"{"method":"message/send""#.len() {
+                prop_assert_eq!(r.method.as_deref(), Some("message/send"));
+            }
+            if cut >= r#"{"method":"message/send","params":{"message":{"messageId":"m1""#.len() {
+                prop_assert_eq!(r.message_id.as_deref(), Some("m1"));
+            }
         }
     }
 }

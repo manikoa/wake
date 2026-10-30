@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -171,11 +172,15 @@ func (s *Server) fetchRules(ctx context.Context) {
 }
 
 // fetch fetches one agent's rules from wake-proxy's /v1/memory, where the SDKs fetch theirs,
-// given wake-proxy's address.
+// given wake-proxy's address. Like them it says how long its hooks act on the rules they
+// have, and whether they refuse what a halt covers, which only a hook can say.
 func (s *Server) fetch(ctx context.Context, agent string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	query := url.Values{"agent": {agent}, "process": {s.process}}
+	query := url.Values{"agent": {agent}, "process": {s.process}, "ttl": {strconv.Itoa(int(rulesTTL / time.Second))}}
+	if _, err := os.Stat(stoppingPath(s.Dir, agent)); err == nil {
+		query.Set("stops", "1")
+	}
 	address := strings.TrimRight(s.Rules, "/") + "/v1/memory?" + query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
