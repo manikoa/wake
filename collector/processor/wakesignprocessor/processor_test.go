@@ -25,9 +25,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
 
-	"github.com/manikoa/wake/collector/event"
+	"github.com/usewake/wake/collector/event"
 
-	wakelog "github.com/manikoa/wake/log"
+	wakelog "github.com/usewake/wake/log"
 )
 
 func writeKey(t *testing.T, dir, name string) (privatePath, publicPath string) {

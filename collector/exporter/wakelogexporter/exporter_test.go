@@ -23,8 +23,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap/zaptest"
 
-	"github.com/manikoa/wake/collector/event"
-	wakelog "github.com/manikoa/wake/log"
+	"github.com/usewake/wake/collector/event"
+	wakelog "github.com/usewake/wake/log"
 )
 
 // testConfig returns the default config for a fresh log in dir.

@@ -9,7 +9,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
-	wakelog "github.com/manikoa/wake/log"
+	wakelog "github.com/usewake/wake/log"
 )
 
 // An event the Rust proxy signed, and the trust bundle its SVID chains to. The proxy's

@@ -4,7 +4,7 @@
 // Anyone can check a log without trusting Wake: its checkpoint, its tree and every
 // event's signature, with Verify or the wake-log command:
 //
-//	go run github.com/manikoa/wake/log/cmd/wake-log verify -log <dir or url> -log-key log.pub -key collector.pub
+//	go run github.com/usewake/wake/log/cmd/wake-log verify -log <dir or url> -log-key log.pub -key collector.pub
 package wakelog
 
 import (
