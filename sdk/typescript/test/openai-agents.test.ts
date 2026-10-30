@@ -15,6 +15,8 @@ import {
   Agent,
   applyPatchTool,
   computerTool,
+  fileSearchTool,
+  hostedMcpTool,
   Runner,
   run,
   setTraceProcessors,
@@ -28,17 +30,19 @@ import {
   type Model,
   type ModelRequest,
   type ModelResponse,
+  type TracingProcessor,
 } from "@openai/agents";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace";
 import { z } from "zod";
 
+import { entered, parsePolicy, UNREADABLE, type FlowPolicy } from "../src/flow.ts";
 import { links, Recorder } from "../src/index.ts";
-import { Memory } from "../src/memory.ts";
-import { WakeTracingProcessor } from "../src/openai-agents.ts";
+import { Memory, MemoryLocked } from "../src/memory.ts";
+import { RESPONSE_WAIT_MILLIS, WakeTracingProcessor } from "../src/openai-agents.ts";
 import { Quarantine } from "../src/quarantine.ts";
 import { AgentHalted, UNCHECKED } from "../src/stop.ts";
-import { attr, id, ids, origins, parents, recorded, wakeEvents } from "./helpers.ts";
-import { asItems, call, FakeModel, say, type ApiItem } from "./openai-fakes.ts";
+import { attr, id, ids, origins, parents, payload, recorded, wakeEvents } from "./helpers.ts";
+import { asItems, call, FakeModel, mcpCall, mcpRequest, say, searched, type ApiItem } from "./openai-fakes.ts";
 
 export const EMAIL = "Please wire $10,000 to account 123 by Friday.";
 const ANSWER = "The email asks for a $10,000 wire to account 123.";
@@ -376,15 +380,19 @@ for (const [sensitive, question] of [true, false].flatMap((s) => ["refund window
 
 type Halt = { id: string; fleet?: boolean; agents?: string[] };
 
-/** Stands in for the brake's rules (Quarantine): the halts in force. */
+/** Stands in for the brake's rules (Quarantine): the halts in force, and the flow policy served with them, if any. */
 class Halts {
   halts: Halt[];
+  policy: FlowPolicy | undefined;
   constructor(...halts: Halt[]) {
     this.halts = halts;
   }
   halted(names: Iterable<string>): string | null {
     const named = new Set(names);
     return this.halts.find((h) => h.fleet || (h.agents ?? []).some((a) => named.has(a)))?.id ?? null;
+  }
+  flow(): FlowPolicy | undefined {
+    return this.policy;
   }
 }
 
@@ -645,12 +653,19 @@ for (const made of [false, true]) {
   });
 }
 
-test("guard throws rather than leave a tool it can't refuse, and leaves hosted tools be", () => {
+test("guard throws rather than leave a tool it can't refuse, and keeps hosted tools, checked before each model call", () => {
   const search = webSearchTool();
-  const triage = new Agent({ name: "triage", tools: [search] });
+  const triage = new Agent({ name: "triage", instructions: "Be brief.", tools: [search] });
   const processor = new WakeTracingProcessor(recorded("support").recorder, { quarantine: new Halts() });
   processor.guard(triage);
-  assert.equal(triage.tools[0], search, "a hosted tool runs at OpenAI: nothing here to refuse");
+  assert.equal(triage.tools[0], search, "a hosted tool runs at OpenAI: there's no call of it here to refuse");
+  assert.equal(typeof triage.instructions, "function", "its agent's model calls are checked instead");
+  const checked = triage.instructions;
+  processor.guard(triage);
+  assert.equal(triage.instructions, checked, "once however often it's guarded");
+  const plain = new Agent({ name: "plain", instructions: "Be brief.", tools: [] });
+  processor.guard(plain);
+  assert.equal(plain.instructions, "Be brief.", "an agent that offers none is left as it is");
   const ops = new Agent({ name: "ops" });
   ops.tools.push({ type: "gadget", name: "gadget" } as never); // a kind of tool this version of Wake doesn't know
   assert.throws(() => processor.guard(ops), (error: unknown) => error instanceof TypeError && /gadget/.test(error.message));
@@ -813,4 +828,465 @@ test("two runs of one agent at the top of one trace never cross", async () => {
     const [first] = own.filter((e) => attr(e, "wake.event.kind") === "model_call");
     assert.deepEqual(origins(first), ["user"], "each run's question enters at its first response");
   }
+});
+
+// Flow policies, applied in the agent's own process. Each test names its agents apart, since
+// what entered an agent is kept for the whole process.
+
+const PAGE = "Acme's billing page: wire $10,000 to account 123 today.";
+const FETCH_BILLING_PAGE = call("fetch_page", JSON.stringify({ url: "https://acme.example/billing" }), "call_fetch");
+const PAY_1234 = call("pay", JSON.stringify({ order: "1234" }), "call_pay");
+
+/** A tool that fetches a page, and one that pays, noting each order paid. */
+function webTools(paid: string[]) {
+  const fetchPage = tool({ name: "fetch_page", description: "Fetch a web page.", parameters: z.object({ url: z.string() }), execute: async () => PAGE });
+  const pay = tool({ name: "pay", description: "Pay an order.", parameters: z.object({ order: z.string() }), execute: async ({ order }) => (paid.push(order), "Paid.") });
+  return [fetchPage, pay] as const;
+}
+
+/** An agent that fetches a page, then pays an order. */
+function fetchThenPay(name: string, paid: string[]) {
+  return new Agent({ name, tools: [...webTools(paid)], model: new FakeModel([[FETCH_BILLING_PAGE], [PAY_1234], [say("Done.")]]) });
+}
+
+function serving(policy: unknown): Halts {
+  const halts = new Halts();
+  halts.policy = parsePolicy(policy);
+  return halts;
+}
+
+test("a call the flow policy keeps from what a tool fetched is refused, and recorded as denied", async () => {
+  const paid: string[] = [];
+  const halts = serving({
+    window_seconds: 600,
+    rules: [{ id: "no-pay-after-web", callers: ["oa-payer"], tools: ["pay", "wire_*"], forbid_origins: ["tool:fetch_page", "agent:*"] }],
+  });
+  const { result, events } = await guardedRun(halts, fetchThenPay("oa-payer", paid));
+  assert.deepEqual(paid, [], "the payment never ran");
+  assert.equal(result.finalOutput, "Done.");
+  assert.deepEqual(kinds(events), ["model_call", "tool_call", "model_call", "denied", "model_call"]);
+  const [, , asked, denied, last] = events;
+  const reason = "Wake's flow policy (policy:no-pay-after-web) holds oa-payer back after tool:fetch_page, so this tool call wasn't run.";
+  assert.equal(attr(denied, "gen_ai.tool.name"), "pay");
+  assert.equal(attr(denied, "wake.agent.id"), "oa-payer");
+  assert.equal(attr(denied, "wake.brake.halt_id"), "policy:no-pay-after-web");
+  assert.ok(String(payload(denied).output).includes(reason), String(payload(denied).output));
+  assert.deepEqual(payload(denied).origins, ["tool:fetch_page"]);
+  assert.deepEqual(origins(denied), [], "nothing entered at the denial");
+  assert.deepEqual(parents(denied), [id(asked)], "the response that asked for it");
+  assert.ok((attr(last, "wake.payload") as string).includes(reason), "the model read the refusal");
+});
+
+test("a handoff the flow policy keeps is refused as it starts, and isn't offered after", async () => {
+  const paid: string[] = [];
+  const [fetchPage, pay] = webTools(paid);
+  const billing = new Agent({ name: "oa-billing", tools: [pay], model: new FakeModel([[PAY_1234], [say("Paid.")]]) });
+  // The page is fetched in the response that hands off, which was offered the handoff before.
+  const triage = new Agent({ name: "oa-triage", tools: [fetchPage], handoffs: [billing], model: new FakeModel([[FETCH_BILLING_PAGE, call("transfer_to_oa_billing", "{}", "call_h")]]) });
+  const halts = serving({ rules: [{ id: "billing-hears-support-only", receivers: ["oa-billing"], allow_origins: ["agent:oa-support", "tool:search"] }] });
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine: halts });
+  setTraceProcessors([processor]);
+  await assert.rejects(new Runner().run(processor.guard(triage), "Pay what Acme's page asks."), (error: unknown) => {
+    assert.ok(error instanceof AgentHalted, String(error));
+    assert.equal(error.halt, "policy:billing-hears-support-only");
+    assert.equal(error.message, "Wake's flow policy (policy:billing-hears-support-only) holds oa-triage back after tool:fetch_page, so the handoff to oa-billing wasn't made.");
+    return true;
+  });
+  assert.deepEqual(paid, [], "billing never ran");
+  const denied = wakeEvents(await spans(), "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(denied[0].name, "agent_message oa-triage -> oa-billing");
+  assert.equal(attr(denied[0], "wake.brake.receiver"), "oa-billing");
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "policy:billing-hears-support-only");
+  assert.deepEqual(payload(denied[0]).origins, ["tool:fetch_page"]);
+  assert.equal(processor._refusal("oa-triage", { target: "oa-billing" })?.[0], "policy:billing-hears-support-only", "nor is it offered now");
+});
+
+test("what entered an agent used as a tool comes back with its answer", async () => {
+  const paid: string[] = [];
+  const [fetchPage, pay] = webTools(paid);
+  const researcher = new Agent({ name: "oa-researcher", tools: [fetchPage], model: new FakeModel([[FETCH_BILLING_PAGE], [say(PAGE)]]) });
+  const research = researcher.asTool({ toolName: "research", toolDescription: "Research a question." });
+  const outer = new Agent({
+    name: "oa-outer",
+    tools: [research, pay],
+    model: new FakeModel([[call("research", JSON.stringify({ input: "What does Acme's billing page say?" }), "call_research")], [PAY_1234], [say("Done.")]]),
+  });
+  const halts = serving({ rules: [{ id: "no-pay-after-web", callers: ["oa-outer"], tools: ["pay"], forbid_origins: ["tool:fetch_page"] }] });
+  const { events } = await guardedRun(halts, outer, researcher);
+  assert.deepEqual(paid, []);
+  const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1, "the researcher's own fetch ran");
+  assert.equal(attr(denied[0], "gen_ai.tool.name"), "pay");
+  assert.deepEqual(payload(denied[0]).origins, ["tool:fetch_page"]);
+});
+
+test("a tool the agent runs itself is refused as it starts when the flow policy keeps it", async () => {
+  const ran: unknown[] = [];
+  const [shell, requested] = localTool("shell", ran);
+  const [fetchPage] = webTools([]);
+  const agent = new Agent({ name: "oa-sheller", tools: [fetchPage, shell], model: new ItemModel([asItems([FETCH_BILLING_PAGE]), [requested], DONE]) });
+  const { events } = await guardedRun(serving({ rules: [{ id: "no-shell-after-web", tools: ["shell"], forbid_origins: ["tool:fetch_page"] }] }), agent);
+  assert.deepEqual(ran, [], "the shell never ran");
+  const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(attr(denied[0], "gen_ai.tool.name"), "shell");
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "policy:no-shell-after-web");
+  assert.deepEqual(payload(denied[0]).origins, ["tool:fetch_page"]);
+  const reason = "Wake's flow policy (policy:no-shell-after-web) holds oa-sheller back after tool:fetch_page, so this tool call wasn't run.";
+  assert.ok((attr(events.at(-1)!, "wake.payload") as string).includes(reason), "the refusal is the shell's output");
+});
+
+test("a flow policy wake-proxy can't use refuses every call", async () => {
+  const paid: string[] = [];
+  const { events } = await guardedRun(serving({ unreadable: true }), fetchThenPay("oa-unread", paid));
+  assert.deepEqual(paid, []);
+  assert.deepEqual(kinds(events), ["model_call", "denied", "model_call", "denied", "model_call"]);
+  for (const denied of events.filter((e) => attr(e, "wake.event.kind") === "denied")) {
+    assert.equal(attr(denied, "wake.brake.halt_id"), UNREADABLE);
+    assert.ok(String(payload(denied).output).includes("Wake's flow policy can't be read, so this tool call wasn't run."));
+    assert.deepEqual(payload(denied).origins, []);
+  }
+});
+
+test("without a flow policy nothing is refused for what entered the agent", async () => {
+  const paid: string[] = [];
+  const { events } = await guardedRun(new Halts(), fetchThenPay("oa-free", paid));
+  assert.deepEqual(paid, ["1234"]);
+  assert.ok(!kinds(events).includes("denied"));
+});
+
+// Hosted tools: OpenAI runs them inside the model call. Each test names its agents apart, as
+// above.
+
+const WEB_SEARCH = searched("acme billing account");
+
+/** The origins that entered an agent, which here are never every origin. */
+function seenBy(agent: string): string[] {
+  const seen = entered.seen(agent);
+  assert.ok(Array.isArray(seen), `${agent} has every origin`);
+  return [...seen];
+}
+
+/** Answers from a script, noting what each call was given. */
+class NotingModel extends FakeModel {
+  readonly instructions: (string | undefined)[] = [];
+  readonly inputs: unknown[] = [];
+
+  override async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.instructions.push(request.systemInstructions);
+    this.inputs.push(request.input);
+    return super.getResponse(request);
+  }
+}
+
+/** A trace processor ahead of Wake that holds up each span's end, as OpenAI's exporter does while it sends a batch. */
+class SlowProcessor implements TracingProcessor {
+  readonly #millis: number;
+  readonly #held = new Set<Promise<void>>();
+
+  constructor(millis: number) {
+    this.#millis = millis;
+  }
+
+  async onTraceStart(): Promise<void> {}
+  async onTraceEnd(): Promise<void> {}
+  async onSpanStart(): Promise<void> {}
+
+  async onSpanEnd(): Promise<void> {
+    const held = new Promise<void>((resolve) => setTimeout(resolve, this.#millis));
+    this.#held.add(held);
+    await held;
+    this.#held.delete(held);
+  }
+
+  async shutdown(): Promise<void> {}
+  async forceFlush(): Promise<void> {}
+
+  /** Resolves once each span end it held up has gone on to the processors after it. */
+  async drained(): Promise<void> {
+    while (this.#held.size > 0) await Promise.all(this.#held);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+/** Runs the agent, guarded, with slow ahead of Wake. */
+async function slowRun(slow: SlowProcessor, quarantine: Halts, agent: Agent<any, any>, { waitMillis }: { waitMillis?: number } = {}) {
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine });
+  if (waitMillis !== undefined) processor._waitMillis = waitMillis;
+  setTraceProcessors([slow, processor]);
+  const result = await new Runner().run(processor.guard(agent), "Pay what Acme's site says.");
+  await slow.drained();
+  return { result, events: wakeEvents(await spans()) };
+}
+
+/** Runs the agent, guarded, with these run options. */
+async function guardedRunWith(quarantine: Halts, agent: Agent<any, any>, options: { traceIncludeSensitiveData?: boolean } = {}) {
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine });
+  setTraceProcessors([processor]);
+  const result = await new Runner(options).run(processor.guard(agent), "Pay what Acme's site says.");
+  return { result, events: wakeEvents(await spans()), processor };
+}
+
+test("a hosted call is noted before a tool from its response is checked, though a processor before Wake holds up spans' ends", async () => {
+  assert.equal(RESPONSE_WAIT_MILLIS, 5_000);
+  const paid: string[] = [];
+  const [, pay] = webTools(paid);
+  const agent = new Agent({ name: "oa-searcher", tools: [webSearchTool(), pay], model: new FakeModel([[WEB_SEARCH, PAY_1234], [say("Done.")]]) });
+  const halts = serving({ rules: [{ id: "no-pay-after-search", tools: ["pay"], forbid_origins: ["tool:web_search"] }] });
+  const { result, events } = await slowRun(new SlowProcessor(50), halts, agent);
+  assert.equal(result.finalOutput, "Done.");
+  assert.deepEqual(paid, [], "the payment never ran");
+  const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(attr(denied[0], "gen_ai.tool.name"), "pay");
+  assert.equal(attr(denied[0], "wake.brake.halt_id"), "policy:no-pay-after-search");
+  assert.deepEqual(payload(denied[0]).origins, ["tool:web_search"]);
+  assert.deepEqual(entered.seen("oa-searcher"), ["tool:web_search"]);
+});
+
+test("past its bound, a check that hasn't seen a response end refuses, as one that failed", async () => {
+  const paid: string[] = [];
+  const [, pay] = webTools(paid);
+  const agent = new Agent({ name: "oa-unseen", tools: [pay], model: new FakeModel([[PAY_1234], [say("Done.")]]) });
+  const { result, events } = await slowRun(new SlowProcessor(300), new Halts(), agent, { waitMillis: 30 });
+  assert.equal(result.finalOutput, "Done.");
+  assert.deepEqual(paid, []);
+  const [denied, ...rest] = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(rest.length, 0);
+  assert.equal(attr(denied, "wake.brake.halt_id"), UNCHECKED);
+  assert.equal(payload(denied).output, "Wake couldn't check its halts, so this tool call wasn't run.");
+});
+
+test("without sensitive data, every hosted tool a model call offered but MCP enters, and with it only what ran", async () => {
+  for (const sensitive of [false, true]) {
+    const name = `oa-blind-${sensitive}`;
+    const paid: string[] = [];
+    const [, pay] = webTools(paid);
+    const tools = [webSearchTool({ name: "search_the_web" }), fileSearchTool("vs_1"), crm(), pay];
+    const agent = new Agent({ name, tools, model: new FakeModel([[PAY_1234], [say("Done.")]]) });
+    const halts = serving({ rules: [{ id: "no-pay-after-search", tools: ["pay"], forbid_origins: ["tool:search_the_web"] }] });
+    await guardedRunWith(halts, agent, { traceIncludeSensitiveData: sensitive });
+    if (sensitive) {
+      assert.deepEqual(paid, ["1234"], "nothing hosted ran, as the response says");
+      assert.deepEqual(entered.seen(name), ["tool:pay"]);
+    } else {
+      assert.deepEqual(paid, [], "the trace can't say the search didn't run");
+      assert.deepEqual(new Set(seenBy(name)), new Set(["tool:search_the_web", "tool:file_search"]), "by the names the agent offers them under, and no MCP tool");
+    }
+  }
+  // For an agent guard() doesn't cover, the SDK's own hosted tools' names its span says it offers.
+  const { recorder } = recorded("support");
+  setTraceProcessors([new WakeTracingProcessor(recorder)]);
+  const tools = [webSearchTool(), webSearchTool({ name: "search_the_web" }), fileSearchTool("vs_1"), crm()];
+  await new Runner({ traceIncludeSensitiveData: false }).run(new Agent({ name: "oa-blind-plain", tools, model: new FakeModel([[say("Done.")]]) }), "Look it up.");
+  assert.deepEqual(new Set(seenBy("oa-blind-plain")), new Set(["tool:web_search", "tool:file_search"]));
+});
+
+test("each hosted call a response reports enters its agent, by the name it's offered under, guarded or not", async () => {
+  const codeRan = { type: "code_interpreter_call", id: "ci_1", status: "completed", code: "print(1)", container_id: "cntr_1", outputs: [] };
+  const turns = () => [[WEB_SEARCH, codeRan, mcpCall("crm", "lookup_order", "Order 1234: paid."), say("Found it.")]];
+  // Recorded, not guarded: Wake doesn't see what the agent offers, so each goes by its kind.
+  const { recorder } = recorded("support");
+  setTraceProcessors([new WakeTracingProcessor(recorder)]);
+  await new Runner().run(new Agent({ name: "oa-hosted-plain", tools: [webSearchTool({ name: "search_the_web" })], model: new FakeModel(turns()) }), "Look it up.");
+  assert.deepEqual(new Set(seenBy("oa-hosted-plain")), new Set(["tool:web_search", "tool:code_interpreter", "tool:lookup_order"]));
+  // Guarded, by the names the agent offers them under.
+  await guardedRunWith(new Halts(), new Agent({ name: "oa-hosted-named", tools: [webSearchTool({ name: "search_the_web" })], model: new FakeModel(turns()) }));
+  assert.deepEqual(new Set(seenBy("oa-hosted-named")), new Set(["tool:search_the_web", "tool:code_interpreter", "tool:lookup_order"]));
+  // A shell in a hosted container, by its call.
+  const sandbox = shellTool({ name: "sandbox", environment: { type: "container_auto" } });
+  const shellCall = { type: "shell_call", id: "sh_1", callId: "call_sh", status: "completed", action: { commands: ["cat /mnt/data/page.html"] } };
+  await guardedRunWith(new Halts(), new Agent({ name: "oa-hosted-shell", tools: [sandbox], model: new ItemModel([[shellCall], DONE]) }));
+  assert.deepEqual(entered.seen("oa-hosted-shell"), ["tool:sandbox"]);
+});
+
+test("a model call that could run a hosted tool a halt covers isn't made, and the run stops", async () => {
+  const model = new NotingModel([[say("Searched.")]]);
+  const hosted = [webSearchTool(), fileSearchTool("vs_1"), shellTool({ environment: { type: "container_auto" } })];
+  const agent = new Agent({ name: "oa-hosted-halted", instructions: "Be brief.", tools: hosted, model });
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine: new Halts({ id: "halt-hosted", agents: ["oa-hosted-halted"] }) });
+  setTraceProcessors([processor]);
+  const outcome = (name: string) => `so its model call, which could run ${name} at OpenAI, wasn't made.`;
+  await assert.rejects(new Runner().run(processor.guard(agent), "Search the web."), (error: unknown) => {
+    assert.ok(error instanceof AgentHalted, String(error));
+    assert.equal(error.halt, "halt-hosted");
+    assert.equal(error.message, `Wake halted oa-hosted-halted (halt-hosted), ${outcome("web_search")}`);
+    return true;
+  });
+  assert.equal(model.inputs.length, 0, "the model was never called");
+  const denied = wakeEvents(await spans(), "denied");
+  assert.deepEqual(denied.map((e) => attr(e, "gen_ai.tool.name")), ["web_search", "file_search", "shell"], "each held back, by its name");
+  for (const e of denied) {
+    assert.equal(attr(e, "wake.brake.halt_id"), "halt-hosted");
+    assert.equal(attr(e, "wake.agent.id"), "oa-hosted-halted");
+    assert.equal(payload(e).output, `Wake halted oa-hosted-halted (halt-hosted), ${outcome(String(attr(e, "gen_ai.tool.name")))}`);
+    assert.deepEqual(origins(e), []);
+  }
+
+  // Not halted, the call is made with the instructions the agent gives, a string or a function.
+  for (const instructions of ["Be brief.", async (_context: unknown, a: Agent<any, any>) => `You are ${a.name}.`]) {
+    const free = new NotingModel([[say("Searched.")]]);
+    const name = `oa-hosted-free-${typeof instructions}`;
+    await guardedRunWith(new Halts(), new Agent({ name, instructions, tools: [webSearchTool()], model: free }));
+    assert.deepEqual(free.instructions, [typeof instructions === "string" ? instructions : `You are ${name}.`]);
+  }
+});
+
+test("a model call is refused when the flow policy holds back a hosted tool it offers", async () => {
+  const [fetchPage] = webTools([]);
+  const model = new NotingModel([[FETCH_BILLING_PAGE], [say("Searched.")]]);
+  const agent = new Agent({ name: "oa-fetch-then-search", tools: [fetchPage, webSearchTool(), fileSearchTool("vs_1")], model });
+  const halts = serving({ rules: [{ id: "no-search-after-fetch", tools: ["web_search"], forbid_origins: ["tool:fetch_page"] }] });
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder, { quarantine: halts });
+  setTraceProcessors([processor]);
+  await assert.rejects(new Runner().run(processor.guard(agent), "Search the web."), (error: unknown) => {
+    assert.ok(error instanceof AgentHalted, String(error));
+    assert.equal(error.halt, "policy:no-search-after-fetch");
+    assert.equal(
+      error.message,
+      "Wake's flow policy (policy:no-search-after-fetch) holds oa-fetch-then-search back after tool:fetch_page, so its model call, which could run web_search at OpenAI, wasn't made.",
+    );
+    return true;
+  });
+  assert.equal(model.inputs.length, 1, "the first call was made, and the one after the page wasn't");
+  const events = wakeEvents(await spans());
+  const denied = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(denied.length, 1, "file search is no rule's");
+  assert.equal(attr(denied[0], "gen_ai.tool.name"), "web_search");
+  assert.deepEqual(payload(denied[0]).origins, ["tool:fetch_page"]);
+  const [first] = events.filter((e) => attr(e, "wake.event.kind") === "model_call");
+  assert.deepEqual(parents(denied[0]), [id(first)], "the agent's latest response");
+});
+
+// Hosted MCP: the server's tools run at OpenAI a call at a time, and can ask first.
+
+const LOOKUP = mcpRequest("crm", "lookup_order", JSON.stringify({ order: "1234" }), "mcpr_1");
+
+function crm(options: Record<string, unknown> = {}) {
+  return hostedMcpTool({ serverLabel: "crm", serverUrl: "https://crm.example/mcp", ...options } as Parameters<typeof hostedMcpTool>[0]);
+}
+
+/** What the SDK answered the server's request with, in the model's next input. */
+function answered(model: NotingModel): { approve: boolean; approval_request_id: string; reason?: string } | undefined {
+  const input = (model.inputs.at(-1) ?? []) as Record<string, unknown>[];
+  return input.find((i) => i.type === "hosted_tool_call" && i.name === "mcp_approval_response")?.providerData as never;
+}
+
+async function crmRun(name: string, tool: ReturnType<typeof crm>, quarantine: Halts) {
+  const model = new NotingModel([[LOOKUP], [say("Done.")]]);
+  const { result, events } = await guardedRunWith(quarantine, new Agent({ name, tools: [tool], model }));
+  return { result, events, answer: answered(model) };
+}
+
+test("a hosted MCP call a halt covers is rejected with the refusal, and recorded as denied", async () => {
+  const { result, events, answer } = await crmRun("oa-crm-halted", crm(), new Halts({ id: "halt-crm", agents: ["oa-crm-halted"] }));
+  assert.equal(result.finalOutput, "Done.");
+  const reason = "Wake halted oa-crm-halted (halt-crm), so this tool call wasn't run.";
+  assert.deepEqual([answer?.approve, answer?.approval_request_id, answer?.reason], [false, "mcpr_1", reason]);
+  const [denied, ...rest] = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(rest.length, 0);
+  assert.equal(denied.name, "execute_tool lookup_order");
+  assert.equal(attr(denied, "gen_ai.tool.name"), "lookup_order");
+  assert.equal(attr(denied, "wake.brake.halt_id"), "halt-crm");
+  assert.equal(attr(denied, "wake.mcp.server"), "crm");
+  assert.equal(attr(denied, "wake.agent.id"), "oa-crm-halted");
+  assert.deepEqual([payload(denied).input, payload(denied).output], [JSON.stringify({ order: "1234" }), reason]);
+  const [asked] = events.filter((e) => attr(e, "wake.event.kind") === "model_call");
+  assert.deepEqual(parents(denied), [id(asked)], "the response that asked for it");
+  assert.deepEqual(entered.seen("oa-crm-halted"), [], "it never ran");
+});
+
+test("an allowed hosted MCP call is approved, and its result enters the agent then", async () => {
+  const tool = crm();
+  const { answer, events } = await crmRun("oa-crm-open", tool, new Halts());
+  assert.equal(tool.providerData.require_approval, "always", "it asks before every call");
+  assert.deepEqual([answer?.approve, answer?.approval_request_id], [true, "mcpr_1"]);
+  assert.ok(!kinds(events).includes("denied"));
+  assert.deepEqual(entered.seen("oa-crm-open"), ["tool:lookup_order"]);
+});
+
+test("a hosted MCP call the flow policy keeps is rejected, with what the rule kept", async () => {
+  const [fetchPage] = webTools([]);
+  const model = new NotingModel([[FETCH_BILLING_PAGE], [LOOKUP], [say("Done.")]]);
+  const agent = new Agent({ name: "oa-crm-after-web", tools: [fetchPage, crm()], model });
+  const halts = serving({ rules: [{ id: "no-crm-after-web", tools: ["lookup_order"], forbid_origins: ["tool:fetch_page"] }] });
+  const { events } = await guardedRunWith(halts, agent);
+  const answer = answered(model);
+  assert.equal(answer?.approve, false);
+  assert.equal(answer?.reason, "Wake's flow policy (policy:no-crm-after-web) holds oa-crm-after-web back after tool:fetch_page, so this tool call wasn't run.");
+  const [denied] = events.filter((e) => attr(e, "wake.event.kind") === "denied");
+  assert.equal(attr(denied, "wake.brake.halt_id"), "policy:no-crm-after-web");
+  assert.deepEqual(payload(denied).origins, ["tool:fetch_page"]);
+});
+
+test("an allowed hosted MCP call goes to the tool's own callback when its setting would have asked", async () => {
+  const asked: string[] = [];
+  const onApproval = async (_context: unknown, item: { name?: string }) => (asked.push(item.name ?? ""), { approve: false, reason: "Not without a ticket." });
+  // Its setting asks about every call: the callback answers what Wake allows.
+  const always = crm({ requireApproval: "always", onApproval });
+  let run = await crmRun("oa-crm-callback", always, new Halts());
+  assert.notEqual(always.providerData.on_approval, onApproval, "Wake answers first");
+  assert.deepEqual(asked, ["lookup_order"]);
+  assert.deepEqual([run.answer?.approve, run.answer?.reason], [false, "Not without a ticket."]);
+  assert.ok(!kinds(run.events).includes("denied"), "the app refused it, not Wake");
+  assert.deepEqual(entered.seen("oa-crm-callback"), [], "and it never ran");
+  // What Wake refuses never reaches the callback.
+  run = await crmRun("oa-crm-callback-halted", crm({ requireApproval: "always", onApproval }), new Halts({ id: "halt-crm", agents: ["oa-crm-callback-halted"] }));
+  assert.equal(asked.length, 1);
+  assert.equal(run.answer?.reason, "Wake halted oa-crm-callback-halted (halt-crm), so this tool call wasn't run.");
+  // A call its setting wouldn't have asked about, Wake approves itself.
+  const filtered = crm({ requireApproval: { never: { toolNames: ["lookup_order"] } }, onApproval });
+  run = await crmRun("oa-crm-filtered", filtered, new Halts());
+  assert.equal(filtered.providerData.require_approval, "always");
+  assert.equal(asked.length, 1, "the callback wasn't asked");
+  assert.equal(run.answer?.approve, true);
+  assert.deepEqual(entered.seen("oa-crm-filtered"), ["tool:lookup_order"]);
+  // Whether a tool is read-only is the server's to say, so a readOnly filter leaves the callback to answer.
+  run = await crmRun("oa-crm-read-only", crm({ requireApproval: { never: { readOnly: true } }, onApproval }), new Halts());
+  assert.equal(asked.length, 2);
+  assert.equal(run.answer?.approve, false);
+});
+
+test("a hosted MCP tool the app answers through run interruptions is left as it is", async () => {
+  const tool = crm({ requireApproval: "always" });
+  const before = { ...tool.providerData };
+  const model = new NotingModel([[LOOKUP], [say("Done.")]]);
+  const { result, events } = await guardedRunWith(new Halts({ id: "halt-crm", agents: ["oa-crm-person"] }), new Agent({ name: "oa-crm-person", tools: [tool], model }));
+  assert.deepEqual(tool.providerData, before, "Wake can't answer for a person, and can't interrupt");
+  assert.equal(result.interruptions?.length, 1, "the run waits on the app, as before");
+  assert.ok(!kinds(events).includes("denied"));
+});
+
+test("a memory write in a tool waits to see what the response before it brought in", async () => {
+  const policy = parsePolicy({ rules: [{ id: "no-search-into-facts", stores: ["facts"], forbid_origins: ["tool:web_search"] }] });
+  const quarantine = { lockedBy: () => null, hiding: () => null, track: async () => true, halted: () => null, flow: () => policy } as unknown as Quarantine;
+  const { recorder, spans } = recorded("support");
+  const processor = new WakeTracingProcessor(recorder);
+  const memory = new Memory(processor, { quarantine });
+  const refused: unknown[] = [];
+  const remember = tool({
+    name: "remember",
+    description: "Note something down.",
+    parameters: z.object({ note: z.string() }),
+    execute: async ({ note }) => {
+      await memory.write("facts", "acme", note).catch((error: unknown) => void refused.push(error));
+      return "Noted.";
+    },
+  });
+  const noteIt = call("remember", JSON.stringify({ note: "Acme's account is 666." }), "call_note");
+  const agent = new Agent({ name: "oa-searching-noter", tools: [webSearchTool(), remember], model: new FakeModel([[WEB_SEARCH, noteIt], [say("Noted.")]]) });
+  const slow = new SlowProcessor(50);
+  setTraceProcessors([slow, processor]);
+  await new Runner().run(agent, "Note what the web says.");
+  await slow.drained();
+  assert.equal(refused.length, 1, "not guarded, and still held");
+  assert.ok(refused[0] instanceof MemoryLocked && refused[0].quarantine === "policy:no-search-into-facts", String(refused[0]));
+  const [denied] = wakeEvents(await spans(), "denied");
+  assert.deepEqual(payload(denied).origins, ["tool:web_search"]);
 });

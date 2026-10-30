@@ -8,6 +8,9 @@ OpenAI Agents handoff's target or a LangChain named run; every call while the ru
 stale (wake.quarantine); and while an integration can't yet tell which instance is acting,
 any call a halt on one it could be would cover. A check that fails refuses too: the brake
 fails closed.
+
+Once no halt refuses a call, each integration checks the flow policy served with the halts
+at the same point (wake.flow), and refuses what it holds back the same way.
 """
 
 import logging

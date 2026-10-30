@@ -30,6 +30,12 @@ A run the agent starts inside the block descends from the message: from the prox
 record of it when there is one, else from the sender's tool call. Linked inside the
 block, the reply names the run's last step.
 
+The flow policy (wake.flow) isn't applied to a message here, either way. Sending one isn't
+a point where halts are checked in the process, and wake-proxy checks it on its route. A
+message received names no sender the SDK can trust, nor what had entered the sender, so it
+isn't noted as entering the receiver: wake-proxy notes it, on its side, for the calls that
+pass it.
+
 Install with the `a2a` extra.
 """
 

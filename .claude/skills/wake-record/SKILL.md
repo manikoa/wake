@@ -9,7 +9,7 @@ Read the `wake-architecture` skill first for the boundaries and principles. Chec
 
 ## What ships, and what counts as done
 
-**Ships (months 1 to 3):** open source SDKs for the Claude Agent SDK, OpenAI Agents SDK and LangGraph; an MCP and A2A proxy built on agentgateway; the memory adapter; the signed log; the provenance view; each sub-agent recorded as an instance of its own, with what started it; the agent behind a delegated token named, not the user it acts for; secrets stripped before anything is signed.
+**Ships (months 1 to 3):** open source SDKs for the Claude Agent SDK, OpenAI Agents SDK and LangGraph; an MCP and A2A proxy built on agentgateway; hooks for coding agents with no SDK (`docs/hooks.md`); the memory adapter; the signed log; the provenance view; each sub-agent recorded as an instance of its own, with what started it; the agent behind a delegated token named, not the user it acts for; secrets stripped before anything is signed.
 
 **Gate:** live in 3 partners' staging, traces stitched across agents, and one real issue caught.
 

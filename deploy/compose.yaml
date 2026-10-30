@@ -73,7 +73,8 @@ services:
               "--collector", "https://collector:4318", "--collector-ca", "/etc/wake/identity/bundle.pem",
               "--state-dir", "/var/lib/wake-proxy", "--agents", "/etc/wake/agents.json",
               "--control-listen", "0.0.0.0:9002", "--trust-bundle", "/etc/wake/identity/bundle.pem",
-              "--memory-listen", "0.0.0.0:9003", "--metrics-listen", "0.0.0.0:9464"]
+              "--memory-listen", "0.0.0.0:9003", "--metrics-listen", "0.0.0.0:9464",
+              "--policy-file", "/etc/wake/policy.json"]
     environment:
       RUST_LOG: info
     volumes:
@@ -83,6 +84,10 @@ services:
       # Which agent each SPIFFE ID or JWT subject (a delegated token's act.sub) is: the names the brake halts by.
       # WAKE_AGENTS swaps in another map, as the reference fleet does.
       - ${WAKE_AGENTS:-./agents.json}:/etc/wake/agents.json:ro
+      # The flow policy (docs/proxy.md), read again within two seconds of a change, and served
+      # to the SDKs. policy.json has no rules, so it denies nothing. WAKE_POLICY swaps in
+      # another, as the reference fleet does.
+      - ${WAKE_POLICY:-./policy.json}:/etc/wake/policy.json:ro
       # The hooks agentgateway calls, as a Unix socket. Only agentgateway mounts this too:
       # anything that can reach the hooks can get events signed in the proxy's name.
       - proxy-socket:/run/wake

@@ -63,7 +63,8 @@ export class FakeClaudeCode {
     return (response.response as Json) ?? {};
   }
 
-  async hook(event: string, toolUseId: string, fields: Json): Promise<Json[]> {
+  /** Calls the hooks registered for event. A hook about no tool use, such as SubagentStop, has no toolUseId. */
+  async hook(event: string, toolUseId: string | undefined, fields: Json): Promise<Json[]> {
     const answers: Json[] = [];
     for (const callbackId of this.#hooks.get(event) ?? []) {
       answers.push(await this.request({
@@ -74,6 +75,11 @@ export class FakeClaudeCode {
       }));
     }
     return answers;
+  }
+
+  /** Says a subagent has stopped, as Claude Code does before it hands its answer on: the SubagentStop hooks. */
+  async stopped(agentId: string, agentType: string): Promise<void> {
+    await this.hook("SubagentStop", undefined, { agent_id: agentId, agent_type: agentType, agent_transcript_path: "", stop_hook_active: false });
   }
 
   async mcp(server: string, method: string, params: Json, id?: number): Promise<Json> {

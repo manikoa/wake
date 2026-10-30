@@ -282,14 +282,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 collector_ca,
                 response_timeout: Duration::from_secs(response_timeout),
                 halts: halts.clone(),
-                policy,
+                policy: policy.clone(),
                 observed,
                 ..Default::default()
             };
             if let Some(memory_listen) = memory_listen {
                 let listener = tokio::net::TcpListener::bind(&memory_listen).await?;
                 tracing::info!(memory_listen, "serving memory rules to memory adapters");
-                tokio::spawn(wake_proxy::memory::serve(listener, halts.clone(), stopping()));
+                tokio::spawn(wake_proxy::memory::serve(
+                    listener,
+                    halts.clone(),
+                    policy.clone(),
+                    stopping(),
+                ));
             }
             if let Some(metrics_listen) = metrics_listen {
                 let listener = tokio::net::TcpListener::bind(&metrics_listen).await?;

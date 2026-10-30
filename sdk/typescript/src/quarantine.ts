@@ -29,7 +29,10 @@
  * SDK integration, OpenAI Agents SDK's guard() and a LangChain handler given these rules
  * refuse their tool calls, and the runs they'd start (halted, stop.ts). That reaches what the
  * proxy deny can't, such as built-in tools and subagents that call with their parent's
- * credentials, but like the rest of this it holds only while the agent's code does.
+ * credentials, but like the rest of this it holds only while the agent's code does. They
+ * carry the flow policy wake-proxy enforces too, when it enforces one, which the same
+ * integrations apply to the same calls in the agent's process (flow(), flow.ts), and the
+ * memory adapter to the changes it makes to the stores the policy names.
  *
  * The proxy notes each fetch by the agent and the process it names, which is how the brake
  * confirms an adapter, or an integration's stop, has a quarantine or a halt: only once every
@@ -51,6 +54,7 @@ import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { context as otelContext } from "@opentelemetry/api";
 import { suppressTracing } from "@opentelemetry/core";
 
+import { parsePolicy, type FlowPolicy } from "./flow.ts";
 import { log } from "./log.ts";
 
 /** The id writes and reads are refused under while the rules are stale. */
@@ -109,6 +113,8 @@ export interface Rules {
   quarantines?: { id: string; selection?: Selection | null }[];
   /** The halts in force, when the proxy says: the fleet, or the agents and instances named. */
   halts?: { id: string; fleet?: boolean; agents?: string[] }[];
+  /** The flow policy the proxy enforces, when it enforces one, read by flow(). */
+  flow?: unknown;
   [key: string]: unknown;
 }
 
@@ -188,6 +194,7 @@ export class Quarantine {
   readonly #fetched: Map<string, Fetched>;
   #warnedStale = false;
   #warnedFull = false;
+  #flow: readonly [served: unknown, policy: FlowPolicy] | undefined; // the flow policy last read, and what it was read from
   #closed = false;
   #stops = false; // whether an integration refuses halted instances' calls with these rules
   #timer: NodeJS.Timeout | null = null;
@@ -314,6 +321,26 @@ export class Quarantine {
     if (!Array.isArray(halts)) return null;
     const named = new Set(names);
     return halts.find((h) => h.fleet === true || (h.agents ?? []).some((a) => named.has(a)))?.id ?? null;
+  }
+
+  /**
+   * The flow policy the proxy serves with the rules (flow.ts), checked after the halts: so
+   * while the rules are stale, halted() refuses every call first. Undefined when the proxy
+   * serves none, as one that enforces no policy, or is older than this, doesn't, so nothing is
+   * checked against one. A policy that isn't valid, or that the proxy can't use, refuses every
+   * call and every change to memory, and going so is logged as a warning.
+   */
+  flow(): FlowPolicy | undefined {
+    const served = this.rules()?.flow;
+    if (served === undefined || served === null) return undefined;
+    if (this.#flow?.[0] !== served) {
+      const policy = parsePolicy(served);
+      if (policy.unreadable !== null && policy.unreadable !== this.#flow?.[1].unreadable) {
+        log.warn(`can't use the flow policy wake-proxy serves (${policy.unreadable}); refusing every call and memory change until it's fixed`);
+      }
+      this.#flow = [served, policy];
+    }
+    return this.#flow[1];
   }
 
   /**

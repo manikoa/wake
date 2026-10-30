@@ -40,6 +40,18 @@
  * rejects with MemoryLocked: it's kept, as evidence. Each refusal is recorded as a denied event. If
  * checking the quarantine fails, the write or delete is refused and the entry isn't served.
  * In a process that names its agents' runs, each run's writes are locked by its own name.
+ *
+ * What a read serves enters the agent reading it, for the flow policy (flow.ts): the origins
+ * its label carries, but the user's, when the label vouches for it, and memory:unlabeled when
+ * none does, as for an entry planted or changed since it was written.
+ *
+ * The flow policy served with the quarantine's rules holds each write, delete and rollback
+ * too, after the quarantine and before the gate: a rule naming the store refuses the change
+ * when it keeps an origin that entered the agent making it, by the same name and lineage the
+ * integration's own checks use. It rejects with MemoryLocked under policy:<rule id>, and a
+ * policy that can't be used, or a check that fails, refuses every change under
+ * policy:unreadable-policy. When the integration can't tell which agent is making the change,
+ * it counts as one with every origin, so any rule naming the store refuses it.
  */
 
 import { randomBytes, randomUUID } from "node:crypto";
@@ -49,10 +61,12 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { Context, Span } from "@opentelemetry/api";
 
 import * as events from "./events.ts";
-import { failed, traceIdOf, unique, type Recording } from "./graph.ts";
+import { entered, MAX_ORIGINS, UNLABELED, UNREADABLE } from "./flow.ts";
+import { failed, traceIdOf, unique, type Acting, type Recording } from "./graph.ts";
 import * as links from "./links.ts";
 import { log } from "./log.ts";
 import { MemoryLocked, MemoryQuarantined, type Label, type Quarantine } from "./quarantine.ts";
+import { flowRefusal, keptOf, type Kept, type Refusal } from "./stop.ts";
 
 export { MemoryLocked, MemoryQuarantined, type Label };
 
@@ -239,7 +253,7 @@ export class Memory {
    * failed. current and label are what the entry holds now (undefined if nothing) and the
    * label stored with it. Rejects with MemoryLocked, before anything is written, when the
    * brake's quarantine locks this agent's writes, or hides the entry: a quarantined entry is
-   * kept, as evidence, not overwritten. And when the gate refuses it.
+   * kept, as evidence, not overwritten. And when the flow policy or the gate refuses it.
    */
   async write(store: string, entry: string, content: unknown, current?: unknown, label?: Label | null): Promise<WriteLabel | null> {
     return (await this._admitWrite(store, entry, content, current, label))();
@@ -259,6 +273,7 @@ export class Memory {
     { history = false }: { history?: boolean } = {},
   ): Promise<() => WriteLabel | null> {
     await this.#check("write", store, entry, current, label);
+    await this.#flowCheck("write", store, entry, this.#linked());
     const text = contentOf(content);
     const lineage = await this.#gated("write", store, entry, text, () => this.#parentsAndOrigins(text));
     const previous = history ? historyOf(label, current) : [];
@@ -278,7 +293,7 @@ export class Memory {
    * Records the delete of an entry, given what it holds now (undefined if nothing) and the
    * label stored with it. Rejects with MemoryLocked, before anything is deleted, when the
    * brake's quarantine locks this agent's writes, or hides the entry: a quarantined entry is
-   * kept, as evidence. And when the gate refuses it.
+   * kept, as evidence. And when the flow policy or the gate refuses it.
    */
   async delete(store: string, entry: string, current?: unknown, label?: Label | null): Promise<void> {
     (await this._admitDelete(store, entry, current, label))();
@@ -287,6 +302,7 @@ export class Memory {
   /** Checks a delete as delete() does, and resolves to what records it. */
   async _admitDelete(store: string, entry: string, current?: unknown, label?: Label | null): Promise<() => void> {
     await this.#check("delete", store, entry, current, label);
+    await this.#flowCheck("delete", store, entry, this.#linked());
     const lineage = await this.#gated("delete", store, entry, null, () => this.#deleteLineage());
     return () => {
       try {
@@ -300,10 +316,10 @@ export class Memory {
   /**
    * Checks a rollback of an entry to a version its label's history keeps, and resolves to the
    * version's content and what records the rollback, which gives the label to keep with it. A
-   * rollback is a write, so it's refused as one, and also when the quarantine wouldn't serve
-   * the version: restoring it would give it a label the quarantine no longer matches. Rejects
-   * with MemoryLocked when refused, and with an Error when there's no such version or it
-   * doesn't match its digest.
+   * rollback is a write, so it's refused as one, by the quarantine, the flow policy and the
+   * gate, and also when the quarantine wouldn't serve the version: restoring it would give it
+   * a label the quarantine no longer matches. Rejects with MemoryLocked when refused, and with
+   * an Error when there's no such version or it doesn't match its digest.
    */
   async _admitRollback<T>(
     store: string,
@@ -322,6 +338,7 @@ export class Memory {
       this.#refused("write", store, entry, hidden, [...this.#linked(), version.event]);
       throw new MemoryLocked(hidden, store, entry);
     }
+    await this.#flowCheck("write", store, entry, [...this.#linked(), version.event]);
     await this.#gated("write", store, entry, text, () => ({ parents: [version.event], origins: version.origins }));
     // The version it replaces is kept too, so a rollback can be rolled back.
     const previous = historyOf(label, current);
@@ -350,6 +367,49 @@ export class Memory {
       this.#refused(action, store, entry, refused, [...this.#linked(), ...(write ? [write] : [])]);
       throw new MemoryLocked(refused, store, entry);
     }
+  }
+
+  /**
+   * Throws MemoryLocked, and records the refusal with what the rule kept, when the flow policy
+   * served with the quarantine's rules keeps this change to store from what entered the agent
+   * making it.
+   */
+  async #flowCheck(action: string, store: string, entry: string, parents: string[]): Promise<void> {
+    const refused = await this.#flowRefusal(action, store, entry);
+    if (refused === undefined) return;
+    this.#refused(action, store, entry, refused[0], parents, undefined, keptOf(refused));
+    log.warn(`refused a memory ${action} to ${store}/${entry}: ${refused[1]}`);
+    throw new MemoryLocked(refused[0], store, entry);
+  }
+
+  /**
+   * The flow policy's refusal of a change to store, if any (flowRefusal, in stop.ts): the
+   * rules naming the store decide on what entered the agent making it, named as the
+   * integration's own checks name it (_acting), once the integration has noted what entered
+   * it so far. When the integration can't tell which agent is acting, it counts as one with
+   * every origin, so any rule naming the store refuses the change, whatever agents the rule
+   * names. Undefined without a quarantine, or when the proxy serves no policy. Never rejects: a
+   * check that fails refuses, as a policy that can't be used does.
+   */
+  async #flowRefusal(action: string, store: string, entry: string): Promise<Refusal | undefined> {
+    const quarantine = this.#quarantine;
+    if (quarantine?.flow === undefined) return undefined;
+    const outcome = `this memory ${action} wasn't made`;
+    try {
+      if (quarantine.flow() === undefined) return undefined;
+      if (!(await this.#handler._settled())) throw new Error("what entered the agent acting couldn't be seen in time");
+    } catch (error) {
+      log.warn(`couldn't check the flow policy for a memory ${action} to ${store}/${entry}; refusing it`, error);
+      return [UNREADABLE, `Wake's flow policy can't be read, so ${outcome}.`, { origins: [] }];
+    }
+    let acting: Acting | undefined;
+    try {
+      acting = this.#handler._acting();
+    } catch (error) {
+      log.warn(`couldn't tell which agent is changing ${store}/${entry}`, error);
+    }
+    if (acting === undefined) return flowRefusal(quarantine, "the agent acting", { caller: undefined, store }, outcome);
+    return flowRefusal(quarantine, acting.who, { caller: acting.caller, lineage: acting.lineage, store }, outcome);
   }
 
   /**
@@ -384,7 +444,8 @@ export class Memory {
 
   /**
    * Records a read of an entry, with the label it was stored with, if any. Returns the id of
-   * the quarantine that stops the entry being served, or null to serve it.
+   * the quarantine that stops the entry being served, or null to serve it. What's served enters
+   * the agent reading it.
    */
   read(store: string, entry: string, content: unknown, label: Label | null | undefined): string | null {
     const text = contentOf(content);
@@ -394,12 +455,30 @@ export class Memory {
       this.#refused("read", store, entry, hidden, write ? [write] : []);
       return hidden;
     }
+    this.#entering(text, isLabel(label) ? label : null);
     try {
       this.#read(store, entry, text, isLabel(label) ? label : null, content);
     } catch (error) {
       this._failed("a memory read", error);
     }
     return null;
+  }
+
+  /**
+   * Notes what content read from memory brings into the agent reading it, now: the origins its
+   * label carries, but the user's, which isn't an origin, when the label vouches for the content
+   * by its digest, and memory:unlabeled when no label does. Past MAX_ORIGINS of them the agent
+   * has every origin anyway, so no more are noted.
+   */
+  #entering(text: string, label: Label | null): void {
+    try {
+      const agent = this.#handler._currentAgent();
+      const vouched = label !== null && label.sha256 === digest(text) && Array.isArray(label.origins);
+      const origins = vouched ? unique(strings(label.origins).filter((o) => o !== events.ORIGIN_USER)).slice(0, MAX_ORIGINS + 1) : [UNLABELED];
+      for (const origin of origins) entered.note(agent, origin);
+    } catch (error) {
+      log.warn("couldn't note what a memory read brought in", error);
+    }
   }
 
   /**
@@ -527,11 +606,12 @@ export class Memory {
   }
 
   /**
-   * Records what the quarantine or the gate refused, as a denied event, with why the gate
-   * couldn't judge it, if it couldn't.
+   * Records what the quarantine, the flow policy or the gate refused, as a denied event, with
+   * why the gate couldn't judge it, if it couldn't, and the origins the flow policy kept, as
+   * its refusals elsewhere say them.
    */
-  #refused(action: string, store: string, entry: string, quarantine: string, parents: string[], reason?: string): void {
-    const payload: { store: string; [key: string]: unknown } = { store, entry, refused: action, quarantine };
+  #refused(action: string, store: string, entry: string, quarantine: string, parents: string[], reason?: string, kept: Kept | Record<string, never> = {}): void {
+    const payload: { store: string; [key: string]: unknown } = { store, entry, refused: action, quarantine, ...kept };
     if (reason !== undefined) payload.error = reason;
     try {
       this.#emit(randomUUID(), events.DENIED, this.#handler._eventContext(), parents, [], {

@@ -1,0 +1,308 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "wake-hook"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "wake-hook",
+            "version": "test"
+          },
+          "spans": [
+            {
+              "traceId": "c8f81ff2313bda090033d77dee1015e4",
+              "spanId": "1bfb1fa37c41a11e",
+              "name": "agent_message",
+              "kind": 1,
+              "startTimeUnixNano": "1793275200001000000",
+              "endTimeUnixNano": "1793275200001000000",
+              "attributes": [
+                {
+                  "key": "wake.event.id",
+                  "value": {
+                    "stringValue": "d9877ece-6d36-4aac-9a6f-419ec627c76b"
+                  }
+                },
+                {
+                  "key": "wake.event.kind",
+                  "value": {
+                    "stringValue": "agent_message"
+                  }
+                },
+                {
+                  "key": "wake.agent.id",
+                  "value": {
+                    "stringValue": "claude-code"
+                  }
+                },
+                {
+                  "key": "wake.agent.instance",
+                  "value": {
+                    "stringValue": "claude-code#abc123"
+                  }
+                },
+                {
+                  "key": "wake.agent.lineage",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "claude-code"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "wake.capture",
+                  "value": {
+                    "stringValue": "hook"
+                  }
+                },
+                {
+                  "key": "wake.hook.host",
+                  "value": {
+                    "stringValue": "claude-code"
+                  }
+                },
+                {
+                  "key": "wake.origins",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "user"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "wake.payload",
+                  "value": {
+                    "stringValue": "{\"content\":\"Write a function to calculate the factorial of a number\",\"from\":\"user\",\"hook\":{\"cwd\":\"/Users/me/proj\",\"permission_mode\":\"default\",\"transcript_path\":\"/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl\"},\"to\":\"claude-code\"}"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "c8f81ff2313bda090033d77dee1015e4",
+              "spanId": "8d8c8542dcb8a994",
+              "name": "tool_call Write",
+              "kind": 1,
+              "startTimeUnixNano": "1793275199992000000",
+              "endTimeUnixNano": "1793275200004000000",
+              "attributes": [
+                {
+                  "key": "wake.event.id",
+                  "value": {
+                    "stringValue": "8ddd78f3-4cf4-429e-b54f-635daba38436"
+                  }
+                },
+                {
+                  "key": "wake.event.kind",
+                  "value": {
+                    "stringValue": "tool_call"
+                  }
+                },
+                {
+                  "key": "wake.agent.id",
+                  "value": {
+                    "stringValue": "claude-code"
+                  }
+                },
+                {
+                  "key": "wake.agent.instance",
+                  "value": {
+                    "stringValue": "claude-code#abc123"
+                  }
+                },
+                {
+                  "key": "wake.agent.lineage",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "claude-code"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "wake.capture",
+                  "value": {
+                    "stringValue": "hook"
+                  }
+                },
+                {
+                  "key": "wake.hook.host",
+                  "value": {
+                    "stringValue": "claude-code"
+                  }
+                },
+                {
+                  "key": "wake.origins",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "tool:Write"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "execute_tool"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "Write"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.id",
+                  "value": {
+                    "stringValue": "toolu_01DEF456"
+                  }
+                },
+                {
+                  "key": "wake.parents",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "d9877ece-6d36-4aac-9a6f-419ec627c76b"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "wake.payload",
+                  "value": {
+                    "stringValue": "{\"hook\":{\"cwd\":\"/Users/me/proj\",\"permission_mode\":\"default\",\"transcript_path\":\"/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl\"},\"input\":{\"content\":\"def factorial(n):\\n    return 1 if n \u003c 2 else n * factorial(n - 1)\\n\",\"file_path\":\"/Users/me/proj/factorial.py\"},\"output\":{\"filePath\":\"/Users/me/proj/factorial.py\",\"type\":\"create\"}}"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "c8f81ff2313bda090033d77dee1015e4",
+              "spanId": "e3eb28cb670f0e97",
+              "name": "denied Bash",
+              "kind": 1,
+              "startTimeUnixNano": "1793275200008000000",
+              "endTimeUnixNano": "1793275200008000000",
+              "attributes": [
+                {
+                  "key": "wake.event.id",
+                  "value": {
+                    "stringValue": "43cea3e8-28a1-4c70-8e9a-7f3b59f9a2aa"
+                  }
+                },
+                {
+                  "key": "wake.event.kind",
+                  "value": {
+                    "stringValue": "denied"
+                  }
+                },
+                {
+                  "key": "wake.agent.id",
+                  "value": {
+                    "stringValue": "claude-code"
+                  }
+                },
+                {
+                  "key": "wake.agent.instance",
+                  "value": {
+                    "stringValue": "claude-code#abc123"
+                  }
+                },
+                {
+                  "key": "wake.agent.lineage",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "claude-code"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "wake.capture",
+                  "value": {
+                    "stringValue": "hook"
+                  }
+                },
+                {
+                  "key": "wake.hook.host",
+                  "value": {
+                    "stringValue": "claude-code"
+                  }
+                },
+                {
+                  "key": "wake.brake.halt_id",
+                  "value": {
+                    "stringValue": "h1"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "execute_tool"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.name",
+                  "value": {
+                    "stringValue": "Bash"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.call.id",
+                  "value": {
+                    "stringValue": "toolu_01ABC123"
+                  }
+                },
+                {
+                  "key": "wake.parents",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "d9877ece-6d36-4aac-9a6f-419ec627c76b"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "wake.payload",
+                  "value": {
+                    "stringValue": "{\"hook\":{\"cwd\":\"/Users/me/proj\",\"permission_mode\":\"default\",\"prompt_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"transcript_path\":\"/Users/me/.claude/projects/proj/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl\"},\"input\":{\"command\":\"npm test\",\"description\":\"Run test suite\",\"run_in_background\":false,\"timeout\":120000},\"output\":\"Wake's brake has halted this agent (halt h1), so this was refused.\"}"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

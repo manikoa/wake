@@ -1,7 +1,7 @@
 /**
  * LangGraph support. LangGraph runs are LangChain runs, so the handler in wake-sdk/langchain
  * records them; WakeStore records LangGraph's long-term memory store, and WakeToolNode stops a
- * halted agent's tool calls.
+ * halted agent's tool calls, and those the flow policy keeps.
  *
  *     const memory = new Memory(handler);
  *     const store = new WakeStore(new InMemoryStore(), memory); // or any BaseStore, such as PostgresStore
@@ -31,9 +31,10 @@ type SearchItem = Item & { score?: number };
 export { AgentHalted, AgentRun, WakeCallbackHandler } from "./langchain.ts";
 
 /**
- * A ToolNode that refuses a tool call a halt covers before it runs, answering the model with
- * why, and records it as denied: new WakeToolNode(handler, tools), where the handler was given
- * the brake's rules. Any other call runs as in a ToolNode.
+ * A ToolNode that refuses a tool call a halt covers before it runs, or one the flow policy the
+ * rules carry keeps from what entered the agent making it, answering the model with why, and
+ * records it as denied: new WakeToolNode(handler, tools), where the handler was given the
+ * brake's rules. Any other call runs as in a ToolNode.
  */
 export class WakeToolNode<T = any> extends ToolNode<T> {
   readonly #handler: WakeCallbackHandler;

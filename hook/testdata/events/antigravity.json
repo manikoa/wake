@@ -1,0 +1,36 @@
+{
+  "pre_tool": {
+    "toolCall": {"name": "run_command", "args": {"CommandLine": "npm test", "Cwd": "/workspace/project"}},
+    "stepIdx": 19,
+    "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+    "workspacePaths": ["/workspace/project"],
+    "transcriptPath": "/home/me/.gemini/antigravity/conversations/ec33ebf9.pb",
+    "modelName": "gemini-3-pro"
+  },
+  "post_tool": {
+    "toolCall": {"name": "run_command", "args": {"CommandLine": "npm test", "Cwd": "/workspace/project"}},
+    "stepIdx": 19,
+    "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+    "workspacePaths": ["/workspace/project"],
+    "transcriptPath": "/home/me/.gemini/antigravity/conversations/ec33ebf9.pb",
+    "modelName": "gemini-3-pro",
+    "error": ""
+  },
+  "post_tool_failure": {
+    "toolCall": {"name": "run_command", "args": {"CommandLine": "npm test", "Cwd": "/workspace/project"}},
+    "stepIdx": 20,
+    "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+    "workspacePaths": ["/workspace/project"],
+    "transcriptPath": "/home/me/.gemini/antigravity/conversations/ec33ebf9.pb",
+    "modelName": "gemini-3-pro",
+    "error": "exit status 1"
+  },
+  "stop": {
+    "executionNum": 1,
+    "terminationReason": "completed",
+    "error": "",
+    "fullyIdle": true,
+    "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+    "workspacePaths": ["/workspace/project"]
+  }
+}

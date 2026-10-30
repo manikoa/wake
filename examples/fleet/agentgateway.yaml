@@ -1,7 +1,8 @@
 # yaml-language-server: $schema=https://agentgateway.dev/schema/config
 #
-# agentgateway for the reference fleet: an A2A route per agent and the fleet's MCP server,
-# every call recorded by wake-proxy, and denied when the brake has halted it.
+# agentgateway for the reference fleet: an A2A route per agent, the fleet's MCP server, and
+# a route to each model provider for FLEET_MODELS=real, every call checked by wake-proxy and
+# denied when the brake has halted it. A2A and MCP calls are recorded there too.
 #
 # Who's calling comes from the caller's SPIFFE ID or JWT (the agent a delegated token names
 # as acting, act.sub, else its subject), as in production, and failing those from the x-fleet-agent header the fleet's agents send. That header is a
@@ -168,3 +169,48 @@ routes:
       - name: fleet
         mcp:
           host: http://tools:3001/mcp
+# The model providers, for FLEET_MODELS=real: research's OpenAI client and billing's Claude
+# Code send their model calls here, so the agents' networks stay internal in that mode too.
+# The gateway's deny lever above covers these calls, so a halted agent's model calls are
+# denied. The gateway adds the provider's key (models.yaml), which no agent holds; without
+# real models the keys are empty and nothing calls these routes.
+- name: openai
+  matches:
+  - path:
+      pathPrefix: /models/openai
+  policies:
+    urlRewrite:
+      path:
+        prefix: /
+    ai:
+      routes:
+        /v1/responses: responses
+        /v1/chat/completions: completions
+        "*": passthrough
+    backendAuth:
+      key: "$OPENAI_API_KEY"
+  backends:
+  - ai:
+      name: openai
+      provider:
+        openAI: {}
+- name: anthropic
+  matches:
+  - path:
+      pathPrefix: /models/anthropic
+  policies:
+    urlRewrite:
+      path:
+        prefix: /
+    ai:
+      routes:
+        /v1/messages: messages
+        /v1/messages/count_tokens: anthropicTokenCount
+        "*": passthrough
+    backendAuth:
+      key: "$ANTHROPIC_API_KEY"
+  backends:
+  - ai:
+      name: anthropic
+      provider:
+        anthropic: {}
