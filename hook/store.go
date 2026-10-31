@@ -160,6 +160,10 @@ func wantPath(dir, agent string) string {
 	return filepath.Join(dir, rulesDir, name(agent)+".want")
 }
 
+func stoppingPath(dir, agent string) string {
+	return filepath.Join(dir, rulesDir, name(agent)+".stopping")
+}
+
 // brakeRules is what the hook reads of the rules wake-proxy serves: the halts in force,
 // and the flow policy (flow.go).
 type brakeRules struct {
@@ -199,6 +203,21 @@ func (o Options) rules(agent string) (rules *brakeRules, problem string) {
 func (o Options) want(agent string) {
 	if _, err := os.Stat(wantPath(o.Dir, agent)); err != nil {
 		write(wantPath(o.Dir, agent), []byte(agent), o.hex)
+	}
+}
+
+// sayIfStopping leaves serve the word of the hook that last gated a call by agent: whether
+// it refuses what a halt covers. serve can't see the hosts' settings, and only tells
+// wake-proxy so while this says it, so the brake never counts on a hook run without Stop.
+func (o Options) sayIfStopping(agent string) {
+	path := stoppingPath(o.Dir, agent)
+	_, err := os.Stat(path)
+	if !o.Stop {
+		if err == nil {
+			os.Remove(path)
+		}
+	} else if err != nil && os.MkdirAll(filepath.Dir(path), 0o700) == nil {
+		os.WriteFile(path, nil, 0o600) // being there is all it says
 	}
 }
 

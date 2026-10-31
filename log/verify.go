@@ -42,10 +42,23 @@ func (d DirReader) ReadEntryBundle(_ context.Context, index uint64, p uint8) ([]
 	return data, err
 }
 
+// What Verify finds when a log doesn't match an earlier checkpoint it was given.
+var (
+	// ErrCutBack means the log holds fewer entries than an earlier checkpoint signed: its
+	// tail is gone, as when an older checkpoint is put back in place of the latest.
+	ErrCutBack = errors.New("the log was cut back")
+	// ErrRewritten means the entries an earlier checkpoint covers now hash to another root:
+	// someone with the log's key signed a different history.
+	ErrRewritten = errors.New("the log was rewritten")
+)
+
 // Checked is what Verify found in a log.
 type Checked struct {
 	Origin string
 	Size   uint64
+	// Checkpoint is the signed checkpoint the log was checked at, as it was read. Keep it
+	// where the log's host can't write, and pass it to a later Verify.
+	Checkpoint []byte
 	// Unsigned are the indexes of entries whose event signature doesn't check under the
 	// trust given, or that can't be read as entries at all.
 	Unsigned []uint64
@@ -56,12 +69,33 @@ type Checked struct {
 // signed by a signer in trust. each, if not nil, sees every entry in order, with whether
 // its signature checked. An error means the log itself doesn't hold together; entries
 // that fail their signature check are listed in Checked.Unsigned instead.
-func Verify(ctx context.Context, r Reader, logKey note.Verifier, trust Trust, each func(index uint64, e Entry, signed bool)) (Checked, error) {
-	cp, _, _, err := client.FetchCheckpoint(ctx, r.ReadCheckpoint, logKey, logKey.Name())
+//
+// One checkpoint alone only says the log agrees with itself: an older checkpoint put back
+// passes, with the entries after it gone, and so does a history re-signed with the log's
+// key. So earlier takes checkpoints kept from before, as Checked.Checkpoint gave them. Each
+// must be signed by logKey, the log must hold at least its entries (ErrCutBack), and those
+// entries must hash to its root (ErrRewritten). A checkpoint vouches only for the entries
+// it covers, and only as well as it was kept out of reach of whoever holds the log's key.
+func Verify(ctx context.Context, r Reader, logKey note.Verifier, trust Trust, each func(index uint64, e Entry, signed bool), earlier ...[]byte) (Checked, error) {
+	cp, raw, _, err := client.FetchCheckpoint(ctx, r.ReadCheckpoint, logKey, logKey.Name())
 	if err != nil {
 		return Checked{}, fmt.Errorf("checkpoint: %w", err)
 	}
-	out := Checked{Origin: cp.Origin, Size: cp.Size}
+	out := Checked{Origin: cp.Origin, Size: cp.Size, Checkpoint: raw}
+	roots := map[uint64][]byte{}
+	for _, data := range earlier {
+		before, _, _, err := client.FetchCheckpoint(ctx, func(context.Context) ([]byte, error) { return data, nil }, logKey, logKey.Name())
+		if err != nil {
+			return out, fmt.Errorf("earlier checkpoint: %w", err)
+		}
+		if before.Size > cp.Size {
+			return out, fmt.Errorf("%w: an earlier checkpoint signed %d entries, and it's at %d", ErrCutBack, before.Size, cp.Size)
+		}
+		if root, ok := roots[before.Size]; ok && !bytes.Equal(root, before.Hash) {
+			return out, fmt.Errorf("%w: two earlier checkpoints sign different roots for %d entries", ErrRewritten, before.Size)
+		}
+		roots[before.Size] = before.Hash
+	}
 	tree := (&compact.RangeFactory{Hash: rfc6962.DefaultHasher.HashChildren}).NewEmptyRange(0)
 	treeSize := func(context.Context) (uint64, error) { return cp.Size, nil }
 	index := uint64(0)
@@ -90,6 +124,15 @@ func Verify(ctx context.Context, r Reader, logKey note.Verifier, trust Trust, ea
 				each(index, e, signed)
 			}
 			index++
+			if want, ok := roots[index]; ok {
+				root, err := tree.GetRootHash(nil)
+				if err != nil {
+					return out, err
+				}
+				if !bytes.Equal(root, want) {
+					return out, fmt.Errorf("%w: its first %d entries don't hash to the root an earlier checkpoint signed", ErrRewritten, index)
+				}
+			}
 		}
 	}
 	if index != cp.Size {

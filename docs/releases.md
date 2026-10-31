@@ -9,6 +9,7 @@ Wake records evidence other people rely on, so its own releases have to be check
 Pushing a tag `vX.Y.Z` releases:
 - **Images:** `ghcr.io/usewake/wake-collector:X.Y.Z`, which also holds `wake-keygen` and `wake-log`, and `ghcr.io/usewake/wake-proxy:X.Y.Z`. linux/amd64 for now.
 - **`wake-log` and `wake-keygen` on their own**, so anyone can check a log without running Wake: `wake-log_X.Y.Z_<os>_<arch>.tar.gz` for Linux and macOS, amd64 and arm64. There's no Windows build: Tessera's log storage locks files the Unix way.
+- **`wake-hook`**, for coding agents: `wake-hook_X.Y.Z_<os>_<arch>.tar.gz` for Linux, macOS and Windows, amd64 and arm64.
 - **The Python SDK**, `wake-sdk` X.Y.Z, on PyPI. The same wheel and sdist are attached to the GitHub release.
 - **The TypeScript SDK**, `wake-sdk` X.Y.Z, on npm. The same tarball, `wake-sdk-X.Y.Z.tgz`, is attached to the GitHub release. It carries the repository's `LICENSE` and `NOTICE`, which packing copies in.
 
@@ -54,7 +55,7 @@ gh attestation verify oci://ghcr.io/usewake/wake-collector:0.1.0 \
 
 The same goes for `wake-proxy`. Add `--predicate-type https://spdx.dev/Document/v2.3` to `gh attestation verify` to check the SBOM instead.
 
-**`wake-log` builds.** Check the signed checksums, then the file's own provenance:
+**`wake-log` and `wake-hook` builds.** Check the signed checksums, then the file's own provenance, here for `wake-log`:
 
 ```bash
 gh release download v0.1.0 -R usewake/wake -p 'wake-log_0.1.0_linux_amd64.tar.gz' -p 'SHA256SUMS*'

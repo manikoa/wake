@@ -148,7 +148,9 @@ routes:
       processors:
       - kind: remote
         host: "unix:/run/wake/proxy.sock"
-        failureMode: failOpen
+        # This hook also holds each call to the flow rules that name tools and a charter's
+        # limits, so a call it can't answer for is refused, not sent on unchecked.
+        failureMode: failClosed
         methods:
           tools/call: full
           resources/read: full

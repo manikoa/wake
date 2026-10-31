@@ -204,6 +204,45 @@ fn every_model_route_has_wake_proxy_read_its_calls_and_fails_closed() {
     assert!(model_routes >= 2, "the reference fleet routes to OpenAI and Anthropic");
 }
 
+/// The flow rules that name tools, a charter's limits on tools and halts that land during a
+/// call are checked in the MCP hook and nowhere else: a hook that failed open would let a call
+/// it can't answer for go on unchecked. agentgateway's value for this hook is failClosed,
+/// which is its default, and deny isn't one: only ext_authz has that.
+#[test]
+fn every_mcp_route_refuses_a_call_its_hook_cant_answer_for() {
+    for (path, _) in CONFIGS {
+        let config = load(path);
+        let routes = config["routes"].as_vec().unwrap();
+        let mut hooks = 0;
+        for (i, route) in routes.iter().enumerate() {
+            let name = route["name"].as_str().map(String::from).unwrap_or(format!("#{i}"));
+            let backends = route["backends"].as_vec().into_iter().flatten();
+            let mcp = backends.into_iter().any(|b| !b["mcp"].is_badvalue());
+            let processors = route["policies"]["mcpGuardrails"]["processors"].as_vec();
+            assert!(
+                !mcp || processors.is_some(),
+                "{path}: MCP route {name} has no mcpGuardrails"
+            );
+            for processor in processors.into_iter().flatten() {
+                hooks += 1;
+                assert_eq!(
+                    processor["failureMode"].as_str(),
+                    Some("failClosed"),
+                    "{path}: route {name}: a call the MCP hook can't answer for must be refused"
+                );
+                for method in ["tools/call", "resources/read", "prompts/get"] {
+                    assert_eq!(
+                        processor["methods"][method].as_str(),
+                        Some("full"),
+                        "{path}: route {name}: the hook must see {method}, both ways"
+                    );
+                }
+            }
+        }
+        assert!(hooks > 0, "{path}: no MCP hook");
+    }
+}
+
 #[test]
 fn mcp_capture_can_pair_each_response_with_its_request() {
     for (path, _) in CONFIGS {

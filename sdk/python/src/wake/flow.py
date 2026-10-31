@@ -18,7 +18,9 @@ policy's window, as wake-proxy's rules do:
 
 What entered each agent is kept for the whole process, since one agent's origins can come
 from several integrations and from its memory reads. It's coarse, as wake-proxy is:
-everything that entered an agent within the window counts for each call it makes.
+everything that entered an agent within the window counts for each call it makes. Unlike
+wake-proxy, a process starts with no origins and no first window of every origin, so what
+entered before it started, as in a resumed session, isn't known here.
 
 It fails closed, as halts do. A policy wake-proxy can't use, or one that isn't valid,
 refuses every call under policy:unreadable-policy, and so does a check that fails. An agent

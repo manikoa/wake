@@ -80,9 +80,10 @@ routes:
       processors:
       - kind: remote
         host: "localhost:9001"
-        # Recording never blocks: if wake-proxy is down or slow, calls go through
-        # unrecorded. Deny is the gateway's extAuthz above, which fails closed.
-        failureMode: failOpen
+        # This hook also holds each call to the flow rules that name tools and a charter's
+        # limits, so a call it can't answer for is refused, not sent on unchecked. Recording
+        # still never blocks: with wake-proxy up, the hook answers whatever becomes of the record.
+        failureMode: failClosed
         methods:
           tools/call: full
           resources/read: full

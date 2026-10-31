@@ -57,9 +57,11 @@ services:
       - keys:/etc/wake/keys:ro
       - identity:/etc/wake/identity:ro
       - data:/var/lib/wake
-    # OTLP, then the health check and the collector's metrics for Prometheus on this host.
-    # On this network they're collector:13133 and collector:8888/metrics.
-    ports: ["4318:4318", "127.0.0.1:13133:13133", "127.0.0.1:8888:8888"]
+    # OTLP, then the health check and the collector's metrics for Prometheus, all on this
+    # host's loopback. On this network they're collector:4318, collector:13133 and
+    # collector:8888/metrics. OTLP takes events from anything that reaches it, and signs them
+    # in whatever agent's name they give, so publish it wider only to a network you trust.
+    ports: ["127.0.0.1:4318:4318", "127.0.0.1:13133:13133", "127.0.0.1:8888:8888"]
     restart: unless-stopped
 
   wake-proxy:

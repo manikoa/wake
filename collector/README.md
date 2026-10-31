@@ -24,6 +24,8 @@ The `health_check` extension answers on port 13133 while the collector is up. Th
 
 ## Checking the log
 
+The receiver authenticates no sender: TLS proves the collector to whoever calls it, not the other way round. So anything that reaches port 4318 can have an unsigned event signed in any agent's name, and logged valid. The signature on an SDK, memory adapter or hook event says the collector received it. Only the proxy's own signature says more, which is why [docs/signing.md](../docs/signing.md) keeps the two apart.
+
 The log is a [tlog-tiles](https://c2sp.org/tlog-tiles) log in `data/log`, with checkpoints signed by `keys/log.pub`. Any tlog-tiles tool can check it, including Tessera's `fsck`. Each entry can be checked on its own with `keys/collector.pub`; payloads too large for their entries are in `data/log/payload/sha256/`. The entry format is in [docs/events.md](../docs/events.md).
 
 ## Development

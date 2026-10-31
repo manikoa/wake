@@ -7,12 +7,15 @@
 //! for a call a halt catches under way: a request that reaches the hook after a halt that
 //! covers its caller is refused, and a result coming back to that caller after one is kept
 //! from it, as the gateway's error, and recorded as cut. The tool already ran; the agent
-//! never gets what it returned. The hook fails open, as capture does, so this holds only
-//! while wake-proxy answers; ext_authz fails closed for every call after.
+//! never gets what it returned.
 //!
 //! It also checks the flow policy's rules that name tools, since only this hook sees which
 //! tool a call is for, and notes the tool as an origin entering its caller (origins.rs)
 //! before the call goes on, so the result never reaches the caller ahead of the note.
+//!
+//! So the shipped configs run it with failureMode: failClosed: a call this hook can't answer
+//! for is refused rather than going on unchecked. Recording itself never holds a call up:
+//! with wake-proxy up, the hook answers whatever becomes of the record.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,8 +48,10 @@ use pb::{
     mcp_request_result, mcp_response_result,
 };
 
-/// Largest hook message accepted. A tool result larger than this is passed through by
-/// agentgateway under failOpen and isn't recorded.
+/// Largest hook message accepted. agentgateway reads at most 2 MiB of an MCP call or its
+/// result, unless the route's buffer policy says more. Past this size, on such a route, the
+/// hook answers with an error, so a failClosed hook refuses the call or keeps its result from
+/// the caller, where a failOpen one would let it through unchecked and unrecorded.
 pub const MAX_MESSAGE: usize = 32 << 20;
 
 pub struct Processor {

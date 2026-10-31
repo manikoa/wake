@@ -1,0 +1,27 @@
+# Asks wake-platform to run its game days and staging stack on each push to main, against
+# that commit, since a change here doesn't run its CI otherwise. It takes a token that can
+# run that repository's Actions, in the WAKE_PLATFORM_DISPATCH secret. Without one, the change
+# waits for the game days wake-platform runs against main every night.
+name: Game day
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ask:
+    name: ask wake-platform for a game day
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.WAKE_PLATFORM_DISPATCH }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::WAKE_PLATFORM_DISPATCH isn't set, so this change waits for tonight's game day."
+            exit 0
+          fi
+          gh api repos/usewake/wake-platform/dispatches -f event_type=wake-changed -f "client_payload[ref]=$COMMIT"

@@ -5,6 +5,8 @@ Records what a coding agent does through its hooks, and refuses what Wake's brak
 - **The hook:** the agent's host runs `wake-hook <host>` on each hook event. It writes the event to a spool, and answers at once.
 - **The service:** `wake-hook serve` runs beside it, as a service for each user. It sends the spool to the collector. With `--rules`, it also fetches the brake's rules for the hooks to check.
 
+Each release ships it for Linux, macOS and Windows ([docs/releases.md](../docs/releases.md)), or build it:
+
 ```bash
 go build -o wake-hook ./cmd/wake-hook
 ```
@@ -22,7 +24,7 @@ wake-hook serve --collector https://collector.example.com:4318 --ca /etc/wake/ca
 |---|---|
 | `--collector` | The collector's OTLP/HTTP endpoint (`WAKE_ENDPOINT`) |
 | `--ca` | A PEM file of roots to trust for the collector and wake-proxy (`WAKE_CA_FILE`) |
-| `--rules` | wake-proxy's address. serve fetches each agent's rules from its `/v1/memory`, as the SDKs do. Hooks run with `--stop` need it |
+| `--rules` | wake-proxy's address. serve fetches each agent's rules from its `/v1/memory`, as the SDKs do. Hooks run with `--stop` need it. Once one of them has gated a call by an agent, serve tells wake-proxy that agent's hooks stop what a halt covers, and takes it back once a hook runs without `--stop` |
 | `--agent` | An agent to fetch rules for from the start; a hook asks for any other. After a restart, serve also fetches for each agent whose rules it finds. Repeatable |
 | `--dir` | Where the hooks spool events and note what entered each agent: `WAKE_HOOK_DIR`, or `wake-hook` in the user's cache directory. The hooks and serve must agree |
 | `--interval` | How often to send and fetch, every 2 seconds by default |

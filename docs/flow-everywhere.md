@@ -14,7 +14,7 @@ A flow policy keeps content from an untrusted origin, such as a page a tool fetc
 
 1. **wake-proxy serves the policy it enforces.** The rules SDKs already fetch from the read-only port (`GET /v1/memory`) gain a `flow` field: the parsed policy, `{"version", "window_seconds", "rules"}`, with `version` a SHA-256 of the rules and window, so an SDK can tell a new policy from the one it has. A file wake-proxy can't use is served as `{"unreadable": true}`. Without `--policy-file` the field is absent. So every SDK holds the policy wake-proxy holds, set where agents can't write it, and SDKs that don't know the field ignore it, as they ignore any field they don't know.
 
-2. **The SDKs apply it in the agent's own process, with the origins they saw enter the agent.** Each SDK keeps, per agent, the origins that entered it and when, over the policy's window, as wake-proxy does:
+2. **The SDKs apply it in the agent's own process, with the origins they saw enter the agent.** Each SDK keeps, per agent, the origins that entered it and when, over the policy's window. It keeps them in the process's memory, and starts with none, where wake-proxy counts every agent as having every origin for one window after it starts ([Not covered yet](#not-covered-yet)):
    - a tool's result enters as `tool:<name>`. An MCP tool's origin uses its MCP name, as wake-proxy's does, so `mcp__crm__lookup_order` enters as `tool:lookup_order`;
    - a message, a handoff or a sub-agent's result from another agent enters as `agent:<name>`, and what had entered the sender goes with it, as wake-proxy carries origins across an A2A hop. A sub-agent starts with what had entered the agent that started it;
    - a memory read enters the origins its label carries, at the time of the read. Content with no label, or changed since its label was written, enters as `memory:unlabeled`, which a rule can name;
@@ -66,6 +66,7 @@ Also by founder decision, October 30, 2026.
 
 ## Not covered yet
 
+- **What entered before a process started.** wake-proxy can't know what entered before it started, so for one window every agent counts as having every origin. The SDKs have no such window: a new process starts with no origins, so a worker that restarted, or a session resumed with earlier content in its context, passes rules that content should fail. A process restarts far more often than a proxy, and for a short-lived one a window of refusals could be every call it ever makes, so it needs a way to say it's carrying on, which isn't built. `wake-hook` keeps origins in files, so a restart of its own loses nothing.
 - **Model calls that don't go through the gateway.** Claude Code has no hook before a model call, so Claude's server tools are checked only when its model calls go through the gateway. In the agent's process, what they bring in is noted as the stream shows it, which can be after the agent's next call.
 - **What a provider-run tool returned**, beyond its name, isn't read, and neither are MCP tool listings. Run charters' `never` and budgets don't cover these tools.
 - **Approvals Wake can't match to their request** are turned down, not checked: with the conversation kept at OpenAI and a run resumed in another process (Python), or a run traced without sensitive data (TypeScript). In TypeScript, the app's approvals are checked only when it passes `checkApprovals()`.

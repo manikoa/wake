@@ -139,7 +139,7 @@ wake-proxy enforces a flow policy on the calls that pass it, and serves it with 
   - a message, handoff, subagent start or subagent answer from another agent, as `agent:<sender>`, with whatever had entered the sender, each as of when it entered the sender;
   - a memory read, the origins its label carries when the label vouches for what was read, else `memory:unlabeled`.
 
-  The user's own prompt is never an origin.
+  The user's own prompt is never an origin. What entered is kept in the process's memory, so a new process starts with none, even one resuming a session whose context holds earlier content. wake-proxy's first window, when every agent counts as having every origin, has no match here.
 - **What a refusal says.** It looks like a halt's in each integration, and is recorded as a `denied` event under `policy:<id>`, with the origins behind it in its payload:
   - `Wake's flow policy (policy:no-pay-after-web) holds billing back after tool:fetch_page, so this tool call wasn't run.`
   - Past 256 origins within the window, or 10,000 agents, an agent counts as having every origin: `Wake's flow policy (policy:no-pay-after-web) holds billing back, because more origins entered it than Wake keeps, so this tool call wasn't run.`, with `every_origin` in the payload.
