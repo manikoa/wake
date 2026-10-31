@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	wakelog "github.com/manikoa/wake/log"
+	wakelog "github.com/usewake/wake/log"
 	"golang.org/x/mod/sumdb/note"
 )
 

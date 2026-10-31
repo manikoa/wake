@@ -17,7 +17,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
 
-	wakelog "github.com/manikoa/wake/log"
+	wakelog "github.com/usewake/wake/log"
 )
 
 // testdata/redaction.json holds payloads and what each signer must make of them: the

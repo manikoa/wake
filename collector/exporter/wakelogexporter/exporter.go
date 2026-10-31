@@ -20,8 +20,8 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
 
-	"github.com/manikoa/wake/collector/event"
-	wakelog "github.com/manikoa/wake/log"
+	"github.com/usewake/wake/collector/event"
+	wakelog "github.com/usewake/wake/log"
 )
 
 // Config for the wakelog exporter.
@@ -86,7 +86,7 @@ func createTraces(ctx context.Context, set exporter.Settings, cfg component.Conf
 }
 
 func newTraces(ctx context.Context, set exporter.Settings, cfg *Config, open func(wakelog.Config) (appender, error)) (exporter.Traces, error) {
-	dropped, err := set.MeterProvider.Meter("github.com/manikoa/wake/collector/exporter/wakelogexporter").Int64Counter(
+	dropped, err := set.MeterProvider.Meter("github.com/usewake/wake/collector/exporter/wakelogexporter").Int64Counter(
 		"wake_log_dropped_events",
 		metric.WithDescription("Events that never reached the signed log, by reason: unloggable (too large for an entry even without their payload, or no canonical bytes) or retries_exhausted (retry_on_failure gave up)"),
 		metric.WithUnit("{event}"),

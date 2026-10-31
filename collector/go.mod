@@ -1,11 +1,11 @@
-module github.com/manikoa/wake/collector
+module github.com/usewake/wake/collector
 
 go 1.27.3
 
 require (
-	github.com/manikoa/wake/log v0.0.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.164.0
 	github.com/transparency-dev/tessera v1.0.4
+	github.com/usewake/wake/log v0.0.0
 	go.opentelemetry.io/collector/component v1.70.0
 	go.opentelemetry.io/collector/component/componenttest v0.164.0
 	go.opentelemetry.io/collector/config/configoptional v1.70.0
@@ -81,4 +81,4 @@ require (
 	k8s.io/klog/v2 v2.130.1 // indirect
 )
 
-replace github.com/manikoa/wake/log => ../log
+replace github.com/usewake/wake/log => ../log

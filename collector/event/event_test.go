@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"golang.org/x/mod/sumdb/note"
 
-	wakelog "github.com/manikoa/wake/log"
+	wakelog "github.com/usewake/wake/log"
 )
 
 func newKey(t *testing.T, name string) (note.Signer, note.Verifier) {

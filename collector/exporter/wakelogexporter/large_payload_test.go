@@ -26,9 +26,9 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/mod/sumdb/note"
 
-	"github.com/manikoa/wake/collector/event"
-	"github.com/manikoa/wake/collector/processor/wakesignprocessor"
-	wakelog "github.com/manikoa/wake/log"
+	"github.com/usewake/wake/collector/event"
+	"github.com/usewake/wake/collector/processor/wakesignprocessor"
+	wakelog "github.com/usewake/wake/log"
 )
 
 // countingLog wraps the real log, counting appends and failing the first payload writes.

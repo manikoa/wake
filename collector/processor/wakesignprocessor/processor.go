@@ -19,8 +19,8 @@ import (
 	"go.opentelemetry.io/collector/processor/processorhelper"
 	"golang.org/x/mod/sumdb/note"
 
-	"github.com/manikoa/wake/collector/event"
-	wakelog "github.com/manikoa/wake/log"
+	"github.com/usewake/wake/collector/event"
+	wakelog "github.com/usewake/wake/log"
 )
 
 // Config for the wakesign processor.

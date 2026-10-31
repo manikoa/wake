@@ -1,4 +1,4 @@
-module github.com/manikoa/wake/log
+module github.com/usewake/wake/log
 
 go 1.27.3
 
